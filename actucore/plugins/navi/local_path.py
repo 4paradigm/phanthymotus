@@ -5,6 +5,7 @@ import heapq
 import math
 from dataclasses import dataclass, field
 from functools import partial
+from struct import pack
 from threading import Lock
 
 import numpy as np
@@ -22,6 +23,10 @@ START = (20, 28)
 SHAPE = (87, 57)
 RIGHT, FORWARD = np.meshgrid((np.arange(SHAPE[1]) - START[1]) * RESOLUTION,
                               (np.arange(SHAPE[0]) - START[0]) * RESOLUTION)
+
+
+SUPPORTED_REGION = ((FORWARD[0, 0] - RESOLUTION / 2, RIGHT[0, 0] - RESOLUTION / 2),
+                    (FORWARD[-1, 0] + RESOLUTION / 2, RIGHT[0, -1] + RESOLUTION / 2))
 
 
 def footprint_region(center, half_cells):
@@ -66,6 +71,8 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
             return None
         goal_row, last_row = int(rows.min()), int(rows.max())
         goal_col, last_col = int(cols.min()), int(cols.max())
+    best_target_cost = (target_cost[rows, cols].min()
+                        if target_cost is not None and target_cells is not None else None)
 
     def distance_to_goals(point):
         if target_cost is not None:
@@ -98,7 +105,10 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
             continue
         if (goal_col <= col <= last_col and goal_row <= row <= last_row
                 and (target_cells is None or target_cells[current])):
-            if target_cost is None:
+            # With ranked goals the queue is Dijkstra ordered. Reaching the
+            # globally best eligible rank first also minimizes walked cost
+            # for that rank, including the existing queue tie order.
+            if target_cost is None or target_cost[current] == best_target_cost:
                 return path_to(current)
             score = (target_cost[current], walked)
             if score < best_score:
@@ -253,6 +263,22 @@ def confirmed_free(grid):
     return getattr(grid, "confirmed_free", grid[0])
 
 
+def frozen_mask(mask):
+    if not mask.flags.writeable and mask.flags.owndata:
+        return mask
+    result = mask.copy()
+    result.setflags(write=False)
+    return result
+
+
+def frozen_grid(grid):
+    """Share the same immutable projection with routing, planning and publication."""
+    free, occupied = grid
+    clear = confirmed_free(grid)
+    frozen_free = frozen_mask(free)
+    return DepthGrid(frozen_free, frozen_mask(occupied), frozen_free if clear is free else frozen_mask(clear))
+
+
 def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
             require_valid_depth=False, check_free_space=True):
     valid = np.isfinite(frame) & (frame > 0.) if frame is not None else None
@@ -266,7 +292,6 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     fx, cx, fy, cy = intrinsics_for(geometry, height, width)
     u = (np.arange(width) - cx) / fx
     v = (np.arange(height) - cy) / fy
-    x, y = u * frame, v[:, None] * frame
     above_floor = None
     if plane is not None:
         optical_normal, c = plane
@@ -274,6 +299,7 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         if abs(normal[2]) >= .5 * np.linalg.norm(normal):
             top = geometry.height if geometry.height is not None else abs(c / normal[2])
             if .02 < top <= 2.5:
+                x, y = u * frame, v[:, None] * frame
                 above_floor = (y + optical_normal[0]*x + optical_normal[2]*frame - c) / normal[2]
     if above_floor is None:
         hits = valid & _floorless_hits(frame)
@@ -285,11 +311,21 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         valid &= frame <= max_hit_depth
         hits &= valid
     samples = valid if check_free_space else hits
+    transform = geometry.base_from_optical
+    if transform[0, 0] == transform[0, 1] == 0. and transform[0, 2] == 1.:
+        # With an optical axis parallel to grid forward, depth alone bounds
+        # the supported rows. Keep boundary ties for the normal rasterizer.
+        lower = forward[0, 0] - transform[0, 3] - resolution
+        upper = forward[-1, 0] - transform[0, 3] + resolution
+        samples = samples & (frame >= lower) & (frame <= upper)
+    row, col = np.nonzero(samples)
+    z = frame[row, col]
+    x, y = u[col] * z, v[row] * z
     floor_context = None
     floor_samples = ground[samples] if above_floor is not None and check_free_space else None
     if above_floor is not None and geometry.min_obstacle_height == APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M:
         floor_context = (frame, above_floor, samples, (fx, cx, fy, cy), optical_normal)
-    return _project_observed(geometry, right, forward, resolution, x[samples], y[samples], frame[samples],
+    return _project_observed(geometry, right, forward, resolution, x, y, z,
                              hits[samples], check_free_space=check_free_space,
                              heights=above_floor[samples] if above_floor is not None else None,
                              floor_context=floor_context, floor_samples=floor_samples)
@@ -299,12 +335,21 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
                       check_free_space, heights, floor_context=None, floor_samples=None):
     transform = geometry.base_from_optical
     body_f = x * transform[0, 0] + y * transform[0, 1] + z * transform[0, 2] + transform[0, 3]
-    body_l = x * transform[1, 0] + y * transform[1, 1] + z * transform[1, 2] + transform[1, 3]
     hit_row = np.rint((body_f - forward[0, 0]) / resolution).astype(int)
+    in_rows = (hit_row >= 0) & (hit_row < right.shape[0])
+    all_rows = in_rows.all()
+    # Returns outside forward support cannot vote in any grid cell.
+    if not all_rows:
+        x, y, z = x[in_rows], y[in_rows], z[in_rows]
+    body_l = x * transform[1, 0] + y * transform[1, 1] + z * transform[1, 2] + transform[1, 3]
     hit_col = np.rint((-body_l - right[0, 0]) / resolution).astype(int)
-    in_grid = ((hit_row >= 0) & (hit_row < right.shape[0])
-               & (hit_col >= 0) & (hit_col < right.shape[1]))
-    cells = (hit_row[in_grid], hit_col[in_grid])
+    in_cols = (hit_col >= 0) & (hit_col < right.shape[1])
+    if all_rows:
+        in_grid = in_cols
+    else:
+        in_grid = in_rows.copy()
+        in_grid[in_rows] = in_cols
+    cells = (hit_row[in_grid], hit_col[in_cols])
     possible_hits = hits[in_grid]
     raised = possible_hits
     if heights is not None:
@@ -435,6 +480,8 @@ class Detour:
     points: tuple[tuple[float, float], ...]  # metres, (forward, right)
     geometry: Geometry
     preview: tuple[tuple[float, float], ...] = ()
+    reachable_prefix: bool = False
+    topology: tuple[tuple[float, float], ...] = ()  # original ordered nodes, in the observed grid
 
 
 def target_in_grid(geometry, forward, right):
@@ -467,6 +514,8 @@ class DepthProjection:
             # free space for the same image.
             projected = observe(self.frame, geometry, RIGHT, FORWARD, RESOLUTION, self.ground,
                                 require_valid_depth=True, check_free_space=check_free_space)
+            if projected is not None:
+                projected = frozen_grid(projected)
             with self._lock:
                 if key not in self._grids and len(self._grids) == 4:
                     del self._grids[next(iter(self._grids))]
@@ -530,7 +579,7 @@ class PlanCache:
                allow_forward, allow_return, velocity_limits, observation.get("stop_target"),
                observation.get("body_half_width"), observation.get("closest"),
                observation.get("preferred_heading"), observation.get("allow_unknown", False),
-               observation.get("preview_occluded", False))
+               observation.get("preview_occluded", False), observation.get("finite_turn", False))
         if self.key != key:
             self.key = key
             self.plans.clear()
@@ -542,7 +591,7 @@ class PlanCache:
                 velocity_limits=velocity_limits, target=observation.get("stop_target"),
                 projected_grid=self.grid_for(observation, geometry),
                 body_half_width=observation.get("body_half_width"),
-                closest=observation.get("closest", False),
+                closest=observation.get("closest", False), finite_turn=observation.get("finite_turn", False),
                 preferred_heading=observation.get("preferred_heading"),
                 allow_unknown=observation.get("allow_unknown", False),
                 require_observed_endpoint=(ground is not None and geometry.free_space_validated
@@ -641,6 +690,281 @@ class ObstacleSquares:
 
     centers: np.ndarray
     yaw: float
+    alignment_error: float = 0.
+
+
+@dataclass(frozen=True)
+class GridTransform:
+    """An earlier grid expressed in the current forward/right coordinates."""
+
+    forward: float = 0.
+    right: float = 0.
+    yaw: float = 0.
+    shift_error: float = 0.
+    turn_error: float = 0.
+
+    def points(self, points):
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
+        return np.asarray(points) @ np.array([[c, s], [-s, c]]) + (self.forward, self.right)
+
+    def source_points(self, points):
+        """Express current-grid points in this exposure's coordinates."""
+        c, s = math.cos(self.yaw), math.sin(self.yaw)
+        return (np.asarray(points) - (self.forward, self.right)) @ np.array([[c, -s], [s, c]])
+
+    def error(self, radius):
+        return self.shift_error + radius * min(2., self.turn_error)
+
+    def squares(self, cells):
+        cells = occupied_squares(cells)
+        if cells is None or not cells.centers.size:
+            return None
+        radius = np.linalg.norm(cells.centers, axis=1).max() + RESOLUTION / math.sqrt(2)
+        return ObstacleSquares(self.points(cells.centers), cells.yaw + self.yaw,
+                               cells.alignment_error + self.error(radius))
+
+
+
+def array_revision(array):
+    if array is None:
+        return None
+    return array.shape, array.dtype.str, hash(array.tobytes())
+
+
+def clearance_margin(half_width):
+    """Physical clearance on each side of the adopted chassis."""
+    return .10 * half_width
+
+
+def occupied_squares(occupied):
+    """Keep the original extent and orientation of each measured occupied cell."""
+    if isinstance(occupied, ObstacleSquares) or occupied is None:
+        return occupied
+    rows, cols = np.nonzero(occupied)
+    return ObstacleSquares(np.column_stack((FORWARD[rows, cols], RIGHT[rows, cols])), 0.)
+
+
+def rectangle_clearance(poses, squares, front, rear, width, *, padding=0., cell_size=RESOLUTION):
+    """Minimum Euclidean separation and first contact sample for closed rectangles.
+
+    The chassis is expressed about its reference pose. Work in the obstacle
+    axes so the same calculation handles raster cells and rotated map memory.
+    Padding bounds the continuous motion between the checked samples.
+    """
+    if not len(poses) or squares is None or not squares.centers.size:
+        return math.inf, None
+    padding += squares.alignment_error
+    f, r, yaw = np.asarray(poses).T
+    length, shift = (front + rear) / 2, (front - rear) / 2
+    f, r = f + shift * np.cos(yaw), r + shift * np.sin(yaw)
+    c, s = math.cos(squares.yaw), math.sin(squares.yaw)
+    ox, oy = squares.centers.T
+    ox, oy = c * ox + s * oy, -s * ox + c * oy
+    x, y = c * f + s * r, -s * f + c * r
+    c, s = np.cos(yaw - squares.yaw), np.sin(yaw - squares.yaw)
+    half = cell_size / 2
+    # Any point in the first body paired with a cell centre gives an upper
+    # bound on the minimum distance. Discard only cells whose bounding-box
+    # lower bound exceeds both that distance and the contact padding.
+    if len(ox) > 32:
+        dx, dy = ox - x[0], oy - y[0]
+        u = np.maximum(abs(c[0]*dx + s[0]*dy) - length, 0.)
+        v = np.maximum(abs(-s[0]*dx + c[0]*dy) - width, 0.)
+        cutoff = max(float(np.hypot(u, v).min()), padding) + 1e-10
+        ex, ey = length*abs(c) + width*abs(s) + half, length*abs(s) + width*abs(c) + half
+        gap_x = np.maximum(0., np.maximum((x-ex).min() - ox, ox - (x+ex).max()))
+        gap_y = np.maximum(0., np.maximum((y-ey).min() - oy, oy - (y+ey).max()))
+        near = gap_x*gap_x + gap_y*gap_y <= cutoff*cutoff
+        ox, oy = ox[near], oy[near]
+    minimum = math.inf
+    batch = max(1, 32768 // len(ox))
+    start, end = 0, 1
+    while start < len(f):
+        a, b = c[start:end, None], s[start:end, None]
+        dx, dy = ox - x[start:end, None], oy - y[start:end, None]
+        if np.all(b == 0.):
+            distance = np.hypot(np.maximum(abs(dx) - length - half, 0.),
+                                np.maximum(abs(dy) - width - half, 0.))
+        else:
+            u, v = a * dx + b * dy, -b * dx + a * dy
+            cell_extent = half * (abs(a) + abs(b))
+            # Four separating axes also detect crossing edges with no interior vertex.
+            overlap = ((abs(dx) <= length * abs(a) + width * abs(b) + half)
+                       & (abs(dy) <= length * abs(b) + width * abs(a) + half)
+                       & (abs(u) <= length + cell_extent) & (abs(v) <= width + cell_extent))
+            # For disjoint polygons the closest pair includes a vertex. Check
+            # both vertex-to-box directions (including corner-to-corner gaps).
+            distance2 = np.full(dx.shape, np.inf)
+            for i, j in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+                du = np.maximum(abs(u + half * (i * a + j * b)) - length, 0.)
+                dv = np.maximum(abs(v + half * (-i * b + j * a)) - width, 0.)
+                px = np.maximum(abs(dx - i * length * a + j * width * b) - half, 0.)
+                py = np.maximum(abs(dy - i * length * b - j * width * a) - half, 0.)
+                distance2 = np.minimum(distance2, np.minimum(du*du + dv*dv, px*px + py*py))
+            distance = np.sqrt(np.where(overlap, 0., distance2))
+        nearest = distance.min(axis=1) - padding
+        hits = np.flatnonzero(nearest <= 1e-10)
+        if hits.size:
+            return 0., start + int(hits[0])
+        minimum = min(minimum, float(nearest.min()))
+        start, end = end, min(len(f), end + batch)
+    return minimum, None
+
+
+_PREPARED_PAIR_BUDGET = 32768
+_CONTACT_EPS = 1e-10
+
+
+class PreparedObstacleLayers:
+    """Packed original squares from one registered DWA scene."""
+
+    def __init__(self, occupied, remembered):
+        self.layers = tuple((square, reason)
+                            for evidence, reason in ((occupied, "footprint_collision"),
+                                                     (remembered, "remembered_obstacle"))
+                            for layer in (evidence if isinstance(evidence, tuple) else (evidence,))
+                            if (square := occupied_squares(layer)) is not None
+                            and len(square.centers))
+        self._first_pose = None
+        if not self.layers:
+            return
+        self.yaws = np.asarray([square.yaw for square, _ in self.layers])
+        self.cos_yaws = np.asarray([math.cos(yaw) for yaw in self.yaws])
+        self.sin_yaws = np.asarray([math.sin(yaw) for yaw in self.yaws])
+        self.counts = [len(square.centers) for square, _ in self.layers]
+        ids = self.layer_index = np.repeat(np.arange(len(self.counts)), self.counts)
+        sx, sy = np.concatenate([square.centers for square, _ in self.layers]).T
+        self.ox = self.cos_yaws[ids] * sx + self.sin_yaws[ids] * sy
+        self.oy = -self.sin_yaws[ids] * sx + self.cos_yaws[ids] * sy
+        self.error = np.asarray([square.alignment_error for square, _ in self.layers])
+        self.native_shapes = (np.isfinite(self.error).all() and np.isfinite(sx).all() and np.isfinite(sy).all()
+                              and all(square.centers.dtype == np.float64 for square, _ in self.layers))
+
+    def clearance(self, poses, f, r, yaw, front, rear, width, padding):
+        if not self.layers:
+            return math.inf, None, None
+        # The native tail switches formulas as a group for each per-layer block.
+        # If it could split any layer into more than one tail block, retain it.
+        if not self.native_shapes or max(self.counts) * (len(f) - 1) > _PREPARED_PAIR_BUDGET:
+            clearance, first_hit, cause = math.inf, None, None
+            for squares, reason in self.layers:
+                distance, hit = rectangle_clearance(
+                    poses, squares, front, rear, width, padding=padding)
+                clearance = min(clearance, distance)
+                if hit is not None and (first_hit is None or hit < first_hit):
+                    first_hit, cause = hit, reason
+            return clearance, first_hit, cause
+
+        x = self.cos_yaws * f[:, None] + self.sin_yaws * r[:, None]
+        y = -self.sin_yaws * f[:, None] + self.cos_yaws * r[:, None]
+        delta = yaw[:, None] - self.yaws
+        c, s = np.cos(delta), np.sin(delta)
+        length, half = (front + rear) / 2, RESOLUTION / 2
+        ids = self.layer_index
+        cell_pad = (padding + self.error)[ids]
+        # Include the actual broadcast operands so cache reuse preserves
+        # even a numerical kernel's last-bit differences across trace shapes.
+        key = (pack("!7d", f[0], r[0], yaw[0], front, rear, width, half),
+               x[0].tobytes(), y[0].tobytes(), c[0].tobytes(), s[0].tobytes())
+        initial = self._first_pose
+        if initial is None or initial[0] != key:
+            unpadded = self.point_distances(
+                self.ox-x[0, ids], self.oy-y[0, ids], c[0, ids], s[0, ids],
+                s[0, ids] == 0., length, half, width)
+            initial = self._first_pose = (key, unpadded)
+        first = initial[1] - cell_pad
+        hits = np.flatnonzero(first <= _CONTACT_EPS)
+        if hits.size:
+            return 0., 0, self.layers[ids[hits[0]]][1]
+        minimum = float(first.min())
+        if len(f) == 1:
+            return minimum, None, None
+
+        # The expanded rectangle in each source's axes bounds all true separations.
+        # The exact first sample gives an upper bound for the whole trace.
+        ex = length*abs(c) + width*abs(s) + half
+        ey = length*abs(s) + width*abs(c) + half
+        gx = np.maximum(0., np.maximum((x-ex).min(axis=0)[ids] - self.ox,
+                                       self.ox - (x+ex).max(axis=0)[ids]))
+        gy = np.maximum(0., np.maximum((y-ey).min(axis=0)[ids] - self.oy,
+                                       self.oy - (y+ey).max(axis=0)[ids]))
+        gap = np.hypot(gx, gy)
+        keep = np.flatnonzero(gap <= max(minimum, _CONTACT_EPS) + cell_pad + _CONTACT_EPS)
+        axis_aligned_tail = np.all(s[1:] == 0., axis=0)
+        # Distance from one real cell vertex at the terminal pose to the body
+        # bounds the full-trace minimum from above. Use it only for pruning;
+        # only the original full evaluator can report a distance or a contact.
+        upper_bound = minimum
+        if keep.size:
+            source = ids[keep]
+            dx = self.ox[keep] - x[-1, source]
+            dy = self.oy[keep] - y[-1, source]
+            a, b = c[-1, source], s[-1, source]
+            u, v = a * dx + b * dy, -b * dx + a * dy
+            i, j = -np.copysign(1., dx), -np.copysign(1., dy)
+            du = np.maximum(abs(u + half * (i*a + j*b)) - length, 0.)
+            dv = np.maximum(abs(v + half * (-i*b + j*a)) - width, 0.)
+            witness = np.sqrt(du*du + dv*dv)
+            aligned = axis_aligned_tail[source]
+            if aligned.any():
+                witness[aligned] = np.hypot(np.maximum(abs(dx[aligned]) - length - half, 0.),
+                                             np.maximum(abs(dy[aligned]) - width - half, 0.))
+            upper = witness - cell_pad[keep]
+            upper_bound = min(minimum, float(upper.min()) + _CONTACT_EPS)
+            keep = keep[gap[keep] <= max(upper_bound, _CONTACT_EPS) + cell_pad[keep] + _CONTACT_EPS]
+        first_hit, hit_layer = len(f), len(self.layers)
+        batch = max(1, _PREPARED_PAIR_BUDGET // (len(f) - 1))
+        for start in range(0, len(keep), batch):
+            cell = keep[start:start+batch]
+            layer = ids[cell]
+            # A contact at first_hit still needs to check earlier layers for a tie.
+            stop = min(len(f), first_hit + 1)
+            dx = self.ox[cell] - x[1:stop, layer]
+            dy = self.oy[cell] - y[1:stop, layer]
+            gap_x = np.maximum(abs(dx) - ex[1:stop, layer], 0.)
+            gap_y = np.maximum(abs(dy) - ey[1:stop, layer], 0.)
+            limit = max(min(minimum, upper_bound), _CONTACT_EPS) + cell_pad[cell] + _CONTACT_EPS
+            row, col = np.nonzero(gap_x*gap_x + gap_y*gap_y <= limit*limit)
+            if not row.size:
+                continue
+            source = layer[col]
+            time_index = row + 1
+            distance = self.point_distances(dx[row, col], dy[row, col],
+                                            c[time_index, source], s[time_index, source],
+                                            axis_aligned_tail[source], length, half, width) - cell_pad[cell[col]]
+            minimum = min(minimum, float(distance.min()))
+            hits = np.flatnonzero(distance <= _CONTACT_EPS)
+            if hits.size:
+                i = hits[0]  # Pose-major and source-major order within each slab.
+                if (time_index[i], source[i]) < (first_hit, hit_layer):
+                    first_hit, hit_layer = int(time_index[i]), int(source[i])
+                minimum = 0.
+        return (minimum, None, None) if first_hit == len(f) else (0., first_hit, self.layers[hit_layer][1])
+
+    @staticmethod
+    def point_distances(dx, dy, a, b, aligned, length, half, width):
+        result = np.empty_like(dx)
+        if aligned.any():
+            result[aligned] = np.hypot(np.maximum(abs(dx[aligned]) - length - half, 0.),
+                                       np.maximum(abs(dy[aligned]) - width - half, 0.))
+        if aligned.all():
+            return result
+        rotate = ~aligned
+        dx, dy, a, b = dx[rotate], dy[rotate], a[rotate], b[rotate]
+        u, v = a * dx + b * dy, -b * dx + a * dy
+        cell_extent = half * (abs(a) + abs(b))
+        overlap = ((abs(dx) <= length * abs(a) + width * abs(b) + half)
+                   & (abs(dy) <= length * abs(b) + width * abs(a) + half)
+                   & (abs(u) <= length + cell_extent) & (abs(v) <= width + cell_extent))
+        distance2 = np.full(dx.shape, np.inf)
+        for i, j in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+            du = np.maximum(abs(u + half * (i * a + j * b)) - length, 0.)
+            dv = np.maximum(abs(v + half * (-i * b + j * a)) - width, 0.)
+            px = np.maximum(abs(dx - i * length * a + j * width * b) - half, 0.)
+            py = np.maximum(abs(dy - i * length * b - j * width * a) - half, 0.)
+            distance2 = np.minimum(distance2, np.minimum(du*du + dv*dv, px*px + py*py))
+        result[rotate] = np.sqrt(np.where(overlap, 0., distance2))
+        return result
 
 
 def _square_sweep_hits(squares, lower, upper, radius):
@@ -681,7 +1005,7 @@ def _square_sweep_hits(squares, lower, upper, radius):
 
 def _sweep_circle(geometry, half_width):
     center = (geometry.front - geometry.rear) / 2
-    radius = math.hypot(geometry.half_length, half_width) + .05
+    radius = math.hypot(geometry.half_length, half_width) + clearance_margin(half_width)
     return center, radius
 
 
@@ -760,6 +1084,72 @@ def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tole
                 & (abs(right) <= half_width + cell)).any()
 
 
+def clearance_route(grid, geometry, half_width, target, stop, approach_origin, previous=()):
+    """Find a clearance-weighted reference about the body pivot, on either side of the goal line."""
+    free, occupied = grid
+    if not free.any() or not occupied.any() or target is None:
+        return None
+    remaining = np.hypot(FORWARD-target[0], RIGHT-target[1])
+    goal = (remaining >= stop) & (remaining <= stop + RESOLUTION)
+    if not goal.any():
+        return None
+    rows, cols = occupied.shape
+    columns = np.arange(cols)
+    # Squared Euclidean distance to the nearest occupied centre, by two
+    # separable one-dimensional minima on this bounded grid.
+    low = np.maximum.accumulate(np.where(occupied, columns, -rows-cols), axis=1)
+    high = np.minimum.accumulate(np.where(occupied, columns, rows+cols)[:, ::-1], axis=1)[:, ::-1]
+    lateral = np.minimum(columns - low, high - columns)
+    row_dist = np.subtract.outer(np.arange(rows), np.arange(rows)) ** 2
+    clearance = np.sqrt((row_dist[:, :, None] + lateral[None, :, :] ** 2).min(axis=1)) * RESOLUTION
+    pivot = -geometry.half_length if geometry.front == 0. else 0.
+    start = (START[0] + round(pivot / RESOLUTION), START[1])
+    radius = math.ceil(half_width / RESOLUTION)
+    if not 0 <= start[0] < rows or 2*radius >= min(rows, cols):
+        return None
+    # Fusion can spread a measured cell over neighbouring centres. Use the
+    # field for route preference. Every command still checks the original
+    # occupied squares and the complete oriented footprint to a stop.
+    allowed = clearance > half_width - RESOLUTION
+    allowed[start] = True
+    desired = half_width + 2.5 * RESOLUTION
+    cost = 3. * np.square(np.maximum(0., desired - clearance) / (2.5 * RESOLUTION))
+    if previous:
+        distance = np.full_like(clearance, np.inf)
+        for f, r in previous:
+            np.minimum(distance, (FORWARD - pivot - f)**2 + (RIGHT - r)**2, out=distance)
+        cost += .5 * np.minimum(1., np.sqrt(distance) / max(.1, half_width))
+    # Rejoin the original approach line when the obstruction ends. Otherwise
+    # any point on the standoff circle, even far to the side, is equally good.
+    dx, dy = target[0] - (approach_origin[0] + pivot), target[1] - approach_origin[1]
+    length = max(RESOLUTION, math.hypot(dx, dy))
+    lateral = abs((FORWARD-target[0])*dy - (RIGHT-target[1])*dx) / length
+    cost += .5 * lateral / max(.15, half_width)
+    # A single visible centre can lie next to an unseen obstacle face. Prefer
+    # a path with measured floor under the whole chassis while remaining able
+    # to approach the boundary of an occluded region for the next view.
+    size = 2 * radius + 1
+    padded = np.pad(~free, ((radius+1, radius), (radius+1, radius)), constant_values=True)
+    integral = padded.cumsum(0).cumsum(1)
+    unknown = integral[size:, size:] - integral[:-size, size:] - integral[size:, :-size] + integral[:-size, :-size]
+    cost += 5. * unknown / size**2
+    preferred = goal & (lateral <= RESOLUTION) & allowed
+    allowed &= remaining >= stop
+    if not (goal & allowed).any():
+        return None
+    path = shortest_path(allowed, start, start, target_cells=preferred, cell_cost=cost) if preferred.any() else None
+    if path is None:
+        path = shortest_path(allowed, start, start, target_cells=goal, cell_cost=cost)
+    if not path or len(path) < 2:
+        return None
+    # Steer toward the measured lookahead, rather than following a stair-step
+    # tangent of the discretized path. The supporting cells remain observable.
+    topology = tuple((FORWARD[cell], RIGHT[cell]) for cell in path)
+    relative = tuple((f - pivot, r) for f, r in topology)
+    look = next((i for i, point in enumerate(relative) if math.hypot(*point) >= .40), len(relative) - 1)
+    return Detour(None, ((0., 0.), *relative[look:]), geometry, topology=topology)
+
+
 def opening_route(frame, occupied, geometry, half_width, plane, target):
     """Aim toward a measured opening straddling the forward axis."""
     if (plane <= geometry.front or target is None or target[0] <= plane
@@ -828,7 +1218,7 @@ def _turnable_endpoints(cells, occupied, geometry, half_width):
 def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_age_ms,
                          watchdog_ms=300, *, velocity_limits, observed_grid=None, allow_forward=True, allow_return=True,
                          target=None, projected_grid=None, body_half_width=None, closest=False,
-                         preferred_heading=None, allow_unknown=False, require_observed_endpoint=True):
+                         preferred_heading=None, allow_unknown=False, require_observed_endpoint=True, finite_turn=False):
     if velocity_limits is not None:
         (floor_vx, max_vx), (floor_vy, max_vy) = velocity_limits
         if not (max_vx > 0 and max_vy > 0 and floor_vx <= max_vx and floor_vy <= max_vy):
@@ -895,6 +1285,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
     if velocity_limits is None or max(floor_vx, floor_vy) <= min(max_vx, max_vy):
         steps = STEPS if allow_return else tuple(step for step in STEPS if step[1] >= 0)
     path, target_cells = None, None
+    reachable_prefix = False
     if target is not None:
         optical_forward, optical_right, stop, tolerance = target
         target_f, target_r = target_in_grid(geometry, optical_forward, optical_right)
@@ -905,9 +1296,11 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         if observed_endpoint:
             target_cells &= free
         turn_width = half_width if body_half_width is None else body_half_width
-        target_cells = _turnable_endpoints(target_cells, occupied, geometry, turn_width)
+        if not finite_turn:
+            target_cells = _turnable_endpoints(target_cells, occupied, geometry, turn_width)
         path = find_path(allowed, start, goal, steps=steps, target_cells=target_cells)
         if path is None and closest:
+            reachable_prefix = True
             target_cells = ranges < ranges[start] - resolution / 2
             if observed_endpoint:
                 target_cells &= free
@@ -980,7 +1373,7 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
             path = path[:first + 1]
         points = ((0., 0.),) + tuple(((row - row_zero) * resolution, side * (col - col_zero) * resolution)
                                      for row, col in path[first:])
-        return Detour(command, points, geometry)
+        return Detour(command, points, geometry, reachable_prefix=reachable_prefix)
 
     if velocity_limits is None:
         return detour(path, len(path) - 1 if reposition else 1, None)

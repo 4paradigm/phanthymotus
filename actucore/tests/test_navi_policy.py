@@ -21,6 +21,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from plugins.navi.active_scan import NearProjection  # noqa: E402
 from plugins.navi import depth as D  # noqa: E402
 from plugins.navi import policy as P  # noqa: E402
 
@@ -1594,14 +1595,14 @@ def test_the_keepout_is_wider_than_the_declared_box():
 def test_an_obstacle_the_bands_call_left_now_stops_the_robot():
     """End to end, the reason all of the above exists.
 
-    A doorframe 0.25 m off the axis at 0.7 m is inside a humanoid's width and
+    The near edge of a doorframe centred 0.22 m off-axis at 0.7 m falls inside the keepout and
     outside the centre third of the picture. The bands file it under "left",
     and the left band has never stopped forward motion."""
     # `obstacle_stop_m` pinned to what this scenario was measured at; the
     # shipped default has since been tuned down on r1_sz.
     config = _cfg(obstacle_stop_m=0.8)
     P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
-    depth = {"map": _obstacle_map(5.0, [(-0.25, 0.7, 0.1)], config=config),
+    depth = {"map": _obstacle_map(5.0, [(-0.22, 0.7, 0.1)], config=config),
              "bands": {"left": 0.7, "center": 5.0, "right": 5.0}}
     state = seed(_state(), _detections(_obj(x=0.0)), depth, config)
     decision = P.step(detections=_detections(_obj(x=0.0)), depth=depth,
@@ -1960,10 +1961,8 @@ def test_a_standard_doorway_reads_as_passable():
     比任何一扇门都宽。于是门框永远算在正前方，clearance 读到门平面而不是门洞。
     """
     true_fov = 0.888
-    config = _cfg(clearance_margin_m=.10, half_fov_rad=true_fov, obstacle_stop_m=.60)
-    # 必须用机器人自己声明的 footprint。Config 的兜底半宽 0.35 加上余量要求
-    # **1.0 m 净宽**，而标准门只有 0.8~0.9 m —— 也就是说没有 footprint 声明的底盘
-    # 本来就过不了门，而且过不去的理由跟视场角无关。R1 声明的是 0.179。
+    config = _cfg(half_fov_rad=true_fov, obstacle_stop_m=.60)
+    # R1 声明物理半宽 0.179 m；走廊使用协商后的半宽和每侧 10% 余量。
     P.adopt_limits(config, dict(_R1_DESC, footprint=_R1_FOOTPRINT))
     keep = config.half_width_m + config.clearance_margin_m
     assert 2 * keep < 0.90, "0.9 m 的门本来就该放得下这台机器人"
@@ -1977,9 +1976,11 @@ def test_a_standard_doorway_reads_as_passable():
             f"离门 {wall} m 时走廊被门框挡住了：clearance={clearance}")
         assert coverage >= config.coverage_min
 
-    # 反过来钉住这条测试确实有效：把视场角填成出厂的 0.55，同一张图就会在 0.6 m
-    # 处判定挡住 —— 也就是真机上看到的行为。
-    depth = _doorway(0.90, 0.6, half_fov_rad=true_fov)
+    # With the smaller derived keepout the miscalibration shows up in a narrower door.
+    depth = _doorway(0.60, 0.6, half_fov_rad=true_fov)
+    correct, _ = D.corridor(depth, half_width_m=keep, half_fov_rad=true_fov,
+                            reference_m=config.obstacle_stop_m)
+    assert correct > config.obstacle_stop_m
     wrong, _ = D.corridor(depth, half_width_m=keep, half_fov_rad=0.55,
                           reference_m=config.obstacle_stop_m)
     assert wrong <= config.obstacle_stop_m
@@ -2791,7 +2792,7 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
     ]), .275, .275, None)
     config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.,
                   half_width_m=.275, vx_max=.3, wz_max=1., obstacle_stop_m=.6,
-                  clearance_margin_m=.1, stop_distance_m=.6)
+                  stop_distance_m=.6)
     state = _state(motion_source="measured")
     robot = [0., 0., 0.]          # SIM pose: forward, left, yaw (ccw)
     world_target = (3.4, -0.57)   # metres, (forward, left) at the start
@@ -2806,8 +2807,8 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
 
     monkeypatch.setattr(state.tracker, "step", lambda **kwargs: target())
     free = np.ones(local_path.SHAPE, dtype=bool)
-    # Posts 0.30 m ahead at +-0.35 m enter the circular turn sweep.
-    posts = np.isclose(local_path.FORWARD, .30) & (np.abs(np.abs(local_path.RIGHT) - .35) < .03)
+    # Posts 0.30 m ahead at +-0.30 m enter the circular turn sweep.
+    posts = np.isclose(local_path.FORWARD, .30) & np.isclose(np.abs(local_path.RIGHT), .30)
     recovery_changes_scene = fault.startswith("recovery_")
     after_gap = False
 
@@ -2930,7 +2931,7 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
     config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
-                  half_width_m=.275, clearance_margin_m=.1)
+                  half_width_m=.275)
     state = _state(motion_source="measured")
     target = SimpleNamespace(bearing_rad=0., range_m=3.5, range_known=True,
                              observed=True, measured_range_m=3.5)
@@ -2985,7 +2986,7 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
     config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
-                  half_width_m=.275, clearance_margin_m=.10, vy_max=0.)
+                  half_width_m=.275, vy_max=0.)
     state = _state(motion_source="measured")
     target = SimpleNamespace(bearing_rad=0., range_m=4., range_known=True,
                              observed=True, measured_range_m=4.)
@@ -3058,14 +3059,14 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
     pytest.fail("The segment neither completed nor held for the newly observed obstruction")
 
 
-def test_local_obstacle_beyond_slowdown_starts_a_detour_with_five_centimetre_margins(monkeypatch):
+def test_local_obstacle_beyond_slowdown_starts_a_detour_with_width_based_margin(monkeypatch):
     from plugins.navi import local_path
 
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336), (480, 420, 243), .20)
     config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20)
-    assert P._keepout_m(config) == pytest.approx(.25)
+    assert P._keepout_m(config) == pytest.approx(.22)
     state = _state(motion_source="measured")
     view = dict(frame_id=1000, map=np.ones((4, 4)), ground=np.ones((4, 4), dtype=bool))
     occupied = (abs(local_path.RIGHT) <= .10) & np.isclose(local_path.FORWARD, 2.)
@@ -3167,7 +3168,7 @@ def test_detour_first_leg_passes_the_obstacle_at_the_permitted_heading_error(sid
     geometry = local_path.Geometry(None, None, np.array([
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275, clearance_margin_m=.1)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.375 / 1.10)
     state = _state()
     scan = state.active_scan
     scan.receipt_only = True
@@ -3192,7 +3193,7 @@ def test_detour_first_turn_can_execute_with_the_braking_reserve():
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336), (480, 420, 243),
                                         .20, half_length=.23)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20, clearance_margin_m=.10,
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
                   max_depth_age_ms=800, watchdog_ms=600)
     state = _state(motion_source="measured")
     scan = state.active_scan
@@ -3217,7 +3218,7 @@ def test_initial_route_points_at_measured_opening_between_offset_jambs():
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(320, 247, 159.5), (240, 247, 115), .275)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275, clearance_margin_m=.10)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275)
     state = _state(motion_source="measured")
     scan = state.active_scan
     occupied = (np.isclose(local_path.FORWARD, 1.) &
@@ -3289,7 +3290,7 @@ def test_similar_side_ranges_prefer_the_side_away_from_the_measured_post(monkeyp
     geometry = local_path.Geometry(None, None, np.array([
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275, clearance_margin_m=.10)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275)
     state = _state()
     scan = state.active_scan
     scan.receipt_only, scan.current_frame = True, 1000
@@ -3325,7 +3326,7 @@ def test_blocked_route_replans_once_from_current_heading(monkeypatch, identity, 
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 493, 318), (480, 493, 229), .275)
     config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275,
-                  clearance_margin_m=.10, use_lateral=False)
+                  use_lateral=False)
     state = _state(motion_source="measured")
     scan = state.active_scan
     occupied = np.isclose(local_path.FORWARD, 1.) & (local_path.RIGHT <= .10)
@@ -3507,7 +3508,7 @@ def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obsta
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 600, 320), (480, 600, 240), .21)
     cfg = _cfg(lost_frames=1, local_planning=True, local_geometry=geometry,
-               half_width_m=.21, clearance_margin_m=.10, obstacle_stop_m=.60, search_rate=.60)
+               half_width_m=.21, obstacle_stop_m=.60, search_rate=.60)
     depth = dict(_scene(3.0, [(0., ahead, .5)]), frame_id=1000)
     depth["ground"] = np.zeros_like(depth["map"], dtype=bool)
     depth["ground"][0, 0] = True
@@ -4611,7 +4612,7 @@ def test_checked_approach_can_move_while_turning(monkeypatch, arc_blocked):
     state.active_scan.attempted = True
     blocked = np.isclose(local_path.FORWARD, .95)
     if arc_blocked:
-        blocked[local_path.START[0] + 7, local_path.START[1] + 6] = True
+        blocked[local_path.START[0] + 6, local_path.START[1] + 6] = True
     ground = np.ones((4, 4), dtype=bool)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.95, 1.))
     monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~blocked, blocked))
@@ -4777,7 +4778,7 @@ def test_blind_spot_history_only_blocks_a_motion_that_sweeps_through_it(monkeypa
     scan.receipt_only, scan.current_frame = True, 1000
     empty = np.zeros(P.local_path.SHAPE, dtype=bool)
     scan.views.append((1000, scan.pose, empty, empty))
-    scan.near_hits = np.isclose(P.FORWARD, .40) & np.isclose(P.RIGHT, right)
+    scan.near_projection = NearProjection(hits=np.isclose(P.FORWARD, .40) & np.isclose(P.RIGHT, right))
     frame = np.full((8, 8), 3.)
     depth = dict(frame_id=1000, map=frame, ground=frame.astype(bool))
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (3., .9))
@@ -5022,13 +5023,13 @@ def test_target_search_uses_a_directional_sweep_for_retained_obstacles(monkeypat
                   search_rate=.6, lost_frames=1, max_depth_age_ms=800)
     state = _state(motion_source="measured")
     scan = state.active_scan
-    scan.near_hits = np.zeros(P.local_path.SHAPE, dtype=bool)
+    hits = np.zeros(P.local_path.SHAPE, dtype=bool)
     row, col = P.local_path.START
     if blocked == "side":
-        scan.near_hits[row + 7, col + 8] = True
+        hits[row + 7, col + 8] = True
     else:
-        scan.near_hits[row, col + 2] = True
-    scan.near_revision = 1000
+        hits[row, col + 2] = True
+    scan.near_projection = NearProjection(hits=hits, stamp_ms=1000)
     monkeypatch.setattr(active_scan.ActiveScan, "update_near_obstacles", lambda *args, **kwargs: None)
     empty = np.zeros_like(scan.near_hits)
     monkeypatch.setattr(active_scan, "observe", lambda *args: (~empty, empty))
@@ -5054,8 +5055,8 @@ def test_off_axis_remembered_door_jamb_allows_a_checked_prefix(monkeypatch, late
     scan.poses.append((1000, scan.pose, 0.))
     grid = np.zeros(g.SHAPE, dtype=bool)
     scan.views.append((1000, scan.pose, ~grid, grid))
-    scan.near_hits = np.isclose(g.FORWARD, .65) & np.isclose(g.RIGHT, lateral)
-    scan.near_revision = 1000
+    hits = np.isclose(g.FORWARD, .65) & np.isclose(g.RIGHT, lateral)
+    scan.near_projection = NearProjection(hits=hits, stamp_ms=1000)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (2.5, 1.))
     view = dict(map=np.ones((4, 4)), ground=np.ones((4, 4), dtype=bool), frame_id=1000)
     decision = P._avoid(.2, 0., .3, view, config, P.APPROACHING, "", state,
@@ -5101,7 +5102,8 @@ def test_wheeled_detour_can_leave_box_corner_when_grid_search_has_no_complete_ro
     scan.poses.append((1000, scan.pose, 0.))
     empty = np.zeros(g.SHAPE, dtype=bool)
     scan.views.append((1000, scan.pose, empty, empty.copy()))
-    scan.near_hits = (g.FORWARD >= .50) & (g.FORWARD <= .85) & (g.RIGHT >= .29)
+    hits = (g.FORWARD >= .50) & (g.FORWARD <= .85) & (g.RIGHT >= .29)
+    scan.near_projection = NearProjection(hits=hits)
     monkeypatch.setattr(g.PlanCache, "route", lambda *args, **kwargs: None)
     monkeypatch.setattr(g, "opening_route", lambda *args, **kwargs: None)
 
@@ -5147,8 +5149,8 @@ def test_wheeled_box_corner_prefers_longer_checked_escape_to_the_open_side(monke
     empty = np.zeros(grid.SHAPE, dtype=bool)
     scan.poses.append((1000, scan.pose, 0.))
     scan.views.append((1000, scan.pose, empty, empty))
-    scan.near_hits = ((grid.FORWARD >= .4) & (grid.FORWARD <= .71)
-                      & (grid.RIGHT >= .25) & (grid.RIGHT <= .40))
+    hits = (grid.FORWARD >= .4) & (grid.FORWARD <= .71) & (grid.RIGHT >= .25) & (grid.RIGHT <= .40)
+    scan.near_projection = NearProjection(hits=hits)
     monkeypatch.setattr(grid.PlanCache, "route", lambda *args, **kwargs: None)
     monkeypatch.setattr(grid, "opening_route", lambda *args, **kwargs: None)
 
@@ -5241,11 +5243,13 @@ def test_checked_arc_uses_original_cell_without_dropping_its_collision_margin():
                   max_depth_age_ms=1200, watchdog_ms=500)
     state = _state(commanded=(.0375, 0., -.06249))
     scan = state.active_scan
-    pose = PlanarPose(1891, ("odom",), 9.3620810745, -.6700612578, -.2815547738)
+    # The aged rotated square separates the low and high speed envelopes.
+    pose = PlanarPose(1891, ("odom",), 9.38, -.71, -.28)
     scan.near_obstacles.frame = pose.frame
     scan.near_obstacles.cells.add((185, -23))
-    scan.near_hits, squares = scan.near_obstacles.project(pose, include_squares=True)
-    scan.control_ms, scan.near_revision = 2000, 1891
+    hits, squares = scan.near_obstacles.project(pose, include_squares=True)
+    scan.near_projection = NearProjection(hits=hits, origin=pose, stamp_ms=1891)
+    scan.control_ms = 2000
     empty = np.zeros(grid.SHAPE, dtype=bool)
     scan.receipt_only = True
     scan.views.append((2000, scan.pose, ~empty, empty))
@@ -5257,6 +5261,777 @@ def test_checked_arc_uses_original_cell_without_dropping_its_collision_margin():
                                          .15, 1.75, 1., -.06249, (-1., 1.))
 
     assert prefix()[0] == pytest.approx(.0375)
-    scan.near_squares = squares
+    scan.near_projection = NearProjection(hits, squares, pose, 1891)
     assert prefix()[0] == pytest.approx(.075)
     assert scan.grid()[1].sum() == 4
+
+
+@pytest.mark.parametrize("accelerates", [True, False])
+def test_acceleration_lag_is_not_a_stop_reason(accelerates):
+    cfg = _cfg(local_controller="dwa", stuck_window_s=.2, idle_timeout_s=.85)
+    scene = _depth(map_=_solid_depth(5.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    for i in range(15):
+        stamp = 1000 + 100 * i
+        vx = min(.2, max(0., (i - 3) * .05)) if accelerates else 0.
+        odom = dict(vx=vx, vy=0., wz=0., received_ms=stamp, source_sample_id=stamp)
+        decision = _step(_detections(_obj()), scene, odom, cfg, state)
+        if decision.status == P.FAILED:
+            break
+        assert decision.values[0] > 0.
+    if accelerates:
+        assert decision.status == P.APPROACHING
+    else:
+        assert .85 <= (i + 1) * .1 < 1.
+        assert decision.status == P.FAILED and "progress" in decision.reason
+        assert decision.values == [0.] * 6
+
+
+@pytest.mark.parametrize("feedback", ["outward", "stationary", "duplicate", "regressing", "oscillating", "camera_turn"])
+def test_detour_progress_requires_net_measured_body_displacement(monkeypatch, feedback):
+    from plugins.navi.local_path import Detour
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.6, blocked_timeout_s=.15)
+    scene = _depth(map_=_solid_depth(3.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    # A left turn in the planned route moves away from a target on the right.
+    route = ((0., 0.), (0., -.5), (.2, -.7))
+
+    def avoid(*args, **kwargs):
+        state.view_detour = Detour(None, ((0., 0.), (.1, 0.)), None, route)
+        state.checked_prefix = True
+        return 0., .20, 0., P.AVOIDING, "detour"
+
+    monkeypatch.setattr(P, "_avoid", avoid)
+    for i in range(14):
+        stamp = 1000 + i * 100
+        if feedback == "duplicate":
+            stamp = 1000
+        elif feedback == "regressing":
+            stamp = 3000 - 100 * i
+        left = .025 * i if feedback != "stationary" else 0.
+        if feedback == "oscillating":
+            left = .03 * (i % 2)
+        # Direct odometry uses the body pivot even when the head rotates.
+        pose = (PlanarPose(stamp, ("odom",), 0., 0., .1 * i) if feedback == "camera_turn" else
+                PlanarPose(stamp, ("odom",), 0., left, 0.))
+        decision = _step(_detections(_obj()), scene, dict(obstacle_pose=pose), cfg, state)
+        if decision.status == P.FAILED:
+            break
+    if feedback == "outward":
+        assert decision.status == P.AVOIDING and state.idle_for_s < .4
+    else:
+        assert decision.status == P.FAILED and "progress" in decision.reason
+        assert i >= 5, "only the measured idle budget may terminate this DWA action"
+
+
+def test_turning_in_place_cannot_reset_progress_forever(monkeypatch):
+    from plugins.navi.active_scan import ANGLE
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.35)
+    state = _state()
+    scan = state.active_scan
+    grid = np.ones((2, 2), dtype=bool)
+    stamp = 0
+    heading = 0.
+
+    def turn(*args, **kwargs):
+        scan.pose = (0., 0., heading)
+        scan.poses.append((stamp, scan.pose, -.3))
+        scan.source_frame = scan.side_frame = scan.current_frame = stamp
+        scan.views.append((stamp, scan.pose, grid, ~grid))
+        return P.Decision(P._twist(0., 0., -.3), P.AVOIDING, "evaluate view")
+
+    monkeypatch.setattr(P, "_decide", turn)
+    for i, heading in enumerate((0., 0., ANGLE, ANGLE, 2*ANGLE, ANGLE, 0., ANGLE, 2*ANGLE)):
+        stamp = 1000 + 100*i
+        depth = dict(capture_ms=stamp, control_ms=stamp)
+        decision = P.step(detections=None, depth=depth, odom=None, state=state, config=cfg, dt=.1)
+        if i in (2, 4):
+            assert state.idle_for_s == 0., "a newly evaluated heading earns one credit"
+        if i == 3:
+            assert state.idle_for_s == pytest.approx(.1)
+    assert decision.status == P.FAILED and "progress" in decision.reason
+
+
+@pytest.mark.parametrize("broken", [False, True])
+def test_continuous_velocity_history_counts_between_slow_ticks(broken):
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.38)
+    scene = _depth(map_=_solid_depth(4.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    history = []
+    for i in range(4):
+        stamp = 1000 + 100*i
+        if broken and i in (1, 2):
+            continue
+        history.append((stamp, stamp, (.25, 0., 0.)))
+        if i in (0, 3):
+            odom = dict(vx=.25, vy=0., wz=0., received_ms=stamp, source_sample_id=stamp,
+                        velocity_history=tuple(history))
+            decision = _step(_detections(_obj()), scene, odom, cfg, state, dt=.1 if i == 0 else .3)
+    if broken:
+        assert decision.status == P.FAILED
+    else:
+        assert decision.status == P.APPROACHING and state.idle_for_s == 0.
+
+
+def test_recovery_view_can_be_projected_after_its_measured_heading(monkeypatch):
+    from plugins.navi.active_scan import ANGLE
+
+    state = _state()
+    scan = state.active_scan
+    cfg = _cfg(local_controller="dwa")
+    grid = np.ones((2, 2), dtype=bool)
+    stamp = 0
+
+    def turn(*args, **kwargs):
+        scan.pose = (0., 0., 0. if stamp == 1000 else ANGLE)
+        pose_ms = min(stamp, 1100)
+        if not scan.poses or scan.poses[-1][0] < pose_ms:
+            scan.poses.append((pose_ms, scan.pose, 0.))
+        scan.source_frame = scan.current_frame = stamp
+        scan.views.append((stamp, scan.pose, grid, ~grid))
+        scan.side_frame = stamp if stamp >= 1150 else 0
+        return P.Decision(P._twist(0., 0., -.3), P.AVOIDING, "observe")
+
+    monkeypatch.setattr(P, "_decide", turn)
+    for stamp in (1000, 1100, 1150, 1200):
+        P.step(detections=None, depth=dict(control_ms=stamp, capture_ms=stamp),
+               odom=None, state=state, config=cfg, dt=.05)
+        if stamp == 1150:
+            assert state.idle_for_s == 0.
+    assert state.idle_for_s == pytest.approx(.05)
+
+
+def test_reverse_travel_during_a_hold_cancels_subcell_progress(monkeypatch):
+    from plugins.navi.odom import PlanarPose
+
+    state = _state()
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.55)
+    i = 0
+
+    def pulse(*args, **kwargs):
+        return P.Decision(P._twist(0. if i % 2 else .20, 0., 0.), P.AVOIDING, "pulsed motion")
+
+    monkeypatch.setattr(P, "_decide", pulse)
+    for i in range(6):
+        pose = PlanarPose(1000 + i * 100, ("body",), .03 * (i % 2), 0., 0.)
+        decision = P.step(detections=None, depth=None, odom={"motion_pose": pose},
+                          state=state, config=cfg, dt=.1)
+    assert decision.status == P.FAILED
+
+
+def test_unregistered_scan_restart_cannot_relabel_the_same_view(monkeypatch):
+    from plugins.navi.active_scan import ANGLE
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.35)
+    state = _state()
+    scan = state.active_scan
+    grid = np.ones((2, 2), dtype=bool)
+    stamp = 0
+    heading = 0.
+
+    def observe(*args, **kwargs):
+        if stamp == 1300:
+            scan.invalidate()
+        scan.pose = (0., 0., heading)
+        scan.poses.append((stamp, scan.pose, 0.))
+        scan.side_frame = scan.current_frame = scan.source_frame = stamp
+        scan.views.append((stamp, scan.pose, grid, ~grid))
+        return P.Decision(P._twist(0., 0., -.3), P.AVOIDING, "observe")
+
+    monkeypatch.setattr(P, "_decide", observe)
+    for stamp, heading in zip(range(1000, 1600, 100), (0., ANGLE, ANGLE, 0., ANGLE, ANGLE)):
+        depth = dict(capture_ms=stamp, source_frame_id=stamp, control_ms=stamp)
+        decision = P.step(detections=None, depth=depth, odom=None, config=cfg, state=state, dt=.1)
+    assert decision.status == P.FAILED
+
+
+@pytest.mark.parametrize("turns_corner", [False, True], ids=["returns-to-start", "turns-corner"])
+def test_replanned_directions_require_net_body_displacement(monkeypatch, turns_corner):
+    from plugins.navi.local_path import Detour
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.55, blocked_timeout_s=.15)
+    scene = _depth(map_=_solid_depth(3.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    x = left = 0.
+    vx = vy = 0.
+
+    def avoid(*args, **kwargs):
+        if vx or vy:
+            state.checked_prefix = True
+            state.view_detour = Detour(None, (), None, ((0., 0.), (vx, -vy)))
+        return vx, vy, 0., P.AVOIDING, "detour"
+
+    monkeypatch.setattr(P, "_avoid", avoid)
+    for i in range(17):
+        x += .1 * vx
+        left += .1 * vy
+        if i % 4 == 0:
+            vx, vy = 0., .3
+        elif i % 4 == 2:
+            vx, vy = (.3, 0.) if turns_corner else (0., -.3)
+        else:
+            vx = vy = 0.
+        pose = PlanarPose(1000 + 100*i, ("odom",), x, left, 0.)
+        decision = _step(_detections(_obj()), scene, dict(obstacle_pose=pose), cfg, state)
+        if decision.status == P.FAILED:
+            break
+    if turns_corner:
+        assert decision.status == P.AVOIDING and max(x, left) > .10
+    else:
+        assert decision.status == P.FAILED and state.idle_for_s == pytest.approx(.6)
+
+
+@pytest.mark.parametrize("stream", ["velocity", "mixed", "broken"])
+def test_slow_measured_pose_and_velocity_share_one_progress_interval(stream):
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.85)
+    scene = _depth(map_=_solid_depth(5.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    history = []
+    credits = []
+    for i in range(16):
+        stamp = 1000 + i*100
+        velocity = (.25, 0., 0.) if stream != "broken" or i % 3 == 0 else None
+        history.append((stamp, stamp, velocity))
+        odom = dict(received_ms=stamp, source_sample_id=stamp, velocity_history=tuple(history))
+        if velocity is not None:
+            odom.update(zip(("vx", "vy", "wz"), velocity))
+        if stream != "velocity":
+            pose_i = i - i % 3
+            odom["motion_pose"] = PlanarPose(1000 + 100*pose_i, ("odom",), .025*pose_i, 0., 0.)
+        decision = _step(_detections(_obj()), scene, odom, cfg, state)
+        if state.idle_for_s == 0.:
+            credits.append(i)
+        if decision.status == P.FAILED:
+            break
+    if stream == "broken":
+        assert decision.status == P.FAILED and state.idle_for_s == pytest.approx(.9)
+    else:
+        assert decision.status == P.APPROACHING
+        assert credits == list(range(2, 16, 2)), "each measured 5 cm earns a single credit"
+
+
+@pytest.mark.parametrize("broken", [False, True])
+@pytest.mark.parametrize("delay", [0, 1], ids=["current-pose", "delayed-pose"])
+def test_fresh_absolute_pose_at_end_of_a_slow_tick_uses_measured_interval(broken, delay):
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.65)
+    scene = _depth(map_=_solid_depth(5.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    history = []
+    for i in range(11):
+        stamp = 1000 + 100*i
+        if not broken or i % 5 == 0:
+            history.append((stamp, stamp, (.25, 0., 0.)))
+        if i % 5 == 0:
+            pose_i = max(0, i - delay)
+            pose = PlanarPose(1000 + 100*pose_i, ("odom",), .025*pose_i, 0., 0.)
+            odom = dict(motion_pose=pose, vx=.25, vy=0., wz=0., received_ms=stamp,
+                        source_sample_id=stamp, velocity_history=tuple(history))
+            decision = _step(_detections(_obj()), scene, odom, cfg, state, dt=.5 if i else .1)
+            if decision.status == P.FAILED:
+                break
+    assert (decision.status == P.FAILED) == broken
+    if not broken:
+        assert state.idle_for_s == 0.
+
+
+def test_delayed_absolute_pose_reconciles_only_its_measured_suffix():
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.85)
+    scene = _depth(map_=_solid_depth(5.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    history = []
+    anchor = PlanarPose(1000, ("odom",), 0., 0., 0.)
+    for i, expected_x in enumerate((0., .025, .05, .065, .09)):
+        stamp = 1000 + i*100
+        history.append((stamp, stamp, (.25, 0., 0.)))
+        if i == 3:
+            # At 1300 we learn the measured pivot was at .04 at 1200.
+            anchor = PlanarPose(1200, ("odom",), .04, 0., 0.)
+        odom = dict(obstacle_pose=anchor, received_ms=stamp, source_sample_id=stamp,
+                    vx=.25, vy=0., wz=0., velocity_history=tuple(history))
+        _step(_detections(_obj()), scene, odom, cfg, state)
+        actual = state.dwa_progress.pose
+        assert actual.stamp_ms == stamp and actual.x == pytest.approx(expected_x)
+
+
+@pytest.mark.parametrize("speed,covered", [(0., False), (0., True), (.25, True)],
+                         ids=["stationary-gap", "stationary-covered", "moving-covered"])
+def test_absolute_pose_dropout_requires_registered_travel(speed, covered):
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.8)
+    scene = _depth(map_=_solid_depth(5.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    history, credits = [], []
+    previous_tick = 900
+    for stamp in range(1000, 3401, 100):
+        phase = (stamp - 1000) % 400
+        if covered or phase in (0, 300):
+            history.append((stamp, stamp, (speed, 0., 0.)))
+        if phase not in (0, 300):
+            continue
+        odom = dict(vx=speed, vy=0., wz=0., received_ms=stamp, source_sample_id=stamp,
+                    velocity_history=tuple(history))
+        if phase == 0:
+            x = 20. + speed * (stamp - 1000) / 1000
+            odom["motion_pose"] = PlanarPose(stamp, ("odom",), x, 0., 0.)
+        decision = _step(_detections(_obj()), scene, odom, cfg, state, dt=(stamp - previous_tick) / 1000)
+        previous_tick = stamp
+        if state.idle_for_s == 0.:
+            credits.append(stamp)
+        if decision.status == P.FAILED:
+            break
+    if speed:
+        assert decision.status == P.APPROACHING
+        assert credits == list(range(1300, 3401, 400))
+        assert state.dwa_progress.pose.x == pytest.approx(20.6)
+    else:
+        assert decision.status == P.FAILED and not credits
+
+
+def test_returning_world_fix_after_local_velocity_progress_only_rebaselines():
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=.8)
+    scene = _depth(map_=_solid_depth(5.))
+    state = seed(_state(), _detections(_obj()), scene, cfg)
+    history, credits = [], []
+    previous_tick = 900
+    # Travel in the gap is unknown. The measured .05 m after it returns the
+    # body to x=20 before the first new absolute fix.
+    for stamp, speed, x in ((1000, 0., 20.), (1300, 0., None), (1400, .25, None),
+                            (1500, .25, None), (1600, 0., 20.), (1700, .25, 20.025),
+                            (1800, .25, 20.05)):
+        history.append((stamp, stamp, (speed, 0., 0.)))
+        odom = dict(vx=speed, vy=0., wz=0., received_ms=stamp, source_sample_id=stamp,
+                    velocity_history=tuple(history))
+        if x is not None:
+            odom["motion_pose"] = PlanarPose(stamp, ("odom",), x, 0., 0.)
+        decision = _step(_detections(_obj()), scene, odom, cfg, state, dt=(stamp - previous_tick) / 1000)
+        assert decision.status == P.APPROACHING
+        previous_tick = stamp
+        if state.idle_for_s == 0.:
+            credits.append(stamp)
+    assert credits == [1500, 1800]
+
+
+@pytest.mark.parametrize("feedback", ["absolute", "velocity"])
+@pytest.mark.parametrize("continues", [False, True], ids=["two-subgoals", "new-passage"])
+def test_measured_round_trips_only_credit_new_passage(monkeypatch, continues, feedback):
+    from plugins.navi.local_path import Detour
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=10.)
+    scene = Sim(range_m=3., config=cfg)
+    state = seed(_state(), *scene.observe(), cfg)
+    initial = PlanarPose(1000, ("odom",), 0., 0., 0.)
+    anchor = state.goal_anchor = P.DetourGoal(3., 0., pose=initial, generation=state.tracker.track.generation)
+
+    def avoid(*args, **kwargs):
+        state.checked_prefix = True
+        state.view_detour = Detour(None, (), None, ((0., 0.), (forward, left - subgoal)))
+        return vx, vy, 0., P.AVOIDING, "detour"
+
+    monkeypatch.setattr(P, "_avoid", avoid)
+    credits = []
+    for index in range(421):
+        t = index / 10
+        phase = math.tau * t / 4.
+        left = .06 * (1. - math.cos(phase))
+        vy = .06 * math.tau / 4. * math.sin(phase)
+        subgoal = .12 if math.sin(phase + math.tau * .05 / 4.) > 0. else 0.
+        # The positive twin leaves the explored strip around its first corner.
+        x = .04 * max(0., t - 4.) if continues else 0.
+        vx = .04 if continues and t >= 4. else 0.
+        forward = .12 if vx else 0.
+        pose = PlanarPose(1000 + 100 * index, initial.frame, x, left, 0.)
+        odom = dict(motion_pose=pose, obstacle_pose=pose, vx=vx, vy=vy, wz=0.)
+        if feedback == "velocity":
+            # The mean measured twist covers precisely this 100 ms interval.
+            odom = dict(received_ms=pose.stamp_ms, source_sample_id=pose.stamp_ms,
+                        vx=(x - scene.pose[0]) / .1, vy=(left - scene.pose[1]) / .1, wz=0.)
+        scene.pose[:2] = x, left
+        decision = _step(*scene.observe(), odom, cfg, state)
+        assert state.goal_anchor is anchor
+        assert (anchor.x + x, anchor.y + left) == pytest.approx((3., 0.))
+        if state.idle_for_s == 0.:
+            credits.append(t)
+        if decision.status == P.FAILED:
+            break
+    assert any(0. < stamp <= 2. for stamp in credits), "the first lateral detour must earn progress"
+    if continues:
+        assert decision.status == P.AVOIDING and credits[-1] > 40.
+    else:
+        assert decision.status == P.FAILED and "progress" in decision.reason
+        assert decision.values == [0.] * 6 and credits[-1] + 10. <= t + .1
+        assert t <= 18., "established four-second cycles must exhaust the ten-second idle budget"
+
+
+def test_long_measured_route_retains_prior_visits_and_can_exit_at_a_corner():
+    from plugins.navi.odom import PlanarPose
+
+    cfg, state = _cfg(local_controller="dwa", idle_timeout_s=10.), _state()
+    decision = P.Decision(P._twist(.3, 0., 0.), P.AVOIDING, "detour")
+    stamp = 1000
+
+    def move(x, y, direction):
+        nonlocal stamp
+        stamp += 200
+        pose = PlanarPose(stamp, ("odom",), x, y, 0.)
+        route = ((0., 0.), direction)
+        result = P._account_dwa_progress(decision, state, cfg, {"motion_pose": pose}, None, route, .2)
+        assert result.status == P.AVOIDING
+        return state.idle_for_s == 0.
+
+    # More than a thousand distinct checkpoints along a continuous 75 m route.
+    for index in range(1201):
+        assert move(-index / 16, 0., (-1., 0.)) is (index > 0)
+    # A confirmed absolute fix returns to the early part of the same frame
+    # after an uncovered gap. No part of a known segment becomes a first visit.
+    stamp += 1000
+    for index in range(12):
+        assert not move(-index / 16, 0., (-1., 0.))
+    for index in range(1, 12):
+        assert move(-11 / 16, index / 16, (0., -1.))
+
+
+def test_new_velocity_frame_after_uncovered_gap_can_measure_its_own_travel():
+    cfg, state = _cfg(local_controller="dwa", idle_timeout_s=.8), _state()
+    decision = P.Decision(P._twist(.25, 0., 0.), P.APPROACHING, "approach")
+    credits = []
+    for stamp in (*range(1000, 4000, 100), *range(4300, 5500, 100)):
+        odom = dict(received_ms=stamp, source_sample_id=stamp, vx=.25, vy=0., wz=0.)
+        elapsed = .4 if stamp == 4300 else .1
+        result = P._account_dwa_progress(decision, state, cfg, odom, None, ((0., 0.), (1., 0.)), elapsed)
+        assert result.status == P.APPROACHING
+        if not state.idle_for_s and stamp >= 4300:
+            credits.append(stamp)
+    assert credits == list(range(4500, 5500, 200))
+
+
+def test_continuous_scan_keeps_registered_passage_when_absolute_pose_is_late():
+    from plugins.navi.odom import PlanarPose
+
+    cfg, state = _cfg(local_controller="dwa"), _state()
+    decision = P.Decision(P._twist(.25, 0., 0.), P.AVOIDING, "detour")
+    scan = state.active_scan
+    credits = []
+    for index, (f, r, route) in enumerate(((0., 0., (1., 0.)), (.0625, 0., (1., 0.)),
+                                           (0., 0., (-1., 0.)), (0., .0625, (0., 1.)))):
+        stamp = 1000 + index * 100
+        scan.pose = (f, r, 0.)
+        scan.poses.append((stamp, scan.pose, 0.))
+        odom = {}
+        if index < 2:
+            odom["obstacle_pose"] = PlanarPose(stamp, ("odom",), 10. + r, 20. + f, math.pi / 2)
+        P._account_dwa_progress(decision, state, cfg, odom, None, ((0., 0.), route), .1)
+        if state.idle_for_s == 0.:
+            credits.append(index)
+    assert credits == [1, 3]
+
+
+@pytest.mark.parametrize("return_motion", ["direct", "approach-before-detour", "stationary-changing-target",
+                                           "coasting", "missing-feedback", "replacement", "interleaved-detector"])
+def test_native_return_to_observed_target_on_a_previously_traversed_strip(monkeypatch, return_motion):
+    from plugins.navi.local_path import Detour
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=10., vx_max=.15625,
+               half_fov_rad=math.radians(89.9), max_coast_s=20.)
+    scene = Sim(range_m=2., config=cfg)
+    scene.target[1] = .01
+    scene.pose[:] = (.00625, 0., math.pi / 2)
+    if return_motion == "approach-before-detour":
+        scene.pose[:] = (-.18125, 0., 0.)
+    state = seed(_state(), *scene.observe(), cfg)
+    original = expected_track = state.tracker.track
+    stamp = 1000
+    detector_frame = None
+
+    def tick(vx, vy, wz, *, returning=False):
+        nonlocal stamp, detector_frame
+        stamp += 100
+        pose = PlanarPose(stamp, ("odom",), *scene.pose)
+        odom = dict(motion_pose=pose, obstacle_pose=pose, vx=vx, vy=vy, wz=wz,
+                    received_ms=stamp, source_sample_id=stamp)
+        if returning and return_motion == "missing-feedback":
+            odom = {}
+        objects, depth = scene.observe()
+        fresh = True
+        if returning and return_motion == "interleaved-detector":
+            fresh = detector_frame is None or stamp % 400 == 100
+            if fresh:
+                detector_frame = objects
+            objects = detector_frame
+        result = _step(objects, depth, odom, cfg, state)
+        assert state.tracker.track is expected_track and original.generation == 1
+        if not returning or return_motion != "coasting":
+            assert expected_track.observed and expected_track.accepted_detection == fresh
+            if fresh:
+                assert expected_track.measured_range_m == pytest.approx(scene.relative()[0], abs=.001)
+        return result
+
+    if return_motion == "approach-before-detour":
+        previous = [0.] * 6
+        for _ in range(12):
+            result = tick(previous[0], previous[1], previous[5])
+            assert result.status == P.APPROACHING
+            scene.apply(result.values, .1)
+            previous = result.values
+
+    with monkeypatch.context() as seam:
+        def depart(*args, **kwargs):
+            state.checked_prefix = True
+            state.view_detour = Detour(None, (), None, ((0., 0.), (0., -4.)))
+            return 0., vy, wz, P.AVOIDING, "detour leg"
+
+        seam.setattr(P, "_avoid", depart)
+        if return_motion == "approach-before-detour":
+            vy, wz = 0., math.pi / 8
+            for index in range(1, 41):
+                scene.pose[2] = math.pi / 2 * index / 40
+                assert tick(0., vy, wz).status == P.AVOIDING
+        vy, wz = .15625, 0.
+        for index in range(193):
+            scene.pose[:] = (.00625 - index / 64., 0., math.pi / 2)
+            assert tick(0., vy, wz).status == P.AVOIDING
+        vy, wz = 0., -math.pi / 8
+        for index in range(1, 41):
+            scene.pose[2] = math.pi / 2 * (1. - index / 40)
+            assert tick(0., vy, wz).status == P.AVOIDING
+
+    # The entire return uses the native policy. Only the feedback/observation
+    # condition named by a negative twin changes.
+    scene.visible = return_motion != "coasting"
+    initial_distance = scene.relative()[0]
+    previous = [0.] * 6
+    for index in range(194):
+        if return_motion == "replacement" and index == 16:
+            # Lose the old track and genuinely confirm another chair. Its
+            # measurements cannot extend the original target's return credit.
+            state.tracker.step(detections=None, depth=None, target=state.target, config=cfg,
+                               ego=(0., 0., 0.), dt=cfg.max_coast_s + .01)
+            scene.target[0] -= .125
+            for _ in range(cfg.confirm_hits):
+                objects, depth = scene.observe()
+                state.tracker.step(detections=objects, depth=depth, target=state.target, config=cfg,
+                                   ego=(0., 0., 0.), dt=.1)
+            expected_track = state.tracker.track
+            assert expected_track is not original and expected_track.generation == 2
+        result = tick(previous[0], previous[1], previous[5], returning=True)
+        if result.status == P.FAILED:
+            break
+        assert result.status == P.APPROACHING and result.values[0] > 0.
+        if return_motion == "stationary-changing-target":
+            scene.target[0] -= .015625
+            scene.target[1] = .01 + .005 * (-1) ** index
+            previous = [0.] * 6
+        else:
+            scene.apply(result.values, .1)
+            previous = result.values
+    if return_motion in ("direct", "approach-before-detour", "interleaved-detector"):
+        assert result.status == P.APPROACHING and index == 193
+        assert initial_distance - scene.relative()[0] == pytest.approx(194 / 64.)
+        assert state.idle_for_s < .5
+    else:
+        assert result.status == P.FAILED and "progress" in result.reason
+        assert result.values == [0.] * 6 and state.idle_for_s >= cfg.idle_timeout_s
+        if return_motion == "stationary-changing-target":
+            assert initial_distance - scene.relative()[0] > .9
+        if return_motion == "coasting":
+            assert not original.observed and original.measured_range_m is None
+
+
+def test_alternating_direct_and_detour_legs_cannot_recredit_the_same_closure(monkeypatch):
+    from plugins.navi.local_path import Detour
+    from plugins.navi.odom import PlanarPose
+
+    cfg = _cfg(local_controller="dwa", idle_timeout_s=10., vx_max=.15625)
+    scene = Sim(range_m=3., config=cfg)
+    state = seed(_state(), *scene.observe(), cfg)
+    original = state.tracker.track
+    native = P._avoid
+
+    def avoid(*args, **kwargs):
+        if returning:
+            return native(*args, **kwargs)
+        state.checked_prefix = True
+        state.view_detour = Detour(None, (), None, ((0., 0.), (-.125, 0.)))
+        return -.125, 0., 0., P.AVOIDING, "local detour"
+
+    monkeypatch.setattr(P, "_avoid", avoid)
+    direct_ticks = 0
+    for index in range(421):
+        t = index / 10
+        phase = t * math.tau / 4.
+        scene.pose[0] = -.0625 * (1. - math.cos(phase))
+        vx = -.0625 * math.tau / 4. * math.sin(phase)
+        returning = math.sin(phase + .05 * math.tau / 4.) < 0.
+        pose = PlanarPose(1000 + 100 * index, ("odom",), *scene.pose)
+        result = _step(*scene.observe(), dict(motion_pose=pose, vx=vx, vy=0., wz=0.), cfg, state)
+        assert state.tracker.track is original and original.observed and original.accepted_detection
+        if result.status == P.FAILED:
+            break
+        if returning:
+            assert result.status == P.APPROACHING and result.values[0] > 0.
+            direct_ticks += 1
+        else:
+            assert result.status == P.AVOIDING
+    assert direct_ticks > 20
+    assert result.status == P.FAILED and "progress" in result.reason and t < 22.
+
+
+@pytest.mark.parametrize("evidence", ["target-closes-alone", "body-follows-receding-target"])
+def test_revisited_motion_needs_body_and_observed_target_closure(evidence):
+    from plugins.navi.odom import PlanarPose
+
+    cfg, state = _cfg(local_controller="dwa", idle_timeout_s=.8), _state()
+    scene = Sim(range_m=4., config=cfg)
+    scene.target[1] = 1. if evidence == "target-closes-alone" else -.5
+    seed(state, *scene.observe(), cfg)
+    original = state.tracker.track
+    stamp = 1000
+
+    def sample(left, vy, status):
+        nonlocal stamp
+        stamp += 100
+        scene.pose[1] = left
+        objects, depth = scene.observe()
+        state.tracker.step(detections=objects, depth=depth, target=state.target, config=cfg,
+                           ego=(0., vy, 0.), dt=.1)
+        assert state.tracker.track is original and P.current_target_observed(state)
+        pose = PlanarPose(stamp, ("odom",), 0., left, 0.)
+        route = ((0., 0.), (0., -math.copysign(1., vy)))
+        return P._account_dwa_progress(P.Decision(P._twist(0., vy, 0.), status, "rollout"),
+                                       state, cfg, {"motion_pose": pose}, depth, route, .1)
+
+    for index in range(17):
+        assert sample(index / 16, .625, P.AVOIDING).status == P.AVOIDING
+    # For both returns the pivot follows a checked route through old cells.
+    # One has only a closer detector observation. In the other the pivot
+    # approaches the earlier target point, but the real target retreats.
+    start_range = original.measured_range_m
+    for index in range(17):
+        if evidence == "target-closes-alone":
+            scene.target[0] = 4. - index / 16
+        else:
+            scene.target[1] = -.5 - index / 16
+        result = sample(1. - index / 16, -.625, P.APPROACHING)
+        assert state.idle_for_s > 0.
+        if result.status == P.FAILED:
+            break
+    if evidence == "target-closes-alone":
+        assert original.measured_range_m < start_range - .25
+    else:
+        assert original.measured_range_m == pytest.approx(start_range, abs=.001)
+    assert result.status == P.FAILED and result.values == [0.] * 6
+
+
+@pytest.mark.parametrize("pairing", ["precise", "receipt-lag", "ordinary", "missing", "outdated",
+                                     "unregistered-capture", "clock_epoch", "source_generation", "segment_id", "calibration_id"])
+def test_pose_only_return_uses_capture_paired_body_measurements(monkeypatch, pairing):
+    from plugins.navi import odom as O, local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315., 320.), (480, 420., 240.), .20)
+    cfg = _cfg(local_controller="dwa", local_planning=True, local_geometry=geometry,
+               idle_timeout_s=1., vx_max=.15625)
+    scene = Sim(range_m=2., config=cfg)
+    state = seed(_state(), *scene.observe(), cfg)
+    track = state.tracker.track
+    stamp, prior = 1000, None
+    reset = pairing in ("clock_epoch", "source_generation", "segment_id", "calibration_id")
+
+    def sample(return_index=None):
+        nonlocal stamp, prior
+        stamp += 100
+        receipt = stamp + (17 if pairing == "receipt-lag" else 0)
+        changed = reset and return_index is not None and return_index >= 4
+        epoch = 2 if changed and pairing == "clock_epoch" else 1
+        generation = 2 if changed and pairing == "source_generation" else 1
+        slam = dict(segment_id=2 if changed and pairing == "segment_id" else 1)
+        if pairing != "ordinary":
+            slam["measurement"] = dict(clock_epoch=epoch, source_generation=generation,
+                                       stamp_ns=stamp * 10**6, frame_id="odom")
+        x, y, yaw = scene.pose
+        payload = dict(schema=O.SCHEMA, stamp_ms=stamp,
+                       pose=dict(stamp_ms=stamp, frame_id="odom", child_frame_id="base_link",
+                                 position=[float(x), float(y), 0.],
+                                 quaternion=[0., 0., math.sin(yaw / 2), math.cos(yaw / 2)]),
+                       vendor=dict(motus_slam=slam, calibration_id=2 if changed and pairing == "calibration_id" else 1))
+        pose = O.planar_pose(payload, stamp)
+        _, capture = O.measured_obstacle_pose(payload, {})
+        previous = prior or O.PlanarPose(stamp - 100, pose.frame, *scene.pose)
+        prior = pose
+        odom = dict(received_ms=receipt, source_sample_id=stamp, motion_pose=pose,
+                    pose_feedback=pose.feedback_since(previous, 150), pose_feedback_since_ms=previous.stamp_ms)
+        if return_index is None or pairing not in ("missing", "outdated"):
+            odom["obstacle_pose"] = capture
+        elif pairing == "outdated":
+            odom["obstacle_pose"] = last_outbound
+        objects, depth = scene.observe()
+        if pairing == "unregistered-capture" and return_index == 2:
+            # The earlier depth capture belongs to a different SLAM epoch.
+            earlier = stamp - 10
+            payload["pose"]["stamp_ms"] = earlier
+            slam["measurement"].update(clock_epoch=0, stamp_ns=earlier * 10**6)
+            _, capture = O.measured_obstacle_pose(payload, {})
+        depth.update(frame_id=stamp, capture_ms=capture.stamp_ms, control_ms=receipt, obstacle_capture_pose=capture)
+        result = _step(objects, depth, odom, cfg, state)
+        assert state.tracker.track is track and track.generation == 1 and P.current_target_observed(state)
+        assert track.measured_range_m == pytest.approx(scene.relative()[0], abs=.001)
+        return result, capture
+
+    with monkeypatch.context() as seam:
+        def depart(*args, **kwargs):
+            state.checked_prefix = True
+            state.view_detour = local_path.Detour(None, (), None, ((0., 0.), (-4., 0.)))
+            return -.15625, 0., 0., P.AVOIDING, "checked detour"
+
+        seam.setattr(P, "_avoid", depart)
+        for i in range(66):
+            scene.pose[0] = .00625 - i / 64.
+            result, last_outbound = sample()
+            assert result.status == P.AVOIDING
+
+    start = scene.pose[0]
+    for i in range(65):
+        assert scene.pose[0] == pytest.approx(start + i / 64.)
+        result, capture = sample(i)
+        if pairing == "unregistered-capture":
+            if i == 2:
+                assert state.dwa_progress.approach_fix is None
+            if i == 4:
+                assert state.dwa_progress.credited_range is None
+        if reset and i == 3:
+            fix = state.dwa_progress.approach_fix
+            assert fix is not None and fix.frame == capture.frame
+            assert state.dwa_progress.credited_range is None
+        if reset and i == 4:
+            # This step completes the first 5 cm. A fix from the previous
+            # clock, generation, segment or calibration cannot certify it.
+            assert capture.frame != fix.frame and state.dwa_progress.credited_range is None
+            assert state.dwa_progress.approach_fix is None or state.dwa_progress.approach_fix.frame == capture.frame
+            assert state.idle_for_s > 0.
+            break
+        if result.status == P.FAILED:
+            break
+        assert result.status == P.APPROACHING and result.values[0] == pytest.approx(.15625)
+        scene.apply(result.values, .1)
+    if reset:
+        assert i == 4
+    elif pairing in ("missing", "outdated"):
+        assert result.status == P.FAILED and "progress" in result.reason
+        assert result.values == [0.] * 6 and state.dwa_progress.credited_range is None
+    else:
+        assert i == 64 and result.status == P.APPROACHING and state.idle_for_s < .5
+        assert state.dwa_progress.approach_fix.frame == capture.frame

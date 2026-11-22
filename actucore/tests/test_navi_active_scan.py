@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -1009,7 +1010,7 @@ def test_front_camera_checks_the_body_behind_the_plan_origin():
     occupied |= np.isclose(grid.FORWARD, .80) & np.isclose(grid.RIGHT, 0.)
     assert not grid.segment_clear(occupied, geometry, .25, 0., 1.40 - .60)
 
-    occupied = np.isclose(grid.FORWARD, -.50) & np.isclose(grid.RIGHT, .25)
+    occupied = np.isclose(grid.FORWARD, -.45) & np.isclose(grid.RIGHT, .25)
     look = scan.ActiveScan()
     assert not look.clear_sweep(geometry, .20, 0., occupied=occupied)
 
@@ -1039,7 +1040,7 @@ def test_receipt_only_scan_turns_with_only_front_depth(half_width, route_segment
 @pytest.mark.parametrize("initial_hit", [False, True])
 def test_receipt_only_sweep_uses_measured_cells_and_blocks_an_initial_hit(monkeypatch, initial_hit):
     look, geometry, _, occupied = _setup(monkeypatch)
-    occupied[scan.START[0], scan.START[1] + 5] = initial_hit  # Hits in the 5 cm side margin count.
+    occupied[scan.START[0], scan.START[1] + 5] = initial_hit  # Cell straddles the side of the chassis.
     for stamp in (1000, 1050, 1150):
         look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp},
                     geometry, receipt_only=True)
@@ -1064,7 +1065,7 @@ def test_scan_checks_the_circular_footprint_at_the_requested_rate(monkeypatch, b
 
 
 @pytest.mark.parametrize("at_front", [False, True])
-def test_dynamic_sweep_uses_the_body_diagonal_plus_five_centimetres_on_each_end(at_front):
+def test_dynamic_sweep_uses_the_body_diagonal_plus_the_width_based_margin(at_front):
     from plugins.navi import local_path
 
     front, rear = (0., .55) if at_front else (.275, .275)
@@ -1073,7 +1074,7 @@ def test_dynamic_sweep_uses_the_body_diagonal_plus_five_centimetres_on_each_end(
     shape = local_path.SHAPE
     envelope = local_path.motion_sweep_hits(np.ones(shape, dtype=bool), geometry, .275,
                                            1.75, ((0., 0., 1.),))
-    radius = math.hypot(.275, .275) + .05
+    radius = math.hypot(.275, .275) + .0275
     half_cell = local_path.RESOLUTION / 2
     df = np.maximum(0., abs(local_path.FORWARD - center) - half_cell)
     dr = np.maximum(0., abs(local_path.RIGHT) - half_cell)
@@ -1471,6 +1472,35 @@ def test_new_obstacles_in_remembered_free_cells_are_evicted_with_the_window():
     assert memory.project(ahead) is None
 
 
+def test_near_projection_origin_follows_the_retained_occupied_layer():
+    from plugins.navi.policy import dwa_memory_revision
+
+    look = scan.ActiveScan()
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25, at_front=True)
+    pose = PlanarPose(990, ("odom",), 0., 0., 0.)
+    look.near_obstacles.frame = pose.frame
+    look.near_obstacles.cells.add((10, 4))
+    look.update_near_obstacles(None, geometry, pose, .25, 2., approaching=False)
+    origin = replace(pose, x=.25)
+    assert look.near_projection_pose == origin
+    assert look.near_squares is not None and look.near_hits.any()
+
+    projection = look.near_projection
+    assert not projection.hits.flags.writeable and not projection.squares.centers.flags.writeable
+    moved = replace(look, near_projection=replace(projection, origin=replace(origin, y=.5)))
+    assert dwa_memory_revision(moved) != dwa_memory_revision(look)
+    squares, hits = look.near_squares, look.near_hits
+    look.invalidate()
+    look.update_near_obstacles(None, geometry, None, .25, 2., approaching=False)
+    assert look.near_projection_pose == origin
+    assert look.near_squares is squares and look.near_hits is hits
+
+    look.near_obstacles.cells.clear()
+    look.update_near_obstacles(None, geometry, pose, .25, 2., approaching=False)
+    assert look.near_projection_pose is None
+    assert look.near_squares is None and look.near_hits is None
+
+
 def test_camera_near_obstacle_can_use_continuous_relative_odometry_during_pose_gap():
     from plugins.navi.odom import PlanarPose
 
@@ -1556,7 +1586,7 @@ def test_front_camera_near_memory_rotates_about_the_base_centre():
 def test_forward_sweep_uses_original_rotated_obstacle_after_it_leaves_view(speed, collision):
     from plugins.navi import local_path
 
-    pose = PlanarPose(1795284451891, ("odom",), 9.3620810745, -.6700612578, -.2815547738)
+    pose = PlanarPose(1795284451891, ("odom",), 9.38, -.71, -.28)
     memory = scan.ObservedObstacles(frame=pose.frame, cells={(185, -23)})
     raster, squares = memory.project(pose, include_squares=True)
     assert raster.sum() == 4
@@ -1574,3 +1604,68 @@ def test_exact_square_sweep_keeps_a_cell_enclosed_by_the_center_envelope():
     occupancy = local_path.ObstacleSquares(np.array([[.10, .10]]), math.pi / 4)
     geometry = Geometry(None, None, np.eye(4), 0., 0., None)
     assert local_path.motion_sweep_hits(occupancy, geometry, 0., 1., ((.30, 0., 0.), (0., -.30, 0.))).any()
+
+
+@pytest.mark.parametrize("right,blocked", [(.31, False), (.20, True)])
+def test_observation_checks_the_requested_finite_turn(monkeypatch, right, blocked):
+    from plugins.navi import local_path, policy
+    from test_navi_dwa_integration import advance_case
+    from plugins.navi.active_scan import NearProjection
+    config, state, depth, odom = advance_case(body=True)
+    config.wz_max = .08
+    config.floor_wz = .04
+    scan = state.active_scan
+    scan.phase, scan.route_segment, scan.advance_m = "turn", False, None
+    scan.origin = scan.pose
+    scan.near_projection = NearProjection(squares=local_path.ObstacleSquares(np.array([[0., right]]), .01),
+                                          stamp_ms=1000)
+    # The same view already started the scan. Only its angular command is due.
+    depth.update(frame_id=1000, control_ms=1000, source_frame_id=1000)
+    odom.update(received_ms=1000, source_sample_id=1000)
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, dwa_admission_ms=100)
+    assert (decision.values[5] == 0.) == blocked
+    if not blocked:
+        assert decision.dwa_acceptance.motion_guard.check.accepted
+        assert decision.values[:2] == [0., 0.]
+
+
+def test_physical_memory_requires_three_views_and_complete_free_support():
+    memory = scan.ObservedObstacles()
+    empty = np.zeros(scan.SHAPE, bool)
+    measured = np.isclose(scan.FORWARD, .50) & np.isclose(scan.RIGHT, 0.)
+    base = PlanarPose(0, ("odom",), 0., 0., 0.)
+    for i, y in enumerate((.024, .026, .024)):
+        pose = replace(base, stamp_ms=1000 + 100*i, y=y)
+        memory.remember_view(pose, empty, measured, remember_occupied=measured, physical_support=True)
+        assert bool(memory.has_occupied) is (i == 2)
+    # The current centre snaps to exactly one original .05m world voxel.
+    assert memory.cells == {(10, 0)}
+    pose = replace(base, stamp_ms=1300, y=.026)
+    memory.remember_view(pose, measured, empty, clear=measured, physical_support=True)
+    assert memory.has_occupied
+    clear = measured | (np.isclose(scan.FORWARD, .50) & np.isclose(scan.RIGHT, .05))
+    memory.remember_view(pose, clear, empty, clear=clear, physical_support=True)
+    assert not memory.has_occupied
+
+
+@pytest.mark.parametrize("capture_time", [True, False])
+def test_retained_receipt_view_requires_a_registered_exposure(capture_time):
+    look = scan.ActiveScan(receipt_only=True, keep_physical_views=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20, at_front=True)
+    for stamp in (1000, 1100):
+        depth = dict(map=np.full((8, 8), .60), frame_id=stamp, source_frame_id=stamp, control_ms=stamp)
+        if capture_time:
+            depth["capture_ms"] = stamp
+        odom = dict(vx=0., vy=0., wz=0., received_ms=stamp, source_sample_id=stamp)
+        assert look.update(depth, odom, geometry, receipt_only=True) is None
+        look.observed_grid()
+    assert len(look.views) == 1  # newest view alone supplies receipt-time routing
+    if capture_time:
+        assert len(look.registered_history) == 1
+        stamp, origin = look.registered_history[0][5]
+        assert stamp == origin.stamp_ms == 1000
+        assert origin.frame == ("navi_relative", look.motion_frame)
+        assert (origin.x, origin.y) == pytest.approx((.20, 0.))
+    else:
+        assert not look.registered_history

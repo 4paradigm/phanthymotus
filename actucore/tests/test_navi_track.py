@@ -740,3 +740,56 @@ def test_local_front_range_retains_only_the_remaining_depth_freshness_window():
     assert seen.measured_range_m is None
     expired = feed(1910, .31)
     assert expired.observed and expired.front_fix is None
+
+
+def test_readonly_match_does_not_advance_tracker():
+    import pickle
+
+    tracker, config = T.Tracker(), _cfg()
+    for stamp in (800, 900, 1000):
+        _feed(tracker, _stamped(stamp, _obj()), config=config, depth=dict(_depth(), frame_id=stamp))
+    before = pickle.dumps(tracker)
+    snapshot = tracker.track.snapshot(1000)
+    observation = _stamped(1100, _obj(bearing=.01, confidence=.25))
+    for _ in range(3):
+        match = T.match_observation(snapshot, observation, dict(_depth(), frame_id=1100),
+                                    ego_motion=(.01, .02, -.03), elapsed_s=.1, target="chair", config=config)
+        assert match.generation == snapshot.generation and match.range_m == pytest.approx(3.)
+        assert match.source == 1100
+        assert pickle.dumps(tracker) == before
+    assert not T.match_observation(snapshot, observation, {"bands": {"center": 3.}},
+                                   ego_motion=STILL, elapsed_s=.1, target="chair", config=config)
+    old_mean, old_cov = snapshot.mean, snapshot.cov
+    tracker.track.mean[:] = -25.
+    tracker.track.cov[:] = 10.
+    assert old_mean[0] == 3. and old_cov[0][0] < .1
+    _feed(tracker, _stamped(2000, _obj()), config=config, dt=config.max_coast_s + .01)
+    assert tracker.track.generation > snapshot.generation
+
+
+@pytest.mark.parametrize("near_patch", [False, True])
+def test_readonly_person_match_requires_a_continuous_front_return(near_patch):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    config = _cfg(depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
+    person = dict(_obj("person"), bbox_norm=(.1, .1, .9, .9))
+    tracker = T.Tracker()
+    image = np.full((60, 80), 3.)
+    for stamp in (100, 200, 300):
+        _feed(tracker, _stamped(stamp, person), config=config, target="person",
+              depth=dict(map=image, frame_id=stamp))
+    snapshot = tracker.track.snapshot(300)
+    if near_patch:
+        image[22:29, 35:45] = .8
+    observed = _stamped(400, person)
+    depth = dict(map=image, frame_id=400)
+    live = _feed(tracker, observed, config=config, target="person", depth=depth)
+    match = T.match_observation(snapshot, observed, depth, ego_motion=STILL,
+                                elapsed_s=.1, target="person", config=config)
+    assert live.accepted_detection
+    if near_patch:
+        assert live.measured_range_m is None and match is None
+    else:
+        assert match.range_m == live.measured_range_m
+        assert T.match_observation(snapshot, observed, dict(depth, source_frame_id=299),
+                                   ego_motion=STILL, elapsed_s=.1, target="person", config=config) is None

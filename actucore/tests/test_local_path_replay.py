@@ -621,3 +621,21 @@ def test_low_components_use_diagonal_connectivity_and_strict_height_limit(height
     assert occupied.sum() == remaining
     assert np.array_equal(fast, occupied)
     assert free.sum() == n - remaining
+
+
+def test_dwa_route_can_end_at_a_waypoint_with_limited_turning_space():
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
+    post = np.isclose(replay.FORWARD, .65) & (abs(replay.RIGHT) <= .05)
+    # A straight slot centered at right=.55 admits the footprint at the
+    # target ring, while obstructing a complete in-place rotation there.
+    slot = (replay.FORWARD >= 1.35) & (abs(replay.RIGHT - .55) >= .30)
+    hits = post | slot
+    cache = replay.PlanCache()
+    observation = dict(frame_id=1000, map=np.ones((5, 5)), projected_grid=(~hits, hits),
+                       stop_target=(2.55, .55, .50, .05), body_half_width=.23, allow_unknown=True)
+    legacy = cache.route(observation, geometry, .253, .65, 1., 500)
+    finite = cache.route(dict(observation, finite_turn=True), geometry, .253, .65, 1., 500)
+    assert finite is not None
+    end = finite.points[-1]
+    assert np.hypot(2.55 - end[0], .55 - end[1]) <= .55 + 1e-9
+    assert legacy is None or legacy.points[-1] != end

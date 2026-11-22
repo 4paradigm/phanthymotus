@@ -11,7 +11,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from plugins.navi import dwa, local_path, plugin, policy
+from plugins.navi import active_scan, dwa, local_path, plugin, policy
+from plugins.navi.active_scan import NearProjection
 from plugins.navi.camera import HorizontalIntrinsics
 
 
@@ -100,7 +101,7 @@ def test_legacy_checked_prefix_does_not_call_dwa(monkeypatch, body):
     config, state, depth, odom = observation_case(controller="legacy", body=body)
     calls = observe_selector(monkeypatch)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert calls == []
     assert decision.values == [.15, 0., 0., 0., 0., .25]
     assert not state.dwa_selected
@@ -110,7 +111,7 @@ def test_existing_body_route_still_uses_real_dwa(monkeypatch):
     config, state, depth, odom = observation_case(attempted=False)
     calls = observe_selector(monkeypatch)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     accepted = [choice for _, choice in calls if choice is not None]
     assert accepted and state.dwa_selected
     assert tuple(decision.values[i] for i in (0, 1, 5)) == accepted[-1].command
@@ -119,7 +120,7 @@ def test_existing_body_route_still_uses_real_dwa(monkeypatch):
 def test_dwa_policy_intersects_operator_and_directional_lateral_limits(monkeypatch):
     config, state, depth, odom = observation_case(controller="legacy")
     policy.step(detections=None, depth=depth, odom=odom, config=config,
-                state=state, dt=.1, control_period_s=.1)
+                state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     config.local_controller = "dwa"
     config.use_lateral = True
     config.vy_max = .2
@@ -161,7 +162,7 @@ def test_ready_advance_hands_motion_to_dwa_and_retires_the_fixed_leg(monkeypatch
     anchor = state.goal_anchor
     calls = observe_selector(monkeypatch)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert calls and any(choice is not None for _, choice in calls)
     assert state.dwa_selected and state.checked_prefix
     assert decision.values[0] > 0. and decision.values[1] == 0.
@@ -171,16 +172,33 @@ def test_ready_advance_hands_motion_to_dwa_and_retires_the_fixed_leg(monkeypatch
     assert state.executing_leg is None
 
 
-@pytest.mark.parametrize("turning,stale", [(True, False), (False, True)])
-def test_ready_advance_still_obeys_stop_and_freshness_conditions(monkeypatch, turning, stale):
-    config, state, depth, odom = advance_case(body=False)
-    if turning:
-        odom["wz"] = .12
-    if stale:
-        depth["capture_invalid"] = True
+@pytest.mark.parametrize("blocked", [False, True])
+def test_advance_can_decelerate_yaw_without_standing_first(monkeypatch, blocked):
+    config, state, depth, odom = advance_case(body=True)
+    odom["wz"] = .12
+    state.commanded = (0., 0., .12)
+    if blocked:
+        # A remembered square overlaps the side of the actual body.
+        squares = local_path.ObstacleSquares(np.array([[.05, .20]]), .01)
+        state.active_scan.near_projection = NearProjection(squares=squares, stamp_ms=1100)
     calls = observe_selector(monkeypatch)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, dwa_admission_ms=100)
+    assert calls and calls[0][0]["measured"][2] == .12
+    assert calls[0][0]["previous"] == (0., 0., .12)
+    if blocked:
+        assert decision.values == [0.] * 6
+        assert state.dwa_trace["rejected"]["remembered_obstacle"] > 0
+    else:
+        assert decision.dwa_acceptance is not None and decision.values[0] > 0.
+
+
+def test_ready_advance_still_obeys_freshness_conditions(monkeypatch):
+    config, state, depth, odom = advance_case(body=False)
+    depth["capture_invalid"] = True
+    calls = observe_selector(monkeypatch)
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert decision.values == [0.] * 6
     assert not state.dwa_selected
     assert calls == []
@@ -189,17 +207,17 @@ def test_ready_advance_still_obeys_stop_and_freshness_conditions(monkeypatch, tu
 def test_a_changed_nonzero_policy_result_cannot_keep_an_unchecked_dwa_motion(monkeypatch):
     config, state, depth, odom = observation_case()
     calls = observe_selector(monkeypatch)
-    account_idle = policy._account_idle
+    account_progress = policy._account_dwa_progress
 
     def alter_after_selection(decision, *args):
-        decision = account_idle(decision, *args)
+        decision = account_progress(decision, *args)
         if state.dwa_selected:
             decision.values[0] *= .5
         return decision
 
-    monkeypatch.setattr(policy, "_account_idle", alter_after_selection)
+    monkeypatch.setattr(policy, "_account_dwa_progress", alter_after_selection)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert any(choice is not None for _, choice in calls)
     assert decision.values == [0.] * 6
     assert decision.dwa_acceptance is None
@@ -214,7 +232,7 @@ def test_accepted_identity_retains_full_tail_check_and_true_participation_counts
     config, state, depth, odom = observation_case(body=body)
     calls = observe_selector(monkeypatch)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     accepted = decision.dwa_acceptance
     assert accepted is not None
     assert accepted.command == tuple(decision.values[i] for i in (0, 1, 5))
@@ -234,15 +252,18 @@ def test_accepted_identity_retains_full_tail_check_and_true_participation_counts
 @pytest.mark.parametrize("body", [True, False])
 def test_route_selection_precedes_the_legacy_straight_waypoint_gate(monkeypatch, body):
     config, state, depth, odom = observation_case(body=body, attempted=False)
+    # Put the bend within this command's held trajectory.
+    depth["map"][220:370, 302:338] = 1.
     calls = observe_selector(monkeypatch)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     kwargs, choice = calls[0]
-    endpoint = kwargs["route"][-1]
-    blocked = local_path.route_obstacles(kwargs["grid"], kwargs["geometry"],
-                                         kwargs["half_width"], allow_unknown=True)
+    assert choice is not None
+    endpoint = (kwargs["route"], *kwargs["alternate_routes"])[choice.reference_index][-1]
+    keepout = kwargs["footprint"].half_width + kwargs["footprint"].clearance_margin_m
+    blocked = local_path.route_obstacles(kwargs["grid"], kwargs["geometry"], keepout, allow_unknown=True)
     assert not local_path.segment_clear(
-        blocked, kwargs["geometry"], kwargs["half_width"], math.atan2(endpoint[1], endpoint[0]),
+        blocked, kwargs["geometry"], keepout, math.atan2(endpoint[1], endpoint[0]),
         math.hypot(*endpoint), heading_tolerance=policy.ANGLE_TOLERANCE)
     assert choice is not None and decision.dwa_acceptance is not None
     assert choice.command == decision.dwa_acceptance.command
@@ -253,7 +274,7 @@ def test_route_selection_precedes_the_legacy_straight_waypoint_gate(monkeypatch,
 def prepared_reference_case(*, body=False):
     config, state, depth, odom = observation_case(controller="legacy", body=body)
     policy.step(detections=None, depth=depth, odom=odom, config=config,
-                state=state, dt=.1, control_period_s=.1)
+                state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert state.view_detour is not None
     config.local_controller = "dwa"
     return config, state, depth, state.view_detour
@@ -279,63 +300,216 @@ def test_unavailable_selector_context_has_a_specific_reason_without_a_call(monke
     assert state.dwa_trace["fallback_reason"] == reason
 
 
-@pytest.mark.parametrize("reason", ["collision", "remembered_obstacle", "occluded_prefix",
-                                    "target_standoff", "insufficient_room"])
+@pytest.mark.parametrize("reason", ["footprint_collision", "remembered_obstacle", "occluded_prefix",
+                                    "target_standoff"])
 def test_candidate_rejections_preserve_the_actual_constraint(monkeypatch, reason):
     config, state, depth, reference = prepared_reference_case()
     extra, distance = {}, 3.
     scan = state.active_scan
-    if reason in ("collision", "remembered_obstacle"):
+    if reason in ("footprint_collision", "remembered_obstacle"):
         hits = np.zeros(local_path.SHAPE, dtype=bool)
         hits[local_path.START] = True
-        if reason == "collision":
-            scan.historical_hits = hits
+        if reason == "footprint_collision":
+            stamp, pose, free, _, *extra_view = scan.views[-1]
+            scan.views[-1] = (stamp, pose, free, hits, *extra_view)
         else:
-            scan.near_hits = hits
-            scan.near_squares = local_path.ObstacleSquares(np.array([[0., .10]]), .27)
-            scan.near_revision = scan.control_ms
+            squares = local_path.ObstacleSquares(np.array([[0., .10]]), .27)
+            scan.near_projection = NearProjection(hits, squares, stamp_ms=scan.control_ms)
     elif reason == "occluded_prefix":
         extra["shadow"] = np.ones(local_path.SHAPE, dtype=bool)
     elif reason == "target_standoff":
         distance = config.stop_distance_m / 2
-    else:
-        extra["room"] = 0.
     calls = observe_selector(monkeypatch)
     assert policy._dwa_detour(depth, config, state, reference, distance, 0., **extra) is None
     assert len(calls) == 1
     trace = state.dwa_trace
     assert trace["sampled_candidates"] > 0 and trace["admissible_candidates"] == 0
     assert trace["rejected"][reason] > 0
-    assert set(trace["rejected"]) <= {reason, "outside_grid"}
+    assert set(trace["rejected"]) <= {reason, "outside_grid", "off_route", "insufficient_progress"}
     assert sum(trace["rejected"].values()) == trace["sampled_candidates"]
 
 
-@pytest.mark.parametrize("budget", [7, 64])
-def test_multiple_references_share_one_tick_sampling_budget(monkeypatch, budget):
-    config, state, depth, reference = prepared_reference_case()
+@pytest.mark.parametrize("budget", [7, 128])
+@pytest.mark.parametrize("first", [-1., 1.])
+def test_same_twist_is_validated_once_across_references(monkeypatch, budget, first):
+    config, state, depth, _ = prepared_reference_case(body=True)
     config.dwa_samples = budget
-    calls = observe_selector(monkeypatch)
-    for _ in range(5):
-        assert policy._dwa_detour(depth, config, state, reference, 3., 0.,
-                                   room=0., budget=max(1, budget // 3)) is None
-    assert calls
-    assert sum(kwargs["diagnostics"]["sampled_candidates"] for kwargs, _ in calls) == budget
-    assert state.dwa_trace["sampled_candidates"] == budget
-    assert state.dwa_remaining == 0
-    assert state.dwa_trace["fallback_reason"] == "sample_budget_exhausted"
+    geometry = config.local_geometry
+    plans = {-1.: local_path.Detour(None, ((0., 0.), (.55, -.48)), geometry),
+              1.: local_path.Detour(None, ((0., 0.), (.75, .11)), geometry)}
+    monkeypatch.setattr(local_path, "opening_route", lambda *args: None)
+
+    requested = []
+    def route(_depth, _geometry, _keep, _ahead, side, *_):
+        requested.append(side)
+        return plans[side]
+
+    monkeypatch.setattr(state.local_plan, "route", route)
+    predictions, checks = [], []
+    predict, evaluate = dwa.predict_motion, dwa.evaluate_motion
+
+    def record_prediction(measured, previous, command, **kwargs):
+        result = predict(measured, previous, command, **kwargs)
+        predictions.append((command, result))
+        return result
+
+    def record_check(trace, **kwargs):
+        result = evaluate(trace, **kwargs)
+        checks.append((trace, result))
+        return result
+
+    monkeypatch.setattr(dwa, "predict_motion", record_prediction)
+    monkeypatch.setattr(dwa, "evaluate_motion", record_check)
+    result = policy._start_detour_segment(depth, config, state, geometry, 2., (first, -first), 3., 0.)
+    assert requested == [first, -first]
+    assert isinstance(result, tuple) and state.dwa_selected
+    assert state.view_detour.preview == plans[1.].points
+    assert 0 < len(checks) <= len(predictions) <= min(budget, 64)
+    assert state.dwa_trace["physical_evaluations"] == len(checks)
+    assert len({command for command, _ in predictions}) == len(predictions)
+    trace = state.dwa_trace
+    assert trace["sampled_candidates"] == len(predictions)
+    assert trace["reference_scores"] == trace["attempts"][0]["reference_scores"]
+    assert all(count > 0 for count in trace["attempts"][0]["scores_by_reference"])
+    guard = state.dwa_motion_guard
+    assert result[:3] == state.dwa_proposal.command == trace["proposed_twist"]
+    assert any(command == result[:3] and prediction is guard.trace for command, prediction in predictions)
+    assert any(prediction is guard.trace and check is guard.check for prediction, check in checks)
+
+
+@pytest.mark.parametrize("closest", [False, True], ids=["ordinary", "closest"])
+@pytest.mark.parametrize("first", [-1., 1.], ids=["left-first", "right-first"])
+def test_lateral_handoff_scores_both_eligible_sides_without_scanning(monkeypatch, closest, first):
+    config, state, depth, odom = observation_case()
+    config.use_lateral = True
+    config.vy_max = .30
+    state.goal_anchor = None
+    state.commanded = (0., 0., 0.)
+    odom.update(vx=0., velocity_history=((1000, 1000, (0., 0., 0.)),))
+    depth["map"][:] = 5.
+    depth["map"][220:370, 292:328] = .85
+    scan = state.active_scan
+    assert scan.update(depth, odom, config.scan_geometry, receipt_only=True,
+                       max_depth_age_ms=config.depth_age_limit_ms) is None
+    scan.exhausted = closest
+    monkeypatch.setattr(policy, "_local_side_order", lambda *args: (first, -first))
+
+    result = policy._avoid(.20, 0., 0., depth, config, policy.APPROACHING, "", state,
+                           target_distance=3., target_bearing=.12, odom=odom, may_scan=False)
+
+    assert state.dwa_selected
+    trace = state.dwa_trace
+    assert trace["select_calls"] == 1
+    assert 0 < trace["sampled_candidates"] <= 64
+    counts = trace["attempts"][0]["scores_by_reference"]
+    assert len(counts) == 2 and min(counts) > 0
+    assert state.escape_side == 1.
+    assert state.view_detour.preview == state.local_plan.plans[1.].points
+    proposal = state.dwa_proposal
+    assert result[:3] == proposal.command == trace["proposed_twist"]
+    assert state.dwa_motion_guard is proposal.guard
+    assert proposal.guard.trace is proposal.choice.trace
+    assert proposal.guard.check is proposal.choice.check and proposal.guard.check.accepted
+
+
+@pytest.mark.parametrize("budget", [1, 7])
+def test_physical_reuse_checks_changed_memory_and_visibility(monkeypatch, budget):
+    config, state, depth, reference = prepared_reference_case(body=True)
+    config.dwa_samples = budget
+    config.vx_max = config.floor_vx = .08
+    config.wz_max = 0.
+    motion_checks = []
+    evaluate = dwa.evaluate_motion
+
+    def record(trace, **kwargs):
+        checked = evaluate(trace, **kwargs)
+        motion_checks.append(checked)
+        return checked
+
+    monkeypatch.setattr(dwa, "evaluate_motion", record)
+    def select(route=reference, **kwargs):
+        return policy._dwa_detour(depth, config, state, route, 3., 0., **kwargs)
+
+    first = select()
+    assert first is not None and len(motion_checks) == 1
+    alternate = replace(reference, points=((0., 0.), (.18, .03)))
+    second = select(alternate)
+    assert second is not None and second.reference is alternate
+    assert second.guard.trace is first.guard.trace
+    assert second.guard.check is first.guard.check
+    assert select(shadow=np.ones(local_path.SHAPE, dtype=bool)) is None
+    assert state.dwa_trace["fallback_reason"] == "no_admissible_candidates"
+    assert state.dwa_trace["rejected"]["occluded_prefix"] > 0
+    assert len(motion_checks) == 1
+    scan = state.active_scan
+    scan.near_projection = NearProjection(
+        squares=local_path.ObstacleSquares(np.array([[.05, .20]]), .01),
+        stamp_ms=scan.near_projection.stamp_ms)
+    assert select() is None
+    if budget == 1:
+        assert len(motion_checks) == 1
+        assert state.dwa_trace["fallback_reason"] == "sample_budget_exhausted"
+    else:
+        assert len(motion_checks) == 2 and motion_checks[-1].reason == "remembered_obstacle"
+
+
+@pytest.mark.parametrize("mode", ["synchronized", "body-receipt", "front-camera"])
+def test_dwa_scan_and_raw_occupancy_share_the_fresh_projection(monkeypatch, mode):
+    config, state, depth, odom = observation_case(body=mode != "front-camera")
+    if mode == "synchronized":
+        state.active_scan.receipt_only = False
+        odom["stamp_ms"] = 1000
+    real_observe = local_path.observe
+    requests = []
+
+    def observe(frame, *args, **kwargs):
+        if frame is depth["map"] and kwargs.get("max_hit_depth") is None:
+            requests.append(kwargs.get("check_free_space", True))
+        return real_observe(frame, *args, **kwargs)
+
+    monkeypatch.setattr(local_path, "observe", observe)
+    monkeypatch.setattr(active_scan, "observe", observe)
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, dwa_admission_ms=0)
+    assert decision.dwa_acceptance is not None
+    assert state.active_scan.receipt_only == (mode != "synchronized")
+    assert requests == [True]
+    assert "grid_projection" not in depth
+
+
+@pytest.mark.parametrize("changed", ["map", "ground"])
+def test_duplicate_source_keeps_fresh_raw_occupancy(changed):
+    config, state, depth, odom = observation_case()
+    if changed == "ground":
+        depth["map"][220:370, 302:338] = .20
+        depth["ground"] = np.ones_like(depth["map"], dtype=bool)
+
+    def tick():
+        return policy.step(detections=None, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, dwa_admission_ms=0)
+
+    assert tick().dwa_acceptance
+    retained_view = state.active_scan.views[-1]
+    if changed == "map":
+        depth["map"][:] = .18
+    else:
+        depth["ground"][220:370, 302:338] = False
+    assert tick().values == [0.] * 6
+    assert state.active_scan.views[-1] is retained_view
+    assert state.dwa_trace["rejected"]["footprint_collision"] > 0
 
 
 def test_advance_handoff_does_not_resume_the_old_leg_on_the_next_tick():
     config, state, depth, odom = advance_case(body=False)
     anchor = state.goal_anchor
     first = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                        state=state, dt=.1, control_period_s=.1)
+                        state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert first.dwa_acceptance is not None
     depth = dict(depth, frame_id=1200, control_ms=1200, source_frame_id=1200)
     odom = dict(odom, vx=first.values[0], wz=first.values[5],
                 received_ms=1200, source_sample_id=1200)
     second = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                         state=state, dt=.1, control_period_s=.1)
+                         state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert state.goal_anchor is anchor
     assert state.active_scan.advance_m is None
     assert state.executing_leg is None
@@ -352,7 +526,7 @@ def test_public_stop_reports_why_dwa_did_not_run(monkeypatch, reason):
         depth["capture_invalid"] = True
     calls = observe_selector(monkeypatch)
     policy.step(detections=None, depth=depth, odom=odom, config=config,
-                state=state, dt=.1, control_period_s=.1)
+                state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert calls == []
     assert state.dwa_trace["fallback_reason"] == reason
     assert state.dwa_totals["attempted_ticks"] == 0
@@ -375,7 +549,7 @@ def test_trajectory_visibility_stops_at_the_first_shadow(spacing, hit_forward, e
 
 @pytest.mark.parametrize("body", [True, False])
 @pytest.mark.parametrize("lateral", [True, False])
-def test_route_cannot_restore_forward_motion_inside_the_configured_stop_line(monkeypatch, body, lateral):
+def test_real_obstacle_is_evaluated_inside_the_configured_stop_line(monkeypatch, body, lateral):
     config, state, depth, odom = observation_case(body=body, attempted=False)
     config.use_lateral = lateral
     config.obstacle_stop_m = .85
@@ -384,32 +558,32 @@ def test_route_cannot_restore_forward_motion_inside_the_configured_stop_line(mon
     odom.update(vx=0., velocity_history=((1000, 1000, (0., 0., 0.)),))
     calls = observe_selector(monkeypatch)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert calls, "Use the real route selector at the previously bypassed stop line"
-    assert all(kwargs["x_limit"] == (0., 0.) for kwargs, _ in calls)
-    assert decision.values[0] == 0.
-    if lateral:
-        assert decision.values[1] or decision.values[5], "A checked escape remains available"
+    assert all(kwargs["x_limit"][1] > 0. for kwargs, _ in calls)
+    assert decision.dwa_acceptance is not None
+    assert next(choice for _, choice in calls if choice is not None).check.accepted
 
 
 @pytest.mark.parametrize("body", [True, False])
-def test_short_ready_advance_room_bounds_the_complete_dwa_prediction(monkeypatch, body):
+def test_reference_endpoint_is_not_a_physical_wall(monkeypatch, body):
     config, state, depth, odom = advance_case(body=body)
     state.active_scan.advance_m = .10
     config.dwa_horizon_s = 3.
     config.floor_vx_moving = .08
     calls = observe_selector(monkeypatch)
     decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
-                           state=state, dt=.1, control_period_s=.1)
+                           state=state, dt=.1, control_period_s=.1, dwa_admission_ms=0)
     assert calls
-    assert all(choice is None for _, choice in calls)
-    assert decision.dwa_acceptance is None
-    assert state.dwa_trace["rejected"]["insufficient_room"] > 0
+    assert decision.dwa_acceptance is not None
+    choice = next(choice for _, choice in calls if choice is not None)
+    assert choice.trace.body_travel_m > .10
+    assert choice.check.accepted
 
 
 def test_constructed_escape_prefix_is_not_reported_as_an_astar_route(monkeypatch):
     config, state, depth, _ = prepared_reference_case(body=True)
-    state.active_scan.near_hits = np.zeros(local_path.SHAPE, dtype=bool)
+    state.active_scan.near_projection = NearProjection(hits=np.zeros(local_path.SHAPE, dtype=bool))
     monkeypatch.setattr(local_path, "opening_route", lambda *args: None)
     monkeypatch.setattr(state.local_plan, "route", lambda *args, **kwargs: None)
     calls = observe_selector(monkeypatch)
@@ -418,3 +592,324 @@ def test_constructed_escape_prefix_is_not_reported_as_an_astar_route(monkeypatch
     assert calls and any(choice is not None for _, choice in calls)
     assert isinstance(result, tuple) and state.dwa_selected
     assert state.dwa_trace["branch"] == "prefix"
+
+
+def test_dwa_registration_uses_measurement_and_only_uncovered_residual():
+    from plugins.navi.odom import PlanarPose
+    config, state, _, _ = observation_case()
+    geometry = config.local_geometry
+    start = PlanarPose(1000, ("odom",), 0., 0., 0.)
+    measured = PlanarPose(1100, start.frame, .50, 0., math.pi / 2)
+    twist = (.20, 0., 0.)
+    odom = {"obstacle_pose": measured, "velocity_history": ((1108, 1108, twist),)}
+    current = policy.dwa_grid_pose(state.active_scan, geometry, 1110, odom)
+    assert current is not None and current.stamp_ms == 1108
+    assert (current.x, current.y, current.yaw) == pytest.approx((.5, .0016, math.pi / 2))
+    registered = policy.dwa_registration(start, current, 1000, 1110, geometry, (twist,))
+    assert registered.points((.50, -.22)) == pytest.approx((.22 - .0016, 0.))
+    assert registered.shift_error == pytest.approx(.20 * .002)
+    assert registered.turn_error == 0.
+
+def test_partial_reference_precedes_scan_exhaustion(monkeypatch):
+    config, state, depth, odom = observation_case(attempted=False)
+    wall = np.isclose(local_path.FORWARD, 1.15)
+    depth["map"][:] = 1.15
+    # This observed wall extends across the complete local map.
+    monkeypatch.setattr(state.active_scan, "_project_view", lambda *args: (~wall, wall))
+    anchor = state.goal_anchor
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, dwa_admission_ms=100)
+    assert decision.dwa_acceptance and decision.values[0] > 0.
+    assert state.dwa_trace["branch"] == "reachable_prefix"
+    endpoint = state.view_detour.preview[-1]
+    assert 0. < endpoint[0] < 1.15
+    assert not state.active_scan.attempted and state.goal_anchor is anchor
+
+
+def test_observation_hysteresis_never_reuses_invalid_motion():
+    config, state, depth, odom = observation_case(attempted=False)
+    def tick(stamp, source):
+        observation = dict(depth, control_ms=stamp, frame_id=stamp, capture_ms=stamp, source_frame_id=source)
+        feedback = dict(odom, vx=0., received_ms=stamp, source_sample_id=stamp,
+                        velocity_history=((stamp, stamp, (0., 0., 0.)),))
+        return policy.step(detections=None, depth=observation, odom=feedback, config=config,
+                           state=state, dt=.05, dwa_admission_ms=100)
+
+    assert tick(1000, 1000).dwa_acceptance
+    # Occupancy under the current footprint invalidates every continuation.
+    squares = local_path.ObstacleSquares(np.array([[.06, .18]]), .025)
+    state.active_scan.near_projection = NearProjection(squares=squares, stamp_ms=1000)
+    for stamp, source in ((1050, 1050), (1100, 1050), (1150, 1050), (1200, 1200)):
+        assert tick(stamp, source).values == [0.] * 6
+        assert not state.active_scan.active
+    assert tick(1250, 1250).values == [0.] * 6
+    assert state.active_scan.active
+    state.active_scan.near_projection = NearProjection()
+    assert tick(1300, 1300).dwa_acceptance
+    assert not state.active_scan.active
+
+
+@pytest.mark.parametrize("contact", [False, True])
+def test_parking_yaw_checks_the_actual_body_motion(contact):
+    config, state, depth, odom = advance_case(body=True)
+    scan = state.active_scan
+    scan.finish()
+    radius, angle = config.stop_distance_m + .01, .35
+    state.goal_anchor = policy.DetourGoal(radius * math.cos(angle), -radius * math.sin(angle))
+    config.wz_max = .08
+    state.commanded = (0., 0., 0.)
+    squares = local_path.ObstacleSquares(np.array([[0., .20 if contact else .31]]), .01)
+    scan.near_projection = NearProjection(squares=squares, stamp_ms=1100)
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, dwa_admission_ms=100)
+    if contact:
+        assert decision.values == [0.] * 6
+    else:
+        assert decision.values[:2] == [0., 0.] and decision.values[5] < 0.
+        assert decision.dwa_acceptance.motion_guard.check.accepted
+
+
+def test_policy_keeps_complete_adopted_width_route_through_slot(monkeypatch):
+    config, state, depth, odom = observation_case(attempted=False)
+    camera = local_path.camera_square(config.local_geometry.horizontal, config.local_geometry.vertical, .23)
+    geometry = local_path.body_square(camera, {"body_from_optical": camera.base_from_optical})
+    config = replace(config, half_width_m=.23, scan_geometry=geometry, local_geometry=geometry,
+                     stop_distance_m=.50)
+    state.goal_anchor = policy.DetourGoal(2.55, -.55)
+    state.commanded = (0., 0., 0.)
+    odom.update(vx=0., velocity_history=((1000, 1000, (0., 0., 0.)),))
+    post = np.isclose(local_path.FORWARD, .65) & (abs(local_path.RIGHT) <= .05)
+    slot = (local_path.FORWARD >= 1.35) & (abs(local_path.RIGHT - .55) >= .30)
+    occupied = post | slot
+    monkeypatch.setattr(state.active_scan, "_project_view", lambda *args: (~occupied, occupied))
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, dwa_admission_ms=100)
+    assert decision.dwa_acceptance and decision.values[0] > 0.
+    assert state.view_detour.preview[-1] == pytest.approx((2., .55))
+    assert state.dwa_trace["branch"] == "route"
+
+
+@pytest.mark.parametrize("body", [True, False], ids=["body", "camera"])
+@pytest.mark.parametrize("vx,vy,yaw", [(0., 0., 1.), (.1, -.05, .3)])
+def test_detour_goal_is_fixed_in_motion_reference(body, vx, vy, yaw):
+    from plugins.navi.odom import PlanarPose
+
+    config, state, depth, odom = observation_case(body=body)
+    geometry = config.local_geometry
+    if body:
+        mount = geometry.base_from_optical.copy()
+        mount[0, 3] = .2
+        config.local_geometry = config.scan_geometry = replace(geometry, base_from_optical=mount)
+    initial = PlanarPose(1000, ("odom",), 0., 0., 0.)
+    c, s = math.cos(yaw / 2), math.sin(yaw / 2)
+    arc = math.sin(yaw / 2) / (yaw / 2)
+    dx, dy = arc * (c * vx - s * vy), arc * (s * vx + c * vy)
+    end = PlanarPose(2000, initial.frame, dx, dy, yaw)
+    anchor = state.goal_anchor = policy.DetourGoal(2.8, 0., pose=initial)
+    odom = dict(vx=vx, vy=vy, wz=yaw, received_ms=2000)
+    if body:
+        odom["motion_pose"] = end
+    policy.step(detections=None, depth=dict(depth, control_ms=2000, frame_id=2000),
+                odom=odom, state=state, config=config, dt=1.)
+    c, s = math.cos(yaw), math.sin(yaw)
+    world = (dx + c * (anchor.x + .2) - s * anchor.y, dy + s * (anchor.x + .2) + c * anchor.y)
+    assert world == pytest.approx((3., 0.), abs=1e-9)
+
+
+@pytest.mark.parametrize("body", [True, False])
+def test_visible_same_track_updates_range_but_only_clear_route_releases_goal(body):
+    config, state, depth, odom = observation_case(body=body)
+    person = {"name": "person", "position": [0., -.6], "confidence": .9}
+    for stamp in (700, 800, 900):
+        state.tracker.step(detections={"timestamp": stamp, "objects": [person]},
+                           depth=dict(depth, frame_id=stamp, source_frame_id=stamp),
+                           ego=(0., 0., 0.), dt=.1, config=config, target="person")
+    state.goal_anchor = None
+    state.escape_side = 1.
+    policy._remember_detour_goal(state, config, state.tracker.track, dict(odom, received_ms=900))
+    anchor = state.goal_anchor
+    assert anchor is not None and anchor.x == pytest.approx(5.)
+    # Two measured arcs combine left-positive translation with a right turn.
+    # The camera approximation places the optical origin at the chassis front.
+    offset = 0. if body else .2
+    wx = wy = heading = 0.
+    yaw = -.015
+    for i, stamp in enumerate((1000, 1100), 1):
+        image = depth["map"].copy()
+        image[:150] = 4.9
+        payload = {"timestamp": stamp, "objects": [dict(person, position=[.02 * i, -.6])]}
+        odom = dict(vx=.1, vy=.04, wz=-.15, received_ms=stamp)
+        arc = .1 * math.sin(yaw / 2) / (yaw / 2)
+        c, s = math.cos(heading + yaw / 2), math.sin(heading + yaw / 2)
+        wx += arc * (.1 * c - .04 * s)
+        wy += arc * (.1 * s + .04 * c)
+        heading += yaw
+        frame = dict(depth, map=image, control_ms=stamp, capture_ms=stamp, frame_id=stamp, source_frame_id=stamp)
+        policy.step(detections=payload, depth=frame, odom=odom, config=config, state=state, dt=.1)
+        assert state.tracker.track.accepted_detection
+        assert anchor.verified_range_m == pytest.approx(4.9)
+        assert state.goal_anchor is anchor
+        c, s = math.cos(heading), math.sin(heading)
+        assert (wx + c * (anchor.x + offset) - s * anchor.y,
+                wy + s * (anchor.x + offset) + c * anchor.y) == pytest.approx((5. + offset, 0.))
+    # Once the obstruction clears, policy can steer to the moving live fix.
+    rows = np.arange(480)[:, None] - 240.
+    floor = .35 * 420. / np.maximum(rows, 1.)
+    clear = np.broadcast_to(np.minimum(floor, 4.9), image.shape).copy()
+    ground = np.broadcast_to((rows > 0.) & (floor < 4.9), image.shape).copy()
+    for stamp in (1200, 1300, 1400):
+        frame = dict(depth, map=clear, ground=ground, control_ms=stamp, capture_ms=stamp,
+                     frame_id=stamp, source_frame_id=stamp)
+        result = policy.step(detections=dict(payload, timestamp=stamp), depth=frame,
+                             odom=dict(odom, received_ms=stamp), config=config, state=state, dt=.1)
+    assert state.goal_anchor is None
+    assert result.bearing > .01 and result.distance_m < 4.95
+
+
+def test_paired_mount_update_preserves_original_world_anchor():
+    from plugins.navi.odom import PlanarPose
+
+    config, state, depth, odom = observation_case(body=True)
+    anchor = state.goal_anchor
+    for stamp, offset, yaw in ((1000, .20, 0.), (1100, .25, 0.), (1200, .25, .12)):
+        pose = PlanarPose(stamp, ("odom",), 0., 0., 0.)
+        mount = config.local_geometry.base_from_optical.copy()
+        c, s = math.cos(yaw), math.sin(yaw)
+        mount[:2] = np.array([[c, -s], [s, c]]) @ mount[:2]
+        mount[0, 3] = offset
+        frame = dict(depth, frame_id=stamp, capture_ms=stamp, source_frame_id=stamp, control_ms=stamp,
+                     obstacle_capture_pose=pose, body_from_optical=mount, body_mount_required=True)
+        feedback = dict(vx=0., vy=0., wz=0., received_ms=stamp, obstacle_pose=pose, motion_pose=pose, stamp_ms=stamp)
+        policy.step(detections=None, depth=frame, odom=feedback, config=config, state=state, dt=.1)
+        assert state.use_body_mount and state.goal_anchor is anchor
+        world = offset + c * anchor.x - s * anchor.y, s * anchor.x + c * anchor.y
+        assert world == pytest.approx((3.20, 0.))
+
+
+def test_paired_mount_update_matches_in_the_current_camera_frame():
+    from plugins.navi.odom import PlanarPose
+    from plugins.navi.track import match_observation
+
+    config, state, depth, _ = observation_case(body=True)
+    geometry = config.local_geometry
+    person = {"name": "person", "position": [0., -.6], "confidence": .95}
+    mount = geometry.base_from_optical.copy()
+    mount[0, 3] = .20
+    for stamp in (800, 900, 1000):
+        pose = PlanarPose(stamp, ("odom",), 0., 0., 0.)
+        frame = dict(depth, frame_id=stamp, capture_ms=stamp, source_frame_id=stamp, control_ms=stamp,
+                     obstacle_capture_pose=pose, body_from_optical=mount, body_mount_required=True)
+        feedback = dict(vx=0., vy=0., wz=0., received_ms=stamp, obstacle_pose=pose, motion_pose=pose, stamp_ms=stamp)
+        objects = {"timestamp": stamp / 1000, "objects": [person]}
+        policy.step(detections=objects, depth=frame, odom=feedback, config=config, state=state, dt=.1)
+    track = state.tracker.track
+    assert state.use_body_mount and track.observed and track.measured_range_m == 5.
+    frozen = track.snapshot(1000)
+    # Reuse the mount array as a producer might; the snapshot owns its original frame.
+    mount[0, 3] = .25
+    pose = PlanarPose(1100, ("odom",), 0., 0., 0.)
+    fresh = dict(objects, timestamp=1.1)
+    frame = dict(frame, map=np.full_like(depth["map"], 4.95), frame_id=1100, capture_ms=1100,
+                 source_frame_id=1100, control_ms=1100, obstacle_capture_pose=pose, body_from_optical=mount)
+    current = replace(geometry, base_from_optical=mount)
+    config.gate_chi2 = .00001
+    match = match_observation(frozen, fresh, frame, ego_motion=(0., 0., 0.), elapsed_s=.1, target="person",
+                              config=replace(config, scan_geometry=current))
+    assert match is not None and match.point == pytest.approx((4.95, 0.))
+    stale_range = dict(frame, map=np.full_like(depth["map"], 5.))
+    assert match_observation(frozen, fresh, stale_range, ego_motion=(0., 0., 0.), elapsed_s=.1,
+                             target="person", config=replace(config, scan_geometry=current)) is None
+    feedback = dict(feedback, received_ms=1100, obstacle_pose=pose, motion_pose=pose, stamp_ms=1100)
+    policy.step(detections=fresh, depth=frame, odom=feedback, config=config, state=state, dt=.1)
+    assert track.accepted_detection and track.measured_range_m == 4.95
+
+
+@pytest.mark.parametrize("body", [True, False])
+@pytest.mark.parametrize("speed", [.319, .320, .321])
+def test_small_feedback_overshoot_selects_valid_deceleration(monkeypatch, body, speed):
+    config, state, depth, odom = observation_case(body=body)
+    odom.update(vx=speed, velocity_history=((1000, 1000, (speed, 0., 0.)),))
+    card, packets = card_for_case(monkeypatch, config, state, depth, odom)
+    message = card.next_command()
+    accepted = card._last_decision.dwa_acceptance
+    assert accepted is not None and 0. < accepted.command[0] <= config.vx_max == .30
+    assert accepted.motion_guard.trace.velocities[0] == (speed, 0., 0.)
+    if body:
+        card._publish_command(message)
+    else:
+        card._stage_command(message, card._output_epoch)
+    assert tuple(packets[-1]["values"][i] for i in (0, 1, 5)) == accepted.command
+
+
+@pytest.mark.parametrize("branch", ["route", "prefix", "advance"])
+@pytest.mark.parametrize("body", [True, False], ids=["body", "camera"])
+def test_real_reference_reaches_serialized_wire(monkeypatch, branch, body):
+    if branch in ("advance", "prefix"):
+        config, state, depth, odom = advance_case(body=body)
+        if branch == "prefix":
+            # After a fresh view during an observation turn, target-directed
+            # progress can resume without completing the scan.
+            state.active_scan.retire_motion()
+            assert state.active_scan.begin((1.,))
+    else:
+        config, state, depth, odom = observation_case(body=body, attempted=branch == "prefix")
+    card, packets = card_for_case(monkeypatch, config, state, depth, odom)
+    now = depth["control_ms"]
+    monkeypatch.setattr(plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: (None, depth, odom, now))
+    card._tick()
+    assert len(packets) == 1
+    choice = state.dwa_proposal.choice
+    assert state.dwa_trace["branch"] == branch
+    assert choice.check.accepted and choice.trace.stopped
+    assert choice.trace.velocities[-1] == pytest.approx((0., 0., 0.), abs=1e-12)
+    vx, vy, wz = choice.command
+    assert vx > 0.
+    assert packets[0]["values"] == [vx, vy, 0., 0., 0., wz]
+    assert packets[0]["seq"] == state.dwa_trace["wire_seq"]
+    assert card._last_decision.dwa_acceptance.decision_id == state.dwa_trace["decision_id"]
+
+
+def test_full_topology_and_visible_execution_have_independent_evidence():
+    config, _, _, _ = observation_case()
+    geometry, goal = config.local_geometry, (2., 0.)
+    # The original side A* uses the grid origin; clearance A* uses the pivot.
+    # Both reached the same standoff cell and both see only the first 0.4 m.
+    for pivot in (0., -.20):
+        points = ((0., 0.), (.4, .05), (1.2 - pivot, 0.))
+        original = tuple((f + pivot, r) for f, r in points)
+        plan = local_path.Detour(None, points, geometry, topology=original)
+        tier, ref = policy._dwa_route_reference(plan, 2, goal, .80, .05)
+        assert tier == "route" and ref.preview == points and ref.points == points[:2]
+        assert not ref.reachable_prefix
+        short = replace(plan, points=points[:2], topology=original[:2])
+        tier, ref = policy._dwa_route_reference(short, 2, goal, .80, .05)
+        assert tier == "reachable_prefix" and ref.reachable_prefix and not ref.preview
+        explicitly_partial = replace(plan, reachable_prefix=True)
+        tier, _ = policy._dwa_route_reference(explicitly_partial, 2, goal, .80, .05)
+        assert tier == "reachable_prefix"
+
+
+def test_clearance_route_keeps_every_original_turn_node_as_its_topology(monkeypatch):
+    config, _, _, _ = observation_case()
+    geometry = config.local_geometry
+    occupied = np.isclose(local_path.FORWARD, .25) & np.isclose(local_path.RIGHT, .05)
+    seen = []
+    search = local_path.shortest_path
+
+    def observe(allowed, *args, **kwargs):
+        path = search(allowed, *args, **kwargs)
+        if path:
+            seen.append((allowed.copy(), path))
+        return path
+
+    monkeypatch.setattr(local_path, "shortest_path", observe)
+    plan = local_path.clearance_route((~occupied, occupied), geometry, .22, (1.8, 0.), .50, (0., 0.))
+    allowed, path = seen[-1]
+    raw = tuple((local_path.FORWARD[node], local_path.RIGHT[node]) for node in path)
+    assert len(raw) == 29 and len(plan.points) < len(raw)
+    assert not allowed[local_path.START[0] + 4, local_path.START[1] - 2]
+    assert plan.topology == raw
+    tier, ref = policy._dwa_route_reference(plan, 2, (1.8, 0.), .50, .05)
+    assert tier == "route" and ref.points == plan.points[:2]
+    assert ref.topology == raw and ref.geometry is geometry

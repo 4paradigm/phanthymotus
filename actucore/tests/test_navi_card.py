@@ -1787,11 +1787,20 @@ def test_the_card_adopts_the_geometry_of_whichever_topic_carries_the_depth():
     assert any("0.888" in note for note in card._camera_notes)
 
 
+def test_old_config_margin_cannot_override_adopted_chassis_width():
+    from plugins.navi import policy
+
+    card = _card(half_width_m=.35, clearance_margin_m=.05)
+    assert policy._keepout_m(card._config) == pytest.approx(.385)
+    policy.adopt_limits(card._config, {"footprint": {"half_width": .20}})
+    assert policy._keepout_m(card._config) == pytest.approx(.22)
+
+
 def test_a_calibrated_corridor_excludes_the_left_doorframe():
     import numpy as np
     from plugins.navi import policy, view
 
-    card = _card(half_width_m=0.23, clearance_margin_m=.10, obstacle_stop_m=.60)
+    card = _card(half_width_m=.30, obstacle_stop_m=.60)
     depth = np.full((480, 640), 1.12, dtype=np.float32)
     depth[168:408, 104:120] = 0.56
     declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
@@ -1823,7 +1832,7 @@ def test_unusable_intrinsics_fall_back_to_the_centered_corridor(intrinsics):
     import numpy as np
     from plugins.navi import policy, view
 
-    card = _card(half_width_m=0.23, clearance_margin_m=.10)
+    card = _card(half_width_m=.30)
     depth = np.full((480, 640), 1.12, dtype=np.float32)
     depth[168:408, 132:145] = 0.56
     declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole", half_fov_rad=0.7934)
@@ -2381,8 +2390,8 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
         assert "body_mount_required" not in card.observation(with_capture_timing=True)[1]
     assert command["ttl_ms"] == expected_ttl
     expected_limit = depth_limit_ms or 500
-    assert attempted[:2] == [(-1.0, .28, expected_limit, 600), (1.0, .28, expected_limit, 600)]
-    assert all(attempt[1:] == (.28, expected_limit, 600) for attempt in attempted)
+    assert attempted[:2] == [(-1.0, .253, expected_limit, 600), (1.0, .253, expected_limit, 600)]
+    assert all(attempt[1:] == (.253, expected_limit, 600) for attempt in attempted)
     assert command["obs_stamp_ms"] == depth_stamp
     assert card._state.view_detour.points == ((0., 0.), (.2, .3))
     card._depth_ms = 0
