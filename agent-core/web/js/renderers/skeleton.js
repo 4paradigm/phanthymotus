@@ -1,5 +1,5 @@
 /**
- * skeleton.js — 3D skeleton renderer for Unitree G1 humanoid robot.
+ * skeleton.js — 3D skeleton renderer for robot joint streams.
  * Fetches URDF model from driver via MCP tool, parses kinematic chain,
  * and renders a real-time 3D skeleton driven by joint state data.
  */
@@ -48,10 +48,10 @@ export const SkeletonRenderer = {
   _rootGroup: null,  // Z-up → Y-up coordinate transform
   _pelvisGroup: null, // IMU orientation applied here
   _loaded: false,
-  _mcpId: null,
+  _modelRequest: null,
+  _modelStatus: null,
 
   mount(container, mcpId) {
-    this._mcpId = mcpId;
     this._joints = {};
     this._links = {};
     this._loaded = false;
@@ -60,7 +60,13 @@ export const SkeletonRenderer = {
     container.appendChild(this._el);
 
     this._initThree();
-    this._loadModel(mcpId);
+    this._modelStatus = document.createElement('div');
+    this._modelStatus.setAttribute('role', 'status');
+    this._modelStatus.style.cssText = 'position:absolute;inset:0;display:grid;place-content:center;' +
+      'text-align:center;padding:12px;color:#ddd;font-size:13px;pointer-events:none';
+    this._el.appendChild(this._modelStatus);
+    const request = this._modelRequest = new AbortController();
+    this._loadModel(mcpId, request.signal);
     this._animate();
 
     this._ro = new ResizeObserver(() => this._resize());
@@ -101,42 +107,61 @@ export const SkeletonRenderer = {
     this._scene.add(grid);
   },
 
-  async _loadModel(mcpId) {
+  _setModelStatus(text) {
+    this._modelStatus.textContent = text || '';
+    this._modelStatus.style.display = text ? 'grid' : 'none';
+  },
+
+  async _loadModel(mcpId, signal) {
     if (!mcpId || mcpId === 'dashboard') {
-      this._buildFallbackSkeleton();
+      this._setModelStatus('未找到此关节流对应的机器人驱动');
       return;
     }
+    this._setModelStatus('正在加载机器人模型…');
     try {
-      const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+      const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call?timeout_s=5`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tool: 'model', arguments: {} }),
+        signal,
       });
       const json = await res.json();
-      // API returns { code, data } where data is the content array
-      const content = json.data?.[0]?.text ?? json.result?.content?.[0]?.text;
-      if (!content) { this._buildFallbackSkeleton(); return; }
-      const data = JSON.parse(content);
-      if (data.urdf) {
+      if (signal.aborted) return;
+      if (!res.ok || (json.code !== undefined && json.code !== 200) || json.result?.isError) {
+        this._setModelStatus('无法从此驱动加载机器人模型，请检查驱动是否在线并提供 model');
+        return;
+      }
+      // Local MCP returns a content array; a paired driver wraps the tool result.
+      let data = json.data?.result ?? json.data ?? json.result?.content;
+      if (Array.isArray(data)) data = data.find(item => item?.type === 'text')?.text;
+      if (typeof data === 'string') data = JSON.parse(data);
+      if (typeof data?.urdf === 'string' && data.urdf.trim()) {
         this._parseAndBuild(data.urdf, data.skeleton_visual_links);
-      } else if (data.type === 'quadruped') {
+      } else if (data?.type === 'quadruped') {
         this._buildQuadrupedSkeleton(data);
       } else {
-        this._buildFallbackSkeleton();
+        this._setModelStatus('此驱动没有提供可用的机器人模型');
+        return;
       }
+      this._setModelStatus(null);
     } catch (e) {
+      if (signal.aborted) return;
       console.warn('[skeleton] Failed to load URDF model:', e);
-      this._buildFallbackSkeleton();
+      this._setModelStatus('机器人模型加载失败，请检查驱动后重新打开数据流');
     }
   },
 
   _parseAndBuild(urdfXml, visualLinks) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(urdfXml, 'text/xml');
+    if (doc.documentElement?.localName !== 'robot' || doc.querySelector('parsererror')) {
+      throw new Error('Invalid robot URDF');
+    }
 
     // Parse links and joints
     const linkNodes = doc.querySelectorAll('link');
     const jointNodes = doc.querySelectorAll('joint');
+    if (!linkNodes.length) throw new Error('Robot URDF has no links');
 
     // Build link map
     const linkMap = {};
@@ -435,115 +460,6 @@ export const SkeletonRenderer = {
     this._loaded = true;
   },
 
-  _buildFallbackSkeleton() {
-    // Humanoid stick figure based on G1 dimensions when URDF not available
-    const boneMat = new THREE.MeshPhongMaterial({ color: 0xaabbcc });
-    const jointMat = new THREE.MeshPhongMaterial({ color: 0x00ccff, emissive: 0x003344 });
-    const handMat = new THREE.MeshPhongMaterial({ color: 0x668899 });
-
-    const root = new THREE.Group();
-    this._scene.add(root);
-
-    const addJoint = (pos, r = 0.012) => {
-      const s = new THREE.Mesh(new THREE.SphereGeometry(r, 8, 8), jointMat);
-      s.position.copy(pos);
-      root.add(s);
-      return s;
-    };
-    const addBone = (from, to, r = 0.008) => {
-      const dir = new THREE.Vector3().subVectors(to, from);
-      const len = dir.length();
-      if (len < 0.005) return;
-      const geom = new THREE.CylinderGeometry(r, r, len, 6);
-      geom.translate(0, len / 2, 0);
-      const bone = new THREE.Mesh(geom, r < 0.006 ? handMat : boneMat);
-      bone.position.copy(from);
-      bone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
-      root.add(bone);
-    };
-
-    // Key positions (Y-up, approximate G1 proportions)
-    const pelvis = new THREE.Vector3(0, 0.75, 0);
-    const waist = new THREE.Vector3(0, 0.80, 0);
-    const torso = new THREE.Vector3(0, 1.05, 0);
-    const head = new THREE.Vector3(0, 1.15, 0);
-
-    // Left leg
-    const lHip = new THREE.Vector3(0.065, 0.65, 0);
-    const lKnee = new THREE.Vector3(0.065, 0.40, 0);
-    const lAnkle = new THREE.Vector3(0.065, 0.10, 0);
-    const lFoot = new THREE.Vector3(0.065, 0.08, 0);
-
-    // Right leg
-    const rHip = new THREE.Vector3(-0.065, 0.65, 0);
-    const rKnee = new THREE.Vector3(-0.065, 0.40, 0);
-    const rAnkle = new THREE.Vector3(-0.065, 0.10, 0);
-    const rFoot = new THREE.Vector3(-0.065, 0.08, 0);
-
-    // Left arm
-    const lShoulder = new THREE.Vector3(0.10, 1.05, 0);
-    const lElbow = new THREE.Vector3(0.10, 0.87, 0);
-    const lWrist = new THREE.Vector3(0.10, 0.72, 0);
-    const lPalm = new THREE.Vector3(0.10, 0.68, 0);
-
-    // Right arm
-    const rShoulder = new THREE.Vector3(-0.10, 1.05, 0);
-    const rElbow = new THREE.Vector3(-0.10, 0.87, 0);
-    const rWrist = new THREE.Vector3(-0.10, 0.72, 0);
-    const rPalm = new THREE.Vector3(-0.10, 0.68, 0);
-
-    // Draw bones
-    addBone(pelvis, waist);
-    addBone(waist, torso);
-    addBone(torso, head);
-
-    // Left leg
-    addBone(pelvis, lHip);
-    addBone(lHip, lKnee);
-    addBone(lKnee, lAnkle);
-    addBone(lAnkle, lFoot);
-
-    // Right leg
-    addBone(pelvis, rHip);
-    addBone(rHip, rKnee);
-    addBone(rKnee, rAnkle);
-    addBone(rAnkle, rFoot);
-
-    // Left arm
-    addBone(torso, lShoulder);
-    addBone(lShoulder, lElbow);
-    addBone(lElbow, lWrist);
-    addBone(lWrist, lPalm, 0.005);
-
-    // Right arm
-    addBone(torso, rShoulder);
-    addBone(rShoulder, rElbow);
-    addBone(rElbow, rWrist);
-    addBone(rWrist, rPalm, 0.005);
-
-    // Finger stubs (left)
-    const lF1 = new THREE.Vector3(0.10, 0.65, 0.012);
-    const lF2 = new THREE.Vector3(0.10, 0.65, 0);
-    const lF3 = new THREE.Vector3(0.10, 0.65, -0.012);
-    addBone(lPalm, lF1, 0.003); addBone(lPalm, lF2, 0.003); addBone(lPalm, lF3, 0.003);
-
-    // Finger stubs (right)
-    const rF1 = new THREE.Vector3(-0.10, 0.65, 0.012);
-    const rF2 = new THREE.Vector3(-0.10, 0.65, 0);
-    const rF3 = new THREE.Vector3(-0.10, 0.65, -0.012);
-    addBone(rPalm, rF1, 0.003); addBone(rPalm, rF2, 0.003); addBone(rPalm, rF3, 0.003);
-
-    // Draw joints at key positions
-    addJoint(pelvis, 0.02);
-    addJoint(head, 0.04);
-    [lHip, lKnee, lAnkle, rHip, rKnee, rAnkle].forEach(p => addJoint(p));
-    [waist, torso].forEach(p => addJoint(p, 0.015));
-    [lShoulder, lElbow, lWrist, rShoulder, rElbow, rWrist].forEach(p => addJoint(p));
-    [lPalm, rPalm].forEach(p => addJoint(p, 0.008));
-
-    this._loaded = true;
-  },
-
   onData(buffer, fmt) {
     if (!this._loaded) return;
     try {
@@ -600,6 +516,9 @@ export const SkeletonRenderer = {
   },
 
   unmount() {
+    this._modelRequest?.abort();
+    this._modelRequest = null;
+    this._modelStatus = null;
     if (this._raf) cancelAnimationFrame(this._raf);
     this._ro?.disconnect();
     this._controls?.dispose();

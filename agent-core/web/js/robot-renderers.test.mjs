@@ -3,12 +3,84 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 // Load the renderer without WebGL and substitute the scene objects used by the tests.
-function renderer(three = {}) {
+function renderer(three = {}, fetch = globalThis.fetch) {
   const source = readFileSync(new URL('./renderers/skeleton.js', import.meta.url), 'utf8')
     .replace(/^import .*;\r?\n/gm, '')
     .replace('export const SkeletonRenderer', 'const SkeletonRenderer');
-  return new Function('THREE', `${source}\nreturn { ...SkeletonRenderer };`)(three);
+  return new Function('THREE', 'fetch', `${source}\nreturn { ...SkeletonRenderer };`)(three, fetch);
 }
+
+test('the Canvas opens live and cached joint streams with their own driver model', async () => {
+  const extract = (file, name) => {
+    const source = readFileSync(new URL(`./${file}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+    const start = source.indexOf(`function ${name}(`);
+    assert.ok(start >= 0);
+    return source.slice(start, source.indexOf('\n}\n', start) + 3);
+  };
+  const panelNode = () => ({ classList: { remove() {} }, style: {}, appendChild() {} });
+  const mounted = [];
+  const detail = new Function('mount', `
+    const _cleanup = () => {}, openDetailPanelMobile = () => {}, _setStatus = () => {}, _connect = () => {};
+    const node = ${panelNode.toString()};
+    const _panel = node(), document = { getElementById: node, createElement: node };
+    const ActivityRenderer = {}, TextRenderer = {}, RENDERERS = [{ canRender: () => true, mount }];
+    const _CENTERED = '', _session = 0;
+    let _textLike, _renderer, _frames, _status;
+    ${extract('detail-panel.js', 'showTopicDetail')}
+    return showTopicDetail;
+  `)((_, mcpId) => mounted.push(mcpId));
+  const cards = [{ el: { querySelectorAll: () => [] }, toolName: 'joints', id: 'left' },
+    { el: { querySelectorAll: () => [] }, toolName: 'joints', id: 'right' }];
+  const openDetail = new Function('_cards', 'showTopicDetail', 'fetch', `
+    const inputArgs = () => ({}), _inputTopicsFor = () => [], _parseMcpCallResult = value => value;
+    const _allMcps = [];
+    async ${extract('canvas.js', '_openTopicDetailFor')}
+    return _openTopicDetailFor;
+  `)(cards, detail, async url => ({ json: async () => ({
+    topic_out: url.includes('panther') ? [{ topic: '/panther/joints', format: 'sensor/skeleton' }] : [],
+  }) }));
+
+  await openDetail(cards[0].el, 'panther-driver', []);
+  await openDetail(cards[1].el, 'quadruped-driver', [{ topic: '/quadruped/joints', format: 'sensor/skeleton' }]);
+  assert.deepEqual(mounted, ['panther-driver', 'quadruped-driver']);
+
+  const requested = [];
+  const builds = [];
+  const skeleton = renderer({}, async (url, init) => {
+    requested.push([url, JSON.parse(init.body)]);
+    const model = url.includes('panther') ? { urdf: '<robot/>', skeleton_visual_links: ['base_link'] }
+      : { type: 'quadruped' };
+    return { ok: true, json: async () => ({ code: 200, data: [{ type: 'text', text: JSON.stringify(model) }] }) };
+  });
+  skeleton._setModelStatus = () => {};
+  skeleton._parseAndBuild = (...args) => builds.push(args);
+  skeleton._buildQuadrupedSkeleton = model => builds.push(model);
+  for (const mcpId of mounted) await skeleton._loadModel(mcpId, new AbortController().signal);
+  assert.deepEqual(requested, mounted.map(id => [`/api/mcp/${id}/call?timeout_s=5`, { tool: 'model', arguments: {} }]));
+  assert.deepEqual(builds, [['<robot/>', ['base_link']], { type: 'quadruped' }]);
+});
+
+test('a missing model is reported and a response after unmount is discarded', async () => {
+  let response;
+  const skeleton = renderer({}, () => new Promise(resolve => { response = resolve; }));
+  const statuses = [];
+  skeleton._setModelStatus = status => statuses.push(status);
+  skeleton._parseAndBuild = () => assert.fail('no robot should be drawn');
+  await skeleton._loadModel('dashboard', new AbortController().signal);
+  assert.match(statuses.at(-1), /未找到/);
+  const missing = skeleton._loadModel('robot', new AbortController().signal);
+  response({ ok: true, json: async () => ({ code: 200, data: [] }) });
+  await missing;
+  assert.match(statuses.at(-1), /没有提供可用/);
+
+  const request = skeleton._modelRequest = new AbortController();
+  const late = skeleton._loadModel('robot', request.signal);
+  skeleton.unmount();
+  response({ ok: true, json: async () => ({ code: 200, data: { urdf: '<robot/>' } }) });
+  await late;
+  assert.equal(request.signal.aborted, true);
+  assert.equal(statuses.at(-1), '正在加载机器人模型…');
+});
 
 test('successive lift readings replace the upper-body offset without moving its base', () => {
   const skeleton = renderer();
