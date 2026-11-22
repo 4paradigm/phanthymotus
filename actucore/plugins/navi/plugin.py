@@ -33,6 +33,7 @@ an answer, so this one does, and pushes the ACP callback when it gets there.
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 import json
 import logging
 import math
@@ -46,6 +47,7 @@ from ..control_stream import build as build_message
 from ..control_stream import negotiate
 from . import camera as camera_mod
 from . import depth as depth_mod
+from . import dwa
 from . import local_path
 from . import odom as odom_mod
 from . import policy as policy_mod
@@ -79,6 +81,30 @@ class _ForwardCheck:
     remembered_ms: int
     occupied: object = None
     remembered_squares: local_path.ObstacleSquares | None = None
+    guard_horizon_s: float = 0.
+    renewable: bool = True
+    checked_ms: int | None = None
+    motion_guard: policy_mod.DwaMotionGuard | None = None
+    peak_speed_mps: float = 0.
+    target: str = ""
+    target_source: object = None
+    front_required: bool = False
+    target_observation: str | None = None
+
+
+@dataclass(frozen=True)
+class _DwaOrigin:
+    acceptance: policy_mod.DwaAcceptance
+    epoch: int
+    state_id: int
+    target: str
+    action_id: str
+    constraints: tuple
+    forward_check: _ForwardCheck | None = None
+
+    @property
+    def identity(self):
+        return self.epoch, self.state_id, self.acceptance.decision_id
 
 
 @dataclass
@@ -94,6 +120,8 @@ class _ScheduledCommand:
     checked_pose: tuple | None = None
     previous_motion: tuple = (0., 0.)
     forward_check: _ForwardCheck | None = None
+    dwa_origin: _DwaOrigin | None = None
+    stop_reason: str | None = None
 
 # A direct hardware depth topic is allowed to come up after Navi.  Do not wait
 # in ``start`` (that would turn an upstream loading delay into a canvas-wide
@@ -196,6 +224,10 @@ class NaviPlugin:
         self._output_lock = threading.RLock()
         self._scheduled_command = None
         self._staged_forward_check = None
+        self._staged_dwa_command = None
+        self._dwa_last_published = None
+        self._dwa_publication = None
+        self._wire_dwa_origin = None
         self._output_epoch = 0
         self._output_blocked = False
         self._output_stop = None
@@ -1118,7 +1150,7 @@ class NaviPlugin:
                 # tracker state and unrelated navigation counters stay intact.
                 self._state.adaptive_fwd_scale = 1.0
             if changed or (refresh and descriptor != self._descriptor):
-                if self._command_timer is not None:
+                if self._command_timer is not None or self._staged_dwa_command is not None:
                     self._publish_stop_if_moving()
                     self._command_window = (0., 0.)
             self._config = candidate
@@ -1137,7 +1169,7 @@ class NaviPlugin:
             return result
 
     def _info(self):
-        with self._lock:
+        with self._lock, self._output_lock:
             decision = self._last_decision
             return {
                 "state": ("running" if self._running and not self._paused else
@@ -1189,6 +1221,9 @@ class NaviPlugin:
                            "local_geometry_ready": self._config.local_geometry is not None},
                 "downstream_limits": self._descriptor.get("limits") or {},
                 "published": self._published,
+                "dwa": {"decision": deepcopy(self._state.dwa_trace),
+                        "totals": deepcopy(self._state.dwa_totals),
+                        "publication": deepcopy(self._dwa_publication)},
                 "gains": {
                     "forward": {"base": self._config.k_fwd,
                                 "effective": getattr(decision, "k_fwd_effective", None)},
@@ -1828,13 +1863,15 @@ class NaviPlugin:
                     odom = {**odom, "stamp_ms": self._odom_ms}
         return objects, depth, odom, objects_ms
 
-    def _forward_check(self, decision, previous_twist, depth, odom, objects_ms):
+    def _forward_check(self, decision, previous_twist, depth, odom, objects_ms, *, renewable=True,
+                       target_source=None):
         """Copy the inputs needed to recheck a command without running the planner."""
         config, state = self._config, self._state
         scan, route = state.active_scan, state.view_detour
         if (not config.local_planning or depth is None or depth.get("map") is None
-                or depth.get("capture_invalid") or not decision.values or decision.values[0] <= 0
-                or decision.distance_m is None or not objects_ms or scan.active
+                or depth.get("capture_invalid") or not decision.values or not any(decision.values)
+                or (decision.values[0] <= 0 and decision.dwa_acceptance is None)
+                or decision.distance_m is None or (not objects_ms and renewable) or scan.active
                 or (scan.result_frame and not (scan.receipt_only and state.checked_prefix))
                 or (decision.status != policy_mod.APPROACHING
                     and not (decision.status == policy_mod.AVOIDING and state.avoidance_yaw_override
@@ -1863,20 +1900,95 @@ class NaviPlugin:
                 geometry is config.local_geometry and scan.views[-1][0] == depth["frame_id"]
                 and scan.matches_route_view(depth)):
             occupied = scan.views[-1][3]
+        acceptance = decision.dwa_acceptance
+        motion_guard = acceptance.motion_guard if acceptance is not None else None
         return _ForwardCheck(geometry, depth["frame_id"], depth.get("source_frame_id"),
                              objects_ms, decision.distance_m, previous_twist, mount_frame,
                              (odom or {}).get("source_sample_id"), (odom or {}).get("received_ms"),
-                             remembered, memory_ms, occupied, squares)
+                             remembered, memory_ms, occupied, squares,
+                             decision.dwa_acceptance.guard_horizon_s if decision.dwa_acceptance else 0.,
+                             renewable, scan.control_ms or depth.get("control_ms") or depth["frame_id"],
+                             motion_guard, motion_guard.speed_mps if motion_guard is not None else 0.,
+                             state.target, target_source,
+                             bool(state.tracker.track is not None and state.tracker.track.front_required),
+                             acceptance.target_observation if acceptance is not None else None)
 
-    def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False):
+    def _dwa_motion_rejection(self, check, values, depth, odom, now_ms, *, target_range=None,
+                              geometry=None, occupied=None):
+        """Keep the same finite motion budget and map support on refreshed input."""
+        config, guard = self._config, check.motion_guard
+        horizon = max(check.guard_horizon_s, (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000)
+        if guard is None:
+            return None, check.peak_speed_mps, horizon
+        geometry = check.geometry if geometry is None else geometry
+        measured = odom_mod.planar_feedback(odom)
+        if measured is None:
+            return "no_feedback", check.peak_speed_mps, horizon
+        command = tuple(values[i] for i in (0, 1, 5))
+        velocities = measured, check.previous_twist, command
+        speed = max(math.hypot(*v[:2]) for v in velocities)
+        history_speed = max((math.hypot(*twist[:2]) for stamp, _, twist in odom.get("velocity_history", ())
+                             if guard.checked_ms <= stamp <= now_ms), default=0.)
+        peak = max(check.peak_speed_mps, guard.speed_mps, speed, history_speed)
+        stopping_horizon = dwa.stopping_horizon(command, measured, horizon=guard.prediction_horizon_s)
+        if stopping_horizon is None:
+            return "braking_incomplete", peak, horizon
+        horizon = max(horizon, stopping_horizon)
+        elapsed = max(0, now_ms - guard.checked_ms) / 1000
+        room = guard.room_m - peak * elapsed
+        distance_ms = check.target_ms or check.checked_ms
+        target_room = check.distance_m - config.stop_distance_m - peak * max(0, now_ms - distance_ms) / 1000
+        if target_range is not None:
+            target_room = min(target_room, target_range - config.stop_distance_m)
+        if speed * horizon > target_room:
+            return "target_standoff", peak, horizon
+        room = min(room, target_room)
+        if max(v[0] for v in velocities) > 0.:
+            ahead, _ = policy_mod._clearance(depth, config)
+            if depth.get("ground") is None and geometry.horizontal is not None and geometry.vertical is not None:
+                if occupied is None:
+                    grid = local_path.project_observation(depth, geometry, require_valid_depth=True,
+                                                          check_free_space=False)
+                    if grid is None:
+                        return "stale_observation", peak, horizon
+                    occupied = grid[1]
+                ahead = policy_mod.projected_forward_clearance(occupied, geometry, config)
+            if ahead is not None:
+                foreground = ahead + policy_mod.FORWARD_CLEARANCE_MARGIN_M < check.distance_m - peak * elapsed
+                stop_line = guard.stop_line_m
+                if foreground:
+                    stop_line = max(stop_line, policy_mod.forward_stop_line(
+                        config, max(v[0] for v in velocities)))
+                room = min(room, ahead - stop_line)
+        depth_ms = depth.get("capture_ms") or depth["frame_id"]
+        rejection = local_path.motion_limits_rejection(
+            geometry, config.half_width_m, horizon, velocities, room=room, bounded=True,
+            padding=speed * max(0, now_ms - depth_ms) / 1000)
+        return rejection, peak, horizon
+
+    def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False,
+                         snapshot=None, diagnostics=None):
         """Try the short motion against current depth and feedback without retiming either."""
         config = self._config
-        target_deadline = check.target_ms + min(max_age, config.max_obs_age_ms)
-        if not check.target_ms <= now_ms < target_deadline:
+        distance_ms = check.target_ms or check.checked_ms
+        target_deadline = distance_ms + min(max_age, config.max_obs_age_ms)
+        if not distance_ms <= now_ms < target_deadline:
             return None
-        _, depth, odom, _ = self._observation_snapshot(with_capture_timing=True)
+        objects, depth, odom, _ = (self._observation_snapshot(with_capture_timing=True)
+                                  if snapshot is None else snapshot)
         if depth is None or depth.get("capture_invalid") or depth.get("map") is None:
             return None
+        target_range = None
+        target_source = (objects or {}).get("timestamp") if isinstance(objects, dict) else None
+        if check.guard_horizon_s and check.renewable:
+            target_range = policy_mod.observed_target_range(
+                objects, depth, check.target, config, observation=check.target_observation,
+                front_required=check.front_required)
+            if (target_range is None or (check.target_source is not None and
+                    (target_source is None or target_source < check.target_source))):
+                if diagnostics is not None:
+                    diagnostics["reason"] = "target_missing"
+                return None
         source = depth.get("source_frame_id")
         feedback = (odom or {}).get("source_sample_id")
         same_depth = (allow_same_depth and depth["frame_id"] == check.frame_id
@@ -1909,16 +2021,21 @@ class NaviPlugin:
                 return None
             if feedback_source == check.feedback_source and check.feedback_ms is not None:
                 odom_ms = min(odom_ms, check.feedback_ms)
-        obs_ms = min(check.target_ms, depth_ms, odom_ms)
+        obs_ms = min(distance_ms, depth_ms, odom_ms)
         deadline = int(min(target_deadline, depth_ms + config.depth_age_limit_ms,
                            odom_ms + min(self._odom_max_age_ms, config.max_feedback_gap_ms),
                            obs_ms + max_age))
         if not max(depth_ms, odom_ms) <= now_ms < deadline:
             return None
-        horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
+        if check.guard_horizon_s and policy_mod._feedback_speed_reduction(config, odom) < 1.:
+            if diagnostics is not None:
+                diagnostics["reason"] = "measured_overspeed"
+            return obs_ms, deadline, False, check
+        horizon = max(check.guard_horizon_s,
+                      (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000)
         velocities = measured, check.previous_twist, tuple(values[i] for i in (0, 1, 5))
         speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
-        if speed * (horizon + (now_ms - check.target_ms) / 1000) > check.distance_m - config.stop_distance_m:
+        if speed * (horizon + (now_ms - distance_ms) / 1000) > check.distance_m - config.stop_distance_m:
             return None
         half_width = config.half_width_m
         occupied = check.occupied if same_depth and check.mount_frame is None else None
@@ -1928,6 +2045,13 @@ class NaviPlugin:
             if grid is None:
                 return None
             occupied = grid[1]
+        rejection, peak, horizon = self._dwa_motion_rejection(
+            check, values, depth, odom, now_ms, target_range=target_range,
+            geometry=geometry, occupied=occupied)
+        if rejection is not None:
+            if diagnostics is not None:
+                diagnostics["reason"] = rejection
+            return obs_ms, deadline, False, check
         clear = not local_path.motion_sweep_hits(occupied, geometry, half_width, horizon, velocities,
                                                  padding=speed * (now_ms - depth_ms) / 1000).any()
         age = max(0, now_ms - check.remembered_ms) / 1000
@@ -1935,8 +2059,10 @@ class NaviPlugin:
             if clear and remembered is not None:
                 clear = not local_path.motion_sweep_hits(remembered, geometry, half_width, horizon,
                                                          velocities, padding=speed * age).any()
-        newer = replace(check, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
-                        feedback_source=feedback_source, feedback_ms=odom_ms, occupied=occupied)
+        newer = replace(check, geometry=geometry, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
+                        feedback_source=feedback_source, feedback_ms=odom_ms, occupied=occupied,
+                        guard_horizon_s=horizon if check.guard_horizon_s else 0.,
+                        peak_speed_mps=peak, target_source=target_source if check.renewable else check.target_source)
         return obs_ms, deadline, clear, newer
 
     def next_command(self):
@@ -1946,6 +2072,7 @@ class NaviPlugin:
         numbers and the two timestamps — is testable without a node.
         """
         self._staged_forward_check = None
+        self._staged_dwa_command = None
         tick = time.monotonic()
         control_period_s = 1.0 / self._rate_hz
         previous_tick = self._last_tick
@@ -1981,8 +2108,14 @@ class NaviPlugin:
         now = time.time()
         scan = self._state.active_scan
         self._last_decision = decision
+        origin = (self._dwa_origin(decision.dwa_acceptance)
+                  if decision.dwa_acceptance is not None else None)
+        if self._config.local_controller == "dwa":
+            self._state.dwa_trace.update(target=self._state.target, action_id=self._acp_action_id)
         command_only = self._config.local_planning and self._state.motion_source == "command"
         if not decision.publishes:
+            if origin is not None:
+                self._veto_dwa(origin, "postcheck_veto")
             # Stop once when a policy goes quiet while the chassis may still
             # hold its last motion command under the longer watchdog.
             if (self._config.watchdog_ms <= 300
@@ -2039,16 +2172,23 @@ class NaviPlugin:
                                       depth_ms + self._config.depth_age_limit_ms)
         recheck_deadline = None
         recheck_blocked = False
-        forward_check = (self._forward_check(decision, previous_twist, depth, odom, objects_ms)
-                         if bounded_age and objects is not None and values == decision.values else None)
+        target_observed = (origin.acceptance.target_observed if origin is not None else objects is not None)
+        forward_check = (self._forward_check(decision, previous_twist, depth, odom,
+                                             objects_ms if target_observed else 0,
+                                             renewable=target_observed and bounded_age,
+                                             target_source=objects.get("timestamp") if isinstance(objects, dict) else None)
+                         if (origin is not None or (bounded_age and objects is not None))
+                         and values == decision.values else None)
         short_prefix = (prefix_deadline is not None
                         and prefix_deadline - now_ms <= 2000 * control_period_s)
-        if forward_check is not None and (short_prefix or obs_ms + max_age - now_ms < 1000 * control_period_s):
+        if (forward_check is not None and forward_check.renewable and bounded_age
+                and (short_prefix or obs_ms + max_age - now_ms < 1000 * control_period_s)):
             original_deadline = min(obs_ms + max_age, now_ms + self._ttl_ms)
             if prefix_deadline is not None:
                 original_deadline = min(original_deadline, prefix_deadline)
+            recheck_diagnostics = {}
             refreshed = self._recheck_forward(forward_check, values, max_age, now_ms,
-                                              allow_same_depth=short_prefix)
+                                              allow_same_depth=short_prefix, diagnostics=recheck_diagnostics)
             now = time.time()
             now_ms = int(now * 1000)
             stale = max_age <= now_ms - obs_ms
@@ -2114,6 +2254,17 @@ class NaviPlugin:
                                        distance_m=decision.distance_m, bearing=decision.bearing)
             self._last_decision = policy_mod._account_idle(hold, self._state, self._config, dt)
             obs_ms = now_ms
+        if origin is not None and values != self._dwa_values(origin):
+            values = [0.] * ACTION_DIM
+            self._veto_dwa(origin, "publish_expired" if stale or expired_turn or (
+                prefix_deadline is not None and now_ms >= prefix_deadline) else (
+                    recheck_diagnostics.get("reason", "postcheck_veto") if recheck_blocked
+                    else "postcheck_veto"))
+            decision.values = values
+            self._last_decision.values = values
+            obs_ms = now_ms
+            forward_check = None
+            recheck_deadline = None
         if scan.turn_stop_ms is not None and scan.turn_stop_ms != previous_turn_stop_ms:
             # Bracket the outgoing stop, including time spent planning it.
             scan.turn_stop_ms = now_ms
@@ -2129,6 +2280,16 @@ class NaviPlugin:
             message["ttl_ms"] = min(message["ttl_ms"], scan.turn_until_ms - now_ms)
             if buffered_turn:
                 scan.turn_until_ms = now_ms + message["ttl_ms"]
+        if origin is not None and any(values):
+            rejection = self._dwa_publish_rejection(message, origin, now_ms)
+            if rejection is not None:
+                self._veto_dwa(origin, rejection)
+                values = [0.] * ACTION_DIM
+                message = dict(message, values=values, obs_stamp_ms=now_ms, ttl_ms=self._ttl_ms)
+                forward_check = None
+            else:
+                origin = replace(origin, forward_check=forward_check)
+                self._staged_dwa_command = (message["seq"], origin)
         if any(values):
             if forward_check is not None and self._state.executing_leg is None:
                 self._staged_forward_check = (message["seq"], forward_check)
@@ -2136,6 +2297,8 @@ class NaviPlugin:
             self._command_window = (issued, issued + min(message["ttl_ms"], self._config.watchdog_ms) / 1000)
         else:
             self._command_window = (0., 0.)
+        if self._config.local_controller == "dwa":
+            log.info("navi dwa decision: %s", json.dumps(self._state.dwa_trace, ensure_ascii=False))
         return message
 
     def _command_message(self, values, now, obs_ms):
@@ -2199,9 +2362,14 @@ class NaviPlugin:
 
     def _tick(self):
         entered = time.monotonic()
+        with self._output_lock:
+            if self._scheduled_command is not None and self._scheduled_command.stop_reason is not None:
+                self._dispatch_command()
+                return
         with self._lock:
             if self._publisher is None or not self._running or self._paused or self._starting:
                 return
+            publishing = False
             try:
                 with self._output_lock:
                     epoch = self._output_epoch
@@ -2233,7 +2401,9 @@ class NaviPlugin:
                     if not self._stage_command(message, epoch):
                         return
                 elif message is not None:
+                    publishing = True
                     self._publish_command(message)
+                    publishing = False
                 finished = time.monotonic()
                 period = 1.0 / self._rate_hz
                 interval = self._last_tick - previous if previous else 0.
@@ -2242,7 +2412,8 @@ class NaviPlugin:
                              interval * 1000, (started - entered) * 1000, (decided - started) * 1000,
                              (finished - decided) * 1000, message["seq"] if message is not None else None)
             except Exception as error:                        # noqa: BLE001
-                self._cancel_scheduled_motion()
+                if self._scheduled_command is None or self._scheduled_command.stop_reason is None:
+                    self._cancel_scheduled_motion(dwa_reason="publish_error" if publishing else None)
                 self._command_window = (0., 0.)
                 self._state.moving_for_s = 0.
                 self._state.detour_leg = self._state.executing_leg = None
@@ -2258,10 +2429,147 @@ class NaviPlugin:
 
         self._maybe_complete()
 
+    def _dwa_constraints(self):
+        """Values whose change invalidates an already checked DWA command."""
+        config = self._config
+        geometry = config.scan_geometry or config.local_geometry
+        footprint = (None if geometry is None else
+                     (geometry.front, geometry.rear, geometry.height,
+                      geometry.horizontal, geometry.vertical, tuple(geometry.base_from_optical.flat)))
+        fields = ("local_controller", "vx_max", "vy_max", "wz_max", "use_lateral",
+                  "floor_vx", "floor_vy", "floor_wz", "floor_vx_moving", "floor_vy_moving",
+                  "floor_wz_moving", "left_vy_limit", "right_vy_limit", "left_wz_limit",
+                  "right_wz_limit", "half_width_m", "stop_distance_m", "max_feedback_gap_ms",
+                  "watchdog_ms", "dwa_horizon_s")
+        return (tuple(getattr(config, key) for key in fields), config.depth_age_limit_ms,
+                footprint, json.dumps(self._descriptor.get("limits") or {}, sort_keys=True))
+
+    def _dwa_origin(self, acceptance):
+        return _DwaOrigin(acceptance, self._output_epoch, id(self._state), self._state.target,
+                          self._acp_action_id, self._dwa_constraints())
+
+    @staticmethod
+    def _dwa_values(origin):
+        vx, vy, wz = origin.acceptance.command
+        return [vx, vy, 0., 0., 0., wz]
+
+    def _dwa_for_message(self, message):
+        staged = self._staged_dwa_command
+        return staged[1] if staged is not None and staged[0] == message["seq"] else None
+
+    def _dwa_publish_rejection(self, message, origin, now_ms):
+        if (origin.epoch != self._output_epoch or origin.state_id != id(self._state)
+                or origin.target != self._state.target or origin.action_id != self._acp_action_id
+                or self._output_blocked or self._paused or not self._running):
+            return "superseded"
+        expires_ms = message["stamp_ms"] + message["ttl_ms"]
+        max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
+        if type(max_age) in (int, float) and 0 < max_age < math.inf:
+            expires_ms = min(expires_ms, message["obs_stamp_ms"] + max_age)
+        if not message["stamp_ms"] <= now_ms < expires_ms:
+            return "publish_expired"
+        values = message["values"]
+        if (values != self._dwa_values(origin) or origin.constraints != self._dwa_constraints()
+                or policy_mod.apply_deadband(values, self._deadband_for(values)) != values):
+            return "postcheck_veto"
+        config = self._config
+        vx, vy, wz = origin.acceptance.command
+        (floor_x, cap_x), (floor_y, cap_y) = policy_mod._local_velocity_limits(
+            config, -1. if vy > 0 else 1.)
+        floor_wz = (config.floor_wz_moving if (vx or vy) and config.floor_wz_moving is not None
+                    else config.floor_wz)
+        cap_wz = policy_mod._scan_yaw_rate(config, -1. if wz > 0 else 1.)
+        if vx < 0 or any(value and not floor <= abs(value) <= cap
+                         for value, floor, cap in ((vx, floor_x, cap_x), (vy, floor_y, cap_y),
+                                                   (wz, floor_wz, cap_wz))):
+            return "postcheck_veto"
+        limits = self._descriptor.get("limits") or {}
+        lower, upper = limits.get("lower"), limits.get("upper")
+        if lower and upper and any(not lo <= value <= hi for value, lo, hi in zip(values, lower, upper)):
+            return "postcheck_veto"
+        return None
+
+    def _dwa_event(self, origin, event, reason=None):
+        publication = dict(decision_id=origin.acceptance.decision_id,
+                           epoch=origin.epoch, target=origin.target,
+                           action_id=origin.action_id, event=event, reason=reason)
+        previous = self._dwa_publication
+        if (event == "veto" and previous is not None and previous["event"] in ("veto", "stopped")
+                and all(previous[key] == value for key, value in publication.items() if key != "event")):
+            return
+        self._dwa_publication = publication
+        log.info("navi dwa publication: %s", json.dumps(self._dwa_publication, ensure_ascii=False))
+
+    def _recheck_dwa_inputs(self, origin, values, now_ms):
+        """A newer observation must be checked before the command reaches the wire."""
+        check = origin.forward_check
+        if check is None:
+            return "postcheck_veto", None
+        snapshot = self._observation_snapshot(with_capture_timing=True)
+        objects, depth, odom, _ = snapshot
+        if depth is None or depth.get("capture_invalid") or depth.get("map") is None:
+            return "stale_observation", None
+        if odom_mod.planar_feedback(odom) is None:
+            return "no_feedback", None
+        if policy_mod._feedback_speed_reduction(self._config, odom) < 1.:
+            return "measured_overspeed", None
+        target_range = None
+        target_source = objects.get("timestamp") if isinstance(objects, dict) else None
+        if check.renewable:
+            target_range = policy_mod.observed_target_range(
+                objects, depth, check.target, self._config, observation=check.target_observation,
+                front_required=check.front_required)
+            if (target_range is None or (check.target_source is not None and
+                    (target_source is None or target_source < check.target_source))):
+                return "target_missing", None
+        same_depth = (depth.get("source_frame_id") == check.source_id if check.source_id is not None
+                      else depth.get("frame_id") == check.frame_id)
+        same_feedback = (odom.get("source_sample_id") == check.feedback_source if check.feedback_source is not None
+                         else odom.get("received_ms") == check.feedback_ms)
+        if same_depth and same_feedback and (not check.renewable or target_source == check.target_source):
+            rejection, _, _ = self._dwa_motion_rejection(
+                check, values, depth, odom, now_ms, target_range=target_range, occupied=check.occupied)
+            return rejection, None
+        max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
+        if not (type(max_age) in (int, float) and 0 < max_age < math.inf):
+            max_age = self._config.max_obs_age_ms
+        diagnostics = {}
+        checked = self._recheck_forward(check, values, max_age, now_ms, allow_same_depth=True,
+                                        snapshot=snapshot, diagnostics=diagnostics)
+        if checked is not None and not checked[0] <= int(time.time() * 1000) < checked[1]:
+            return "publish_expired", None
+        if checked is None or not checked[2]:
+            return diagnostics.get("reason", "postcheck_veto"), None
+        return None, checked
+
+    def _veto_dwa(self, origin, reason):
+        self._dwa_event(origin, "veto", reason)
+        state, trace = self._state, self._state.dwa_trace
+        # An older queued command must not rewrite a newer planner decision.
+        if origin.state_id != id(state) or trace.get("decision_id") != origin.acceptance.decision_id:
+            return
+        if trace.get("accepted_twist") is not None and self._dwa_last_published != origin.identity:
+            state.dwa_totals["accepted_ticks"] = max(0, state.dwa_totals.get("accepted_ticks", 0) - 1)
+        trace.update(accepted_twist=None, final_twist=(0., 0., 0.),
+                     controller_used="stop", veto_reason=reason)
+        state.dwa_selected = state.checked_prefix = False
+        state.commanded = (0., 0., 0.)
+        state.commanded_vx = 0.
+        if self._last_decision is not None:
+            self._last_decision.dwa_acceptance = None
+            if self._last_decision.values and any(self._last_decision.values):
+                self._last_decision.values = [0.] * ACTION_DIM
+                self._last_decision.reason = f"局部规划：已检查的DWA指令失效，停车（{reason}）"
+
     def _stage_command(self, message, epoch):
         """Hand the publisher one checked result. New work replaces old work."""
         with self._output_lock:
             if epoch != self._output_epoch or self._output_blocked:
+                origin = self._dwa_for_message(message) if message is not None else None
+                if origin is not None:
+                    self._veto_dwa(origin, "superseded")
+                return False
+            if self._scheduled_command is not None and self._scheduled_command.stop_reason is not None:
                 return False
             if message is None:
                 if self._scheduled_command is not None:
@@ -2313,9 +2621,10 @@ class NaviPlugin:
             staged = self._staged_forward_check
             forward_check = staged[1] if staged is not None and staged[0] == message["seq"] else None
             self._scheduled_command = _ScheduledCommand(
-                message, expires_ms, expires_at, turn, leg=leg, feedback=feedback, depth_grid=depth_grid,
+                dict(message, values=list(message["values"])), expires_ms, expires_at, turn,
+                leg=leg, feedback=feedback, depth_grid=depth_grid,
                 checked_pose=scan.pose if leg is not None else None, previous_motion=previous_motion,
-                forward_check=forward_check)
+                forward_check=forward_check, dwa_origin=self._dwa_for_message(message))
             if turn is None:
                 # Deliver a new result immediately. The independent timer
                 # can repeat the checked prefix while the next search runs.
@@ -2387,21 +2696,35 @@ class NaviPlugin:
                 return
             now_ms = int(time.time() * 1000)
             work = self._scheduled_command
+            if work is not None and work.stop_reason is not None:
+                # A stop is still owed even while paused or after the motion's
+                # deadline. Each timer dispatch attempts exactly one packet.
+                if self._send_scheduled(None, now_ms, self._ttl_ms,
+                                         dwa_origin=work.dwa_origin, stop_reason=work.stop_reason):
+                    if self._scheduled_command is work:
+                        self._scheduled_command = None
+                return
             if work is None:
                 if self._wire_moving:
-                    self._send_scheduled(None, now_ms, self._ttl_ms)
+                    origin = self._wire_dwa_origin
+                    if origin is not None:
+                        self._veto_dwa(origin, "superseded")
+                    self._send_scheduled(None, now_ms, self._ttl_ms,
+                                         dwa_origin=origin, stop_reason="superseded")
                 return
             if self._output_blocked or self._paused:
                 return
             remaining_ms = min(work.expires_ms - now_ms, round((work.expires_at - time.monotonic()) * 1000))
-            stop = None
-            if (work.turn is not None and not work.sent and not self._wire_moving
+            rejection = (self._dwa_publish_rejection(work.message, work.dwa_origin, now_ms)
+                         if work.dwa_origin is not None else None)
+            stop = (rejection, False) if rejection is not None else None
+            if stop is None and (work.turn is not None and not work.sent and not self._wire_moving
                     and now_ms >= work.message["stamp_ms"]
                     and remaining_ms < math.ceil(1000 / self._rate_hz)):
                 stop = (_UNSENT_TURN, False)
-            elif remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
+            elif stop is None and (remaining_ms <= 0 or now_ms < work.message["stamp_ms"]):
                 stop = ("速度指令窗口已到期", False)
-            elif work.turn is not None:
+            elif stop is None and work.turn is not None:
                 with self._obs_lock:
                     history = tuple(self._velocity_history)
                     depth_ok = (0 <= now_ms - self._depth_ms <= self._config.depth_age_limit_ms
@@ -2410,7 +2733,7 @@ class NaviPlugin:
                     stop = work.turn.check_turn_feedback(history, now_ms, self._config.wz_max)
                 else:
                     stop = (DEPTH_RECHECK_HOLD, True)
-            elif work.leg is not None:
+            elif stop is None and work.leg is not None:
                 stop = self._check_scheduled_leg(work, now_ms, remaining_ms)
                 now_ms = int(time.time() * 1000)
                 remaining_ms = min(work.expires_ms - now_ms,
@@ -2420,14 +2743,18 @@ class NaviPlugin:
                 elif stop is None and now_ms - work.feedback.poses[-1][0] > work.feedback.max_feedback_gap_ms:
                     stop = ("局部规划：运动反馈已到期，停车后重规划", True)
             renewed = False
-            if (stop is None and work.forward_check is not None
+            recheck_diagnostics = {}
+            if (stop is None and work.forward_check is not None and work.forward_check.renewable
                     and remaining_ms <= math.ceil(2000 / self._rate_hz)):
                 max_age = self._descriptor["rate"]["max_obs_age_ms"]
                 checked = self._recheck_forward(work.forward_check, work.message["values"],
-                                                max_age, now_ms, allow_same_depth=True)
+                                                max_age, now_ms, allow_same_depth=True,
+                                                diagnostics=recheck_diagnostics)
                 now_ms = int(time.time() * 1000)
                 remaining_ms = min(work.expires_ms - now_ms,
                                    round((work.expires_at - time.monotonic()) * 1000))
+                if checked is None and recheck_diagnostics.get("reason"):
+                    stop = ("局部规划：续发所用目标或运动约束已失效", True)
                 # The old window can elapse while a new observation is
                 # being checked. A still-valid new check has its own deadline.
                 if checked is not None and checked[0] <= now_ms < checked[1]:
@@ -2438,13 +2765,20 @@ class NaviPlugin:
                         work.forward_check = newer
                         work.message = dict(work.message, obs_stamp_ms=obs_ms)
                         remaining_ms = min(self._ttl_ms, deadline - now_ms)
+                        if work.dwa_origin is not None:
+                            work.message = dict(work.message, stamp_ms=now_ms, ttl_ms=remaining_ms)
+                            work.dwa_origin = replace(work.dwa_origin, forward_check=newer)
                         work.expires_ms = now_ms + remaining_ms
                         work.expires_at = time.monotonic() + remaining_ms / 1000
                         renewed = True
                 if stop is None and remaining_ms <= 0:
                     stop = ("速度指令窗口已到期", False)
             if stop is not None:
-                self._cancel_scheduled_motion(stop=(now_ms, *stop))
+                reason = None
+                if work.dwa_origin is not None:
+                    reason = (rejection or ("publish_expired" if remaining_ms <= 0
+                                           else recheck_diagnostics.get("reason", "postcheck_veto")))
+                self._cancel_scheduled_motion(stop=(now_ms, *stop), dwa_reason=reason)
                 return
             # Turns and fixed legs can repeat within the existing window.
             # Other forward motion requires a newly checked observation.
@@ -2453,9 +2787,14 @@ class NaviPlugin:
                 if work.sent and "control_interface" in message:
                     message = message.copy()
                     del message["control_interface"]
-                work.sent = self._send_scheduled(message, now_ms, remaining_ms) or work.sent
+                work.sent = self._send_scheduled(message, now_ms, remaining_ms,
+                                                 dwa_origin=work.dwa_origin) or work.sent
+                if (work.dwa_origin is not None and self._wire_dwa_origin is not None
+                        and self._wire_dwa_origin.identity == work.dwa_origin.identity):
+                    work.dwa_origin = self._wire_dwa_origin
+                    work.forward_check = self._wire_dwa_origin.forward_check
 
-    def _send_scheduled(self, message, now_ms, ttl_ms):
+    def _send_scheduled(self, message, now_ms, ttl_ms, *, dwa_origin=None, stop_reason=None):
         """Serialize wire sequence numbers for plan results and checked repeats."""
         self._wire_seq = max(self._wire_seq + 1, message["seq"] if message is not None else 0)
         if message is None:
@@ -2466,36 +2805,117 @@ class NaviPlugin:
         else:
             packet = dict(message, seq=self._wire_seq, stamp_ms=now_ms, ttl_ms=ttl_ms)
         try:
-            self._publish_command(packet)
+            moving = (self._publish_command(packet, dwa_origin=dwa_origin, stop_reason=stop_reason)
+                      if dwa_origin is not None
+                      else self._publish_command(packet))
         except Exception as error:                            # noqa: BLE001
             log.warning("navi velocity publish failed: %s", error)
+            pending_stop = self._scheduled_command is not None and self._scheduled_command.stop_reason is not None
+            if dwa_origin is not None and any(packet["values"]) and not pending_stop:
+                self._cancel_scheduled_motion(stop=(now_ms, "局部规划：速度发布失败，等待重规划", False),
+                                              dwa_reason="publish_error")
             return False
-        self._wire_moving = any(packet["values"])
+        self._wire_moving = moving if isinstance(moving, bool) else any(packet["values"])
         return True
 
-    def _cancel_scheduled_motion(self, *, block=False, stop=None):
+    def _cancel_scheduled_motion(self, *, block=False, stop=None, dwa_reason=None):
         with self._output_lock:
-            if self._command_timer is None:
-                return
+            work = self._scheduled_command
+            origin = ((work.dwa_origin if work is not None else None)
+                      or (self._staged_dwa_command[1] if self._staged_dwa_command is not None else None)
+                      or self._wire_dwa_origin)
+            reason = ((work.stop_reason if work is not None else None)
+                      or dwa_reason or ("postcheck_veto" if stop is not None else "superseded"))
+            if origin is not None:
+                self._veto_dwa(origin, reason)
             self._output_epoch += 1
             self._output_blocked |= block
+            if self._command_timer is None:
+                if origin is not None and self._wire_moving and self._publisher is not None:
+                    now = time.time()
+                    try:
+                        self._publish_command(self._command_message([0.] * ACTION_DIM, now, int(now * 1000)),
+                                              dwa_origin=origin, stop_reason=reason)
+                    except Exception as error:                # noqa: BLE001
+                        log.warning("navi stop command failed: %s", error)
+                return
             self._output_stop = stop
             self._scheduled_command = None
             if stop is not None:
                 log.info("navi velocity hold: %s", stop[1])
             if self._wire_moving and self._publisher is not None:
-                self._send_scheduled(None, int(time.time() * 1000), self._ttl_ms)
+                self._send_scheduled(None, int(time.time() * 1000), self._ttl_ms,
+                                     dwa_origin=origin, stop_reason=reason)
 
-    def _publish_command(self, message):
+    def _publish_command(self, message, *, dwa_origin=None, stop_reason=None):
+        with self._output_lock:
+            return self._publish_checked_command(message, dwa_origin, stop_reason)
+
+    def _publish_checked_command(self, message, dwa_origin, stop_reason):
         from std_msgs.msg import String
 
+        origin = dwa_origin or self._dwa_for_message(message)
+        if origin is not None and any(message["values"]):
+            now_ms = int(time.time() * 1000)
+            rejection = self._dwa_publish_rejection(message, origin, now_ms)
+            if rejection is None:
+                rejection, checked = self._recheck_dwa_inputs(origin, message["values"], now_ms)
+                if checked is not None:
+                    origin = replace(origin, forward_check=checked[3])
+                    message = dict(message, ttl_ms=min(message["ttl_ms"], checked[1] - message["stamp_ms"]))
+                now_ms = int(time.time() * 1000)
+                rejection = rejection or self._dwa_publish_rejection(message, origin, now_ms)
+            if rejection is not None:
+                self._veto_dwa(origin, rejection)
+                stop_reason = rejection
+                message = dict(message, values=[0.] * ACTION_DIM, stamp_ms=now_ms,
+                               obs_stamp_ms=now_ms, ttl_ms=self._ttl_ms)
         payload = String()
         payload.data = json.dumps(message, ensure_ascii=False)
-        self._publisher.publish(payload)
+        try:
+            self._publisher.publish(payload)
+        except Exception:
+            if origin is not None:
+                self._veto_dwa(origin, "publish_error")
+                if not any(message["values"]):
+                    # Keep the zero and its original cause in the existing
+                    # output slot. Never recursively retry a failed stop.
+                    self._scheduled_command = _ScheduledCommand(
+                        dict(message), 0, 0., None, dwa_origin=origin,
+                        stop_reason=stop_reason or "publish_error")
+            raise
         self._published += 1
+        moving = any(message["values"])
+        self._wire_moving = moving
+        self._wire_dwa_origin = origin if moving else None
+        totals = self._state.dwa_totals
+        if origin is not None and moving:
+            if self._dwa_last_published != origin.identity:
+                totals["published_decisions"] = totals.get("published_decisions", 0) + 1
+                self._dwa_last_published = origin.identity
+            totals["published_packets"] = totals.get("published_packets", 0) + 1
+            self._dwa_event(origin, "published")
+        elif not moving and (origin is not None or self._config.local_controller == "dwa"):
+            totals["stop_packets"] = totals.get("stop_packets", 0) + 1
+            reason = stop_reason or self._state.dwa_trace.get("veto_reason") or "policy_stop"
+            reasons = totals.setdefault("stop_reasons", {})
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if origin is not None:
+                self._dwa_event(origin, "stopped", reason)
+                work = self._scheduled_command
+                if work is not None and work.dwa_origin is not None and work.dwa_origin.identity == origin.identity:
+                    if work.stop_reason is not None:
+                        self._scheduled_command = None
+                    else:
+                        self._cancel_scheduled_motion(stop=(int(time.time() * 1000), reason, False),
+                                                      dwa_reason=reason)
+        return moving
 
     def _publish_stop_if_moving(self):
-        if self._command_timer is not None:
+        if self._scheduled_command is not None and self._scheduled_command.stop_reason is not None:
+            return
+        if (self._command_timer is not None or self._staged_dwa_command is not None
+                or self._wire_dwa_origin is not None):
             self._cancel_scheduled_motion()
             self._state.commanded = (0., 0., 0.)
             self._state.commanded_vx = 0.

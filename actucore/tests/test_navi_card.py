@@ -1406,7 +1406,8 @@ def test_a_lost_target_tells_the_caller_to_look_before_retrying():
 
 def test_the_dialog_exposes_only_generic_card_configuration():
     keys = set(_tool()["configSchema"]["properties"])
-    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m"}
+    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m",
+                    "local_controller", "dwa_horizon_s", "dwa_samples"}
 
 
 def test_only_default_stop_distance_is_available_to_the_config_action():
@@ -2791,4 +2792,26 @@ def test_dwa_controller_is_available_as_instance_config():
     selected = _card(local_controller="dwa", dwa_samples=48)
     assert selected._config.local_controller == "dwa"
     assert selected._config.dwa_samples == 48
+
+
+def test_dwa_instance_values_survive_card_restart(monkeypatch):
+    saved = json.loads(json.dumps({"local_controller": "dwa", "dwa_horizon_s": 1.2,
+                                  "dwa_samples": 64}))
+    card = _card(**saved)
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(
+        card, "_node", _FakeNode({"/camera/depth": ["sensor_msgs/msg/CompressedImage"]})))
+    try:
+        for _ in range(2):
+            assert card.dispatch("navi", {"action": "start", "control_interface": _descriptor(),
+                                          "input_topics": ["/camera/objects", "/camera/depth"]})[
+                "state"] == "running"
+            effective = card._info()["config"]
+            assert {key: effective[key] for key in saved} == saved
+            ignored = card._config_action({"local_controller": "legacy", "dwa_horizon_s": 2.,
+                                           "dwa_samples": 32})
+            assert set(ignored["ignored_parameters"]) == set(saved)
+            assert card._config.local_controller == "dwa"
+            card._stop()
+    finally:
+        card._stop()
 
