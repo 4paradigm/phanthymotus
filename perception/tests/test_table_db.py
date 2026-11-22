@@ -275,18 +275,74 @@ def test_databases_are_isolated(tmp_path):
 
 # ── files ────────────────────────────────────────────────────────────────────
 
-def test_get_file_returns_identical_bytes(tmp_path):
+def test_get_file_by_record_id_returns_identical_bytes(tmp_path):
     card = _card(tmp_path)
     _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
-    record = _call(card, "query", table="名单", where={"姓名": "李四"})["records"][0]
-    got = _call(card, "get_file", table="名单", file_id=record["照片"]["file_id"])
+    rid = _call(card, "query", table="名单", where={"姓名": "李四"})["records"][0]["_id"]
+    got = _call(card, "get_file", table="名单", _id=rid)            # no column: only one file column
 
-    assert got["ok"] is True and got["mime"] == "image/png"
+    assert got["ok"] is True and got["_id"] == rid and got["column"] == "照片"
+    assert got["file"]["mime"] == "image/png"
     with open(got["path"], "rb") as handle:
         assert handle.read() == PNG_B
     assert got["path"].startswith(str(tmp_path / "db"))
+    assert _call(card, "get_file", table="名单", _id=999)["reason"] == "not_found"
+    no_photo = _call(card, "get_file", table="名单", _id=3)        # 王五 has no picture
+    assert no_photo["reason"] == "not_found" and "attach_file" in no_photo["detail"]
+    assert _call(card, "get_file", table="名单", _id="x")["reason"] == "bad_request"
+    assert _call(card, "get_file", table="名单", _id=1, column="姓名")["reason"] == "bad_request"
+    assert _call(card, "get_file", table="名单", _id=1, column="不存在")["reason"] == "unknown_column"
+    assert _call(card, "get_file", table="名单")["missing"] == ["_id"]
+
+
+def test_get_file_needs_column_when_a_table_has_two_file_columns(tmp_path):
+    card = _card(tmp_path)
+    _call(card, "create", table="档案", columns="姓名,照片:file,合同:file")
+    rid = _call(card, "append", table="档案", records=[{"姓名": "张三"}])["ids"][0]
+    _call(card, "attach_file", table="档案", _id=rid, column="合同",
+          file=_write(tmp_path, "c.pdf", b"%PDF-1.4 x"))
+
+    ask = _call(card, "get_file", table="档案", _id=rid)
+    assert ask["reason"] == "bad_request" and ask["columns"] == ["照片", "合同"]
+    got = _call(card, "get_file", table="档案", _id=rid, column="合同")
+    assert got["file"]["mime"] == "application/pdf"
+    assert _call(card, "create", table="纯文字", columns="a")["ok"]
+    _call(card, "append", table="纯文字", records=[{"a": "1"}])
+    assert _call(card, "get_file", table="纯文字", _id=1)["reason"] == "bad_request"
+
+
+def test_get_file_still_accepts_the_old_file_id(tmp_path):
+    card = _card(tmp_path)
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    fid = _call(card, "query", table="名单")["records"][0]["照片"]["file_id"]
+    got = _call(card, "get_file", table="名单", file_id=fid)
+    assert got["ok"] is True and got["file"]["file_id"] == fid
     assert _call(card, "get_file", table="名单", file_id="f_999")["reason"] == "not_found"
-    assert _call(card, "get_file", table="名单", file_id="nope")["reason"] == "bad_request"
+
+
+def test_get_file_url_is_on_the_robot_address_and_serves_the_file(tmp_path):
+    card = _card(tmp_path, public_base="http://10.1.2.3:15720")
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    got = _call(card, "get_file", table="名单", _id=2)
+
+    assert got["url"].startswith("http://10.1.2.3:15720/table_db/file/t/f_")
+    assert "recognize_by_url" in got["how_to_use"]
+    # The model's download goes to localhost, not the LAN address.
+    assert "http://localhost:15720/table_db/file/t/" in got["agent_core"]["download"]
+    status, body, mime, _ = card.handle_http_get(got["url"][len("http://10.1.2.3:15720"):])
+    assert (status, body, mime) == (200, PNG_B, "image/png")
+
+
+def test_get_file_url_falls_back_when_no_lan_address(tmp_path, monkeypatch):
+    import plugins.table_db as module
+
+    class NoNetwork:
+        def __init__(self, *args):
+            raise OSError("no route")
+
+    monkeypatch.setattr(module.socket, "socket", NoNetwork)
+    card = _card(tmp_path)
+    assert card._public_url() == "http://localhost:15720"
 
 
 def test_attach_any_kind_of_file_and_replace(tmp_path):
@@ -441,7 +497,7 @@ def test_import_excel365_place_in_cell_pictures_and_long_ids(tmp_path):
     assert "#VALUE!" not in json.dumps(reply, ensure_ascii=False)
     assert first["身份证号"] == "110101199001011000"            # not 1.10...E+17
     assert any("15 位" in note for note in reply["warnings"])
-    got = _call(card, "get_file", table="名单", file_id=reply["sample"][1]["照片"]["file_id"])
+    got = _call(card, "get_file", table="名单", _id=reply["sample"][1]["_id"])
     with open(got["path"], "rb") as handle:
         assert handle.read() == PNG_B                          # row 3 got picture 2
 
@@ -454,7 +510,7 @@ def test_data_survives_a_restart(tmp_path):
 
     reply = _call(restarted, "query", table="名单")
     assert reply["total"] == 3
-    got = _call(restarted, "get_file", table="名单", file_id=reply["records"][0]["照片"]["file_id"])
+    got = _call(restarted, "get_file", table="名单", _id=reply["records"][0]["_id"])
     with open(got["path"], "rb") as handle:
         assert hashlib.sha256(handle.read()).hexdigest() == hashlib.sha256(PNG_BYTES).hexdigest()
 
@@ -540,7 +596,7 @@ def test_schema_declares_actions_params_and_required():
 def test_every_field_placeholder_starts_with_something_useful():
     """The canvas shows only the first 40 characters of a description."""
     props = TOOLS[0]["inputSchema"]["properties"]
-    for key in ("where", "set", "records", "columns", "_id", "file_id", "table"):
+    for key in ("where", "set", "records", "columns", "_id", "column", "table"):
         head = props[key]["description"][:40]
         assert head.startswith("例"), (key, head)
 
@@ -588,11 +644,10 @@ def test_import_and_attach_use_separate_file_fields(tmp_path):
     assert old["ok"] is True
 
 
-def test_get_file_explains_how_agent_core_can_read_it_and_the_url_works(tmp_path):
+def test_get_file_explains_how_agent_core_can_read_it(tmp_path):
     card = _card(tmp_path)
     _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
-    fid = _call(card, "query", table="名单", where={"姓名": "李四"})["records"][0]["照片"]["file_id"]
-    got = _call(card, "get_file", table="名单", file_id=fid)
+    got = _call(card, "get_file", table="名单", _id=2)
 
     hint = got["agent_core"]
     assert hint["local_path"].startswith("/tmp/") and hint["local_path"] in hint["download"]
@@ -655,7 +710,7 @@ def test_drop_db_removes_every_table_and_needs_the_name_twice(tmp_path):
 @pytest.mark.parametrize("action,extra", [
     ("query", {}), ("stats", {}), ("append", {"records": "[{'x':'1'}]"}),
     ("update", {"_id": 1, "set": "{'x':'2'}"}), ("delete", {"_id": 1}),
-    ("get_file", {"file_id": "f_1"}), ("drop_table", {"confirm": "t"}),
+    ("get_file", {"_id": 1}), ("drop_table", {"confirm": "t"}),
     ("export_files", {"column": "照片", "name_column": "姓名"}),
 ])
 def test_only_create_and_import_may_create_a_library(tmp_path, action, extra):

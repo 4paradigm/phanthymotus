@@ -61,7 +61,7 @@
 | `delete` | `_id` | `deleted`（软删除，查询和统计会自动跳过） |
 | `stats` | `where`、`group_by` | `total`，以及 `groups: [{"value","count"}]` |
 | `attach_file` | `_id`、`column`（文件列）、`file` | 文件信息（会替换原来的文件） |
-| `get_file` | `file_id` | `path`：本容器里的临时文件，24 小时有效 |
+| `get_file` | `_id`（记录编号）、`column`（表里只有一个文件列时可不填） | `url`：文件网址，浏览器能打开，可粘贴到视觉卡的 `*_by_url`；`path`：机器人上的路径，skill 调视觉卡时作为 `image_path`；`agent_core.download`：模型自取文件用 |
 | `export_files` | `column`（文件列）、`name_column`、`profile_columns`、`where` | `dir`：照片加 `manifest.json`，交给 `face_recognition.register_by_corpus` |
 | `drop_table` | `confirm`：再填一遍表名 | 删除整张表及其文件（不可恢复），用于重新导入 |
 | `drop_db` | `db`（必填）、`confirm`：再填一遍库名 | 删除整个库：库里所有表、记录、文件一起删除（不可恢复），返回删掉的表名、行数、文件数 |
@@ -116,7 +116,7 @@
 ### 表里的图片做 OCR / 识别物体
 
 ```text
-query(table=.., where=..) 拿到 照片.file_id → get_file(file_id) 得到 path
+query(table=.., where=..) 拿到这条的 _id → get_file(_id) 得到 path（或 url）
 → ocr.recognize_by_photo(image_path=path) 或 vop.recognize_by_photo(image_path=path)
 → 需要留档就 update(_id, set={"识别结果": ...})
 ```

@@ -49,6 +49,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import socket
 import zipfile
 import io
 from typing import Any, Dict, List, Optional, Tuple
@@ -136,7 +137,7 @@ ACTIONS = [
     ("update", "按 _id 修改一条记录的某些列"),
     ("delete", "按 _id 删除一条记录"),
     ("attach_file", "给一条记录的文件列挂上或更换文件（图片/PDF/音频等）"),
-    ("get_file", "取出文件，返回文件路径（给人脸/OCR 卡用，或让模型下载后读）"),
+    ("get_file", "按 _id 取出这条记录的文件：返回 url（粘贴到人脸/OCR 卡的 *_by_url，或浏览器打开下载）"),
     ("export_files", "把「姓名+照片」导出成一个目录，用于批量录入人脸库"),
     ("drop_table", "删除一张表及其文件（不可恢复），confirm 填表名"),
     ("drop_db", "删除整个库：库里所有表和文件一起删除（不可恢复），confirm 填库名"),
@@ -211,7 +212,8 @@ TOOLS: List[Dict[str, Any]] = [{
             "group_by": {"type": "string",
                          "description": "例 借用人。按这一列分组计数；不填只给总数"},
             "column": {"type": "string",
-                       "description": "例 照片。文件列的列名（list 里 type 为 file 的列）"},
+                       "description": ("例 照片。文件列的列名；get_file 时表里只有一个文件列可不填。"
+                                       "文件列就是 list 里 type 为 file 的列")},
             "name_column": {"type": "string",
                             "description": "例 姓名。每张照片对应的人名所在的列"},
             "profile_columns": {
@@ -219,8 +221,6 @@ TOOLS: List[Dict[str, Any]] = [{
                 "description": ("例 准考证号,身份证号。可不填；这些列会跟人脸一起存进人脸档案，"
                                 "以后认出这个人时一并返回"),
             },
-            "file_id": {"type": "string",
-                        "description": "例 f_3。文件编号，见 query 返回里文件列的 file_id"},
             "mode": {
                 "type": "string",
                 "enum": ["create", "append"],
@@ -302,12 +302,13 @@ TOOLS: List[Dict[str, Any]] = [{
                 "description": "给一条记录的文件列挂上/更换文件（如 vision_capture 刚拍的照片、PDF、录音）。",
             },
             "get_file": {
-                "params": ["db", "table", "file_id"],
-                "required": ["table", "file_id"],
+                "params": ["db", "table", "_id", "column"],
+                "required": ["table", "_id"],
                 "description": (
-                    "取出文件。path 是 perception 容器里的路径，可直接作为 face_recognition / ocr / vop "
-                    "的 image_path；agent-core 的 Read 读不到它，要自己看文件就按返回的 "
-                    "agent_core.download 用 Bash 下载到 /tmp 再 Read。"
+                    "按记录 _id 取出它的文件（表里只有一个文件列时不用填 column）。返回："
+                    "url = 文件的网址：粘贴到 face_recognition / ocr / vop 的 *_by_url 动作的 url，"
+                    "或在浏览器打开下载到电脑；path = 机器人上的路径，skill 调视觉卡时可直接作为 image_path；"
+                    "agent_core.download = 模型要自己看这个文件时，用 Bash 执行它再 Read local_path。"
                 ),
             },
             "export_files": {
@@ -373,6 +374,11 @@ class TableDbPlugin:
         # Where agent-core reaches this container's HTTP server (host network on
         # the robot, so localhost); used only to build get_file's download URL.
         self._http_base = str(cfg.get("http_base") or DEFAULT_HTTP_BASE).rstrip("/")
+        # Address people and other cards use for get_file's url: the robot's
+        # LAN IP, so the same link opens in a browser on the operator's PC and
+        # is fetched by face_recognition / ocr / vop *_by_url (perception runs
+        # on the host network, so it reaches its own LAN address too).
+        self._public_base = str(cfg.get("public_base") or "").rstrip("/")
         # The parser truncates long cells; asking it for one character more than
         # the store accepts means an over-long cell arrives *over* the limit and
         # is refused with its row and column, instead of being silently cut.
@@ -465,6 +471,8 @@ class TableDbPlugin:
         missing = [key for key in spec.get("required", []) if key not in out]
         if action == "attach_file" and "file" in missing and "path" in out:
             missing.remove("file")           # the field's name before `file`
+        if action == "get_file" and "_id" in missing and "file_id" in out:
+            missing.remove("_id")            # the form before get_file took _id
         if missing:
             hint = "；不知道库名或表名就先执行 list" if "table" in missing else ""
             raise TableDbError("bad_request", "%s 需要填写：%s%s" % (
@@ -890,30 +898,106 @@ class TableDbPlugin:
                 "file": info}
 
     def _do_get_file(self, args: dict) -> dict:
+        """The file of one record, named by the record's _id (and column).
+
+        A record is what a caller already holds (query / append return _id);
+        file_id was a second handle for the same thing. The old `file_id`
+        argument is still accepted so calls written against it keep working.
+        """
         db, table = self._db_table(args)
-        fid = parse_file_id(args.get("file_id"))
-        if self._store.columns(db, table) is None:
-            raise TableDbError("unknown_table", "没有表「%s」" % table)
+        columns = self._store.columns(db, table)
+        if columns is None:
+            raise TableDbError("unknown_table", "库 %s 里没有表「%s」。用 list 查看有哪些表" % (db, table))
+        file_columns = [column.name for column in columns if column.type == FILE]
+        record = None
+        column = args.get("column")
+        if "_id" not in args and args.get("file_id"):          # legacy form
+            fid = parse_file_id(args.get("file_id"))
+        else:
+            if not file_columns:
+                raise bad_request("表「%s」没有文件列（list 里 type 为 file 的列），没有文件可取" % table)
+            if column in (None, ""):
+                if len(file_columns) > 1:
+                    raise bad_request("表「%s」有 %d 个文件列：%s，请用 column 指定取哪一列"
+                                      % (table, len(file_columns), "、".join(file_columns)),
+                                      columns=file_columns)
+                column = file_columns[0]
+            column = check_name(column, "列名 column")
+            if column not in file_columns:
+                kinds = {item.name: item.type for item in columns}
+                if column in kinds:
+                    raise bad_request("「%s」是文字列，column 要填文件列：%s"
+                                      % (column, "、".join(file_columns)), column=column)
+                raise TableDbError("unknown_column", "没有列「%s」。文件列有：%s"
+                                   % (column, "、".join(file_columns)), column=column)
+            rid = args.get("_id")
+            try:
+                if isinstance(rid, bool):
+                    raise ValueError
+                rid = int(rid)
+            except (TypeError, ValueError):
+                raise bad_request("_id 要是整数（来自 query / append 的返回），收到 %r" % (rid,))
+            _, _, found_records = self._store.query(db, table, {"_id": rid}, 0, 1)
+            if not found_records:
+                raise TableDbError("not_found", "表「%s」里没有 _id=%d 的记录（或已删除）"
+                                   % (table, rid))
+            record = found_records[0]
+            info = record.get(column)
+            if not isinstance(info, dict) or info.get("missing"):
+                raise TableDbError("not_found", "_id=%d 这条记录的「%s」列没有文件。"
+                                   "可以用 attach_file 挂一个" % (rid, column))
+            fid = parse_file_id(info["file_id"])
         found = self._store.read_files(db, [fid])
         if fid not in found:
             raise TableDbError("not_found", "库 %s 里没有文件 f_%d" % (db, fid))
         name, mime, data = found[fid]
         path = self._write_cache(db, fid, name, mime, data)
+        route = "%s/%s/f_%d" % (HTTP_FILE_PREFIX, db, fid)
+        url = self._public_url() + route
         local = "/tmp/table_db_%s_%s" % (db, os.path.basename(path))
-        url = "%s%s/%s/f_%d" % (self._http_base, HTTP_FILE_PREFIX, db, fid)
-        return {
-            "ok": True, "file_id": "f_%d" % fid, "path": path, "name": name,
-            "mime": mime, "size": len(data), "expires_in_s": CACHE_TTL_S,
-            # `path` lives in the perception container: the vision cards there
-            # open it, agent-core's Read cannot (it only reads /work and /tmp of
-            # its own container). This is the way across, over localhost HTTP.
+        reply: Dict[str, Any] = {
+            "ok": True, "db": db, "table": table,
+            "file": {"file_id": "f_%d" % fid, "name": name, "mime": mime, "size": len(data)},
+            "url": url,
+            "path": path,
+            "expires_in_s": CACHE_TTL_S,
+            "how_to_use": ("画布上：复制 url，粘贴到 face_recognition 的 recognize_by_url / "
+                           "register_by_url（或 ocr / vop 的 recognize_by_url）的 url 格子执行；"
+                           "也可以在浏览器打开 url 把文件下载到电脑。skill 里调视觉卡时直接用 path "
+                           "作为 image_path"),
+            # `path` lives in the perception container; agent-core's Read cannot
+            # open it (it only reads its own /work and /tmp), so the model fetches
+            # the file over localhost HTTP first.
             "agent_core": {
-                "download": "curl -sf -o %s %s" % (local, url),
+                "download": "curl -sf -o %s %s%s" % (local, self._http_base, route),
                 "local_path": local,
-                "note": ("path 给 face_recognition / ocr / vop 用；模型自己要看这个文件，"
-                         "先用 Bash 执行 download，再 Read local_path"),
+                "note": "模型自己要看这个文件：用 Bash 执行 download，再 Read local_path",
             },
         }
+        if record is not None:
+            reply["_id"] = record["_id"]
+            reply["column"] = column
+        return reply
+
+    def _public_url(self) -> str:
+        """http://<robot LAN IP>:<port> for links a person or another card opens."""
+        if self._public_base:
+            return self._public_base
+        port = self._http_base.rsplit(":", 1)[-1] if ":" in self._http_base[6:] else "15720"
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # No packet is sent: connect() on UDP only picks the interface
+                # the default route would use, which is the robot's LAN address.
+                probe.connect(("10.255.255.255", 1))
+                address = probe.getsockname()[0]
+            finally:
+                probe.close()
+        except OSError:
+            address = ""
+        if not address or address.startswith("127.") or address == "0.0.0.0":
+            return self._http_base
+        return "http://%s:%s" % (address, port)
 
     # ── file download over HTTP (GET /table_db/file/<db>/<file_id>) ──────────
 

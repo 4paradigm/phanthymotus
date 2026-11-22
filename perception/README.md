@@ -4619,7 +4619,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 | `delete` | `_id` | 软删除 |
 | `stats` | `where`、`group_by` | `total`、`groups` |
 | `attach_file` | `_id`、`column`、`file` | 文件信息 |
-| `get_file` | `file_id` | 本容器内的临时路径（24 小时），可直接作为 face / ocr / vop 的 `image_path` |
+| `get_file` | `_id`、`column`（可选） | `url`（浏览器/视觉卡 `*_by_url` 可用）和 `path`（作为 `image_path`） |
 | `export_files` | `column`、`name_column`、`profile_columns`、`where` | 目录（文件 + manifest.json），交给 `face_recognition.register_by_corpus` |
 | `drop_table` | `confirm`（再填一遍表名） | 删除整张表及其文件 |
 | `drop_db` | `db`、`confirm`（再填一遍库名） | 删除整个库（所有表和文件） |
