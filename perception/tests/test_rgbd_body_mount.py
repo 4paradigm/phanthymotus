@@ -146,7 +146,7 @@ def test_missing_unavailable_and_expired_tf_keep_camera_tracking():
                                   dict(parent_frame='other_base'), dict(child_frame='other_camera'),
                                   dict(version='v2'), dict(length_unit='mm'),
                                   dict(transform_direction='camera_from_body'),
-                                  dict(matrix=[[1,0,0,0],[0,1,0,0],[0,0,-1,0],[0,0,0,1]])])
+                                  dict(matrix=[[1,0,0,0],[0,-1,0,0],[0,0,-1,0],[0,0,0,1]])])
 def test_numeric_mount_is_used_independently_of_metadata(change):
     observer=mounts();observer.observe(packet(**change),1_010_000_123)
     assert observer.attach(sample(),1_020_000_123)['vendor']['body_pose'] is not None

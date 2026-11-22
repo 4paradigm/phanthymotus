@@ -337,9 +337,30 @@ class ExternalOdometry:
         self._changed(stamp)
         return True
 
+    def revise_vision(self, stamp, segment, body_pose, variance=None):
+        """Replace or retract an owned projection after its dependencies change."""
+        if stamp <= self.base.stamp:
+            return False
+        prior = self.raw_vision.get(stamp)
+        if body_pose is None:
+            if prior is None or prior[0] != segment:
+                return False
+            del self.raw_vision[stamp]
+        else:
+            if (prior is not None and prior[0] == segment and
+                    np.array_equal(prior[1], body_pose) and np.array_equal(prior[2], variance)):
+                return False
+            self.raw_vision[stamp] = (segment, body_pose, variance)
+        self._changed(stamp)
+        return True
+
     def replay_learning(self, stamp):
-        if stamp in self.raw_vision:
-            self._rebuild(stamp)
+        # The solve's former endpoint can have been withdrawn or frozen while
+        # work was in flight. Resume at the first surviving mutable observation.
+        begin = max(stamp, self.base.stamp+1)
+        next_visual = min((value for value in self.raw_vision if value >= begin), default=None)
+        if next_visual is not None:
+            self._rebuild(next_visual)
 
     def _pose_interval(self, t0, t1, left, right, end, overlap):
         # A visual correction can replay these exact measured intervals many
@@ -583,6 +604,10 @@ class ExternalOdometry:
         times = sorted(self.raw_motion)
         before = max((key for key in self.checkpoints if key < begin), default=self.base.stamp)
         state = self.checkpoints.get(before, self.base)
+        # Retractions can remove an event timestamp entirely. Its old checkpoint
+        # must not survive the replay or remain eligible for later publication.
+        self.checkpoints = {stamp: checkpoint for stamp, checkpoint in self.checkpoints.items()
+                            if stamp <= before}
         events = sorted(stamp for stamp in self.raw_motion.keys() | self.raw_vision.keys() if stamp > before)
         for stamp in events:
             state = self._advance(state, stamp, times)

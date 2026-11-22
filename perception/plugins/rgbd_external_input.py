@@ -6,15 +6,17 @@ import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import replace
 
 import numpy as np
 
 from .external_odometry_fusion import (
-    _HISTORY_NS as REPLAY_HISTORY_NS, ExternalOdometry, body_pose_observation, decode_motion,
+    _HISTORY_NS as REPLAY_HISTORY_NS, _MAX_EVENTS as REPLAY_MAX_EVENTS,
+    ExternalOdometry, body_pose_observation, decode_motion,
 )
 from .pointcloud_slam_transforms import rigid
-from .rgbd_body_mount import CaptureMounts
+from .rgbd_body_mount import _INTERPOLATION_NS as MOUNT_WINDOW_NS, CaptureMounts
 from utils.ros_lifecycle import dispose_node
 
 
@@ -49,14 +51,20 @@ class ExternalOdometryInput:
         self.stale_motion_stamp = None
         self.events = queue.Queue(maxsize=_MAX_PENDING_EVENTS)
         self.event_lock = threading.Lock()
+        self.event_sequence = 0
         self.evicted_motion_boundaries = deque(maxlen=_MAX_PENDING_EVENTS)
+        self.evicted_mounts = deque(maxlen=_MAX_PENDING_EVENTS)
+        self.mount_eviction_fault = False
         self.motion_cutoffs = {}
         self.closed = False
         self.last_error = None
         self.dropped = 0
         self.pending_visual = OrderedDict()
+        self.native_visual = OrderedDict()
+        self.accepted_visual = set()
         self.learning_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='rgbd-motion-learning')
         self.learning_work = None
+        self.learning_pending_stamp = None
         self.learning_results = OrderedDict()
         self.visual_state = None
         self.status = dict(active=self.active, topic=self.selected, update=None)
@@ -96,7 +104,7 @@ class ExternalOdometryInput:
                 return
             if self.events.full():
                 try:
-                    _, oldest = self.events.get_nowait()
+                    sequence, received_at, oldest = self.events.get_nowait()
                 except queue.Empty:
                     pass
                 else:
@@ -104,8 +112,14 @@ class ExternalOdometryInput:
                     if self._is_motion_boundary(oldest):
                         kind, source, stamp, motion = oldest
                         # A dropped twist cannot stand in for the interval before it.
-                        self.evicted_motion_boundaries.append((kind, source, stamp, replace(motion, reset=True)))
-            self.events.put_nowait((received, event))
+                        boundary = kind, source, stamp, replace(motion, reset=True)
+                        self.evicted_motion_boundaries.append((sequence, received_at, boundary))
+                    elif oldest[0] in ('mount', 'mount_fault'):
+                        if len(self.evicted_mounts) == self.evicted_mounts.maxlen:
+                            self.mount_eviction_fault = True
+                        self.evicted_mounts.append((sequence, received_at, oldest))
+            self.event_sequence += 1
+            self.events.put_nowait((self.event_sequence, received, event))
 
     @staticmethod
     def _is_motion_boundary(event):
@@ -121,8 +135,18 @@ class ExternalOdometryInput:
         with self.event_lock:
             while not self.events.empty():
                 batch.append(self.events.get_nowait())
+            for _, _, (_, source, stamp, _) in self.evicted_motion_boundaries:
+                if self._motion_time_valid(source, stamp, wall_now):
+                    self.motion_cutoffs[source] = max(self.motion_cutoffs.get(source, 0), stamp)
+            # The head was taken before acquiring this lock. A producer can
+            # evict a later event in between; merge all retained ingress records
+            # by their sequence instead of prepending that newer boundary.
+            batch.extend(self.evicted_motion_boundaries)
+            batch.extend(self.evicted_mounts)
+            self.evicted_motion_boundaries.clear()
+            self.evicted_mounts.clear()
             ready = []
-            for received, event in batch:
+            for _, received, event in sorted(batch, key=lambda item: item[0]):
                 if event[0] == 'visual':
                     # Accepted captures can still correct retained history even
                     # after they become too old for direct publication.
@@ -130,19 +154,18 @@ class ExternalOdometryInput:
                 else:
                     # Mount evidence, including unavailable boundaries, belongs
                     # to those captures. Its storage is bounded by the queue.
-                    keep = (event[0] == 'mount' or received >= cutoff or self._is_motion_boundary(event)
+                    keep = (event[0] in ('mount', 'mount_fault') or received >= cutoff or self._is_motion_boundary(event)
                             or (event[0] == 'motion' and event[3].pose is not None
                                 and 0 <= wall_now - event[2] <= _OUTPUT_TIMEOUT_NS))
                 if keep:
                     ready.append(event)
             self.dropped += len(batch) - len(ready)
-            if self.evicted_motion_boundaries:
-                for _, source, stamp, _ in self.evicted_motion_boundaries:
-                    if not self._motion_time_valid(source, stamp, wall_now):
-                        continue
-                    self.motion_cutoffs[source] = max(self.motion_cutoffs.get(source, 0), stamp)
-                ready = [*self.evicted_motion_boundaries, *ready]
-                self.evicted_motion_boundaries.clear()
+            if self.mount_eviction_fault:
+                # The lost packet may have invalidated any retained bracket.
+                # Clear after this batch's numeric evidence, so its surviving
+                # endpoints cannot silently bridge a missing boundary.
+                ready.append(('mount_fault', 'body mount event history overflow'))
+                self.mount_eviction_fault = False
         return ready
 
     def _receive(self, source, msg):
@@ -224,8 +247,8 @@ class ExternalOdometryInput:
     def _receive_mount(self, msg):
         try:
             self._offer(('mount', json.loads(msg.data), time.time_ns()))
-        except (ValueError, TypeError, AttributeError):
-            return
+        except (ValueError, TypeError, AttributeError) as error:
+            self._offer(('mount_fault', 'invalid body mount JSON: '+str(error)))
 
     def visual(self, stamp, segment, pose):
         self._offer(('visual', stamp, segment, pose))
@@ -239,14 +262,17 @@ class ExternalOdometryInput:
 
     def _apply(self, event, *, publish=True):
         kind, *values = event
-        if kind == 'mount':
-            self.mounts.observe(*values)
-            ready = [stamp for stamp in self.pending_visual if self._camera_mount(stamp) is not None]
-            for stamp in sorted(ready):
-                segment, pose = self.pending_visual.pop(stamp)
-                self._apply_visual(stamp, segment, pose)
-            if not ready:
-                return
+        if kind in ('mount', 'mount_fault'):
+            changed = None
+            with self.fuser.batch():
+                try:
+                    if kind == 'mount_fault':
+                        self.last_error = values[0]
+                        self.mounts.fault(values[0])
+                    else:
+                        changed = {self.mounts.observe(*values)}
+                finally:
+                    self._replay_visuals(changed)
         elif kind == 'motion':
             source, stamp, motion = values
             if self.selected is not None and self.selected != source:
@@ -270,12 +296,11 @@ class ExternalOdometryInput:
         else:
             stamp, segment, pose = values
             if not self._apply_visual(stamp, segment, pose):
-                if self.mounts is not None:
-                    self.pending_visual[stamp] = segment, pose
-                    if len(self.pending_visual) > 24:
-                        self.pending_visual.popitem(last=False)
+                if publish:
+                    self._prune_visuals()
                 return
         if publish:
+            self._prune_visuals()
             self._publish()
 
     def _publishable_stamp(self, stamp):
@@ -338,12 +363,57 @@ class ExternalOdometryInput:
             with self.event_lock:
                 self.dropped += 1
             return True
+        camera, _ = body_pose_observation(pose, np.eye(4))
+        key = (segment, camera.tobytes())
+        prior = self.native_visual.get(stamp)
+        if prior is not None and prior[2] >= key:
+            return True
+        self.native_visual[stamp] = (segment, deepcopy(pose), key)
+        if self.mounts is not None:
+            self.mounts.retain((stamp,), replace=False)
+        return self._project_visual(stamp)
+
+    def _project_visual(self, stamp):
+        segment, pose, _ = self.native_visual[stamp]
         mount = self._camera_mount(stamp)
         if mount is None:
+            self.fuser.revise_vision(stamp, segment, None)
+            self.pending_visual[stamp] = (segment, pose)
             return False
         body, variance = body_pose_observation(pose, rigid(mount))
-        self.fuser.vision(stamp, segment, body, variance)
+        self.pending_visual.pop(stamp, None)
+        self.fuser.revise_vision(stamp, segment, body, variance)
+        self.accepted_visual.add(stamp)
         return True
+
+    def _replay_visuals(self, changed=None):
+        now = time.time_ns()
+        for stamp in sorted(self.native_visual):
+            if stamp <= self.fuser.base.stamp or (stamp not in self.accepted_visual and
+                                                not self._visual_time_valid(stamp, now)):
+                del self.native_visual[stamp]
+                self.pending_visual.pop(stamp, None)
+                self.accepted_visual.discard(stamp)
+            elif changed is None or any(abs(stamp-value) <= MOUNT_WINDOW_NS for value in changed):
+                self._project_visual(stamp)
+
+    def _prune_visuals(self):
+        now = time.time_ns()
+        expired = {stamp for stamp in self.native_visual if stamp <= self.fuser.base.stamp or
+                   (stamp not in self.accepted_visual and not self._visual_time_valid(stamp, now))}
+        pending = sorted(stamp for stamp in self.native_visual
+                         if stamp not in expired and stamp not in self.fuser.raw_vision)
+        # Accepted projections retain their native owner throughout fuser replay.
+        # Retraction does not turn an accepted owner into a wall-clock-expiring
+        # new pending capture. Capacity can still evict unprojected captures,
+        # oldest first, without forgetting any currently accepted projection.
+        excess = max(0, len(self.native_visual)-len(expired)-REPLAY_MAX_EVENTS)
+        for stamp in expired | set(pending[:excess]):
+            del self.native_visual[stamp]
+            self.pending_visual.pop(stamp, None)
+            self.accepted_visual.discard(stamp)
+        if self.mounts is not None:
+            self.mounts.retain(self.native_visual)
 
     def _solve_learning(self, learner):
         # A result can be reused only for identical raw intervals and prior.
@@ -362,6 +432,12 @@ class ExternalOdometryInput:
         if self.learning_work is None:
             snapshot = learner.checkpoint()
             self.learning_work = (key, snapshot, self.learning_pool.submit(snapshot.fit))
+        else:
+            # Revisions can introduce an earlier eligible solve or move it past
+            # a withdrawn endpoint while the single worker is occupied.
+            pending = self.learning_pending_stamp
+            self.learning_pending_stamp = (learner.last_solve_ns if pending is None else
+                                           min(pending, learner.last_solve_ns))
         return None
 
     def _complete_learning(self):
@@ -369,33 +445,46 @@ class ExternalOdometryInput:
             return
         key, result, future = self.learning_work
         self.learning_work = None
+        pending = self.learning_pending_stamp
+        self.learning_pending_stamp = None
         future.result()
         # The worker's elapsed solve time is diagnostic. The replay lookup
         # checks the complete window signature before applying this snapshot.
         self.learning_results[key] = result
         if len(self.learning_results) > 64:
             self.learning_results.popitem(last=False)
-        self.fuser.replay_learning(key[0])
+        self.fuser.replay_learning(key[0] if pending is None else min(key[0], pending))
 
     def _apply_ready(self, events):
         if not events:
             return
+        if self.mounts is not None:
+            # First-seen captures also need the live evidence from before this
+            # batch. Keep these temporary pins through every observation; the
+            # normal post-batch pruning releases invalid/unselected captures.
+            now = time.time_ns()
+            captures = {event[1] for event in events if event[0] == 'visual' and
+                        self._visual_time_valid(event[1], now)}
+            self.mounts.retain(self.native_visual.keys() | captures)
         observations = []
         mounts_received = False
+        changed_mounts = set()
+        mount_fault = False
         for event in events:
-            if event[0] != 'mount':
+            if event[0] not in ('mount', 'mount_fault'):
                 observations.append(event)
                 continue
             mounts_received = True
             try:
-                self.mounts.observe(*event[1:])
+                if event[0] == 'mount_fault':
+                    self.last_error = event[1]
+                    self.mounts.fault(event[1])
+                    mount_fault = True
+                else:
+                    changed_mounts.add(self.mounts.observe(*event[1:]))
             except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
                 self.last_error = str(error)
-        if mounts_received:
-            # Resolve captures against the complete batch, including a later
-            # unavailable transform or fault that invalidates an earlier bracket.
-            ready = [stamp for stamp in self.pending_visual if self._camera_mount(stamp) is not None]
-            observations = [('visual', stamp, *self.pending_visual.pop(stamp)) for stamp in sorted(ready)] + observations
+                mount_fault = True
         current, delayed = [], []
         now = time.time_ns()
         for event in observations:
@@ -403,6 +492,10 @@ class ExternalOdometryInput:
                       and now-event[1] > _OUTPUT_TIMEOUT_NS else current)
             target.append(event)
         with self.fuser.batch():
+            if mounts_received:
+                # Revise accepted projections as well as captures still waiting
+                # for evidence, against the complete mount batch.
+                self._replay_visuals(None if mount_fault else changed_mounts)
             # Stage live observations first, then old corrections newest first.
             # Only accepted measurements may advance the replay floor while the
             # batch defers rebuilding fuser.current until all inputs are staged.
@@ -411,6 +504,7 @@ class ExternalOdometryInput:
                     self._apply(event, publish=False)
                 except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
                     self.last_error = str(error)
+        self._prune_visuals()
         # Keep the measured samples needed to bracket cloud capture timestamps.
         for state in self.fuser.pending_output_states(time.time_ns()-_OUTPUT_TIMEOUT_NS):
             self._publish(state)
