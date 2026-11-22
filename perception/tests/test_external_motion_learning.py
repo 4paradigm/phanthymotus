@@ -87,6 +87,64 @@ def test_mixed_motion_learning_improves_independent_blind_interval():
     assert learned.info()["effective_after_ns"] == info["effective_after_ns"]
 
 
+@pytest.mark.parametrize("lateral", [-.3, .3])
+def test_translation_model_mismatch_cannot_train_stationary_rotation(lateral):
+    learner = ExternalMotionLearner()
+    for index in range(30):
+        velocity = np.array([[1.5, .2][index % 2], 0., 0., 0., 0., 0.])
+        visual = np.eye(4)
+        visual[:3, 3] = velocity[0] * .25 * np.array([1., lateral, 0.])
+        start = index * 250_000_000
+        learner.add(start, start + 250_000_000, [(velocity, .25, None)], visual)
+
+    # The native and raw orientations agree exactly throughout training. A
+    # translational model error supplies no evidence for an angular correction.
+    np.testing.assert_allclose(learner.info()["scale"][3:], 1., atol=1e-10)
+    np.testing.assert_allclose(learner.info()["bias"][3:], 0., atol=1e-10)
+    np.testing.assert_allclose(learner.correct(np.zeros(6), 5.)[:3, :3], np.eye(3), atol=1e-10)
+    assert learner.rank > 0
+
+
+def test_angular_fit_and_uncertainty_ignore_translation_outliers():
+    clean, corrupted = ExternalMotionLearner(), ExternalMotionLearner()
+    scale = np.array([1., 1., 1., 1.13, .88, 1.09])
+    bias = np.array([0., 0., 0., -.037, .04, -.022])
+    rng = np.random.default_rng(42)
+    for index in range(22):
+        intervals = _intervals(rng)
+        visual = _pose(intervals, scale, bias)
+        _add(clean, index, intervals, visual)
+        visual[:3, 3] += rng.uniform(-3., 3., 3)
+        _add(corrupted, index, intervals, visual)
+
+    angular = [3, 4, 5, 9, 10, 11]
+    np.testing.assert_allclose(corrupted.info()["scale"][3:], scale[3:], atol=.004)
+    np.testing.assert_allclose(corrupted.info()["bias"][3:], bias[3:], atol=.004)
+    np.testing.assert_allclose(corrupted.parameters[angular], clean.parameters[angular], atol=1e-10)
+    np.testing.assert_allclose(corrupted.covariance[np.ix_(angular, angular)],
+                               clean.covariance[np.ix_(angular, angular)], atol=1e-10)
+
+
+def test_conditional_linear_fit_retains_angular_uncertainty_and_cross_covariance():
+    learner = ExternalMotionLearner()
+    for index in range(20):
+        velocity = np.array([[1.5, .2][index % 2], 0., 0., 0., 0., 0.])
+        visual = np.eye(4)
+        visual[0, 3] = velocity[0] * .5
+        _add(learner, index, [(velocity, .5, None)], visual)
+
+    # Twenty independent half-second rotations estimate yaw bias with variance
+    # 2 sigma_w² / (20 dt²) = .001. A yaw-bias perturbation produces y
+    # displacement vx dt²/2, so linear bias responds by -mean(vx) dt/2=-.2125.
+    # Its variance includes both its own measurement noise and yaw uncertainty.
+    assert learner.covariance[11, 11] == pytest.approx(.001, rel=1e-6)
+    assert learner.covariance[7, 11] == pytest.approx(-.0002125, rel=1e-6)
+    assert learner.covariance[7, 7] == pytest.approx(.00029515625, rel=1e-6)
+    assert learner.covariance[5, 5] == pytest.approx(.0625)
+    np.testing.assert_allclose(learner.covariance, learner.covariance.T, atol=1e-12)
+    assert np.linalg.eigvalsh(learner.covariance)[0] > 0.
+
+
 def test_only_one_measured_angular_axis_can_receive_bias():
     learner = ExternalMotionLearner()
     yaw_only = np.array([False, False, False, False, False, True])

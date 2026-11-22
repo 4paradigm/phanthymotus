@@ -240,19 +240,21 @@ class ExternalMotionLearner:
 
         return evaluate
 
-    def _solve(self):
-        evaluate = self._residual_model()
-        point = self.parameters / _PARAMETER_SCALE
+    @staticmethod
+    def _fit_stage(evaluate, point, axes):
+        """Fit one twist block and linearize its conditional estimating equation."""
         difference = 1e-5
         perturbations = np.r_[np.zeros((1, 12)), difference * np.eye(12)]
-        for _ in range(5):
-            values = evaluate(point + perturbations)
+        columns = np.r_[axes, axes + 6]
+
+        def linearize():
+            values = evaluate(point + perturbations)[..., axes]
             residual = values[0]
             weights = np.sqrt(np.minimum(1., _HUBER / np.maximum(np.linalg.norm(residual, axis=1), 1e-12)))
             jacobian = (values[1:] - residual) / difference
             jacobian *= weights[None, :, None]
             jacobian = jacobian.reshape(12, -1).T
-            scale, bias = jacobian[:, :6], jacobian[:, 6:]
+            scale, bias = jacobian[:, axes], jacobian[:, axes + 6]
             # The norm perpendicular to the other column measures the independent
             # effect of a one-prior-sigma change, in window noise sigmas. Keep
             # bias fixed at steady speed; near zero, bias alone can be measured.
@@ -266,13 +268,17 @@ class ExternalMotionLearner:
             design = np.column_stack((scale * fit_scale, bias * fit_bias))
             left, singular, right = np.linalg.svd(design, full_matrices=False)
             rank = np.count_nonzero(singular > max(.02, singular[0] * 1e-3))
+            basis = np.zeros((12, rank))
+            basis[columns] = right[:rank].T
+            return residual, weights, jacobian, left[:, :rank], singular[:rank], basis
+
+        for _ in range(5):
+            residual, weights, jacobian, left, scales, basis = linearize()
+            rank = len(scales)
             if not rank:
-                self.rank = 0
-                self.observable_directions = np.empty((0, 12))
-                return False
-            basis, scales = right[:rank].T, singular[:rank]
+                break
             weighted = (weights[:, None] * residual).ravel()
-            step = -basis @ ((left[:, :rank].T @ weighted) / scales)
+            step = -basis @ ((left.T @ weighted) / scales)
             step /= max(1., np.linalg.norm(step))
             if np.linalg.norm(step) <= 1e-6:
                 break
@@ -282,24 +288,44 @@ class ExternalMotionLearner:
                 trial = point + fraction * step
                 if np.any(np.abs(trial[:6] * _PARAMETER_SCALE[:6]) > np.log(4.)):
                     continue
-                cost = np.linalg.norm(evaluate(trial[None, :])[0] * weights[:, None])**2
+                cost = np.linalg.norm(evaluate(trial[None, :])[0][:, axes] * weights[:, None])**2
                 if cost < objective:
                     point = trial
                     accepted = True
                     break
             if not accepted:
                 break
+        # Recompute at the accepted point, including sensitivities to held
+        # parameters. The update basis alone must not erase their uncertainty.
+        _, _, jacobian, left, scales, basis = linearize()
+        gain = (basis / scales) @ left.T
+        return point, np.eye(12) - gain @ jacobian, 2. * gain @ gain.T, left.T @ jacobian
+
+    def _solve(self):
+        evaluate = self._residual_model()
+        point = self.parameters / _PARAMETER_SCALE
+        # SO(3) residuals and their robust weights determine angular calibration
+        # independently of translation-model mismatch. Then fit linear motion
+        # with that angular calibration held fixed, retaining the SE(3) model.
+        point, angular_null, angular_noise, angular_measured = self._fit_stage(
+            evaluate, point, np.arange(3, 6))
+        point, linear_null, linear_noise, linear_measured = self._fit_stage(
+            evaluate, point, np.arange(3))
+        measured = np.vstack((angular_measured, linear_measured))
+        self.rank = measured.shape[0]
+        if not self.rank:
+            self.observable_directions = np.empty((0, 12))
+            return False
         # Use only this window's information. Shared visual endpoints and model
         # mismatch make the covariance an engineering estimate.
-        # Propagate the uncertainty of held parameters through the conditional
-        # fit, e.g. uncertain bias also limits scale learned at a single speed.
-        measured = left[:, :rank].T @ jacobian
-        null = np.eye(12) - (basis / scales) @ measured
+        # For each stage, dpoint = (I - K J) dprior - K dresidual. Compose these
+        # responses in fit order: angular uncertainty therefore enters the
+        # conditional linear fit, including its cross covariance. Held scale /
+        # bias directions retain their prior uncertainty through both stages.
         factors = _PARAMETER_SCALE[:, None] * _PARAMETER_SCALE
         prior = self.covariance / factors
-        observable = (basis * (2. / scales**2)) @ basis.T
-        self.covariance = (null @ prior @ null.T + observable) * factors
-        self.rank = int(rank)
+        angular_covariance = angular_null @ prior @ angular_null.T + angular_noise
+        self.covariance = (linear_null @ angular_covariance @ linear_null.T + linear_noise) * factors
         measured_basis, _ = np.linalg.qr(measured.T)
         self.observable_directions = (measured_basis * _PARAMETER_SCALE[:, None]).T
         self.parameters = point * _PARAMETER_SCALE
