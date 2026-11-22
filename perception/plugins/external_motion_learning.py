@@ -38,6 +38,39 @@ def se3_exp(increment):
     return result
 
 
+def se3_right_jacobian(increment):
+    """Map additive [linear, angular] perturbations to the local tangent of Exp."""
+    vectors = np.asarray(increment, dtype=float).reshape(2, 3)
+    v, w = vectors
+    squared = w @ w
+    if squared < 1e-4:
+        # b = (1-cos(theta))/theta², c = (theta-sin(theta))/theta³.
+        # db and dc are the derivatives with respect to theta, divided by theta.
+        b = .5 - squared / 24. + squared**2 / 720.
+        c = 1. / 6. - squared / 120. + squared**2 / 5040.
+        db = -1. / 12. + squared / 180. - squared**2 / 6720.
+        dc = -1. / 60. + squared / 1260. - squared**2 / 60480.
+    else:
+        angle = np.sqrt(squared)
+        sine_ratio = np.sin(angle) / angle
+        b = 2. * (np.sin(.5 * angle) / angle)**2
+        c = (1. - sine_ratio) / squared
+        db = (sine_ratio - 2. * b) / squared
+        dc = (b - 3. * c) / squared
+    linear, angular = _skew(vectors)
+    second = angular @ angular
+    rotation = np.eye(3) - b * angular + c * second
+    # ad([v,w]) has repeated diagonal blocks [w]x and upper block [v]x.
+    # Applying the Jacobian series to it gives Jr_SO3 on the diagonal
+    # and its directional derivative along v in the upper right block.
+    coupling = (-b * linear + c * (angular @ linear + linear @ angular)
+                + (w @ v) * (-db * angular + dc * second))
+    jacobian = np.zeros((6, 6))
+    jacobian[:3, :3] = jacobian[3:, 3:] = rotation
+    jacobian[:3, 3:] = coupling
+    return jacobian
+
+
 def se3_log(transform):
     """Principal SE(3) logarithm with the inverse rotational translation Jacobian."""
     transform = np.asarray(transform, dtype=float)
@@ -123,6 +156,17 @@ class ExternalMotionLearner:
         if (not axes.any() or target.shape != (4, 4) or not np.isfinite(target).all() or
                 sigma.shape != (6,) or not np.isfinite(sigma).all() or np.any(sigma <= 0)):
             return False
+        missing_rotation = ~axes[3:]
+        if missing_rotation.any():
+            # A projected net rotation can acquire an apparent measured-axis
+            # component from noncommuting turns on omitted axes. Train only
+            # when the visual endpoint is consistent with the reported angular
+            # subspace to one noise sigma, capped at nominal angular precision.
+            # Endpoints alone cannot detect an omitted excursion that closes.
+            rotation = se3_log(target)[3:]
+            tolerance = np.minimum(sigma[3:], _MEASUREMENT_NOISE[3:])
+            if np.linalg.norm(rotation[missing_rotation] / tolerance[missing_rotation]) > 1.:
+                return False
         self.window.append((start_ns, end_ns, tuple(pieces), axes, target.copy(),
                             np.maximum(sigma, _MEASUREMENT_NOISE)))
         while self.window[0][0] < end_ns-_WINDOW_NS:

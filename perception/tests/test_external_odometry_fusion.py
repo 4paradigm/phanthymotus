@@ -69,18 +69,18 @@ def test_pose_precedes_twist_and_known_reset_does_not_create_motion():
     assert engine.current.transform[0, 3] == pytest.approx(1.5)
 
 
-def leg_attitude_packet(t, position, yaw, angular, *, frame='leg', child='body', source='bumi_leg_kinematics', reset=False):
+def attitude_packet(t, position, yaw, angular, *, frame='odometry', child='body', source='independent_motion', reset=False):
     item = packet(t, position, twist=[4., 5., 6., 0., 0., angular], frame=frame, reset=reset)
     item['pose'].update(quaternion=[0., 0., np.sin(yaw/2), np.cos(yaw/2)], child_frame_id=child)
     item['vendor'] = {'source': source}
     return item
 
 
-def test_leg_origin_change_preserves_attitude_only_with_measured_body_rate():
+def test_origin_change_preserves_attitude_only_with_measured_body_rate():
     engine = ExternalOdometry(learning=False)
-    for item in (leg_attitude_packet(0., 10., 0., .6),
-                 leg_attitude_packet(.1, 10.1, 0., .6),
-                 leg_attitude_packet(.31, -20., .126, .6, frame='new_leg')):
+    for item in (attitude_packet(0., 10., 0., .6),
+                 attitude_packet(.1, 10.1, 0., .6),
+                 attitude_packet(.31, -20., .126, .6, frame='new_origin')):
         engine.motion(*decode_motion(item, 1))
     np.testing.assert_allclose(engine.current.transform[:3, 3], [.1, 0., 0.])
     assert np.arctan2(engine.current.transform[1, 0], engine.current.transform[0, 0]) == pytest.approx(.126)
@@ -88,25 +88,25 @@ def test_leg_origin_change_preserves_attitude_only_with_measured_body_rate():
     assert engine.current.twist[5] == pytest.approx(.6)
 
 
-def test_leg_attitude_uses_only_the_axes_observed_by_both_endpoints():
+def test_attitude_uses_only_the_axes_observed_by_both_endpoints():
     engine = ExternalOdometry(learning=False)
-    first = leg_attitude_packet(0., 10., 0., .6)
-    second = leg_attitude_packet(.21, -20., .126, .6, frame='new_leg')
+    first = attitude_packet(0., 10., 0., .6)
+    second = attitude_packet(.21, -20., .126, .6, frame='new_origin')
     for item in (first, second):
         item['motion_model'] = 'planar'
         engine.motion(*decode_motion(item, 1))
     assert engine.current.mask.tolist() == [False, False, False, False, False, True]
 
 
-@pytest.mark.parametrize('override', [dict(source='chassis'), dict(child='another_body'),
+@pytest.mark.parametrize('override', [dict(child='another_body'),
                                       dict(reset=True), dict(t=.5), dict(yaw=1.3), dict(angular=None)])
-def test_leg_attitude_does_not_cross_unverified_source_resets(override):
+def test_attitude_does_not_cross_unverified_origin_resets(override):
     engine = ExternalOdometry(learning=False)
-    first = leg_attitude_packet(0., 10., 0., .6)
-    second = dict(t=.21, position=-20., yaw=.126, angular=.6, frame='new_leg')
+    first = attitude_packet(0., 10., 0., .6)
+    second = dict(t=.21, position=-20., yaw=.126, angular=.6, frame='new_origin')
     second.update(override)
     engine.motion(*decode_motion(first, 1))
-    engine.motion(*decode_motion(leg_attitude_packet(**second), 1))
+    engine.motion(*decode_motion(attitude_packet(**second), 1))
     assert engine.current.last_update is None
     np.testing.assert_array_equal(engine.current.transform, np.eye(4))
 
@@ -272,11 +272,11 @@ def test_pose_model_change_resets_training_without_resetting_body_position():
     assert engine.current.transform[0, 3] == pytest.approx(before[0, 3]+.25)
 
 
-def feed_covariance(engine, t, diagonal, *, x=0., frame='leg_odom',
-                    source='bumi_leg_kinematics', quaternion=None, mount=None, length_scale=1.):
+def feed_covariance(engine, t, diagonal, *, x=0., frame='odometry',
+                    source='independent_motion', quaternion=None, mount=None, length_scale=1.):
     item = packet(t, x, frame=frame)
     item['vendor'] = {'source': source}
-    item['pose']['covariance'] = (np.diag(diagonal).ravel().tolist()
+    item['pose']['process_covariance'] = (np.diag(diagonal).ravel().tolist()
                                    if diagonal is not None else None)
     if quaternion is not None:
         item['pose']['quaternion'] = quaternion
@@ -287,7 +287,7 @@ def feed_covariance(engine, t, diagonal, *, x=0., frame='leg_odom',
     return engine.motion(stamp, motion)
 
 
-def test_bumi_pose_covariance_adds_only_growth_within_one_leg_origin():
+def test_process_covariance_adds_only_growth_within_one_origin():
     engine = ExternalOdometry(learning=False)
     seed = engine.current.covariance.copy()
     baseline = np.arange(1., 7.)
@@ -304,17 +304,17 @@ def test_bumi_pose_covariance_adds_only_growth_within_one_leg_origin():
     np.testing.assert_allclose(engine.current.covariance, seed+2*np.diag(step))
 
 
-def test_late_visual_reuses_leg_noise_until_an_endpoint_changes(monkeypatch):
+def test_late_visual_reuses_process_noise_until_an_endpoint_changes(monkeypatch):
     from plugins import external_odometry_fusion as fusion
 
-    calculate = fusion._leg_increment_covariance
+    calculate = fusion._pose_increment_covariance
     calls = []
 
     def record(*args):
         calls.append(args)
         return calculate(*args)
 
-    monkeypatch.setattr(fusion, '_leg_increment_covariance', record)
+    monkeypatch.setattr(fusion, '_pose_increment_covariance', record)
     engine = ExternalOdometry(learning=False)
     for t, variance in [(0., 1.), (.25, 1.125), (.5, 1.25), (.75, 1.5)]:
         assert feed_covariance(engine, t, [variance]*6)
@@ -354,7 +354,7 @@ def test_repeated_measured_steps_reuse_motion_even_when_rewinding(monkeypatch):
     assert engine.current.transform[0, 3] == pytest.approx(.8)
 
 
-def test_bumi_step_noise_is_split_once_when_vision_is_inside_the_interval():
+def test_process_noise_is_split_once_when_vision_is_inside_the_interval():
     def run(late):
         engine = ExternalOdometry(learning=False)
         feed_covariance(engine, 0., [1.]*6)
@@ -372,7 +372,7 @@ def test_bumi_step_noise_is_split_once_when_vision_is_inside_the_interval():
     np.testing.assert_allclose(delayed.current.transform, ordered.current.transform)
 
 
-def test_bumi_covariance_uses_measured_endpoint_and_only_interpolates_split(monkeypatch):
+def test_process_covariance_uses_measured_endpoint_and_only_interpolates_split(monkeypatch):
     from plugins import external_odometry_fusion as fusion
 
     engine = ExternalOdometry(learning=False)
@@ -388,15 +388,15 @@ def test_bumi_covariance_uses_measured_endpoint_and_only_interpolates_split(monk
         return interpolate(increment)
 
     monkeypatch.setattr(fusion, 'se3_exp', record)
-    full = fusion._leg_increment_covariance(left, right, velocity, .5, 1., True)
+    full = fusion._pose_increment_covariance(left, right, velocity, .5, 1., True)
     assert calls == []
-    partial = fusion._leg_increment_covariance(left, right, velocity, .25, .5, False)
+    partial = fusion._pose_increment_covariance(left, right, velocity, .25, .5, False)
     assert len(calls) == 1
     np.testing.assert_allclose(full, np.eye(6)*.125, atol=1e-12)
     np.testing.assert_allclose(partial, np.eye(6)*.0625, atol=1e-12)
 
 
-def test_bumi_covariance_uses_body_axes_and_sensor_lever_arm():
+def test_process_covariance_uses_body_axes_and_sensor_lever_arm():
     engine = ExternalOdometry(learning=False)
     q = [0., 0., 2**-.5, 2**-.5]
     mount = pose_at(1.)
@@ -410,13 +410,12 @@ def test_bumi_covariance_uses_body_axes_and_sensor_lever_arm():
 
 
 @pytest.mark.parametrize('source,left,right', [
-    ('slamtec', [1.]*6, [2.]*6),
     ('bumi_leg_kinematics', None, [2.]*6),
     ('bumi_leg_kinematics', [2.]*6, [1.]*6),
     ('bumi_leg_kinematics', [1.]*6, [2., 2., -2., 2., 2., 2.]),
     ('bumi_leg_kinematics', [1.]*6, [2., 2., float('nan'), 2., 2., 2.]),
 ])
-def test_chassis_or_unusable_leg_covariance_uses_existing_noise(source, left, right):
+def test_unusable_process_covariance_uses_existing_noise(source, left, right):
     reference = ExternalOdometry(learning=False)
     feed(reference, 0., 0.)
     feed(reference, .5, .2)
@@ -530,3 +529,223 @@ def test_learning_transports_start_uncertainty_to_the_end_body_axes():
     engine.vision(NS+200_000_000, 'vision', turned, np.array([.16, .25, .36, .16, .25, .36]))
     # A quarter turn swaps the start x/y sigmas before adding the end ones.
     np.testing.assert_allclose(engine.current.learner.window[0][5], [.6, .6, .9, .6, .6, .9])
+
+
+@pytest.mark.parametrize('source', ['bumi_leg_kinematics', 'wheel_encoder', 'independent_motion'])
+@pytest.mark.parametrize('mount', [None, np.eye(4)])
+def test_numeric_pose_uncertainty_and_attitude_do_not_depend_on_vendor_name(source, mount):
+    engine = ExternalOdometry(learning=False)
+    for t, frame, yaw, noise in [(0., 'first', 0., 0.), (.1, 'first', 0., .1),
+                                  (.3, 'second', .12, 0.)]:
+        item = attitude_packet(t, 0., yaw, .6, frame=frame, source=source)
+        item['pose']['process_covariance'] = (np.eye(6)*noise).ravel().tolist()
+        if mount is not None:
+            item['body_from_sensor'] = mount.tolist()
+        engine.motion(*decode_motion(item, 1))
+    np.testing.assert_allclose(engine.checkpoints[NS+100_000_000].covariance, np.eye(6)*1.1)
+    assert np.arctan2(engine.current.transform[1, 0], engine.current.transform[0, 0]) == pytest.approx(.12)
+
+
+@pytest.mark.parametrize('source', ['bumi_leg_kinematics', 'wheel_encoder'])
+def test_total_pose_uncertainty_is_not_a_process_accumulator(source):
+    engine, reference = ExternalOdometry(learning=False), ExternalOdometry(learning=False)
+    for t, noise in [(0., .1), (.5, 100.)]:
+        item = packet(t, 0.)
+        item['vendor'] = {'source': source}
+        item['pose']['covariance'] = (np.eye(6)*noise).ravel().tolist()
+        engine.motion(*decode_motion(item, 1))
+        feed(reference, t, 0.)
+    np.testing.assert_allclose(engine.current.covariance, reference.current.covariance)
+
+
+def twist_noise_engine(covariance, *, scale=1., mount=None, end_covariance=None):
+    engine = ExternalOdometry(learning=False)
+    for t, noise in [(0., covariance), (.5, covariance if end_covariance is None else end_covariance)]:
+        item = packet(t, twist=[0.]*6)
+        item['linear_scale_mps'] = scale
+        item['twist_covariance'] = np.asarray(noise).ravel().tolist()
+        if mount is not None:
+            item['body_from_sensor'] = mount.tolist()
+        engine.motion(*decode_motion(item, 1))
+    return engine
+
+
+def test_twist_noise_follows_units_rotation_and_reference_point():
+    raw = np.diag([.04, .01, .02, .001, .002, .09])
+    metres = twist_noise_engine(raw)
+    units = np.diag([1000.]*3+[1.]*3)
+    millimetres = twist_noise_engine(units @ raw @ units, scale=.001)
+    np.testing.assert_allclose(millimetres.current.covariance, metres.current.covariance)
+    quarter_turn = np.eye(4)
+    quarter_turn[:3, :3] = [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]
+    turned = twist_noise_engine(raw, mount=quarter_turn)
+    np.testing.assert_allclose(np.diag(turned.current.covariance)-1.,
+                               [.005, .02, .01, .001, .0005, .045])
+    shifted = twist_noise_engine(raw, mount=pose_at(1.))
+    # v_body = v_sensor + [1,0,0] x omega: y variance includes yaw,
+    # z variance includes pitch, and the y/yaw cross term is negative.
+    added = shifted.current.covariance-np.eye(6)
+    np.testing.assert_allclose(np.diag(added), [.02, .05, .011, .0005, .001, .045])
+    assert added[1, 5] == pytest.approx(-.045)
+    assert added[2, 4] == pytest.approx(.001)
+    assert np.linalg.eigvalsh(added).min() > 0.
+
+
+def test_held_twist_uses_its_own_uncertainty_before_the_next_sample():
+    engine = twist_noise_engine(np.eye(6)*.01, end_covariance=np.eye(6)*100.)
+    np.testing.assert_allclose(engine.current.covariance, np.eye(6)*1.005)
+
+
+@pytest.mark.parametrize('external', [False, True])
+def test_repeated_visual_motion_keeps_latest_measurement_uncertainty(external):
+    engine = ExternalOdometry(learning=False)
+    variance = np.full(6, .01)
+    if external:
+        feed(engine, -.1, 0.)
+        feed(engine, 0., 0.)
+    engine.vision(NS, 'native', pose_at(0.), variance)
+    for i in range(1, 101):
+        x = .1*(-1)**i
+        engine.vision(NS+i*100_000_000, 'native', pose_at(x), variance)
+        assert engine.current.transform[0, 3] == pytest.approx(x)
+        assert engine.current.covariance[0, 0] >= .01-1e-12
+    # No accumulation per repeated observation when the same visual alignment
+    # is simply carried forward; also no R/N claim for an unaveraged pose.
+    first = engine.checkpoints[NS+200_000_000].covariance
+    np.testing.assert_allclose(engine.current.covariance, first, atol=1e-12)
+
+
+@pytest.mark.parametrize('delayed_partial', [False, True])
+def test_partial_twist_between_valid_pose_endpoints_does_not_lose_displacement(delayed_partial):
+    engine, reference = ExternalOdometry(), ExternalOdometry()
+    feed_covariance(engine, 0., [0.]*6, x=0.)
+    if not delayed_partial:
+        feed(engine, .05, twist=[None, None, None, 0., 0., 0.])
+    feed_covariance(engine, .1, [.01]*6, x=.1)
+    if delayed_partial:
+        feed(engine, .05, twist=[None, None, None, 0., 0., 0.])
+    feed_covariance(reference, 0., [0.]*6, x=0.)
+    feed_covariance(reference, .1, [.01]*6, x=.1)
+    np.testing.assert_allclose(engine.current.transform, reference.current.transform)
+    np.testing.assert_allclose(engine.current.noise, reference.current.noise, atol=1e-14)
+    np.testing.assert_allclose(engine.current.sensitivity, reference.current.sensitivity, atol=1e-14)
+    np.testing.assert_allclose(engine.current.covariance, reference.current.covariance, atol=1e-14)
+
+
+def test_available_gyro_continues_while_pose_changes_origin():
+    engine = ExternalOdometry(learning=False)
+    engine.motion(*decode_motion(attitude_packet(0., 10., 0., 2.), 1))
+    feed(engine, .05, twist=[None, None, None, 0., 0., 2.])
+    feed(engine, .1, twist=[None, None, None, 0., 0., 2.])
+    engine.motion(*decode_motion(attitude_packet(.15, -10., .3, 2., frame='new'), 1))
+    assert np.arctan2(engine.current.transform[1, 0], engine.current.transform[0, 0]) == pytest.approx(.3)
+    np.testing.assert_allclose(engine.current.transform[:3, 3], 0.)
+
+
+@pytest.mark.parametrize('reset,new_origin', [(True, False), (False, True)])
+def test_partial_twist_cannot_bridge_reset_or_unknown_pose_origin(reset, new_origin):
+    engine = ExternalOdometry(learning=False)
+    feed(engine, 0., 0.)
+    feed(engine, .05, twist=[None, None, None, 0., 0., 0.], reset=reset)
+    feed(engine, .1, .1, frame='different' if new_origin else 'external')
+    np.testing.assert_allclose(engine.current.transform, np.eye(4))
+
+
+def test_finite_step_parameter_covariance_is_invariant_to_subdivision():
+    def run(pieces):
+        engine = ExternalOdometry()
+        for i in range(pieces+1):
+            feed(engine, i/pieces, twist=[1., 0., 0., 0., 0., np.pi/2])
+        state = engine.current
+        return state.sensitivity @ state.learner.covariance @ state.sensitivity.T
+    full, split = run(1), run(20)
+    np.testing.assert_allclose(full, split, atol=1e-12)
+    # Turning through 90 degrees couples uncertain yaw calibration into y.
+    assert full[1, 1] == pytest.approx(.103204696, abs=1e-9)
+
+
+@pytest.mark.parametrize('boundary', ['reset', 'full_twist'])
+@pytest.mark.parametrize('replace_partial', [False, True])
+def test_delayed_boundary_rebuilds_every_interpolated_checkpoint(boundary, replace_partial):
+    gyro = [None, None, None, 0., 0., 0.]
+    # The nonzero final rate makes this full twist win the same-stamp tie.
+    stop = packet(.2, reset=True) if boundary == 'reset' else packet(.2, twist=[0., 0., 0., 0., 0., 1.])
+
+    def run(delayed):
+        engine = ExternalOdometry()
+        feed_covariance(engine, 0., [0.]*6)
+        vision(engine, 0., 0.)
+        feed(engine, .1, twist=gyro)
+        vision(engine, .12, 0.)
+        if replace_partial:
+            feed(engine, .2, twist=gyro)
+        if not delayed:
+            assert engine.motion(*decode_motion(stop, 1))
+        feed_covariance(engine, .3, [.03]*6, x=.3)
+        if delayed:
+            assert engine.checkpoints[NS+100_000_000].transform[0, 3] == pytest.approx(.1)
+            assert engine.motion(*decode_motion(stop, 1))
+        return engine.checkpoints
+
+    ordered, delayed = run(False), run(True)
+    for stamp, expected in ordered.items():
+        actual = delayed[stamp]
+        np.testing.assert_allclose(actual.transform, expected.transform)
+        np.testing.assert_allclose(actual.noise, expected.noise)
+        np.testing.assert_allclose(actual.sensitivity, expected.sensitivity)
+        assert len(actual.learner.window) == len(expected.learner.window)
+
+
+@pytest.mark.parametrize('alternate', ['planar_pose', 'full_twist'])
+@pytest.mark.parametrize('reverse', [False, True])
+def test_alternate_full_models_cannot_continue_gyro(alternate, reverse):
+    engine = ExternalOdometry()
+    alternate_index = 1 if reverse else 0
+    for i in range(2):
+        item = attitude_packet(.1*i, 10.*i, 0., 2.*(1-i))
+        if i == alternate_index:
+            if alternate == 'planar_pose':
+                item['motion_model'] = 'planar'
+                item['pose'].update(frame_id='another_world', child_frame_id='another_body')
+            else:
+                item['pose'] = None
+        engine.motion(*decode_motion(item, 1))
+    np.testing.assert_allclose(engine.current.transform, np.eye(4))
+    assert engine.current.last_update is None
+
+
+def test_replay_time_limit_keeps_pose_anchor_for_delayed_boundary():
+    def run(delayed):
+        engine = ExternalOdometry()
+        feed(engine, 0., 0.)
+        feed(engine, .1, twist=[None, None, None, 0., 0., 0.])
+        if not delayed:
+            feed(engine, .2, reset=True)
+        feed(engine, .3, .3)
+        # The nominal replay floor now falls inside the earlier pose bracket.
+        feed(engine, 10.15, .3)
+        if delayed:
+            assert feed(engine, .2, reset=True)
+        return engine.current
+
+    ordered, delayed = run(False), run(True)
+    np.testing.assert_allclose(delayed.transform, ordered.transform)
+    np.testing.assert_allclose(delayed.noise, ordered.noise)
+    np.testing.assert_allclose(delayed.sensitivity, ordered.sensitivity)
+
+
+def test_replay_event_limit_freezes_complete_pose_bracket(monkeypatch):
+    monkeypatch.setattr('plugins.external_odometry_fusion._MAX_EVENTS', 4)
+    engine = ExternalOdometry()
+    feed(engine, 0., 0.)
+    for t in (.05, .1):
+        feed(engine, t, twist=[None, None, None, 0., 0., 0.])
+    feed(engine, .15, twist=[None, None, None, 0., 0., 0.])
+    for i in range(4, 12):
+        feed(engine, i*.05, i*.05)
+        assert len(engine.checkpoints) <= 4 and len(engine.raw_motion) <= 4
+        if i == 4:
+            assert engine.base.stamp == NS+200_000_000
+            assert not feed(engine, .1, reset=True)
+            assert engine.pending_output_states(NS)[-1].stamp == engine.current.stamp
+        assert engine.current.transform[0, 3] == pytest.approx(i*.05)

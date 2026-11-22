@@ -181,6 +181,101 @@ def test_external_learning_only_receives_accepted_native_visual_pose():
     assert observation['quaternion'] == [0., 0., 0., 1.]
 
 
+def test_external_native_visual_is_delivered_once_without_imu_and_recovers_from_bad_images():
+    from test_rgbd_fusion import images, warmed
+
+    fusion, anchor = warmed()
+    captures = CaptureObservations(fusion)
+    forwarded = []
+    captures.visual_sink = lambda *values: forwarded.append(values)
+    color, depth = images()
+
+    for step in range(1, 6):
+        stamp = anchor + step*100_000_000
+        pose, info = messages(stamp)
+        pose.child_frame_id = fusion.frame
+        pose.pose.pose.position.x = step*.01
+        captures.add_frame(stamp, color if step != 2 else color*0, depth, stamp)
+        captures.result('pose', pose, stamp+10_000_000)
+        captures.result('info', info, stamp+20_000_000)
+        captures.result('info', info, stamp+21_000_000)
+        # A missing IMU bracket can keep this capture queued for its own deadline.
+        if step == 1:
+            assert [item[0] for item in forwarded] == [stamp]
+    for step in range(1, 6):
+        captures.drain(anchor+650_000_000+step*100_000_000)
+    assert [(stamp, p['position'][0]) for stamp, _, p in forwarded] == [
+        (anchor+100_000_000, .01), (anchor+500_000_000, .05)]
+    assert fusion.filter.stamp == anchor
+
+
+@pytest.mark.parametrize('invalid', ['native_lost', 'few_inliers', 'covariance', 'unmatched_stamp'])
+def test_uncovered_native_visual_keeps_quality_and_exact_join_requirements(invalid):
+    from test_rgbd_fusion import images, warmed
+
+    fusion, anchor = warmed()
+    captures = CaptureObservations(fusion)
+    forwarded = []
+    captures.visual_sink = lambda *values: forwarded.append(values)
+    stamp = anchor + 50_000_000
+    pose, info = messages(stamp)
+    pose.child_frame_id = fusion.frame
+    if invalid == 'native_lost':
+        info.lost = True
+    elif invalid == 'few_inliers':
+        info.inliers = 9
+    elif invalid == 'covariance':
+        pose.pose.covariance[0] = -.01
+    else:
+        _, info = messages(stamp+1)
+    captures.add_frame(stamp, *images(), stamp)
+    captures.result('pose', pose, stamp+10_000_000)
+    captures.result('info', info, stamp+20_000_000)
+    captures.drain(stamp+800_000_000)
+    assert not forwarded
+    assert fusion.filter.stamp == anchor
+
+
+def test_native_visual_admission_does_not_depend_on_the_eskf_innovation(monkeypatch):
+    from test_rgbd_fusion import images, source, warmed
+
+    fusion, anchor = warmed()
+    captures = CaptureObservations(fusion)
+    forwarded = []
+    captures.visual_sink = lambda *values: forwarded.append(values)
+    monkeypatch.setattr(fusion.filter, 'correct', lambda *args, **kwargs: False)
+    stamp = anchor + 50_000_000
+    for t in range(anchor+5_000_000, stamp+1, 5_000_000):
+        fusion.observe_imu(source(t), t+1_000_000)
+    pose, info = messages(stamp)
+    pose.child_frame_id = fusion.frame
+    pose.pose.pose.position.x = .01
+    captures.add_frame(stamp, *images(), stamp)
+    captures.result('pose', pose, stamp+10_000_000)
+    output, = captures.result('info', info, stamp+20_000_000)
+    assert output['pose'] is None
+    assert [(t, p['position'][0]) for t, _, p in forwarded] == [(stamp, .01)]
+
+
+def test_external_native_visual_initializes_without_imu():
+    from test_rgbd_fusion import images, K
+    from plugins.rgbd_fusion import ShortTermFusion
+
+    fusion = ShortTermFusion('run', 'camera_optical', 'clock', K)
+    captures = CaptureObservations(fusion)
+    forwarded = []
+    captures.visual_sink = lambda *values: forwarded.append(values)
+    color, depth = images()
+    for step in range(3):
+        stamp = 1_000_000_000 + step*100_000_000
+        pose, info = messages(stamp)
+        captures.add_frame(stamp, color, depth, stamp)
+        captures.result('info', info, stamp+10_000_000)
+        captures.result('pose', pose, stamp+20_000_000)
+    assert [item[0] for item in forwarded] == [stamp]
+    assert fusion.filter is None
+
+
 @pytest.mark.parametrize('imu_resumes', ['same_capture', 'after_grace', 'next_capture', 'never'])
 def test_uncovered_native_result_does_not_end_running_fusion_before_watchdog(imu_resumes):
     from test_rgbd_fusion import images, source, warmed
@@ -673,3 +768,127 @@ def test_startup_can_fall_back_to_repeated_measured_visual_before_the_full_timeo
     assert session.fusion.reason is None
     session._check_initialization(6.)
     assert 'measured visual' in session.fusion.reason
+
+
+@pytest.mark.parametrize('through_session', [False, True])
+@pytest.mark.parametrize('with_sink', [False, True])
+def test_native_frame_fault_waits_for_earlier_eskf_correction(monkeypatch, through_session, with_sink):
+    from threading import Event, Lock
+    from plugins.rgbd_odometry_runtime import EstimateGate, RgbdSession
+    from test_rgbd_fusion import images, source, warmed
+
+    fusion, anchor = warmed()
+    captures = CaptureObservations(fusion)
+    session = RgbdSession.__new__(RgbdSession)
+    session.fusion, session.observations = fusion, captures
+    session.gate = EstimateGate(fusion.segment, fusion.frame, fusion.clock)
+    session.lock, session.stop_event = Lock(), Event()
+    forwarded = []
+    if with_sink:
+        captures.visual_sink = lambda stamp, *_: forwarded.append(stamp)
+    good, bad = anchor+50_000_000, anchor+100_000_000
+    color, depth = images()
+    for stamp in (good, bad):
+        now = stamp+10_000_000
+        monkeypatch.setattr('time.time_ns', lambda: now)
+        captures.add_frame(stamp, color, depth, now)
+        msg, info = messages(stamp)
+        msg.child_frame_id = fusion.frame if stamp == good else 'wrong_camera'
+        msg.pose.pose.position.x = .01
+        for kind, value in [('pose', msg), ('info', info)]:
+            if through_session:
+                session._result(kind, value)
+            else:
+                assert captures.result(kind, value, now) == []
+    assert list(captures.frames) == [good, bad]
+    assert fusion.state == 'tracking'
+    if with_sink:
+        assert forwarded == [good]
+        assert captures.external_gate.loss_kind == 'frame'
+
+    for t in range(anchor+5_000_000, good+1, 5_000_000):
+        fusion.observe_imu(source(t), now)
+    output, = captures.drain(now)
+    assert output['pose'] is not None
+    assert fusion.last_visual == good
+    assert list(captures.frames) == [bad]
+    for t in range(good+5_000_000, bad+1, 5_000_000):
+        fusion.observe_imu(source(t), now)
+    output, = captures.drain(now)
+    assert output['pose'] is None
+    assert fusion.state == 'lost' and fusion.loss_kind == 'frame'
+    assert fusion.last_visual == good
+
+
+def test_earlier_correction_is_publishable_when_imu_covers_both_queued_captures():
+    from test_rgbd_fusion import images, source, warmed
+
+    fusion, anchor = warmed()
+    captures = CaptureObservations(fusion)
+    captures.visual_sink = lambda *_: None
+    good, bad = anchor+50_000_000, anchor+100_000_000
+    color, depth = images()
+    for stamp in (good, bad):
+        pose, info = messages(stamp)
+        pose.child_frame_id = fusion.frame if stamp == good else 'wrong_camera'
+        captures.add_frame(stamp, color, depth, stamp)
+        captures.result('pose', pose, stamp)
+        captures.result('info', info, stamp)
+    for t in range(anchor+5_000_000, bad+1, 5_000_000):
+        fusion.observe_imu(source(t), bad)
+    # RgbdSession publishes each drain's samples under the current ESKF state.
+    earlier = captures.drain(bad)
+    assert fusion.state == 'tracking'
+    assert len(earlier) == 1 and earlier[0]['pose'] is not None
+    rejected, = captures.drain(bad)
+    assert rejected['pose'] is None and fusion.loss_kind == 'frame'
+
+
+@pytest.mark.parametrize('through_session', [False, True])
+def test_wrong_frame_duplicate_stops_later_native_delivery(monkeypatch, through_session):
+    from threading import Event, Lock
+    from plugins.rgbd_odometry_runtime import EstimateGate, RgbdSession
+    from test_rgbd_fusion import images, source, warmed
+
+    fusion, anchor = warmed()
+    captures = CaptureObservations(fusion)
+    session = RgbdSession.__new__(RgbdSession)
+    session.fusion, session.observations = fusion, captures
+    session.gate = EstimateGate(fusion.segment, fusion.frame, fusion.clock)
+    session.lock, session.stop_event = Lock(), Event()
+    forwarded = []
+    captures.visual_sink = lambda stamp, *_: forwarded.append(stamp)
+    earlier, duplicate, later = (anchor+i*1_000_000 for i in (25, 50, 100))
+    color, depth = images()
+    monkeypatch.setattr('time.time_ns', lambda: now)
+
+    def receive(kind, msg):
+        if through_session:
+            session._result(kind, msg)
+        else:
+            assert captures.result(kind, msg, now) == []
+
+    for stamp in (earlier, duplicate, later):
+        now = stamp+1_000_000
+        captures.add_frame(stamp, color, depth, now)
+        msg, info = messages(stamp)
+        msg.child_frame_id = fusion.frame
+        receive('pose', msg)
+        receive('info', info)
+        if stamp == duplicate:
+            assert forwarded == [earlier, duplicate]
+            wrong, _ = messages(stamp)
+            wrong.child_frame_id = 'wrong_camera'
+            receive('pose', wrong)
+            assert captures.external_gate.loss_kind == 'frame'
+    assert forwarded == [earlier, duplicate]
+    assert captures.external_gate.loss_kind == 'frame'
+    assert fusion.state == 'tracking' and fusion.filter.stamp == anchor
+
+    for t in range(anchor+5_000_000, duplicate+1, 5_000_000):
+        fusion.observe_imu(source(t), now)
+    corrected, = captures.drain(now)
+    assert corrected['pose'] is not None and fusion.last_visual == earlier
+    rejected, = captures.drain(now)
+    assert rejected['pose'] is None and fusion.loss_kind == 'frame'
+    assert forwarded == [earlier, duplicate]

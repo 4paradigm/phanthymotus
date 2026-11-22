@@ -624,6 +624,14 @@ def registration_report(sample, frontend, native=None, *, depth_enabled=False):
     }
 
 
+_NATIVE_FRAME_FAULT = 'native visual frame/segment changed; restart required'
+
+
+def _native_frame_changed(msg, segment, frame):
+    return (getattr(getattr(msg, 'header', None), 'frame_id', None) != segment+'_odom' or
+            getattr(msg, 'child_frame_id', None) != frame)
+
+
 class CaptureObservations:
     """Bounded exact-stamp joins with capture-order delivery and late-result discard."""
     MAX_IN_FLIGHT = 8
@@ -633,6 +641,8 @@ class CaptureObservations:
         self.fusion = fusion
         self.startup_gate = startup_gate
         self.visual_sink = None
+        self.external_gate = None
+        self.external_previous = None
         self.frames = OrderedDict()
         self.last_added = 0
         self.geometry_capture = None
@@ -658,7 +668,7 @@ class CaptureObservations:
         return min(MAX_VISUAL_RESULT_AGE_NS, max(250_000_000, latency, self.retry_wait_ns,
                                                  2*max(cadence, capture_period)))
 
-    def add_frame(self, stamp, color, depth, now):
+    def add_frame(self, stamp, color, depth, now, *, image_quality=None):
         outputs = self.drain(now)
         if stamp <= self.last_added:
             self.fusion.fault('fusion capture timestamp repeated or reset', 'input')
@@ -667,7 +677,7 @@ class CaptureObservations:
             return outputs
         self.last_added = stamp
         wait = self._wait_budget()
-        self.frames[stamp] = dict(color=color, depth=depth, added=now,
+        self.frames[stamp] = dict(color=color, depth=depth, image_quality=image_quality, added=now,
                                   deadline=min(now+wait, stamp+MAX_VISUAL_RESULT_AGE_NS))
         self.counts['queued'] += 1
         return outputs
@@ -683,6 +693,12 @@ class CaptureObservations:
         else:
             completes = kind not in entry and ('pose' if kind == 'info' else 'info') in entry
             entry[kind] = msg
+            if (kind == 'pose' and not entry.get('frame_fault') and
+                    _native_frame_changed(msg, self.fusion.segment, self.fusion.frame)):
+                entry['frame_fault'] = True
+                # A wrong-frame duplicate supersedes an earlier native decision.
+                # The ordered native drain must see the latched boundary once.
+                entry.pop('native_observation', None)
             self.counts[kind+'_joined'] += 1
             if completes:
                 self.native_delays.append(max(0, now-entry['added']))
@@ -697,6 +713,9 @@ class CaptureObservations:
 
     def _visual(self, stamp, entry):
         msg, info = entry.get('pose'), entry.get('info')
+        if (entry.get('frame_fault') or
+                (msg is not None and _native_frame_changed(msg, self.fusion.segment, self.fusion.frame))):
+            return None, _NATIVE_FRAME_FAULT
         if info is not None and info.lost:
             return None, 'native visual tracking lost'
         if info is None:
@@ -706,9 +725,6 @@ class CaptureObservations:
         if msg is None:
             return None, 'visual pose missing'
         try:
-            if msg.header.frame_id != self.fusion.segment+'_odom' or msg.child_frame_id != self.fusion.frame:
-                self.fusion.fault('native visual frame/segment changed; restart required', 'frame')
-                return None, 'visual frame changed'
             p, q = msg.pose.pose.position, msg.pose.pose.orientation
             pose = dict(position=[p.x, p.y, p.z], quaternion=[q.x, q.y, q.z, q.w],
                         frame_id=msg.header.frame_id, child_frame_id=msg.child_frame_id,
@@ -719,7 +735,66 @@ class CaptureObservations:
         except (ValueError, TypeError, AttributeError, np.linalg.LinAlgError):
             return None, 'invalid visual pose or covariance'
 
+    def _native_gate(self, now):
+        gate = self.external_gate
+        if gate is not None and (gate.last_pose is not None or gate.status(now) != 'lost' or
+                                 gate.loss_kind in ('frame', 'clock')):
+            return gate
+        self.external_previous = None
+        gate = EstimateGate(self.fusion.segment, self.fusion.frame, self.fusion.clock)
+        gate.recovery_policy = self.fusion.recovery_policy
+        # A newly attached sink can continue from the last capture-matched raw
+        # visual pose. Never seed from inertial prediction or a geometry update.
+        tracking = self.fusion.last_tracking
+        if (self.external_gate is None and tracking is not None and tracking[2] is not None and
+                0 <= now-self.fusion.last_visual_wall <= MAX_VISUAL_RESULT_AGE_NS):
+            gate.last_pose = (tracking[0], *pose_values(tracking[2]))
+            gate.state, gate.good, gate.last_stamp = 'tracking', 3, tracking[0]
+            gate.last_tracking_received = self.fusion.last_visual_wall
+            gate.anchor_info = self.last_tracking_info
+            self.external_previous = gate.last_pose
+        self.external_gate = gate
+        return gate
+
+    def _drain_external_visual(self, now):
+        # A complete native pair can serve the external filter even while an
+        # earlier ESKF capture is waiting for IMU or depth registration.
+        for stamp, entry in self.frames.items():
+            if 'native_observation' in entry:
+                continue
+            info = entry.get('info')
+            if (('pose' not in entry or info is None) and not getattr(info, 'lost', False)
+                    and now < entry['deadline']):
+                break  # Preserve capture order for native continuity checks.
+            visual, reason = entry['native_observation'] = self._visual(stamp, entry)
+            gate = self._native_gate(now)
+            gate.input(stamp, now_ns=now)
+            if visual is not None:
+                quality = entry['image_quality']
+                if quality is None:
+                    quality = observation_quality(entry['color'], entry['depth'])
+                candidate = (stamp, *pose_values(visual))
+                if not quality['visual_usable']:
+                    reason = 'image_' + quality['reason']
+                elif self.external_previous is not None and not gate._continuous(
+                        *candidate, anchor=self.external_previous):
+                    reason = 'discontinuous native visual observation'
+            if reason is not None:
+                self.external_previous = None
+                if reason == _NATIVE_FRAME_FAULT:
+                    gate.fault(reason, 'frame')
+                else:
+                    gate.degrade(reason, now, stamp=stamp, native_lost=getattr(info, 'lost', False))
+                continue
+            sample = gate.accept(entry['pose'], info, now)
+            if gate.good and gate.last_stamp == stamp:
+                self.external_previous = candidate
+            if sample is not None:
+                self.visual_sink(stamp, gate.segment, visual)
+
     def drain(self, now):
+        if self.visual_sink is not None:
+            self._drain_external_visual(now)
         outputs = []
         if self.geometry_capture is not None:
             self.fusion.poll_geometry(now)
@@ -731,12 +806,6 @@ class CaptureObservations:
         while self.frames:
             stamp, entry = next(iter(self.frames.items()))
             age = now-stamp
-            if age > MAX_VISUAL_RESULT_AGE_NS:
-                # A delayed delivery is unusable without changing the capture clock.
-                self.frames.pop(stamp)
-                self.counts['stale_capture'] += 1
-                self.expired.append(stamp)
-                continue
             ready = ('pose' in entry and 'info' in entry) or getattr(entry.get('info'), 'lost', False)
             coverage = bool(self.fusion.samples) and self.fusion.samples[-1][0] >= stamp
             if ('imu_deadline' not in entry and not coverage and self.fusion.filter is not None and
@@ -750,7 +819,20 @@ class CaptureObservations:
             visual_only_startup = self.fusion.filter is None and not self.fusion.samples
             if (not ready or (not coverage and not visual_only_startup)) and now < deadline:
                 break
+            if outputs and entry.get('frame_fault'):
+                # The session publishes returned samples using the current
+                # filter state. Deliver earlier corrections before faulting.
+                break
             self.frames.pop(stamp)
+            if entry.get('frame_fault'):
+                # The independent gate can inspect newer captures while the
+                # ESKF waits for IMU. Only this ordered drain faults the ESKF.
+                self.fusion.fault(_NATIVE_FRAME_FAULT, 'frame')
+            if age > MAX_VISUAL_RESULT_AGE_NS:
+                # A delayed delivery is unusable without changing the capture clock.
+                self.counts['stale_capture'] += 1
+                self.expired.append(stamp)
+                continue
             if not ready or (not coverage and not visual_only_startup):
                 self.counts['deadline_expired'] += 1
             if not ready:
@@ -763,7 +845,7 @@ class CaptureObservations:
                 self.counts['native_tracking_lost'] += 1
             if not coverage:
                 self.counts['imu_uncovered'] += 1
-            visual, reason = self._visual(stamp, entry)
+            visual, reason = entry.get('native_observation') or self._visual(stamp, entry)
             if age > MAX_FRAME_AGE_NS and (visual is None or not coverage):
                 # An older submitted frame is useful only with a matching
                 # measured correction and IMU coverage at its original stamp.
@@ -780,10 +862,6 @@ class CaptureObservations:
             self.counts['completed'] += 1
             sample = self.fusion.observe_frame(stamp, entry['color'], entry['depth'], visual, now,
                                                reason=reason, arrival_ns=entry['added'])
-            if self.visual_sink is not None and sample.get('pose') is not None:
-                tracking = self.fusion.last_tracking
-                if tracking is not None and tracking[0] == stamp and tracking[2] is not None:
-                    self.visual_sink(stamp, self.fusion.segment, tracking[2])
             probe = self.startup_gate
             if probe is not None:
                 if self.fusion.filter is not None:
@@ -1451,7 +1529,8 @@ class RgbdSession:
                              self._imu_frame_ready(capture_stamp, time.time_ns()))
                     if ready and not self.stop_event.is_set():
                         if self._fusing():
-                            for sample in self.observations.add_frame(capture_stamp, image, depth_image, time.time_ns()):
+                            for sample in self.observations.add_frame(capture_stamp, image, depth_image, time.time_ns(),
+                                                                      image_quality=image_quality):
                                 self._publish(sample)
                                 self.counts['estimates'] += 1
                             self._check_fusion(time.time_ns())
@@ -1750,26 +1829,29 @@ class RgbdSession:
             if self.stop_event.is_set():
                 return
             self._drain_imu()
-            # Frame identity is a session boundary even when an IMU failure
-            # has already stopped fusion and pending captures will be cleared.
-            if kind == 'pose' and (msg.header.frame_id != self.gate.segment+'_odom' or
-                                   msg.child_frame_id != self.gate.frame):
-                self.gate.fault('native visual frame or segment changed; restart required', 'frame')
-                if getattr(self, 'fusion', None) is not None:
-                    self.fusion.fault(self.gate.reason, 'frame')
-                return
+            now = time.time_ns()
+            if kind == 'pose' and _native_frame_changed(msg, self.gate.segment, self.gate.frame):
+                # A live fusion capture owns its frame decision in capture
+                # order. Outside that queue the session boundary is immediate.
+                entry = (self.observations.frames.get(stamp_ns(msg)) if self._fusing() and
+                         self.fusion.state != 'lost' else None)
+                if entry is None or now > entry['deadline']:
+                    self.gate.fault(_NATIVE_FRAME_FAULT, 'frame')
+                    if getattr(self, 'fusion', None) is not None:
+                        self.fusion.fault(_NATIVE_FRAME_FAULT, 'frame')
+                    return
             if kind == 'info' and hasattr(self, 'registration_by_stamp'):
                 self._remember_native(msg)
                 if stamp_ns(msg) == getattr(self, 'probe_stamp', None):
                     self.probe_ack.set()
             if self._fusing():
                 if self.gate.state != 'lost':
-                    for sample in self.observations.result(kind, msg, time.time_ns()):
+                    for sample in self.observations.result(kind, msg, now):
                         self._publish(sample)
                         self.counts['estimates'] += 1
                     self._check_fusion(time.time_ns())
                 return
-            stamp, now = stamp_ns(msg), time.time_ns()
+            stamp = stamp_ns(msg)
             if (getattr(self, 'fallback', None) is not None and stamp <= self.observations.last_added
                     and stamp not in self.results[kind]):
                 # Only incomplete native measurements retained at startup can finish here.

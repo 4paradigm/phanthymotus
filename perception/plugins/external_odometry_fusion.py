@@ -9,7 +9,7 @@ import uuid
 
 import numpy as np
 
-from .external_motion_learning import ExternalMotionLearner, se3_exp, se3_log
+from .external_motion_learning import ExternalMotionLearner, se3_exp, se3_log, se3_right_jacobian
 from .pointcloud_slam_transforms import rigid
 from .rgbd_fusion import quaternion
 from .rgbd_imu import rotation_from_quaternion
@@ -17,7 +17,7 @@ from .rgbd_imu import rotation_from_quaternion
 _HISTORY_NS = 10_000_000_000
 _MAX_EVENTS = 512
 _MAX_INTERVAL_NS = 1_500_000_000
-_LEG_ATTITUDE_INTERVAL_NS = 250_000_000
+_ATTITUDE_INTERVAL_NS = 250_000_000
 _FULL = np.ones(6, dtype=bool)
 _ANGULAR = np.array([False, False, False, True, True, True])
 _DEFAULT_VARIANCE = np.square([.025, .025, .035, .03, .03, .03])
@@ -100,12 +100,10 @@ def _positive_covariance(matrix):
     return normalized * scale
 
 
-def _bumi_pose_covariance(record, length_scale):
+def _optional_covariance(value, units):
     try:
-        covariance = _vector(record.get('covariance'), (36,)).reshape(6, 6)
-        if not covariance.any():
-            return None
-        units = np.array([length_scale] * 3 + [1.] * 3)
+        covariance = _vector(value, (36,)).reshape(6, 6)
+        units = np.asarray(units)
         with np.errstate(over='ignore', invalid='ignore'):
             return _positive_covariance(covariance * units[:, None] * units)
     except (TypeError, ValueError, OverflowError, np.linalg.LinAlgError):
@@ -119,17 +117,17 @@ class Motion:
     mask: np.ndarray
     origin: tuple
     reset: bool
-    variance: np.ndarray
+    covariance: np.ndarray
     model: tuple | None
-    cumulative_pose_covariance: np.ndarray | None = None
+    process_covariance: np.ndarray | None = None
     body_from_sensor: np.ndarray | None = None
     body_angular_velocity: np.ndarray | None = None
 
     def order_key(self):
         vector = self.pose if self.pose is not None else self.twist
-        covariance = self.cumulative_pose_covariance
+        covariance = self.process_covariance
         return (self.reset, self.pose is not None, vector.tobytes() if vector is not None else b'',
-                self.mask.tobytes(), repr(self.origin), self.variance.tobytes(), repr(self.model),
+                self.mask.tobytes(), repr(self.origin), self.covariance.tobytes(), repr(self.model),
                 covariance is not None, covariance.tobytes() if covariance is not None else b'',
                 self.body_from_sensor.tobytes() if self.body_from_sensor is not None else b'',
                 self.body_angular_velocity.tobytes() if self.body_angular_velocity is not None else b'')
@@ -158,33 +156,42 @@ def decode_motion(packet, receipt_ns):
     mount = rigid(sensor) if sensor is not None else None
     record = packet.get('pose')
     pose = pose_matrix(record) if isinstance(record, dict) else None
-    cumulative_pose_covariance = None
+    process_covariance = None
     body_angular_velocity = None
     if pose is not None:
         length_scale = _scale(packet, 'length_scale_m')
         pose[:3, 3] *= length_scale
-        # PR #471's leg producer accumulates random-walk covariance in
-        # its odometry frame. Generic pose producers make no such guarantee.
-        if vendor.get('source') == 'bumi_leg_kinematics':
-            cumulative_pose_covariance = _bumi_pose_covariance(record, length_scale)
-            rate = packet.get('twist')
-            if mount is None and isinstance(rate, (list, tuple)) and len(rate) == 6:
-                try:
-                    body_angular_velocity = _vector(rate[3:], (3,)) * _scale(packet, 'angular_scale_radps')
-                except (TypeError, ValueError, OverflowError):
-                    pass  # Attitude continuity is optional evidence.
+        # Explicit cumulative process noise in this pose origin's world axes.
+        # Total pose covariance is not generally an additive process accumulator.
+        process_covariance = _optional_covariance(record.get('process_covariance'),
+                                                  [length_scale]*3 + [1.]*3)
+        rate = packet.get('twist')
+        if isinstance(rate, (list, tuple)) and len(rate) == 6:
+            try:
+                body_angular_velocity = _vector(rate[3:], (3,)) * _scale(packet, 'angular_scale_radps')
+                if mount is not None:
+                    body_angular_velocity = mount[:3, :3] @ body_angular_velocity
+            except (TypeError, ValueError, OverflowError):
+                pass  # Attitude continuity is optional evidence.
     if pose is not None and mount is not None:
         pose = pose @ np.linalg.inv(mount)
     planar = packet.get('motion_model') == 'planar'
     pose_mask = np.array([True, True, False, False, False, True]) if planar else _FULL
     twist, mask = None, pose_mask if pose is not None else np.zeros(6, dtype=bool)
+    covariance = np.diag(_DEFAULT_VARIANCE)
     if pose is None and isinstance(packet.get('twist'), (list, tuple)) and len(packet['twist']) == 6:
         mask = np.array([value is not None for value in packet['twist']])
         twist = _vector([0. if value is None else value for value in packet['twist']], (6,))
-        twist *= [_scale(packet, 'linear_scale_mps')]*3 + [_scale(packet, 'angular_scale_radps')]*3
+        units = [_scale(packet, 'linear_scale_mps')]*3 + [_scale(packet, 'angular_scale_radps')]*3
+        twist *= units
+        supplied = _optional_covariance(packet.get('twist_covariance'), units)
+        if supplied is not None:
+            # A zero marginal is conventionally unspecified in legacy inputs.
+            covariance = supplied + np.diag(np.where(supplied.diagonal() > 0., 0., _DEFAULT_VARIANCE))
         if mount is not None:
             adjoint = _adjoint(mount)
             twist = adjoint @ twist
+            covariance = adjoint @ covariance @ adjoint.T
             mask = ~((np.abs(adjoint)[:, ~mask] > 1e-10).any(axis=1))
         if not mask.any():
             twist = None
@@ -192,32 +199,26 @@ def decode_motion(packet, receipt_ns):
     if pose is None and twist is None and not reset:
         raise ValueError('no usable external pose or twist')
     origin = (record.get('frame_id'), record.get('child_frame_id')) if pose is not None else ()
-    variance = _DEFAULT_VARIANCE
-    uncertainty = packet.get('twist_covariance') if pose is None else None
-    if uncertainty is not None:
-        diagonal = _vector(uncertainty, (36,)).reshape(6, 6).diagonal()
-        variance = np.where(diagonal > 0., diagonal, _DEFAULT_VARIANCE)
     model = ('planar' if planar else 'pose',) if pose is not None else ('twist',) if twist is not None else None
-    return stamp, Motion(pose, twist, mask, origin, reset, variance, model,
-                         cumulative_pose_covariance, mount if cumulative_pose_covariance is not None else None,
+    return stamp, Motion(pose, twist, mask, origin, reset, covariance, model,
+                         process_covariance, np.eye(4) if mount is None else mount,
                          body_angular_velocity)
 
 
-def _leg_origin_attitude(left, right, duration_ns):
-    """Carry SDK body attitude through an automatic leg-position rebase."""
-    if (duration_ns > _LEG_ATTITUDE_INTERVAL_NS or left.reset or right.reset or
+def _origin_attitude(left, right, duration_ns):
+    """Carry only measured attitude corroborated by body rates across origins."""
+    if (duration_ns > _ATTITUDE_INTERVAL_NS or left.reset or right.reset or
             left.body_angular_velocity is None or right.body_angular_velocity is None or
             not all(left.origin) or not all(right.origin) or left.origin[1] != right.origin[1]):
         return None
-    # The leg contact origin rebases translation, while SDK attitude remains
-    # in its controller frame. Require both endpoints' measured angular rate
-    # to support the relative quaternion before using it across that boundary.
+    # A producer can rebase position while retaining its attitude reference.
+    # Require numeric agreement with both endpoint rates before crossing it.
     change = np.eye(4)
     change[:3, :3] = left.pose[:3, :3].T @ right.pose[:3, :3]
     measured = se3_log(change)
     seconds = duration_ns / 1e9
     predicted = .5 * (left.body_angular_velocity + change[:3, :3] @ right.body_angular_velocity) * seconds
-    # Allow endpoint-rate sampling error during the short contact transition.
+    # Allow endpoint-rate sampling error during a short reference transition.
     tolerance = np.deg2rad(2.) + .3 * np.linalg.norm(predicted)
     error = np.linalg.norm(measured[3:] - predicted)
     if not np.isfinite(error) or error > tolerance:
@@ -225,9 +226,9 @@ def _leg_origin_attitude(left, right, duration_ns):
     return measured / seconds
 
 
-def _leg_increment_covariance(left, right, velocity, elapsed_s, fraction, at_measured_end):
+def _pose_increment_covariance(left, right, velocity, elapsed_s, fraction, at_measured_end):
     """Map the growth in upstream odometry axes into the step's end body axes."""
-    start, end = left.cumulative_pose_covariance, right.cumulative_pose_covariance
+    start, end = left.process_covariance, right.process_covariance
     mount = right.body_from_sensor
     if (start is None or end is None or not all(left.origin) or
             not np.array_equal(left.body_from_sensor, mount)):
@@ -236,13 +237,18 @@ def _leg_increment_covariance(left, right, velocity, elapsed_s, fraction, at_mea
         growth = _positive_covariance(end - start)
         if growth is None:
             return None
-        body = right.pose if at_measured_end else left.pose @ se3_exp(velocity * elapsed_s)
-        sensor = body @ mount if mount is not None else body
+        sensor = right.pose @ mount if mount is not None else right.pose
         axes = np.eye(4)
         axes[:3, :3] = sensor[:3, :3].T
         transport = _adjoint(axes)
         if mount is not None:
             transport = _adjoint(mount) @ transport
+        if not at_measured_end:
+            # The accumulator describes error at the measured endpoint. Split
+            # its growth in that tangent, then carry it back along the remaining
+            # motion so later propagation cannot add the same lever arm twice.
+            body = left.pose @ se3_exp(velocity * elapsed_s)
+            transport = _adjoint(np.linalg.inv(body) @ right.pose) @ transport
         step = transport @ (growth * fraction) @ transport.T
     return .5 * step + .5 * step.T if np.isfinite(step).all() else None
 
@@ -262,6 +268,7 @@ class _State:
     last_update: str | None = None
     motion_since_visual: bool = False
     motion_model: tuple | None = None
+    visual_carry: tuple | None = None
 
     @property
     def covariance(self):
@@ -308,9 +315,17 @@ class ExternalOdometry:
         prior = self.raw_motion.get(stamp)
         if stamp <= self.base.stamp or (prior is not None and prior.order_key() >= motion.order_key()):
             return False
-        previous = max((key for key in self.raw_motion if key < stamp), default=stamp-1)
+        times = sorted(self.raw_motion)
+        index = bisect_left(times, stamp)
+        previous = times[index-1] if index else stamp-1
+        if motion.pose is not None or index < len(times):
+            # A pose can complete an interval across partial reports. Inserting
+            # or replacing *any* endpoint can also break an existing bracket,
+            # invalidating every interpolated checkpoint after its left pose.
+            first = self._pose_start(times, index-1)
+            if first is not None:
+                previous = times[first]
         self.raw_motion[stamp] = motion
-        # The new right endpoint changes only motion after the preceding sample.
         self._changed(previous+1)
         return True
 
@@ -336,13 +351,44 @@ class ExternalOdometry:
             self._pose_intervals.move_to_end(key)
             return cached[2], cached[3]
         velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / ((t1-t0) / 1e9)
-        covariance = _leg_increment_covariance(left, right, velocity, (end-t0)/1e9,
-                                               overlap/(t1-t0), end == t1)
+        covariance = _pose_increment_covariance(left, right, velocity, (end-t0)/1e9,
+                                                overlap/(t1-t0), end == t1)
         self._pose_intervals[key] = (left, right, velocity, covariance)
         self._pose_intervals.move_to_end(key)
         if len(self._pose_intervals) > _MAX_EVENTS:
             self._pose_intervals.popitem(last=False)
         return velocity, covariance
+
+    def _pose_start(self, times, index):
+        while index >= 0:
+            candidate = self.raw_motion[times[index]]
+            if candidate.pose is not None:
+                return index
+            if candidate.reset or candidate.twist is None or candidate.mask.all():
+                break
+            index -= 1
+        return None
+
+    def _pose_bracket(self, times, t0, t1):
+        """Accepted pose endpoints around partial reports, without a reset."""
+        first = self._pose_start(times, bisect_right(times, t0)-1)
+        if first is None:
+            return None
+        last = bisect_left(times, t1)
+        while last < len(times) and self.raw_motion[times[last]].pose is None:
+            candidate = self.raw_motion[times[last]]
+            if candidate.reset or candidate.twist is None or candidate.mask.all():
+                return None
+            last += 1
+        if last >= len(times):
+            return None
+        begin, end = times[first], times[last]
+        left, right = self.raw_motion[begin], self.raw_motion[end]
+        if (begin >= end or end-begin > _MAX_INTERVAL_NS or right.reset or
+                left.origin != right.origin or left.model != right.model or
+                any(self.raw_motion[t].reset for t in times[first+1:last])):
+            return None
+        return begin, end, left, right
 
     def _intervals(self, times, begin, end):
         """Return ordered clipped raw intervals in the producer's body tangent."""
@@ -350,28 +396,50 @@ class ExternalOdometry:
         last = min(len(times)-1, bisect_left(times, end))
         for t0, t1 in zip(times[first:last], times[first+1:last+1]):
             left, right = self.raw_motion[t0], self.raw_motion[t1]
-            if right.reset or t1-t0 > _MAX_INTERVAL_NS or left.model != right.model:
+            if right.reset or t1-t0 > _MAX_INTERVAL_NS:
                 continue
             clipped_end = min(t1, end)
             overlap = clipped_end - max(t0, begin)
             if overlap <= 0:
                 continue
             increment_covariance = None
-            if left.origin != right.origin:
-                velocity = _leg_origin_attitude(left, right, t1-t0)
+            bracket = (self._pose_bracket(times, t0, t1)
+                       if left.pose is None or right.pose is None else None)
+            if bracket is not None:
+                p0, p1, pose_left, pose_right = bracket
+                velocity, increment_covariance = self._pose_interval(
+                    p0, p1, pose_left, pose_right, clipped_end, overlap)
+                mask = pose_left.mask & pose_right.mask
+                covariance = pose_left.covariance
+            elif left.model != right.model:
+                # Only a pose with a measured rate and an angular-only report
+                # can carry gyro through loss or recovery of translation.
+                pose, partial = (left, right) if left.pose is not None else (right, left)
+                if (pose.body_angular_velocity is None or partial.twist is None or
+                        partial.mask[:3].any() or left.reset):
+                    continue
+                rate = left.twist[3:] if left.twist is not None else left.body_angular_velocity
+                velocity = np.r_[np.zeros(3), rate]
+                mask = _ANGULAR & left.mask & right.mask
+                covariance = left.covariance
+            elif left.origin != right.origin:
+                velocity = _origin_attitude(left, right, t1-t0)
                 if velocity is None:
                     continue
                 mask = _ANGULAR & left.mask & right.mask
+                covariance = left.covariance
             elif left.pose is not None and right.pose is not None:
                 velocity, increment_covariance = self._pose_interval(t0, t1, left, right, clipped_end, overlap)
                 mask = left.mask & right.mask
+                covariance = left.covariance
             elif left.twist is not None and right.twist is not None:
                 mask = left.mask & right.mask
                 velocity = np.where(mask, left.twist, 0.)
+                covariance = left.covariance
             else:
                 continue
             if mask.any():
-                yield np.where(mask, velocity, 0.), overlap/1e9, mask, right.variance, increment_covariance
+                yield np.where(mask, velocity, 0.), overlap/1e9, mask, covariance, increment_covariance
 
     def _learned_step(self, learner, velocity, dt, observed):
         # Delayed visual measurements often replay the same measured motion.
@@ -381,7 +449,8 @@ class ExternalOdometry:
         if step is None:
             twist = learner.corrected_velocity(velocity, observed)
             delta = se3_exp(twist * dt)
-            step = (twist, delta, _adjoint(np.linalg.inv(delta)))
+            differential = se3_right_jacobian(twist * dt) if learner.enabled else None
+            step = (twist, delta, _adjoint(np.linalg.inv(delta)), differential)
             self._learned_steps[key] = step
             if len(self._learned_steps) > _MAX_EVENTS:
                 self._learned_steps.popitem(last=False)
@@ -393,25 +462,33 @@ class ExternalOdometry:
         transform, noise, sensitivity = state.transform, state.noise, state.sensitivity
         motion = self.raw_motion.get(stamp)
         model = motion.model if motion is not None and motion.model is not None else state.motion_model
+        if motion is not None and motion.pose is None:
+            bracket = self._pose_bracket(motion_times, stamp, stamp)
+            if bracket is not None:
+                model = bracket[2].model
         learner = state.learner
         if state.motion_model is not None and model != state.motion_model:
             noise, sensitivity = state.covariance, np.zeros((6, 12))
             learner = ExternalMotionLearner(enabled=learner.enabled)
         mask = np.zeros(6, dtype=bool)
         twist = None
-        for velocity, dt, observed, variance, increment in self._intervals(motion_times, state.stamp, stamp):
-            twist, delta, adjoint = self._learned_step(learner, velocity, dt, observed)
+        for velocity, dt, observed, covariance, increment in self._intervals(motion_times, state.stamp, stamp):
+            twist, delta, adjoint, differential = self._learned_step(learner, velocity, dt, observed)
             transform = transform @ delta
+            scales = np.exp(learner.parameters[:6]) * observed
             if increment is None:
-                process_noise = np.diag(np.where(observed, variance, .25) * dt)
+                # Preserve the stream's variance-per-second propagation while
+                # retaining its full spatial covariance and learned unit scale.
+                process_noise = covariance * np.outer(scales, scales) * dt
             else:
                 # The increment already covers dt. Apply the learned velocity
                 # scales and retain the default uncertainty on unobserved axes.
-                scales = np.exp(learner.parameters[:6]) * observed
-                process_noise = increment * np.outer(scales, scales) + np.diag(np.where(observed, 0., .25 * dt))
+                process_noise = increment * np.outer(scales, scales)
+            process_noise = process_noise + np.diag(np.where(observed, 0., .25 * dt))
             noise = adjoint @ noise @ adjoint.T + process_noise
             if learner.enabled:
-                sensitivity = adjoint @ sensitivity + learner.velocity_parameter_jacobian(velocity, observed)*dt
+                sensitivity = (adjoint @ sensitivity +
+                               differential @ learner.velocity_parameter_jacobian(velocity, observed)*dt)
             mask |= observed
         interval_update = mask.any()
         return replace(state, stamp=stamp, transform=transform, noise=noise, sensitivity=sensitivity,
@@ -435,11 +512,25 @@ class ExternalOdometry:
                            visual=visual, training=visual, mask=_FULL if seeded else state.mask,
                            noise=np.diag(variance) if seeded else state.noise,
                            last_update='vision' if seeded else state.last_update,
+                           visual_carry=(np.zeros((6, 6)), np.zeros((6, 12))) if seeded else
+                                        (state.noise + np.diag(variance), state.sensitivity),
                            motion_since_visual=False)
+        if same_segment and not state.motion_since_visual:
+            # The new native pose supplies the motion AND the measurement.
+            # Updating a prior propagated with it as if independent would count
+            # that evidence twice. Carry the fixed alignment uncertainty and
+            # replace the previous native measurement's noise with the new one.
+            delta = np.linalg.inv(state.visual[2]) @ observed
+            adjoint = _adjoint(np.linalg.inv(delta))
+            carry_noise, carry_sensitivity = state.visual_carry
+            carry_noise = adjoint @ carry_noise @ adjoint.T
+            carry_sensitivity = adjoint @ carry_sensitivity
+            return replace(state, transform=state.transform @ delta,
+                           noise=carry_noise + np.diag(variance), sensitivity=carry_sensitivity,
+                           visual=visual, training=visual, mask=_FULL, last_update='vision',
+                           visual_carry=(carry_noise, carry_sensitivity))
         target = alignment @ observed
         predicted = state.transform
-        if same_segment and not state.motion_since_visual:
-            predicted = predicted @ np.linalg.inv(state.visual[2]) @ observed
         residual = se3_log(np.linalg.inv(predicted) @ target)
         diag = np.diag(state.covariance)
         gain = np.clip(diag / (diag + variance), 0., .8)
@@ -454,6 +545,9 @@ class ExternalOdometry:
         reframe = _adjoint(axes)
         noise = reframe @ noise @ reframe.T
         sensitivity = reframe @ damping @ state.sensitivity
+        # For a following visual-only interval, posterior-minus-current-visual
+        # contains (I-K) of both prior and visual error, not K of visual error.
+        carry_noise = reframe @ damping @ (state.noise + np.diag(variance)) @ damping @ reframe.T
         if np.any(correction != applied):
             # A finite SE(3) log's linear part is not a pose-origin offset.
             # Keep the actual unresolved mean error in the bounded body axes.
@@ -461,6 +555,7 @@ class ExternalOdometry:
             axes[:3, :3] = transform[:3, :3].T
             unapplied = _adjoint(axes) @ _world_pose_offset(transform, nominal)
             noise = noise + np.outer(unapplied, unapplied)
+            carry_noise = carry_noise + np.outer(unapplied, unapplied)
         learner = state.learner
         training = visual
         previous = state.training[0]
@@ -482,6 +577,7 @@ class ExternalOdometry:
             training = state.training
         return replace(state, transform=transform, noise=noise, sensitivity=sensitivity,
                        learner=learner, visual=visual, training=training, mask=_FULL, last_update='vision',
+                       visual_carry=(carry_noise, sensitivity),
                        motion_since_visual=False)
 
     def _rebuild(self, begin):
@@ -495,19 +591,29 @@ class ExternalOdometry:
                 state = self._correct(state, *self.raw_vision[stamp], times)
             self.checkpoints[stamp] = state
         self.current = state
-        cutoff = max(state.stamp-_HISTORY_NS, events[max(0, len(events)-_MAX_EVENTS)] if len(events) > _MAX_EVENTS else 0)
-        # Retain an external endpoint so the first interval after a checkpoint
-        # can still be recomputed from the original samples.
         all_times = sorted(self.checkpoints)
-        if len(all_times) > _MAX_EVENTS:
-            cutoff = max(cutoff, all_times[-_MAX_EVENTS])
-        cut = max((stamp for stamp in all_times if stamp <= cutoff), default=0)
+        time_index = bisect_right(all_times, state.stamp-_HISTORY_NS)-1
+        cut = all_times[time_index] if time_index >= 0 else self.base.stamp
+        if cut > self.base.stamp:
+            # A partial checkpoint inside an open or completed pose interval
+            # can still change when a later in-window endpoint is amended.
+            first = self._pose_start(times, bisect_right(times, cut)-1)
+            if first is not None and cut-times[first] <= _MAX_INTERVAL_NS:
+                cut = times[first]
+        if len(all_times) >= _MAX_EVENTS:
+            capacity_cut = all_times[-_MAX_EVENTS]
+            if capacity_cut > cut:
+                # If the event cap forces a completed bracket out, freeze at
+                # its closing measurement, never at a synthetic checkpoint.
+                bracket = self._pose_bracket(times, capacity_cut, capacity_cut)
+                cut = bracket[1] if bracket is not None else capacity_cut
         if cut > self.base.stamp:
             self.base = self.checkpoints[cut]
             predecessor = max((stamp for stamp in times if stamp <= cut), default=cut)
             self.raw_motion = {stamp: event for stamp, event in self.raw_motion.items() if stamp >= predecessor}
             self.raw_vision = {stamp: event for stamp, event in self.raw_vision.items() if stamp > cut}
-            self.checkpoints = {stamp: checkpoint for stamp, checkpoint in self.checkpoints.items() if stamp > cut}
+            # The closing measurement may be the newest publishable state.
+            self.checkpoints = {stamp: checkpoint for stamp, checkpoint in self.checkpoints.items() if stamp >= cut}
 
     def pending_output_states(self, earliest_stamp):
         """Find new measurement checkpoints that can still be published."""

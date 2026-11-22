@@ -4,7 +4,7 @@ from copy import deepcopy
 import numpy as np
 import pytest
 
-from plugins.external_motion_learning import ExternalMotionLearner, se3_exp, se3_log
+from plugins.external_motion_learning import ExternalMotionLearner, se3_exp, se3_log, se3_right_jacobian
 
 
 def _pose(intervals, scale=None, bias=None):
@@ -37,6 +37,23 @@ def test_body_increment_log_exp_round_trip(motion):
     np.testing.assert_allclose(se3_log(transform), motion, atol=1e-8)
     if motion[-1] and motion[0]:
         assert not np.allclose(transform[:3, 3], motion[:3])
+
+
+@pytest.mark.parametrize("motion", [
+    [1.7, -2.2, .9, -1.2, .8, 2.4],
+    [-.8, .3, 1.2, 1e-9, -2e-9, 3e-9],
+    [0.] * 6,
+])
+def test_se3_right_jacobian_matches_body_local_exponential_derivative(motion):
+    motion = np.array(motion)
+    inverse = np.linalg.inv(se3_exp(motion))
+    epsilon = 1e-6
+    columns = []
+    for delta in epsilon * np.eye(6):
+        plus = se3_log(inverse @ se3_exp(motion + delta))
+        minus = se3_log(inverse @ se3_exp(motion - delta))
+        columns.append((plus - minus) / (2. * epsilon))
+    np.testing.assert_allclose(se3_right_jacobian(motion), np.column_stack(columns), atol=2e-9)
 
 
 def test_mixed_motion_learning_improves_independent_blind_interval():
@@ -86,6 +103,47 @@ def test_only_one_measured_angular_axis_can_receive_bias():
     np.testing.assert_allclose(se3_log(result)[-1], (.9 * .6 + known_bias) * .5, atol=.005)
     jacobian = learner.velocity_parameter_jacobian([None, None, None, None, None, .6], yaw_only)
     assert np.count_nonzero(jacobian) == 2
+
+
+@pytest.mark.parametrize("axes", [[5], [0, 1, 5]])
+def test_unmeasured_roll_then_pitch_cannot_train_yaw_bias(axes):
+    learner = ExternalMotionLearner()
+    mask = np.isin(np.arange(6), axes)
+    motion = [(np.zeros(6), .5, mask)]
+    visual = se3_exp(np.array([0., 0., 0., .2, 0., 0.])) @ se3_exp(
+        np.array([0., 0., 0., 0., .2, 0.]))
+    prior = learner.covariance.copy()
+    for index in range(16):
+        _add(learner, index, motion, visual)
+    np.testing.assert_array_equal(learner.parameters, 0.)
+    np.testing.assert_array_equal(learner.covariance, prior)
+
+
+@pytest.mark.parametrize("tilt, sigma, eligible", [
+    (.004, .01, True),
+    (.02, .003, False),
+    (.20, 1., False),
+])
+def test_missing_rotation_gate_uses_visual_precision(tilt, sigma, eligible):
+    learner = ExternalMotionLearner()
+    motion = [(np.zeros(6), .5, np.eye(6, dtype=bool)[5])]
+    visual = se3_exp(np.array([.4, 0., 0., tilt, 0., -.05]))
+    for index in range(8):
+        start = index * 500_000_000
+        learner.add(start, start + 500_000_000, motion, visual, noise=np.full(6, sigma))
+    assert learner.info()["bias"][5] == pytest.approx(-.1 if eligible else 0., abs=1e-6)
+
+
+def test_supported_planar_motion_still_calibrates_with_unobserved_height():
+    learner = ExternalMotionLearner()
+    mask = np.array([True, True, False, False, False, True])
+    bias = np.array([.04, -.02, 0., 0., 0., -.07])
+    for index in range(8):
+        velocity = np.array([.5, -.3, 0., 0., 0., .8]) * (-1)**index
+        visual = se3_exp((velocity + bias) * .5)
+        visual[2, 3] = .4
+        _add(learner, index, [(velocity, .5, mask)], visual)
+    np.testing.assert_allclose(learner.info()["bias"], bias, atol=1e-5)
 
 
 def test_constant_speed_reports_unobservable_scale_bias_split():
