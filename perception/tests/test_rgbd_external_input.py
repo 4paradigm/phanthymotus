@@ -14,6 +14,7 @@ from plugins.rgbd_body_mount import CaptureMounts
 from plugins.rgbd_odometry import RgbdOdometryPlugin
 from test_external_odometry_fusion import attitude_packet, packet, pose_at
 from plugins.external_odometry_fusion import decode_motion
+from plugins.pointcloud_slam_odom import decode_slam_odom
 from test_pointcloud_slam_stream import stream as slam_stream
 from test_rgbd_odometry_contract import declarations
 from test_rgbd_odometry_status import sessions  # noqa: F401
@@ -206,6 +207,213 @@ def test_fusion_backlog_keeps_measured_pose_brackets_without_publishing_stale_po
         stamps = [json.loads(msg)['vendor']['motus_slam']['stamp_ns'] for msg in stream.publisher.messages]
         assert stamps == [2_700_000_000, 2_800_000_000]
         assert stream.dropped == 2
+    finally:
+        stream.close()
+
+
+def test_visual_backlog_publishes_fresh_measured_captures(sessions, monkeypatch):
+    _, now, _ = sessions
+    tick = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: tick[0])
+    stream = fusion_input()
+    try:
+        now[0] = 1_210_000_000
+        for stamp, x in ((1_000_000_000, 0.), (1_100_000_000, .1), (1_200_000_000, .2)):
+            stream.visual(stamp, 'native', dict(position=[x, 0., 0.], quaternion=[0., 0., 0., 1.]))
+        tick[0] = .35
+        now[0] = 1_560_000_000
+        stream._apply_ready(stream._take_ready())
+        samples = [decode_slam_odom(json.loads(msg)) for msg in stream.publisher.messages]
+        assert [sample.stamp_ns for sample in samples] == [1_000_000_000, 1_100_000_000, 1_200_000_000]
+        assert [sample.position[0] for sample in samples] == pytest.approx([0., .1, .2])
+        assert len({sample.segment_id for sample in samples}) == 1
+        assert stream.dropped == 0
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize('boundary', ['none', 'before_bracket', 'after_bracket', 'malformed'])
+def test_visual_backlog_keeps_dynamic_mount_evidence_and_boundaries(sessions, monkeypatch, boundary):
+    _, now, _ = sessions
+    tick = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: tick[0])
+    now[0] = 1_310_000_000
+    stream = rgbd_external_input.ExternalOdometryInput('/fused/state/odom', dict(
+        frame_id='camera', body_mount=dict(topic='/mount'), external_topic='/external',
+        external_candidates=['/external']), learning=False)
+
+    def mount(stamp, x):
+        stream._receive_mount(NS(data=json.dumps(dict(
+            stamp_ns=stamp, matrix=None if x is None else pose_at(x).tolist()))))
+
+    try:
+        for at in (0., .1):
+            stream._receive('/external', NS(data=json.dumps(packet(at, 100.+at))))
+        stream._apply_ready(stream._take_ready())
+        mount(1_100_000_000, 1.)
+        for stamp, x in ((1_100_000_000, 1.1), (1_200_000_000, 2.2)):
+            stream.visual(stamp, 'native', dict(position=[x, 0., 0.], quaternion=[0., 0., 0., 1.]))
+        if boundary == 'before_bracket':
+            mount(1_200_000_000, None)
+        mount(1_300_000_000, 3.)  # Arrives after the visual capture needing interpolation.
+        if boundary == 'after_bracket':
+            mount(1_200_000_000, None)
+        elif boundary == 'malformed':
+            stream._receive_mount(NS(data=json.dumps(dict(stamp_ns=1_200_000_000, matrix=[[1.]]))))
+        tick[0] = .35
+        now[0] = 1_660_000_000
+        stream._apply_ready(stream._take_ready())
+        if boundary != 'none':
+            assert len(stream.publisher.messages) == 1
+            assert stream._camera_mount(1_200_000_000) is None
+            if boundary == 'malformed':
+                assert stream.last_error is not None
+                mount(1_100_000_000, 1.)
+                mount(1_300_000_000, 3.)
+            else:
+                mount(1_200_000_000, 2.)
+            stream._apply_ready(stream._take_ready())
+        packets = [json.loads(msg) for msg in stream.publisher.messages]
+        samples = [decode_slam_odom(item) for item in packets]
+        assert [sample.stamp_ns for sample in samples] == [1_100_000_000, 1_200_000_000]
+        assert [sample.position[0] for sample in samples] == pytest.approx([.1, .2])
+        assert samples[0].segment_id == samples[1].segment_id
+        assert packets[-1]['vendor']['camera_mount']['packet']['matrix'][0][3] == pytest.approx(2.)
+    finally:
+        stream.close()
+
+
+def test_visual_backlog_replays_old_correction_without_republishing_its_stamp(sessions, monkeypatch):
+    _, now, _ = sessions
+    tick = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: tick[0])
+    stream = fusion_input()
+    try:
+        now[0] = 1_010_000_000
+        stream.visual(1_000_000_000, 'native', dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        stream._receive('/external', NS(data=json.dumps(packet(0., 100.))))
+        stream._apply_ready(stream._take_ready())
+        now[0] = 2_010_000_000
+        stream._receive('/external', NS(data=json.dumps(packet(1., 101.))))
+        stream._apply_ready(stream._take_ready())
+        # Accepted while fresh, then queued until it is too old for publication.
+        stream.visual(2_000_000_000, 'native', dict(position=[.98, 0., 0.], quaternion=[0., 0., 0., 1.]))
+        for at in (2., 3.):
+            now[0] = 1_010_000_000 + round(at*1e9)
+            stream._receive('/external', NS(data=json.dumps(packet(at, 100.+at))))
+        tick[0] = 2.1
+        now[0] = 4_110_000_000
+        stream._apply_ready(stream._take_ready())
+        samples = [decode_slam_odom(json.loads(msg)) for msg in stream.publisher.messages]
+        assert [sample.stamp_ns for sample in samples] == [
+            1_000_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000]
+        assert 2.95 < samples[-1].position[0] < 3.
+        assert stream.dropped == 0
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize('queue_delay', [0., .35])
+@pytest.mark.parametrize('bad_stamp', [1_000_000_000, 3_600_000_000_000])
+def test_visual_queue_rejects_expired_and_future_captures(sessions, monkeypatch, queue_delay, bad_stamp):
+    _, now, _ = sessions
+    tick = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: tick[0])
+    stream = fusion_input()
+    try:
+        now[0] = 20_000_000_000
+        stream.visual(20_000_000_000, 'native', dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        stream._apply_ready(stream._take_ready())
+        stream.visual(bad_stamp, 'other', dict(position=[100., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        tick[0] = queue_delay
+        now[0] = 20_500_000_000
+        stream._apply_ready(stream._take_ready())
+        stream.visual(20_100_000_000, 'native', dict(position=[.1, 0., 0.], quaternion=[0., 0., 0., 1.]))
+        stream._apply_ready(stream._take_ready())
+        samples = [decode_slam_odom(json.loads(msg)) for msg in stream.publisher.messages]
+        assert [sample.stamp_ns for sample in samples] == [20_000_000_000, 20_100_000_000]
+        assert samples[-1].position[0] == pytest.approx(.1)
+        assert stream.fuser.current.stamp == 20_100_000_000
+        assert stream.dropped == 1
+    finally:
+        stream.close()
+
+
+def test_pending_visual_expires_before_its_mount_arrives(sessions):
+    _, now, _ = sessions
+    stream = rgbd_external_input.ExternalOdometryInput('/fused/state/odom', dict(
+        frame_id='camera', body_mount=dict(topic='/mount'), external_topic='/external',
+        external_candidates=['/external']), learning=False)
+    try:
+        now[0] = 1_010_000_000
+        stream._receive('/external', NS(data=json.dumps(packet(0., 100.))))
+        stream.visual(1_000_000_000, 'old_native', dict(position=[100., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        stream._apply_ready(stream._take_ready())
+        assert not stream.publisher.messages
+        now[0] = 20_010_000_000
+        for stamp in (1_000_000_000, 20_000_000_000):
+            stream._receive_mount(NS(data=json.dumps(dict(stamp_ns=stamp, matrix=np.eye(4).tolist()))))
+        stream.visual(20_000_000_000, 'new_native', dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        stream._apply_ready(stream._take_ready())
+        sample, = [decode_slam_odom(json.loads(msg)) for msg in stream.publisher.messages]
+        assert sample.stamp_ns == 20_000_000_000
+        assert sample.position == pytest.approx((0., 0., 0.))
+        assert not stream.pending_visual
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize('leading', ['visual', 'selected_motion', 'automatic_motion'])
+def test_visual_backlog_uses_the_newest_usable_capture_for_replay_floor(sessions, monkeypatch, leading):
+    _, now, _ = sessions
+    tick = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: tick[0])
+    calibration = dict(frame_id='body', external_candidates=['/external'])
+    if leading != 'automatic_motion':
+        calibration['external_topic'] = '/external'
+    stream = rgbd_external_input.ExternalOdometryInput('/fused/state/odom', calibration, learning=False)
+    try:
+        now[0] = 9_000_000_000
+        stream.visual(now[0], 'old_native', dict(position=[100., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        tick[0] = 11.
+        now[0] = 20_000_000_000
+        if leading == 'visual':
+            stream.visual(now[0], 'new_native', dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        else:
+            for at in (19., 19.1):
+                now[0] = 1_000_000_000 + round(at*1e9)
+                stream._receive('/external', NS(data=json.dumps(packet(at, at))))
+        stream._apply_ready(stream._take_ready())
+        sample, = [decode_slam_odom(json.loads(msg)) for msg in stream.publisher.messages]
+        assert sample.stamp_ns == (20_000_000_000 if leading == 'visual' else 20_100_000_000)
+        assert sample.position[0] == pytest.approx(0. if leading == 'visual' else .1)
+        assert stream.dropped == 1
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize('unusable', ['invalid_pose', 'missing_mount'])
+def test_unusable_visual_cannot_shorten_queued_replay_history(sessions, monkeypatch, unusable):
+    _, now, _ = sessions
+    tick = [0.]
+    monkeypatch.setattr(time, 'monotonic', lambda: tick[0])
+    calibration = dict(frame_id='body', external_topic='/external', external_candidates=['/external'])
+    if unusable == 'missing_mount':
+        calibration['body_mount'] = dict(topic='/mount')
+    stream = rgbd_external_input.ExternalOdometryInput('/fused/state/odom', calibration, learning=False)
+    try:
+        now[0] = 9_000_000_000
+        if unusable == 'missing_mount':
+            stream._receive_mount(NS(data=json.dumps(dict(stamp_ns=now[0], matrix=np.eye(4).tolist()))))
+        stream.visual(now[0], 'native', dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        now[0] = 20_000_000_000
+        tick[0] = 11.
+        stream.visual(now[0], 'native', dict(position=[1., 0., 0.],
+            quaternion=[0., 0., 0., 0.] if unusable == 'invalid_pose' else [0., 0., 0., 1.]))
+        stream._apply_ready(stream._take_ready())
+        assert not stream.publisher.messages
+        assert list(stream.fuser.raw_vision) == [9_000_000_000]
+        assert stream.fuser.current.stamp == 9_000_000_000
     finally:
         stream.close()
 

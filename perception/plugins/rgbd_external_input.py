@@ -121,12 +121,20 @@ class ExternalOdometryInput:
         with self.event_lock:
             while not self.events.empty():
                 batch.append(self.events.get_nowait())
-            # A bounded burst of fresh absolute poses can still bracket clouds
-            # after waiting in the queue. Auxiliary work keeps the shorter limit.
-            ready = [event for received, event in batch
-                     if received >= cutoff or self._is_motion_boundary(event)
-                     or (event[0] == 'motion' and event[3].pose is not None
-                         and 0 <= wall_now - event[2] <= _OUTPUT_TIMEOUT_NS)]
+            ready = []
+            for received, event in batch:
+                if event[0] == 'visual':
+                    # Accepted captures can still correct retained history even
+                    # after they become too old for direct publication.
+                    keep = self._visual_time_valid(event[1], wall_now)
+                else:
+                    # Mount evidence, including unavailable boundaries, belongs
+                    # to those captures. Its storage is bounded by the queue.
+                    keep = (event[0] == 'mount' or received >= cutoff or self._is_motion_boundary(event)
+                            or (event[0] == 'motion' and event[3].pose is not None
+                                and 0 <= wall_now - event[2] <= _OUTPUT_TIMEOUT_NS))
+                if keep:
+                    ready.append(event)
             self.dropped += len(batch) - len(ready)
             if self.evicted_motion_boundaries:
                 for _, source, stamp, _ in self.evicted_motion_boundaries:
@@ -167,6 +175,14 @@ class ExternalOdometryInput:
             self.dropped += 1
             if source == self.selected and now-stamp > _OUTPUT_TIMEOUT_NS:
                 self.stale_motion_stamp = max(self.stale_motion_stamp or 0, stamp)
+
+    def _visual_time_valid(self, stamp, now):
+        if type(stamp) is not int or stamp <= self.fuser.base.stamp:
+            return False
+        latest = max(self.latest_motion_stamp, self.fuser.current.stamp,
+                     max(self.fuser.raw_vision, default=0))
+        oldest = max(latest, now-_OUTPUT_TIMEOUT_NS) - REPLAY_HISTORY_NS
+        return oldest <= stamp <= now+_FUTURE_TOLERANCE_NS
 
     def _select_candidate(self, source, stamp, motion, now):
         history = self.candidate_history.setdefault(source, {})
@@ -316,6 +332,12 @@ class ExternalOdometryInput:
             visual_status=self.visual_state, external_fusion=self.info()), allow_nan=False)))
 
     def _apply_visual(self, stamp, segment, pose):
+        if not self._visual_time_valid(stamp, time.time_ns()):
+            # Pending captures may have expired while waiting for their mount.
+            # Consume the rejection instead of putting it back in that buffer.
+            with self.event_lock:
+                self.dropped += 1
+            return True
         mount = self._camera_mount(stamp)
         if mount is None:
             return False
@@ -358,8 +380,33 @@ class ExternalOdometryInput:
     def _apply_ready(self, events):
         if not events:
             return
+        observations = []
+        mounts_received = False
+        for event in events:
+            if event[0] != 'mount':
+                observations.append(event)
+                continue
+            mounts_received = True
+            try:
+                self.mounts.observe(*event[1:])
+            except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
+                self.last_error = str(error)
+        if mounts_received:
+            # Resolve captures against the complete batch, including a later
+            # unavailable transform or fault that invalidates an earlier bracket.
+            ready = [stamp for stamp in self.pending_visual if self._camera_mount(stamp) is not None]
+            observations = [('visual', stamp, *self.pending_visual.pop(stamp)) for stamp in sorted(ready)] + observations
+        current, delayed = [], []
+        now = time.time_ns()
+        for event in observations:
+            target = (delayed if event[0] == 'visual' and type(event[1]) is int
+                      and now-event[1] > _OUTPUT_TIMEOUT_NS else current)
+            target.append(event)
         with self.fuser.batch():
-            for event in events:
+            # Stage live observations first, then old corrections newest first.
+            # Only accepted measurements may advance the replay floor while the
+            # batch defers rebuilding fuser.current until all inputs are staged.
+            for event in [*current, *sorted(delayed, key=lambda item: item[1], reverse=True)]:
                 try:
                     self._apply(event, publish=False)
                 except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
