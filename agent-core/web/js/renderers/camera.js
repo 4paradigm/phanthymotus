@@ -1,4 +1,4 @@
-/** camera.js — Renders image/jpeg (live JPEG stream) and image/depth-zlib (zlib-compressed depth).
+/** camera.js — Renders JPEG and PNG streams and zlib-compressed depth.
  *  image/depth-z16 is retired; DepthRenderer is now a tombstone that says so. */
 
 // ── Depth colour ────────────────────────────────────────────────────────────
@@ -115,7 +115,7 @@ export function paintDepth(u16, rgba, count) {
 
 export const CameraRenderer = {
   name: 'camera',
-  canRender: (hint) => hint === 'image/jpeg',
+  canRender: (hint) => hint === 'image/jpeg' || hint === 'image/png',
   _el: null,
   _img: null,
   _fps: 0,
@@ -140,7 +140,7 @@ export const CameraRenderer = {
 
   onData(buffer, hint) {
     if (!this._img) return;
-    const blob = new Blob([buffer], { type: 'image/jpeg' });
+    const blob = new Blob([buffer], { type: hint === 'image/png' ? hint : 'image/jpeg' });
     const url = URL.createObjectURL(blob);
     const old = this._img.src;
     this._img.src = url;

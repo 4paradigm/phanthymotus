@@ -45,3 +45,13 @@ def test_an_unknown_format_still_returns_none():
     """Declining is right for a format nobody can decode; the bug was the set
     of formats, not the declining."""
     assert ros2_bridge._resolve_msg_type("application/x-nonsense") is None
+
+
+@pytest.mark.parametrize("fmt", ["image/jpeg", "image/png", "image/depth-zlib"])
+def test_compressed_images_resolve_to_the_publisher_type(fmt, monkeypatch):
+    sensor = types.ModuleType("sensor_msgs")
+    sensor.msg = types.ModuleType("sensor_msgs.msg")
+    sensor.msg.CompressedImage = type("CompressedImage", (), {})
+    monkeypatch.setitem(sys.modules, "sensor_msgs", sensor)
+    monkeypatch.setitem(sys.modules, "sensor_msgs.msg", sensor.msg)
+    assert ros2_bridge._resolve_msg_type(fmt) is sensor.msg.CompressedImage

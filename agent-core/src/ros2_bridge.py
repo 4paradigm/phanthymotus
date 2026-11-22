@@ -244,7 +244,7 @@ def _resolve_msg_type(fmt: str):
             pass
         return None
     # 未来扩展：video/, sensor/ 等
-    if fmt == 'image/jpeg':
+    if fmt in ('image/jpeg', 'image/png'):
         try:
             from sensor_msgs.msg import CompressedImage
             return CompressedImage
