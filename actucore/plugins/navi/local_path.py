@@ -594,6 +594,19 @@ def occluded_cells(free, occupied, geometry):
 
 def visible_prefix(points, occluded):
     """Return the count of waypoints reachable before crossing a shadow."""
+    if len(points) > 1:
+        samples = np.asarray(points)
+        delta = np.diff(samples, axis=0)
+        # Each sufficiently short segment uses only its two endpoints in
+        # the loop below. Check that identical sample set in one array; DWA
+        # has many such segments in every complete braking prediction.
+        if np.all(np.hypot(delta[:, 0], delta[:, 1]) < RESOLUTION / 2 * (1 - 1e-12)):
+            rows = START[0] + np.rint(samples[:, 0] / RESOLUTION).astype(int)
+            cols = START[1] + np.rint(samples[:, 1] / RESOLUTION).astype(int)
+            valid = (rows >= 0) & (rows < SHAPE[0]) & (cols >= 0) & (cols < SHAPE[1])
+            hits = np.flatnonzero(valid)
+            hits = hits[occluded[rows[valid], cols[valid]]]
+            return max(1, int(hits[0])) if hits.size else len(points)
     for index, (start, end) in enumerate(zip(points, points[1:]), 1):
         count = max(2, math.ceil(2 * math.dist(start, end) / RESOLUTION) + 1)
         f, r = np.linspace(start, end, count).T
