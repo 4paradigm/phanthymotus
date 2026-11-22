@@ -379,6 +379,23 @@ class NaviPlugin:
                     "rate_hz": {"type": "number", "default": 10,
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
+                    "local_controller": {
+                        "type": "string", "enum": ["legacy", "dwa"],
+                        "default": self._cfg.get("local_controller", "legacy"),
+                        "description": "局部避障速度控制：legacy 为现有分段跟踪；"
+                                       "dwa 在有效运动反馈与局部路线可用时预测短时轨迹，"
+                                       "否则保留现有控制方式。更改后重启 Navi。",
+                        "scope": "instance"},
+                    "dwa_horizon_s": {
+                        "type": "number", "minimum": .2, "maximum": 3.,
+                        "default": self._cfg.get("dwa_horizon_s", 1.2),
+                        "description": "DWA 轨迹预测时长（秒）",
+                        "scope": "instance"},
+                    "dwa_samples": {
+                        "type": "integer", "minimum": 1, "maximum": 256,
+                        "default": self._cfg.get("dwa_samples", 64),
+                        "description": "每次局部规划最多验证的 DWA 速度候选数量",
+                        "scope": "instance"},
                     "obstacle_stop_m": {"type": "number",
                                         "default": self._cfg.get("obstacle_stop_m", policy_mod.Config.obstacle_stop_m),
                                         "description": "正前方障碍近于这个距离就完全"

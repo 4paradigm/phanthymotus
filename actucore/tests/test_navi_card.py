@@ -2780,3 +2780,15 @@ def test_delayed_prefix_uses_new_feedback_before_publishing_short_window(
     else:
         assert command["values"] == [0.] * 6
         assert "运动反馈已到期" in card._last_decision.reason
+
+def test_dwa_controller_is_available_as_instance_config():
+    schema = _tool()["configSchema"]["properties"]
+    assert schema["local_controller"]["default"] == "legacy"
+    assert schema["local_controller"]["enum"] == ["legacy", "dwa"]
+    assert schema["local_controller"]["scope"] == "instance"
+    assert schema["dwa_horizon_s"]["scope"] == "instance"
+    assert schema["dwa_samples"]["scope"] == "instance"
+    selected = _card(local_controller="dwa", dwa_samples=48)
+    assert selected._config.local_controller == "dwa"
+    assert selected._config.dwa_samples == 48
+
