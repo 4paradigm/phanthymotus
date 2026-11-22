@@ -672,8 +672,8 @@ def _sweep_circle(geometry, half_width):
     return center, radius
 
 
-def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0., directional=False):
-    """Sweep a circle centered on the chassis through its possible translations."""
+def motion_sweep_bounds(geometry, half_width, horizon, velocities, *, padding=0., directional=False):
+    """Center bounds and radius of the conservative chassis motion envelope."""
     center, radius = _sweep_circle(geometry, half_width)
     # Independently ramped components can reach any center in these bounds.
     # Account for bending of the center's path while turning and translating.
@@ -690,6 +690,30 @@ def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, pa
         radius += math.hypot(f_max, r_max) * min(2., turn / 2)
     lower = center + min(0., *forward) - bend_f, min(0., *right) - bend_r
     upper = center + max(0., *forward) + bend_f, max(0., *right) + bend_r
+    return lower, upper, radius
+
+
+def motion_limits_rejection(geometry, half_width, horizon, velocities, *, room=math.inf,
+                            bounded=False, room_horizon=None, bounds_horizon=None, padding=0.):
+    """Shared travel-room and supported-map limits for a checked motion."""
+    if max(math.hypot(v[0], v[1]) for v in velocities) * max(horizon, room_horizon or 0.) > room:
+        return "insufficient_room"
+    if bounded:
+        lower, upper, radius = motion_sweep_bounds(
+            geometry, half_width, max(horizon, bounds_horizon or 0.), velocities, padding=padding)
+        half_cell = RESOLUTION / 2
+        if (lower[0] - radius < FORWARD[0, 0] - half_cell
+                or upper[0] + radius > FORWARD[-1, 0] + half_cell
+                or lower[1] - radius < RIGHT[0, 0] - half_cell
+                or upper[1] + radius > RIGHT[0, -1] + half_cell):
+            return "outside_grid"
+    return None
+
+
+def motion_sweep_hits(occupied, geometry, half_width, horizon, velocities, *, padding=0., directional=False):
+    """Sweep a circle centered on the chassis through its possible translations."""
+    lower, upper, radius = motion_sweep_bounds(
+        geometry, half_width, horizon, velocities, padding=padding, directional=directional)
     if isinstance(occupied, ObstacleSquares):
         return _square_sweep_hits(occupied, lower, upper, radius)
 

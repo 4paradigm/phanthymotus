@@ -133,6 +133,8 @@ class Track:
     # Evidence applied on the current step. The range is the target's depth
     # map sample before filtering, present only on the first use of that frame.
     accepted_detection: bool = False
+    # Raw detector evidence accepted on this step, before any track filtering.
+    accepted_object: dict | None = None
     measured_range_m: float | None = None
 
     # Matches accumulated since the track started coasting. Resurrecting a
@@ -251,6 +253,7 @@ class Tracker:
             track.age_s += dt
             track.since_obs_s += dt
             track.accepted_detection = False
+            track.accepted_object = None
             track.measured_range_m = None
             track.front_age_s += dt
             front_limit = config.depth_age_limit_ms if config.local_planning else config.max_obs_age_ms
@@ -291,6 +294,7 @@ class Tracker:
         if matched is not None:
             self._hit(matched, config)
             if self.track.accepted_detection:
+                self.track.accepted_object = matched["obj"]
                 box = matched["obj"].get("bbox_norm")
                 if matched["name"].lower() == "person" and box and config.depth_intrinsics is not None:
                     self.track.front_required = True
