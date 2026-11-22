@@ -46,19 +46,19 @@
 
 ## 三、12 个动作
 
-除 `show` 外，每个动作都要传 `table`；`db` 可选，默认 `default`，**建议一律传你的 skill slug**。
+除 `list` 外，每个动作都要传 `table`；`db` 可选，默认 `default`，**建议一律传你的 skill slug**。
 
 | 动作 | 参数 | 返回 |
 |---|---|---|
-| `show` | `db`（可选） | 所有库、每个库里的表、列类型、行数和文件数。**不知道库名、表名时先调它** |
+| `list` | （不填） | 所有库、每个库里的表、列类型、行数和文件数。**不知道库名、表名时先调它** |
 | `create` | `columns`：`[{"name":"姓名","type":"text"},{"name":"照片","type":"file"}]` | 列定义 |
-| `import` | `path`：飞书文件直接填 `files[].path`<br>`mode`：`create`（默认）或 `append`<br>`header_row`：表头在第几行（自动识别错了才填）<br>`dry_run`：`true` 表示只检查不写<br>`request_id`：重试安全 | `columns`、`rows`、`imported`、`files`、`skipped_rows`（空行），以及 3 条 `sample` |
-| `append` | `records`：`[{...}]`（不超过 500 条，只写文字列）<br>`request_id` | `ids` |
+| `import` | `path`：飞书文件直接填 `files[].path`<br>`mode`：`create`（默认）或 `append`<br>`header_row`：表头在第几行（自动识别错了才填）<br>`dry_run`：`true` 表示只检查不写<br> | `columns`、`rows`、`imported`、`files`、`skipped_rows`（空行），以及 3 条 `sample` |
+| `append` | `records`：`[{...}]`（不超过 500 条，只写文字列）<br> | `ids` |
 | `query` | `where`、`offset`、`limit`（默认 20，最多 200） | `total`、`count`、`has_more`、`next_offset`、`records` |
 | `update` | `_id`、`set`：`{"状态":"已归还"}`，值为 `null` 表示清空 | 修改后的完整记录 |
 | `delete` | `_id` | `deleted`（软删除，查询和统计会自动跳过） |
 | `stats` | `where`、`group_by` | `total`，以及 `groups: [{"value","count"}]` |
-| `attach_file` | `_id`、`column`（文件列）、`path` | 文件信息（会替换原来的文件） |
+| `attach_file` | `_id`、`column`（文件列）、`file` | 文件信息（会替换原来的文件） |
 | `get_file` | `file_id` | `path`：本容器里的临时文件，24 小时有效 |
 | `export_files` | `column`（文件列）、`name_column`、`profile_columns`、`where` | `dir`：照片加 `manifest.json`，交给 `face_recognition.register_by_corpus` |
 | `drop_table` | `confirm`：再填一遍表名 | 删除整张表及其文件（不可恢复），用于重新导入 |
@@ -88,7 +88,7 @@
 【导入名单】用户发来名单文件：
 1. table_db.import(table="名单", path=消息里的 files[0].path, dry_run=true)
    把 columns、rows、files（照片数）报给用户，等用户说「确认」。
-2. 用户确认后，同样的参数去掉 dry_run，加 request_id="名单-<文件名>"，正式导入。
+2. 用户确认后，同样的参数去掉 dry_run，正式导入。
 3. 失败时把 detail 原话告诉用户（里面有第几行、哪一列）。
 【录人脸】用户说「录入人脸」：
 4. table_db.export_files(table="名单", column="照片", name_column="姓名", profile_columns=["准考证号"])
@@ -105,7 +105,7 @@
   columns=[{"name":"借用人","type":"text"},{"name":"物品","type":"text"},{"name":"状态","type":"text"},
            {"name":"借出时间","type":"text"},{"name":"归还时间","type":"text"},{"name":"照片","type":"file"}]
 - 借出：append(records=[{"借用人":..,"物品":..,"状态":"借出","借出时间":当前时间}])，把返回的 _id 当作编号念给用户。
-- 拍照留档：vision_capture 拍照后调用 attach_file(_id=该编号, column="照片", path=照片路径)。
+- 拍照留档：vision_capture 拍照后调用 attach_file(_id=该编号, column="照片", file=照片路径)。
 - 归还：query(where={"物品":..,"状态":"借出"}) 找到那一条，再 update(_id, set={"状态":"已归还","归还时间":当前时间})。
 - 谁还没还：stats(where={"状态":"借出"}, group_by="借用人")。
 ```
@@ -133,7 +133,7 @@ query(table=.., where=..) 拿到 照片.file_id → get_file(file_id) 得到 pat
 | `legacy_format` / `unsupported_format` | .xls/.doc 等旧格式 / 不是表格 | 请用户另存为 xlsx 或 csv |
 | `unreadable` / `empty` | 文件损坏 / 没有数据 | 请用户重新发送 |
 | `too_large` | 超出上限（单个文件 8 MiB、2 万行、64 列、单格 2000 字、单库 2 GiB） | `detail` 会说明超了哪一项 |
-| `request_conflict` | 同一个 `request_id` 用在了不同的内容上 | 换一个新的 `request_id` |
+| `request_conflict` | 同一个 用在了不同的内容上 | 换一个新的 |
 | `busy` | 数据库正在被别的写操作占用 | 稍后重试 |
 | `internal_error` | 意外错误（已记录日志，卡片不会崩溃） | 告诉用户稍后再试 |
 
@@ -145,5 +145,5 @@ query(table=.., where=..) 拿到 照片.file_id → get_file(file_id) 得到 pat
 - **不管**：业务含义（什么算逾期、谁算已签到）、调用人脸 / OCR / VOP、发飞书。
 - **录人脸会写库**，属于有副作用的操作，一定要在用户确认之后再调用 `register_by_corpus`。
   人脸卡会按相似度决定是合并到已有的人还是新建一个人，所以录完要汇报返回的 `person_id`。
-- `get_file` 返回的路径在 perception 容器里，视觉卡可以读，但 **agent-core 的 Read 和飞书回复读不到**。不要尝试把文件发回飞书。
+- `get_file` 返回的 `path` 在 perception 容器里，视觉卡可以直接读；**agent-core 的 Read 读不到**（它只能读自己容器的 /work、/tmp）。模型要自己看文件时，用 Bash 执行返回里的 `agent_core.download`（curl 下载到 /tmp），再 Read `agent_core.local_path`。
 - 数据保存在 `/models/table_db/<db>.db`：重启和重新部署都不会丢；一个库就是一个文件，复制即备份。

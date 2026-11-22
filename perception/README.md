@@ -4608,17 +4608,17 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 
 > 模型要看得到这张卡，必须在画布上把决策卡的「连接执行器」连到它（与其它卡相同）。
 
-| 动作 | 参数（除 `show` 外都要 `table`，`db` 可选） | 返回 |
+| 动作 | 参数（除 `list` 外都要 `table`，`db` 可选） | 返回 |
 |---|---|---|
-| `show` | `db`（可选） | 所有库 → 表 → 列、行数、文件数（画布上默认选中，先点它） |
+| `list` | （不填） | 所有库 → 表 → 列、行数、文件数（画布上默认选中，先点它） |
 | `create` | `columns: [{"name","type":"text|file"}]` | 列定义 |
-| `import` | `path`（飞书文件填 `files[].path`）、`mode`（create/append）、`header_row`、`dry_run`、`request_id` | 识别出的列、`imported`、`files`、空行、前 3 条样例 |
-| `append` | `records`（≤500 条，只写文字列）、`request_id` | `ids` |
+| `import` | `path`（飞书文件填 `files[].path`）、`mode`（create/append）、`header_row`、`dry_run` | 识别出的列、`imported`、`files`、空行、前 3 条样例 |
+| `append` | `records`（≤500 条，只写文字列） | `ids` |
 | `query` | `where`、`offset`、`limit`（≤200） | `total`、`has_more`、`records` |
 | `update` | `_id`、`set` | 修改后的记录 |
 | `delete` | `_id` | 软删除 |
 | `stats` | `where`、`group_by` | `total`、`groups` |
-| `attach_file` | `_id`、`column`、`path` | 文件信息 |
+| `attach_file` | `_id`、`column`、`file` | 文件信息 |
 | `get_file` | `file_id` | 本容器内的临时路径（24 小时），可直接作为 face / ocr / vop 的 `image_path` |
 | `export_files` | `column`、`name_column`、`profile_columns`、`where` | 目录（文件 + manifest.json），交给 `face_recognition.register_by_corpus` |
 | `drop_table` | `confirm`（再填一遍表名） | 删除整张表及其文件 |

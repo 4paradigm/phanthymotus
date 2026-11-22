@@ -418,6 +418,32 @@ def make_handler():
                         if client_queue in _sse_clients:
                             _sse_clients.remove(client_queue)
                 return
+            # Plugins may serve a GET route of their own (table_db hands stored
+            # files to agent-core, which cannot read this container's /models).
+            # Same token rule as /file/upload: enforced only when ACCESS_TOKEN is set.
+            for plugin in (_bundle._plugins if _bundle is not None else []):
+                handler = getattr(plugin, "handle_http_get", None)
+                if handler is None:
+                    continue
+                served = handler(self.path)
+                if served is None:
+                    continue
+                from utils.file_intake import access_token
+                token = access_token()
+                if token and self.headers.get("X-Access-Token", "") != token:
+                    self._send(401, '{"error":"bad token"}')
+                    return
+                status, body, content_type, filename = served
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                if filename:
+                    from urllib.parse import quote
+                    self.send_header("Content-Disposition",
+                                     "attachment; filename*=UTF-8''%s" % quote(filename))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             self.send_response(404)
             self.end_headers()
 

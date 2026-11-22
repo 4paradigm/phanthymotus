@@ -9,7 +9,7 @@ Each test pins one promise:
   ids and counts the model never has to compute;
 * files are stored as BLOBs, come back byte-identical via get_file, and
   export_files produces the package face_recognition.register_by_corpus reads;
-* request_id makes retries safe; bad input never writes; nothing raises.
+* bad input never writes; nothing raises.
 
 No ROS, model or network. Run: python -m pytest perception/tests -q
 """
@@ -180,21 +180,6 @@ def test_import_refusals(tmp_path):
     del text_only
 
 
-def test_import_retry_with_request_id_replays(tmp_path):
-    card = _card(tmp_path)
-    path = _write(tmp_path, "r.xlsx", ROSTER)
-    first = _call(card, "import", table="名单", path=path, request_id="imp-1")
-    again = _call(card, "import", table="名单", path=path, request_id="imp-1")
-
-    assert again["replayed"] is True and again["imported"] == first["imported"]
-    assert _call(card, "stats", table="名单")["total"] == 3
-
-    other = _write(tmp_path, "o.csv", "姓名\n赵六\n".encode())
-    conflict = _call(card, "import", table="名单", path=other, mode="append",
-                     request_id="imp-1")
-    assert conflict["reason"] == "request_conflict"
-
-
 # ── append / query / update / delete / stats ─────────────────────────────────
 
 def test_append_query_and_paging(tmp_path):
@@ -279,17 +264,6 @@ def test_create_validation(tmp_path):
     assert _call(card, "create", table="a", columns=["x"])["reason"] == "table_exists"
 
 
-def test_append_retry_with_request_id(tmp_path):
-    card = _card(tmp_path)
-    _ledger(card)
-    record = [{"借用人": "王五", "物品": "电钻", "状态": "借出"}]
-    first = _call(card, "append", table="台账", records=record, request_id="a-1")
-    again = _call(card, "append", table="台账", records=record, request_id="a-1")
-
-    assert again["replayed"] is True and again["ids"] == first["ids"]
-    assert _call(card, "stats", table="台账")["total"] == 4
-
-
 def test_databases_are_isolated(tmp_path):
     card = _card(tmp_path)
     _call(card, "create", table="名单", columns=["姓名"], db="skill-a")
@@ -317,21 +291,21 @@ def test_attach_any_kind_of_file_and_replace(tmp_path):
     _ledger(card)
     pdf = b"%PDF-1.4\n" + os.urandom(2000)
     attached = _call(card, "attach_file", table="台账", _id=1, column="照片",
-                     path=_write(tmp_path, "收据.pdf", pdf))
+                     file=_write(tmp_path, "收据.pdf", pdf))
     assert attached["file"]["mime"] == "application/pdf" and attached["file"]["size"] == len(pdf)
 
     wav = b"RIFF\x00\x00\x00\x00WAVEfmt " + os.urandom(100)
     replaced = _call(card, "attach_file", table="台账", _id=1, column="照片",
-                     path=_write(tmp_path, "note.wav", wav))
+                     file=_write(tmp_path, "note.wav", wav))
     record = _call(card, "query", table="台账", where={"_id": 1})["records"][0]
     assert record["照片"]["file_id"] == replaced["file"]["file_id"]
     assert record["照片"]["mime"] == "audio/wav"
 
     assert _call(card, "attach_file", table="台账", _id=1, column="物品",
-                 path=_write(tmp_path, "a.png", PNG_BYTES))["reason"] == "bad_request"
+                 file=_write(tmp_path, "a.png", PNG_BYTES))["reason"] == "bad_request"
     big = _card(tmp_path, max_file_bytes=10)
     assert _call(big, "attach_file", table="台账", _id=1, column="照片",
-                 path=_write(tmp_path, "b.png", PNG_BYTES))["reason"] == "too_large"
+                 file=_write(tmp_path, "b.png", PNG_BYTES))["reason"] == "too_large"
 
     detached = _call(card, "update", table="台账", _id=1, set={"照片": None})
     assert "照片" not in detached["record"]
@@ -357,7 +331,7 @@ def test_export_files_builds_a_face_corpus(tmp_path):
 
     assert reply["ok"] is True and reply["count"] == 2
     assert reply["skipped"] == [{"_id": 3, "reason": "没有文件"}]
-    assert reply["dir"] in reply["next"]
+    assert reply["dir"] in reply["next_call"]
     with open(os.path.join(reply["dir"], "manifest.json"), encoding="utf-8") as handle:
         manifest = json.load(handle)
     assert manifest[0] == {"file": "r000001.png", "name": "张三", "person": "名单-1",
@@ -373,13 +347,13 @@ def test_export_files_builds_a_face_corpus(tmp_path):
 
 # ── show / drop_table / canvas-style input ───────────────────────────────────
 
-def test_show_lists_every_library_and_table(tmp_path):
+def test_list_shows_every_library_and_table_without_parameters(tmp_path):
     card = _card(tmp_path)
-    assert card.dispatch("table_db", {"action": "show"})["databases"] == []
+    assert card.dispatch("table_db", {"action": "list"})["databases"] == []
 
     _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
     _call(card, "create", table="签到", columns=["姓名"], db="other")
-    reply = card.dispatch("table_db", {"action": "show"})
+    reply = card.dispatch("table_db", {"action": "list"})
 
     assert reply["ok"] is True and reply["count"] == 2
     by_db = {item["db"]: item for item in reply["databases"]}
@@ -388,9 +362,15 @@ def test_show_lists_every_library_and_table(tmp_path):
     assert {"name": "照片", "type": "file"} in roster["columns"]
     assert by_db["other"]["tables"][0]["table"] == "签到"
     assert "query" in reply["next"]
-    only = card.dispatch("table_db", {"action": "show", "db": "other"})
-    assert [item["db"] for item in only["databases"]] == ["other"]
-    assert card.dispatch("table_db", {"action": "show", "db": "nope"})["databases"] == []
+    # The old name still works, so a skill written against `show` keeps running.
+    assert card.dispatch("table_db", {"action": "show"})["count"] == 2
+
+
+def test_create_in_a_new_library_says_it_was_created(tmp_path):
+    card = _card(tmp_path)
+    first = _call(card, "create", db="newlib", table="a", columns="姓名")
+    second = _call(card, "create", db="newlib", table="b", columns="姓名")
+    assert first["db_created"] is True and "db_created" not in second
 
 
 def test_missing_required_field_says_which_and_points_at_show(tmp_path):
@@ -400,7 +380,7 @@ def test_missing_required_field_says_which_and_points_at_show(tmp_path):
     reply = card.dispatch("table_db", {"action": "query", "mode": "create",
                                        "instance_id": "card-x", "table": "  "})
     assert reply["ok"] is False and reply["reason"] == "bad_request"
-    assert reply["missing"] == ["table"] and "show" in reply["detail"]
+    assert reply["missing"] == ["table"] and "list" in reply["detail"]
 
 
 def test_canvas_json_text_fields_are_parsed(tmp_path):
@@ -413,7 +393,7 @@ def test_canvas_json_text_fields_are_parsed(tmp_path):
     assert found["total"] == 1
     assert _call(card, "update", table="台账", _id="1", set='{"物品":"电钻"}')["ok"] is True
     bad = _call(card, "query", table="台账", where="{借用人:张三}")
-    assert bad["reason"] == "bad_request" and bad["column"] == "where" and "JSON" in bad["detail"]
+    assert bad["reason"] == "bad_request" and bad["column"] == "where" and '{"姓名":"张三"}' in bad["detail"]
     assert _call(card, "import", table="x", path=_write(tmp_path, "r.xlsx", ROSTER),
                  dry_run="true")["dry_run"] is True
 
@@ -423,7 +403,7 @@ def test_drop_table_needs_confirmation_and_frees_files(tmp_path):
 
     card = _card(tmp_path)
     path = _write(tmp_path, "r.xlsx", ROSTER)
-    _call(card, "import", table="名单", path=path, request_id="imp-1")
+    _call(card, "import", table="名单", path=path)
     assert _call(card, "drop_table", table="名单", confirm="名")["reason"] == "bad_request"
 
     dropped = _call(card, "drop_table", table="名单", confirm="名单")
@@ -432,11 +412,8 @@ def test_drop_table_needs_confirmation_and_frees_files(tmp_path):
     conn = sqlite3.connect(str(tmp_path / "db" / "t.db"))
     assert conn.execute("SELECT COUNT(*) FROM _blobs").fetchone()[0] == 0
     conn.close()
-    # Re-importing after a drop with the SAME request_id (what a skill that
-    # derives it from the file name does) really imports — the old result is
-    # not replayed as if the rows still existed.
-    again = _call(card, "import", table="名单", path=path, request_id="imp-1")
-    assert again["imported"] == 3 and not again.get("replayed")
+    again = _call(card, "import", table="名单", path=path)
+    assert again["imported"] == 3
     assert _call(card, "stats", table="名单")["total"] == 3
 
 
@@ -538,14 +515,16 @@ def test_schema_declares_actions_params_and_required():
                if action not in ("start", "stop", "info")]
 
     # `show` first: it is what the canvas dropdown selects when the card opens.
-    assert visible == ["show", "query", "stats", "import", "create", "append", "update",
+    assert visible == ["list", "query", "stats", "import", "create", "append", "update",
                        "delete", "attach_file", "get_file", "export_files", "drop_table"]
-    titles = {item["const"] for item in schema["properties"]["action"]["oneOf"]}
-    assert titles == set(visible)
-    assert split["show"]["required"] == []
+    options = schema["properties"]["action"]["oneOf"]
+    assert {item["const"] for item in options} == set(visible)
+    # Bare names in the canvas dropdown; the explanation lives in description.
+    assert all("title" not in item and item["description"] for item in options)
+    assert split["list"] == {**split["list"], "params": [], "required": []}
     for action in visible:
         spec = split[action]
-        if action != "show":
+        if action != "list":
             assert "table" in spec["params"] and "table" in spec["required"]
         for param in spec["params"]:
             assert param in schema["properties"], (action, param)
@@ -559,9 +538,74 @@ def test_every_field_placeholder_starts_with_something_useful():
     props = TOOLS[0]["inputSchema"]["properties"]
     for key in ("where", "set", "records", "columns", "_id", "file_id", "table"):
         head = props[key]["description"][:40]
-        assert "例" in head or "show" in head, (key, head)
+        assert head.startswith("例"), (key, head)
 
 
 def test_schema_is_valid_json_schema():
     jsonschema = pytest.importorskip("jsonschema")
     jsonschema.Draft7Validator.check_schema(TOOLS[0]["inputSchema"])
+
+
+# ── the 2026-11-20 canvas review ─────────────────────────────────────────────
+
+@pytest.mark.parametrize("text,expected", [
+    ("姓名,状态,现场照:file", ["text", "text", "file"]),
+    ("姓名，状态，现场照：file", ["text", "text", "file"]),        # Chinese IME punctuation
+    ("[姓名,状态,现场照:file]", ["text", "text", "file"]),        # brackets, no quotes
+    ('["姓名","状态"]', ["text", "text"]),
+    ('[{"name":"姓名","type":"text"},{"name":"照片","type":"file"}]', ["text", "file"]),
+    ('[{“name”:“姓名”,“type”:“text”}]', ["text"]),               # curly quotes
+])
+def test_columns_accept_every_way_people_type_them(tmp_path, text, expected):
+    card = _card(tmp_path)
+    reply = card.dispatch("table_db", {"action": "create", "table": "t", "columns": text})
+    assert reply["ok"] is True, reply
+    assert [item["type"] for item in reply["columns"]] == expected
+
+
+def test_request_id_is_ignored_not_an_error(tmp_path):
+    card = _card(tmp_path)
+    path = _write(tmp_path, "r.xlsx", ROSTER)
+    assert _call(card, "import", table="名单", path=path, request_id="x")["imported"] == 3
+    assert "request_id" not in TOOLS[0]["inputSchema"]["properties"]
+
+
+def test_import_and_attach_use_separate_file_fields(tmp_path):
+    props = TOOLS[0]["inputSchema"]["properties"]
+    assert props["path"]["accept"] == ".xlsx,.xlsm,.csv,.tsv,.docx,.docm"
+    assert "accept" not in props["file"] and props["file"]["format"] == "file"
+    split = TOOLS[0]["inputSchema"]["x-action-params"]
+    assert "path" in split["import"]["params"] and "file" in split["attach_file"]["params"]
+    # The old field name still works for attach_file.
+    card = _card(tmp_path)
+    _ledger(card)
+    old = _call(card, "attach_file", table="台账", _id=1, column="照片",
+                path=_write(tmp_path, "a.png", PNG_BYTES))
+    assert old["ok"] is True
+
+
+def test_get_file_explains_how_agent_core_can_read_it_and_the_url_works(tmp_path):
+    card = _card(tmp_path)
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    fid = _call(card, "query", table="名单", where={"姓名": "李四"})["records"][0]["照片"]["file_id"]
+    got = _call(card, "get_file", table="名单", file_id=fid)
+
+    hint = got["agent_core"]
+    assert hint["local_path"].startswith("/tmp/") and hint["local_path"] in hint["download"]
+    url = hint["download"].split()[-1]
+    assert url.startswith("http://localhost:15720/table_db/file/t/")
+    status, body, mime, name = card.handle_http_get(url[len("http://localhost:15720"):])
+    assert (status, body, mime) == (200, PNG_B, "image/png") and name
+
+    assert card.handle_http_get("/other/route") is None
+    assert card.handle_http_get("/table_db/file/t/f_999")[0] == 404
+    assert card.handle_http_get("/table_db/file/../etc/passwd")[0] == 400
+    assert card.handle_http_get("/table_db/file/t/../../x")[0] == 400
+
+
+def test_export_reply_says_in_chinese_what_to_do_next(tmp_path):
+    card = _card(tmp_path)
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    reply = _call(card, "export_files", table="名单", column="照片", name_column="姓名")
+    assert "register_by_corpus" in reply["next"] and "package" in reply["next"]
+    assert reply["dir"] in reply["next_call"]

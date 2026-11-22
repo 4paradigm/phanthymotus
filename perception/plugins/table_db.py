@@ -23,7 +23,7 @@ Contract
   `get_file` / `export_files` write it out as a path the vision cards can open.
 * Every write is one transaction. A failure answers
   `{"ok": false, "reason", "detail", "row"?, "column"?, "written": 0}` and
-  leaves the store as it was. `request_id` makes import/append safe to retry.
+  leaves the store as it was.
 * It stores and counts; it does not interpret. What "overdue" means, whether to
   enrol a face, what to tell the user — that is the calling skill's job.
 
@@ -83,6 +83,8 @@ log = logging.getLogger(__name__)
 PREFIX = "table_db"
 
 DEFAULT_DATA_DIR = "/models/table_db"
+DEFAULT_HTTP_BASE = "http://localhost:15720"
+HTTP_FILE_PREFIX = "/table_db/file"
 DEFAULT_ROOTS = ("/models", "/tmp", "/work")
 PAGE_ROWS = 20
 MAX_PAGE_ROWS = 200
@@ -91,7 +93,6 @@ SAMPLE_ROWS = 3
 MAX_SKIPPED = 50
 EXPORT_BATCH = 200            # face_recognition's default max_batch
 CACHE_TTL_S = 24 * 3600
-MAX_REQUEST_ID = 128
 
 _IMPORT_SUFFIXES = (".xlsx", ".xlsm", ".csv", ".tsv", ".docx", ".docm")
 _MIME_BY_MAGIC = (
@@ -109,36 +110,34 @@ _MIME_BY_MAGIC = (
 # the selected action's `params` are hidden. What that means for this schema
 # (agent-core/web/js/canvas.js, _buildCardEl / _executeCard):
 #
-# * Field labels are the property keys; the placeholder is the first 40
-#   characters of `description` — so every description *starts* with an example.
-# * Object / array fields are plain text boxes and arrive as JSON strings;
-#   dispatch() parses them (`_JSON_PARAMS`).
-# * Per-action `required` is not checked by the canvas; dispatch() checks it and
-#   says which field to fill, instead of failing on a None deep inside.
+# * The grey placeholder is the first 40 characters of `description`, so every
+#   description starts with "例 <sample>" followed by the shortest rule; the
+#   full text shows when hovering the field name.
+# * Object / array fields are plain text boxes and arrive as text; dispatch()
+#   parses them (`_JSON_PARAMS`) and accepts the short forms written there.
+# * Per-action `required` is not checked by the canvas; dispatch() checks it.
 # * Dropdowns always send a value, so no enum here may change the meaning of an
 #   action that does not list it (`mode` is read by import only).
-# * `oneOf` titles become the dropdown labels.
+# * `accept` greys out other file types in the 选择文件 dialog, which is why
+#   import (`path`, spreadsheets) and attach_file (`file`, anything) use two
+#   different fields.
 
-_TABLE_DESC = "表名，例 名单。不知道有哪些表？先选 show 执行"
-_DB_DESC = "库名，例 q5-exam-helper；不填 = default。建议填 skill 的 slug"
-_WHERE_DESC = ('例 {"姓名":"张三"}；{"状态":["借出","逾期"]} 等于其一；{"归还时间":null} 为空；'
-               '多个键同时满足；可用 "_id"')
-_REQ_DESC = "例 import-名单-1；可选。同一编号重试返回上次结果，不会重复写入"
-
-ACTION_TITLES = [
-    ("show", "📋 show：查看所有库、表和列（先点这个）"),
-    ("query", "🔍 query：查询记录"),
-    ("stats", "🔢 stats：计数 / 分组计数"),
-    ("import", "📥 import：导入 Excel/CSV 表格"),
-    ("create", "🆕 create：建空表"),
-    ("append", "➕ append：新增记录"),
-    ("update", "✏️ update：按 _id 修改"),
-    ("delete", "🗑️ delete：按 _id 删除一条"),
-    ("attach_file", "📎 attach_file：给记录挂文件"),
-    ("get_file", "📤 get_file：取出文件（得到路径）"),
-    ("export_files", "👤 export_files：导出姓名+照片（录人脸）"),
-    ("drop_table", "⚠️ drop_table：删除整张表"),
+ACTIONS = [
+    ("list", "查看本机所有库、每个库里的表和列（不用填参数，先点这个）"),
+    ("query", "查询某张表的记录（可按条件筛选、分页）"),
+    ("stats", "计数：符合条件的总条数，或按某一列分组计数"),
+    ("import", "导入 Excel/CSV/Word 表格，单元格里的图片存成文件列"),
+    ("create", "建一张空表（自己定表头）；库不存在会自动新建"),
+    ("append", "往已有的表里新增记录，返回每条的 _id"),
+    ("update", "按 _id 修改一条记录的某些列"),
+    ("delete", "按 _id 删除一条记录"),
+    ("attach_file", "给一条记录的文件列挂上或更换文件（图片/PDF/音频等）"),
+    ("get_file", "取出文件，返回文件路径（给人脸/OCR 卡用，或让模型下载后读）"),
+    ("export_files", "把「姓名+照片」导出成一个目录，用于批量录入人脸库"),
+    ("drop_table", "删除整张表及其文件（不可恢复）"),
 ]
+
+_TABLE_FILES = ".xlsx,.xlsm,.csv,.tsv,.docx,.docm"
 
 TOOLS: List[Dict[str, Any]] = [{
     "name": PREFIX,
@@ -148,87 +147,108 @@ TOOLS: List[Dict[str, Any]] = [{
         "表格数据库：每个 skill 用自己的表保存条目，可导入飞书发来的 Excel/CSV（含图片），"
         "运行中增删改查、分组计数。列只有 text（文字）和 file（图片/PDF/音频等非文字）。"
         "编号 _id 和计数由本卡保证，不要自己读写 JSON 文件。只存取，不判断业务含义。"
-        "不知道库名和表名时先调 show。"
+        "不知道库名和表名时先调 list。"
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["start", "stop", "info"] + [name for name, _ in ACTION_TITLES],
-                "oneOf": [{"const": name, "title": title} for name, title in ACTION_TITLES],
-                "description": "Action to perform",
+                "enum": ["start", "stop", "info"] + [name for name, _ in ACTIONS],
+                # No `title`: the canvas dropdown shows the bare action name;
+                # the description is what the detail panel shows.
+                "oneOf": [{"const": name, "description": text} for name, text in ACTIONS],
+                "description": "要做的操作。每个操作的作用见 oneOf 里的 description",
             },
-            "db": {"type": "string", "description": _DB_DESC},
-            "table": {"type": "string", "description": _TABLE_DESC},
+            "db": {"type": "string",
+                   "description": "例 exam。库名，不填=default；填新名字会自动建库（英文/数字/-/_）"},
+            "table": {"type": "string",
+                      "description": "例 名单。表名；不知道有哪些表，先执行 list"},
             "path": {
                 "type": "string",
                 "format": "file",
+                "accept": _TABLE_FILES,
                 "uploadTo": "mcp",
-                "description": "要导入的表格或要挂的文件。飞书发来的文件直接填消息里的 files[].path",
+                "description": "要导入的表格（xlsx/csv/docx）。飞书发来的文件直接填消息里的 files[].path",
             },
-            "where": {"type": "object", "description": _WHERE_DESC},
-            "_id": {"type": "integer", "description": "例 3。记录编号，来自 query / append 的返回"},
+            "file": {
+                "type": "string",
+                "format": "file",
+                "uploadTo": "mcp",
+                "description": "要挂上的文件（图片/PDF/音频等任意类型）。飞书文件填 files[].path",
+            },
+            "where": {"type": "object",
+                      "description": ('例 {"姓名":"张三"}。筛选条件，不填=全部；'
+                                      '{"状态":["借出","逾期"]}=其中之一，{"列":null}=为空')},
+            "_id": {"type": "integer",
+                    "description": "例 3。记录编号，见 query/append 返回的 _id"},
             "set": {"type": "object",
-                    "description": '例 {"状态":"已归还"}。要修改的文字列；值为 null 表示清空'},
+                    "description": ('例 {"状态":"已归还"}。要改的列和新值，没写的列不变；'
+                                    '值写 null 表示清空这一格')},
             "records": {
                 "type": "array", "items": {"type": "object"},
-                "description": '例 [{"姓名":"张三","状态":"借出"}]。按列名填值，只填文字列，一次 ≤500 条',
+                "description": ('例 [{"姓名":"张三"},{"姓名":"李四"}] 一个{}一条,填文字列。'
+                                '键是列名、值是内容；多条用英文逗号隔开；文件列不能在这里填'
+                                '（用 attach_file）；一次≤500条'),
             },
             "columns": {
                 "type": "array",
                 "items": {"type": "object", "properties": {
                     "name": {"type": "string"},
                     "type": {"type": "string", "enum": ["text", "file"]}}},
-                "description": ('例 [{"name":"姓名","type":"text"},{"name":"照片","type":"file"}]；'
-                                '也可写 姓名,照片:file'),
+                "description": ("例 姓名,状态,照片:file 逗号分隔表头;默认文字列,:file=文件列。"
+                                "表头用英文逗号隔开；类型只有 text（文字，默认，可不写）和 "
+                                "file（图片/PDF/音频等），写在列名后面、用英文冒号隔开"),
             },
-            "group_by": {"type": "string", "description": "例 借用人。按这一列分组计数；不填只给总数"},
-            "column": {"type": "string", "description": "例 照片。文件列（type=file）的列名"},
-            "name_column": {"type": "string", "description": "例 姓名。姓名所在的文字列"},
+            "group_by": {"type": "string",
+                         "description": "例 借用人。按这一列分组计数；不填只给总数"},
+            "column": {"type": "string",
+                       "description": "例 照片。文件列的列名（list 里 type 为 file 的列）"},
+            "name_column": {"type": "string",
+                            "description": "例 姓名。每张照片对应的人名所在的列"},
             "profile_columns": {
                 "type": "array", "items": {"type": "string"},
-                "description": '例 准考证号,身份证号。一起导出的文字列（写进人脸档案）',
+                "description": ("例 准考证号,身份证号。可不填；这些列会跟人脸一起存进人脸档案，"
+                                "以后认出这个人时一并返回"),
             },
-            "file_id": {"type": "string", "description": "例 f_3。文件编号，来自 query 返回的文件列"},
+            "file_id": {"type": "string",
+                        "description": "例 f_3。文件编号，见 query 返回里文件列的 file_id"},
             "mode": {
                 "type": "string",
                 "enum": ["create", "append"],
-                "oneOf": [{"const": "create", "title": "create：建新表"},
-                          {"const": "append", "title": "append：追加到已有表"}],
                 "description": "create（默认）= 按表头建新表；append = 追加到已有表（列名要对得上）",
             },
             "header_row": {
                 "type": "integer", "minimum": 0,
-                "description": "例 2。表头在 Excel 第几行（自动识别错了才填）；0 = 没有表头",
+                "description": "例 2。表头在 Excel 第几行，一般不填；0 = 没有表头",
             },
             "dry_run": {"type": "boolean",
-                        "description": "填 true = 只检查并预览，不写库；不填 = 正式导入"},
-            "request_id": {"type": "string", "description": _REQ_DESC},
+                        "description": "例 true。填 true 只预览不写库；不填=正式导入"},
             "confirm": {"type": "string",
-                        "description": "再输入一遍要删除的表名，确认删除整张表（不可恢复）"},
-            "offset": {"type": "integer", "minimum": 0, "description": "例 0。跳过几条，默认 0"},
+                        "description": "例 名单。再填一遍表名才会删除（防误删，不可恢复）"},
+            "offset": {"type": "integer", "minimum": 0,
+                       "description": "例 20。跳过前几条，用于翻页；不填=0"},
             "limit": {"type": "integer", "minimum": 1,
-                      "description": "例 20。最多返回几条，默认 20，上限 200"},
+                      "description": "例 20。最多返回几条；不填=20，最多200"},
         },
         "required": ["action"],
         "x-action-params": {
-            "show": {
-                "params": ["db"],
+            "list": {
+                "params": [],
                 "required": [],
                 "description": (
                     "查看本机所有库（db）、每个库里的表、每张表的列（text/file）、行数和文件数。"
-                    "不知道库名表名时先调它；db 填了就只看这个库。"
+                    "不知道库名表名时先调它。表里的具体记录用 query。"
                 ),
             },
             "create": {
                 "params": ["db", "table", "columns"],
                 "required": ["table", "columns"],
-                "description": "建空表，列类型只有 text / file。表已存在会报 table_exists。",
+                "description": ("建空表，列类型只有 text / file。库不存在会自动新建；"
+                                "表已存在会报 table_exists。"),
             },
             "import": {
-                "params": ["db", "table", "path", "mode", "header_row", "dry_run",
-                           "request_id"],
+                "params": ["db", "table", "path", "mode", "header_row", "dry_run"],
                 "required": ["table", "path"],
                 "description": (
                     "导入表格文件（xlsx/csv，兼容 Word 里的表格；单元格里的图片自动存成 file 列）。"
@@ -237,7 +257,7 @@ TOOLS: List[Dict[str, Any]] = [{
                 ),
             },
             "append": {
-                "params": ["db", "table", "records", "request_id"],
+                "params": ["db", "table", "records"],
                 "required": ["table", "records"],
                 "description": "新增记录（一次 ≤500 条），返回每条的 _id。只写文字列，文件用 attach_file。",
             },
@@ -246,13 +266,14 @@ TOOLS: List[Dict[str, Any]] = [{
                 "required": ["table"],
                 "description": (
                     "查询记录（分页）。返回 total、has_more 和 records；文件列显示为 "
-                    "{file_id,name,mime,size}，要给视觉卡用就调 get_file。"
+                    "{file_id,name,mime,size}，要用文件本身就调 get_file。"
                 ),
             },
             "update": {
                 "params": ["db", "table", "_id", "set"],
                 "required": ["table", "_id", "set"],
-                "description": "按 _id 修改一条记录的文字列，返回修改后的整条记录。",
+                "description": ("按 _id 修改一条记录：set 里写要改的列和新值，没写的列保持不变；"
+                                "返回修改后的整条记录。"),
             },
             "delete": {
                 "params": ["db", "table", "_id"],
@@ -265,16 +286,17 @@ TOOLS: List[Dict[str, Any]] = [{
                 "description": "计数：符合 where 的总条数；给 group_by 时返回每组条数。数数用它，不要自己数。",
             },
             "attach_file": {
-                "params": ["db", "table", "_id", "column", "path"],
-                "required": ["table", "_id", "column", "path"],
+                "params": ["db", "table", "_id", "column", "file"],
+                "required": ["table", "_id", "column", "file"],
                 "description": "给一条记录的文件列挂上/更换文件（如 vision_capture 刚拍的照片、PDF、录音）。",
             },
             "get_file": {
                 "params": ["db", "table", "file_id"],
                 "required": ["table", "file_id"],
                 "description": (
-                    "取出文件，返回本容器里的临时路径（24 小时有效），可直接作为 "
-                    "face_recognition / ocr / vop 的 image_path。"
+                    "取出文件。path 是 perception 容器里的路径，可直接作为 face_recognition / ocr / vop "
+                    "的 image_path；agent-core 的 Read 读不到它，要自己看文件就按返回的 "
+                    "agent_core.download 用 Bash 下载到 /tmp 再 Read。"
                 ),
             },
             "export_files": {
@@ -300,8 +322,13 @@ TOOLS: List[Dict[str, Any]] = [{
 }]
 
 # Object / array parameters the canvas sends as text. A model sends real JSON;
-# both are accepted. profile_columns also takes "a,b,c".
+# both are accepted. columns / profile_columns also take "a,b,c" (see _prepare).
 _JSON_PARAMS = ("where", "set", "records", "columns", "profile_columns")
+
+# Full-width punctuation typed by a Chinese IME, folded before parsing the
+# short forms and as a second chance for JSON.
+_FULLWIDTH = str.maketrans({"，": ",", "：": ":", "“": '"', "”": '"', "‘": "'", "’": "'",
+                            "【": "[", "】": "]", "｛": "{", "｝": "}", "、": ","})
 
 
 class TableDbPlugin:
@@ -324,6 +351,9 @@ class TableDbPlugin:
             max_cell_chars=int(cfg.get("max_cell_chars") or 2000),
         )
         self._store = TableStore(self._data_dir, limits)
+        # Where agent-core reaches this container's HTTP server (host network on
+        # the robot, so localhost); used only to build get_file's download URL.
+        self._http_base = str(cfg.get("http_base") or DEFAULT_HTTP_BASE).rstrip("/")
         # The parser truncates long cells; asking it for one character more than
         # the store accepts means an over-long cell arrives *over* the limit and
         # is refused with its row and column, instead of being silently cut.
@@ -349,13 +379,15 @@ class TableDbPlugin:
         args = args if isinstance(args, dict) else {}
         action = args.get("action") if name == PREFIX else name
         handlers = {
-            "show": self._do_show, "drop_table": self._do_drop_table,
+            "list": self._do_list, "drop_table": self._do_drop_table,
             "create": self._do_create, "import": self._do_import,
             "append": self._do_append, "query": self._do_query,
             "update": self._do_update, "delete": self._do_delete,
             "stats": self._do_stats, "attach_file": self._do_attach,
             "get_file": self._do_get_file, "export_files": self._do_export,
         }
+        if action == "show":                 # the name used before `list`
+            action = "list"
         if action in ("start", "stop"):
             return {"ok": True, "state": "idle", "action": action}
         if action == "info":
@@ -372,38 +404,29 @@ class TableDbPlugin:
         """Normalise one call's arguments the same way for model and canvas.
 
         * Blank strings count as "not given" (a canvas field left empty).
-        * Object/array params given as text are parsed as JSON; a bad JSON text
-          is a bad_request naming the field and the parse error.
+        * Object/array params given as text are parsed: JSON, or the short
+          forms `姓名,状态,照片:file` (columns) and `准考证号,身份证号`
+          (profile_columns). Full-width punctuation from a Chinese IME is
+          folded first. A text that is neither is a bad_request with the field
+          and an example of each accepted form.
         * The action's required params are checked here, so a missing `table`
-          answers "fill in table (try show)" rather than a None further down.
+          answers "fill in table (try list)" rather than a None further down.
+        * `request_id` is no longer part of the interface and is ignored.
         """
         out = {key: value for key, value in args.items()
                if not (isinstance(value, str) and not value.strip())}
+        out.pop("request_id", None)
         for key in _JSON_PARAMS:
             value = out.get(key)
             if not isinstance(value, str):
                 continue
-            text = value.strip()
-            if key in ("profile_columns", "columns") and not text.startswith(("[", "{")):
-                out[key] = [part.strip() for part in re.split(r"[,，、]", text)
-                            if part.strip()]
-                if key == "columns":
-                    out[key] = [{"name": part.split(":")[0].strip(),
-                                 "type": (part.split(":")[1].strip() if ":" in part else "text")}
-                                for part in out[key]]
-                continue
-            try:
-                out[key] = json.loads(text)
-            except ValueError as error:
-                raise bad_request("%s 不是合法的 JSON（%s）。例：%s" % (
-                    key, error, {"where": '{"姓名":"张三"}', "set": '{"状态":"已归还"}',
-                                 "records": '[{"姓名":"张三"}]',
-                                 "columns": '[{"name":"姓名","type":"text"}]',
-                                 "profile_columns": '["准考证号"]'}[key]), column=key)
+            out[key] = _parse_text_param(key, value.strip())
         spec = TOOLS[0]["inputSchema"]["x-action-params"].get(action, {})
         missing = [key for key in spec.get("required", []) if key not in out]
+        if action == "attach_file" and "file" in missing and "path" in out:
+            missing.remove("file")           # the field's name before `file`
         if missing:
-            hint = "；不知道库名或表名就先执行 show" if "table" in missing else ""
+            hint = "；不知道库名或表名就先执行 list" if "table" in missing else ""
             raise TableDbError("bad_request", "%s 需要填写：%s%s" % (
                 action, "、".join(missing), hint), missing=missing)
         return out
@@ -458,17 +481,6 @@ class TableDbPlugin:
         return check_db_name(args.get("db")), check_name(args.get("table"), "表名 table")
 
     @staticmethod
-    def _request(args: dict, payload: Any) -> Optional[Tuple[str, str]]:
-        request_id = args.get("request_id")
-        if request_id in (None, ""):
-            return None
-        if not isinstance(request_id, str) or len(request_id) > MAX_REQUEST_ID:
-            raise bad_request("request_id 要是不超过 %d 字的字符串" % MAX_REQUEST_ID)
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
-                                           default=str).encode("utf-8")).hexdigest()
-        return request_id, digest
-
-    @staticmethod
     def _int(args: dict, key: str, default: int, minimum: int, maximum: int) -> int:
         value = args.get(key)
         if value in (None, ""):
@@ -490,10 +502,13 @@ class TableDbPlugin:
             return value.strip().lower() in ("1", "true", "yes")
         return bool(value)
 
-    def _read_upload(self, args: dict, max_bytes: int, what: str) -> Tuple[bytes, str]:
-        path = args.get("path")
+    def _read_upload(self, args: dict, max_bytes: int, what: str,
+                     key: str = "path") -> Tuple[bytes, str]:
+        path = args.get(key)
+        if key != "path" and not path:
+            path = args.get("path")          # attach_file's field was `path` before `file`
         if not isinstance(path, str) or not path.strip():
-            raise bad_request("需要 path：%s的文件路径（飞书文件填 files[].path）" % what)
+            raise bad_request("需要 %s：%s的文件路径（飞书文件填 files[].path）" % (key, what))
         resolved = check_under_roots(path.strip(), {"image_roots": self._roots},
                                      url_action="upload through the card")
         if not os.path.isfile(resolved):
@@ -506,32 +521,28 @@ class TableDbPlugin:
         with open(resolved, "rb") as handle:
             return handle.read(), os.path.basename(resolved)
 
-    # ── show / drop_table ────────────────────────────────────────────────────
+    # ── list / drop_table ────────────────────────────────────────────────────
 
-    def _do_show(self, args: dict) -> dict:
-        """Every library, its tables, their columns and sizes — the "where am I"."""
-        wanted = check_db_name(args["db"]) if args.get("db") else None
-        names = self._store.databases()
-        if wanted and wanted not in names:
-            return {"ok": True, "databases": [], "detail": (
-                "没有库 %s。现有的库：%s" % (wanted, "、".join(names) or "（无）"))}
+    def _do_list(self, args: dict) -> dict:
+        """Every library, its tables, their columns and sizes — the "where am I".
+
+        No parameters: the records themselves are `query`'s job.
+        """
         databases = []
-        for name in ([wanted] if wanted else names):
-            tables = self._store.overview(name)
-            databases.append({"db": name, "tables": tables,
+        for name in self._store.databases():
+            databases.append({"db": name, "tables": self._store.overview(name),
                               "bytes": self._store.db_bytes(name),
                               "file": self._store.db_path(name)})
         reply: Dict[str, Any] = {"ok": True, "count": len(databases),
                                  "databases": databases}
         if not databases:
             reply["detail"] = ("还没有任何库。用 import 导入一个表格，或 create 建表；"
-                               "db 不填就是 default")
+                               "db 不填就是 default，填新名字会自动建库")
         else:
-            first_db = databases[0]
-            first = next((item for item in first_db["tables"]), None)
-            if first:
-                reply["next"] = ('查询示例：action=query, db=%s, table=%s'
-                                 % (first_db["db"], first["table"]))
+            first_db = next((item for item in databases if item["tables"]), None)
+            if first_db:
+                reply["next"] = ("看某张表的记录：action 选 query，db 填 %s，table 填 %s"
+                                 % (first_db["db"], first_db["tables"][0]["table"]))
         return reply
 
     def _do_drop_table(self, args: dict) -> dict:
@@ -547,7 +558,12 @@ class TableDbPlugin:
     def _do_create(self, args: dict) -> dict:
         db, table = self._db_table(args)
         columns = check_columns(args.get("columns"), self._store.limits)
-        return self._store.create(db, table, columns)
+        new_db = db not in self._store.databases()
+        reply = self._store.create(db, table, columns)
+        if new_db:
+            # A library is just a name: it exists as soon as its first table does.
+            reply["db_created"] = True
+        return reply
 
     # ── import ───────────────────────────────────────────────────────────────
 
@@ -566,14 +582,6 @@ class TableDbPlugin:
         dry_run = self._bool(args, "dry_run")
 
         data, filename = self._read_upload(args, self._max_import_bytes, "表格")
-        request = None
-        if not dry_run:
-            request = self._request(args, {"op": "import", "db": db, "table": table,
-                                           "mode": mode, "header_row": header_row,
-                                           "file": hashlib.sha256(data).hexdigest()})
-            replay = self._store.lookup_request(db, request)
-            if replay:
-                return replay
         suffix = posixpath.splitext(filename.lower())[1]
         if suffix in LEGACY_SUFFIXES:
             raise TableDbError("legacy_format", "这是旧版格式 %s：请用 Excel / WPS 另存为 "
@@ -659,7 +667,7 @@ class TableDbPlugin:
 
         result = self._store.insert(db, table, records,
                                     create_columns=columns if mode == "create" else None,
-                                    request=request, make_reply=make_reply,
+                                    make_reply=make_reply,
                                     row_numbers=numbers, row_word="行")
         log.info("[table_db] import %s/%s from %s: %s rows in %d ms", db, table,
                  escape_log_text(filename), result.get("imported"),
@@ -755,9 +763,7 @@ class TableDbPlugin:
         if len(records) > MAX_APPEND:
             raise TableDbError("too_large", "一次最多新增 %d 条，收到 %d 条"
                                % (MAX_APPEND, len(records)))
-        request = self._request(args, {"op": "append", "db": db, "table": table,
-                                       "records": records})
-        return self._store.insert(db, table, records, request=request)
+        return self._store.insert(db, table, records)
 
     def _do_query(self, args: dict) -> dict:
         db, table = self._db_table(args)
@@ -798,7 +804,8 @@ class TableDbPlugin:
         if "_id" not in args:
             raise bad_request("需要 _id：要挂文件的记录编号")
         column = check_name(args.get("column"), "列名 column")
-        data, filename = self._read_upload(args, self._store.limits.max_file_bytes, "要挂的")
+        data, filename = self._read_upload(args, self._store.limits.max_file_bytes, "要挂的",
+                                           key="file")
         mime = _mime(data, filename)
         number, info = self._store.attach(db, table, args.get("_id"), column,
                                           FileValue(data, filename, mime))
@@ -815,8 +822,50 @@ class TableDbPlugin:
             raise TableDbError("not_found", "库 %s 里没有文件 f_%d" % (db, fid))
         name, mime, data = found[fid]
         path = self._write_cache(db, fid, name, mime, data)
-        return {"ok": True, "file_id": "f_%d" % fid, "path": path, "name": name,
-                "mime": mime, "size": len(data), "expires_in_s": CACHE_TTL_S}
+        local = "/tmp/table_db_%s_%s" % (db, os.path.basename(path))
+        url = "%s%s/%s/f_%d" % (self._http_base, HTTP_FILE_PREFIX, db, fid)
+        return {
+            "ok": True, "file_id": "f_%d" % fid, "path": path, "name": name,
+            "mime": mime, "size": len(data), "expires_in_s": CACHE_TTL_S,
+            # `path` lives in the perception container: the vision cards there
+            # open it, agent-core's Read cannot (it only reads /work and /tmp of
+            # its own container). This is the way across, over localhost HTTP.
+            "agent_core": {
+                "download": "curl -sf -o %s %s" % (local, url),
+                "local_path": local,
+                "note": ("path 给 face_recognition / ocr / vop 用；模型自己要看这个文件，"
+                         "先用 Bash 执行 download，再 Read local_path"),
+            },
+        }
+
+    # ── file download over HTTP (GET /table_db/file/<db>/<file_id>) ──────────
+
+    def handle_http_get(self, url_path: str) -> Optional[Tuple[int, bytes, str, str]]:
+        """Serve one stored file to agent-core, or None if the path is not ours.
+
+        Returns (status, body, content_type, filename). Only `<db>/<f_N>` is
+        accepted — both validated exactly as the tool would — so the URL names
+        a row in the store, never a filesystem path.
+        """
+        route = url_path.split("?", 1)[0]
+        if not route.startswith(HTTP_FILE_PREFIX + "/"):
+            return None
+        parts = route[len(HTTP_FILE_PREFIX) + 1:].split("/")
+        try:
+            if len(parts) != 2:
+                raise bad_request("expected %s/<db>/<file_id>" % HTTP_FILE_PREFIX)
+            db = check_db_name(parts[0])
+            fid = parse_file_id(parts[1])
+            found = self._store.read_files(db, [fid])
+        except TableDbError as error:
+            return 400, error.detail.encode("utf-8"), "text/plain; charset=utf-8", ""
+        except Exception as error:  # noqa: BLE001 - an HTTP handler must answer
+            log.exception("[table_db] file download failed")
+            return 500, str(error)[:200].encode("utf-8"), "text/plain; charset=utf-8", ""
+        if fid not in found:
+            return 404, ("no file f_%d in %s" % (fid, db)).encode(), "text/plain", ""
+        name, mime, data = found[fid]
+        return 200, data, mime, name
 
     def _do_export(self, args: dict) -> dict:
         db, table = self._db_table(args)
@@ -883,7 +932,10 @@ class TableDbPlugin:
         reply = {"ok": True, "db": db, "table": table, "dir": directory,
                  "count": len(manifest), "skipped": skipped[:MAX_SKIPPED],
                  "expires_in_s": CACHE_TTL_S,
-                 "next": "face_recognition.register_by_corpus(package=\"%s\")" % directory}
+                 "next": ("下一步（录入人脸库）：复制上面的 dir，打开 face_recognition 卡，action 选 "
+                          "register_by_corpus，把 dir 粘贴到 package，点执行。会真的写入人脸库，"
+                          "返回里 registered 是成功人数；dir 24 小时内有效"),
+                 "next_call": "face_recognition.register_by_corpus(package=\"%s\")" % directory}
         return reply
 
     def _write_cache(self, db: str, fid: int, name: str, mime: str, data: bytes) -> str:
@@ -946,6 +998,53 @@ class TableDbPlugin:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+_PARAM_EXAMPLES = {
+    "where": '{"姓名":"张三"}',
+    "set": '{"状态":"已归还"}',
+    "records": '[{"姓名":"张三","状态":"借出"}]',
+    "columns": '姓名,状态,照片:file  或  [{"name":"姓名","type":"text"}]',
+    "profile_columns": '准考证号,身份证号',
+}
+
+
+def _split_list(text: str) -> List[str]:
+    """`a,b,c`, `[a,b,c]`, `["a","b"]` -> ["a","b","c"] (quotes and brackets dropped)."""
+    text = text.strip().strip("[]")
+    return [part.strip().strip("\"'").strip() for part in text.split(",")
+            if part.strip().strip("\"'").strip()]
+
+
+def _parse_text_param(key: str, text: str) -> Any:
+    """One object/array parameter that arrived as text (always, from the canvas).
+
+    JSON first, then JSON with full-width punctuation folded (a Chinese IME
+    turns `,` into `，`), then — for the two list-of-names parameters — the
+    short comma form. Only if all of that fails is it a bad_request, and the
+    message shows the accepted forms rather than a bare parser position.
+    """
+    for candidate in (text, text.translate(_FULLWIDTH)):
+        try:
+            value = json.loads(candidate)
+        except ValueError:
+            continue
+        if key == "columns" and isinstance(value, list):
+            value = [item if isinstance(item, dict) else _column_spec(str(item))
+                     for item in value]
+        return value
+    if key in ("columns", "profile_columns"):
+        names = _split_list(text.translate(_FULLWIDTH))
+        if names:
+            return [_column_spec(name) for name in names] if key == "columns" else names
+    raise bad_request("%s 的格式不对，收到 %r。正确写法：%s（逗号、引号、冒号要用英文半角）"
+                      % (key, text[:60], _PARAM_EXAMPLES[key]), column=key)
+
+
+def _column_spec(text: str) -> dict:
+    """`照片:file` -> {"name": "照片", "type": "file"}; no `:type` means text."""
+    name, _, kind = text.partition(":")
+    return {"name": name.strip(), "type": (kind.strip().lower() or TEXT)}
+
 
 def _archive_file(archive, media: str, row: int, column: str) -> FileValue:
     if archive is None:
