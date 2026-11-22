@@ -412,6 +412,36 @@ class TableStore:
                 conn.execute("DELETE FROM _requests WHERE request_id=?", (request_id,))
             return {"rows": rows, "files": len(file_ids)}
 
+    def remove_if_empty(self, db: str) -> bool:
+        """Delete a library that holds no table (left behind by a failed first write)."""
+        with self._lock(db):
+            with self._read(db) as conn:
+                if conn is None:
+                    return False
+                if conn.execute("SELECT COUNT(*) FROM _tables").fetchone()[0]:
+                    return False
+            path = self.db_path(db)
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except FileNotFoundError:
+                    continue
+            return True
+
+    def drop_db(self, db: str) -> dict:
+        """Delete a whole library file (and its WAL/SHM). Returns what it held."""
+        path = self.db_path(db)
+        with self._lock(db):
+            tables = self.overview(db)
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.remove(path + suffix)
+                except FileNotFoundError:
+                    continue
+        return {"tables": len(tables), "table_list": [item["table"] for item in tables],
+                "rows": sum(item["rows"] for item in tables),
+                "files": sum(item["files"] for item in tables)}
+
     def quick_check(self, db: str) -> str:
         with self._read(db) as conn:
             if conn is None:

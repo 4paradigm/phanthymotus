@@ -94,7 +94,8 @@ def test_import_dry_run_writes_nothing(tmp_path):
 
     assert reply["ok"] is True and reply["dry_run"] is True and reply["imported"] == 0
     assert reply["rows"] == 3 and reply["sample"][0]["照片"]["size"] == len(PNG_BYTES)
-    assert _call(card, "query", table="名单")["reason"] == "unknown_table"
+    assert _call(card, "query", table="名单")["reason"] == "unknown_db"
+    assert card.dispatch("table_db", {"action": "list"})["databases_count"] == 0
 
 
 def test_import_wps_embedded_picture_and_csv(tmp_path):
@@ -149,8 +150,10 @@ def test_import_failure_mid_batch_rolls_back_everything(tmp_path):
     reply = _call(card, "import", table="名单", path=_write(tmp_path, "l.xlsx", data))
 
     assert reply["reason"] == "too_large" and reply["row"] == 4 and reply["column"] == "姓名"
-    # The table itself was created inside the failed transaction: gone too.
-    assert _call(card, "query", table="名单")["reason"] == "unknown_table"
+    # The table was created inside the failed transaction, and the library
+    # file that opening it created is removed too: nothing is left behind.
+    assert _call(card, "query", table="名单")["reason"] == "unknown_db"
+    assert card.dispatch("table_db", {"action": "list"})["databases_list"] == []
 
 
 def test_import_append_checks_columns(tmp_path):
@@ -267,7 +270,7 @@ def test_create_validation(tmp_path):
 def test_databases_are_isolated(tmp_path):
     card = _card(tmp_path)
     _call(card, "create", table="名单", columns=["姓名"], db="skill-a")
-    assert _call(card, "query", table="名单", db="skill-b")["reason"] == "unknown_table"
+    assert _call(card, "query", table="名单", db="skill-b")["reason"] == "unknown_db"
 
 
 # ── files ────────────────────────────────────────────────────────────────────
@@ -393,7 +396,7 @@ def test_canvas_json_text_fields_are_parsed(tmp_path):
     assert found["total"] == 1
     assert _call(card, "update", table="台账", _id="1", set='{"物品":"电钻"}')["ok"] is True
     bad = _call(card, "query", table="台账", where="{借用人:张三}")
-    assert bad["reason"] == "bad_request" and bad["column"] == "where" and '{"姓名":"张三"}' in bad["detail"]
+    assert bad["reason"] == "bad_request" and bad["column"] == "where" and "{'姓名':'张三'}" in bad["detail"]
     assert _call(card, "import", table="x", path=_write(tmp_path, "r.xlsx", ROSTER),
                  dry_run="true")["dry_run"] is True
 
@@ -492,6 +495,7 @@ def test_internal_errors_are_answered_not_raised(tmp_path, monkeypatch):
     def boom(*_args, **_kwargs):
         raise RuntimeError("disk on fire")
 
+    _call(card, "create", table="a", columns="x")
     monkeypatch.setattr(card._store, "stats", boom)
     reply = _call(card, "stats", table="a")
     assert reply["reason"] == "internal_error" and "disk on fire" in reply["detail"]
@@ -516,7 +520,7 @@ def test_schema_declares_actions_params_and_required():
 
     # `show` first: it is what the canvas dropdown selects when the card opens.
     assert visible == ["list", "query", "stats", "import", "create", "append", "update",
-                       "delete", "attach_file", "get_file", "export_files", "drop_table"]
+                       "delete", "attach_file", "get_file", "export_files", "drop_table", "drop_db"]
     options = schema["properties"]["action"]["oneOf"]
     assert {item["const"] for item in options} == set(visible)
     # Bare names in the canvas dropdown; the explanation lives in description.
@@ -524,7 +528,7 @@ def test_schema_declares_actions_params_and_required():
     assert split["list"] == {**split["list"], "params": [], "required": []}
     for action in visible:
         spec = split[action]
-        if action != "list":
+        if action not in ("list", "drop_db"):
             assert "table" in spec["params"] and "table" in spec["required"]
         for param in spec["params"]:
             assert param in schema["properties"], (action, param)
@@ -609,3 +613,115 @@ def test_export_reply_says_in_chinese_what_to_do_next(tmp_path):
     reply = _call(card, "export_files", table="名单", column="照片", name_column="姓名")
     assert "register_by_corpus" in reply["next"] and "package" in reply["next"]
     assert reply["dir"] in reply["next_call"]
+
+
+# ── 2026-11-22: drop_db, list summary, db must exist, mode, quotes ───────────
+
+def test_list_starts_with_a_short_summary(tmp_path):
+    card = _card(tmp_path)
+    _call(card, "create", db="a", table="t1", columns="x")
+    _call(card, "create", db="a", table="t2", columns="x")
+    _call(card, "create", db="b", table="名单", columns="姓名")
+    reply = card.dispatch("table_db", {"action": "list"})
+
+    assert list(reply)[:4] == ["ok", "databases_count", "databases_list", "tables_list"]
+    assert reply["databases_count"] == 2 and reply["databases_list"] == ["a", "b"]
+    assert reply["tables_list"] == [{"db": "a", "count": 2, "table_list": ["t1", "t2"]},
+                                    {"db": "b", "count": 1, "table_list": ["名单"]}]
+    assert reply["databases"][0]["tables"][0]["columns"] == [{"name": "x", "type": "text"}]
+
+
+def test_drop_db_removes_every_table_and_needs_the_name_twice(tmp_path):
+    card = _card(tmp_path)
+    _call(card, "import", db="exam", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    _call(card, "create", db="exam", table="签到", columns="姓名")
+    fid = _call(card, "query", db="exam", table="名单")["records"][0]["照片"]["file_id"]
+    _call(card, "get_file", db="exam", table="名单", file_id=fid)        # fills the cache
+
+    assert _call(card, "drop_db", db="exam")["missing"] == ["confirm"]
+    assert _call(card, "drop_db", db="exam", confirm="exa")["reason"] == "bad_request"
+    assert card.dispatch("table_db", {"action": "drop_db", "confirm": "default"})["missing"] == ["db"]
+    dropped = _call(card, "drop_db", db="exam", confirm="exam")
+
+    assert dropped["dropped"] is True and dropped["tables"] == 2
+    assert dropped["table_list"] == ["名单", "签到"] and dropped["rows"] == 3 and dropped["files"] == 2
+    assert card.dispatch("table_db", {"action": "list"})["databases_list"] == []
+    assert not (tmp_path / "db" / "exam.db").exists()
+    assert not (tmp_path / "db" / "cache" / "exam").exists()
+    assert _call(card, "query", db="exam", table="名单")["reason"] == "unknown_db"
+    assert _call(card, "drop_db", db="exam", confirm="exam")["reason"] == "unknown_db"
+
+
+@pytest.mark.parametrize("action,extra", [
+    ("query", {}), ("stats", {}), ("append", {"records": "[{'x':'1'}]"}),
+    ("update", {"_id": 1, "set": "{'x':'2'}"}), ("delete", {"_id": 1}),
+    ("get_file", {"file_id": "f_1"}), ("drop_table", {"confirm": "t"}),
+    ("export_files", {"column": "照片", "name_column": "姓名"}),
+])
+def test_only_create_and_import_may_create_a_library(tmp_path, action, extra):
+    card = _card(tmp_path)
+    reply = card.dispatch("table_db", dict(action=action, db="typo", table="t", **extra))
+    assert reply["ok"] is False and reply["reason"] == "unknown_db" and "list" in reply["detail"]
+    assert reply["written"] == 0
+    assert not (tmp_path / "db" / "typo.db").exists()
+
+
+def test_attach_file_to_a_missing_library_is_refused(tmp_path):
+    card = _card(tmp_path)
+    reply = _call(card, "attach_file", db="nope", table="t", _id=1, column="c",
+                  file=_write(tmp_path, "a.png", PNG_BYTES))
+    assert reply["reason"] == "unknown_db"
+
+
+def test_import_mode_matrix(tmp_path):
+    card = _card(tmp_path)
+    path = _write(tmp_path, "r.xlsx", ROSTER)
+
+    # append: library missing -> unknown_db; table missing -> unknown_table; nothing written
+    assert _call(card, "import", db="exam", table="名单", path=path,
+                 mode="append")["reason"] == "unknown_db"
+    created = _call(card, "import", db="exam", table="名单", path=path)            # mode=create
+    assert created["imported"] == 3 and created["db_created"] is True
+    assert _call(card, "import", db="exam", table="别的表", path=path,
+                 mode="append")["reason"] == "unknown_table"
+    # create on an existing table: refused, says what to do instead
+    again = _call(card, "import", db="exam", table="名单", path=path, mode="create")
+    assert again["reason"] == "table_exists" and "append" in again["detail"]
+    # append to it: works, and warns that it does not deduplicate
+    more = _call(card, "import", db="exam", table="名单", path=path, mode="append")
+    assert more["imported"] == 3 and "db_created" not in more
+    assert any("不去重" in item for item in more["warnings"])
+    assert _call(card, "stats", db="exam", table="名单")["total"] == 6
+
+
+@pytest.mark.parametrize("key,text,check", [
+    ("where", "{'借用人':'张三'}", lambda r: r["total"] == 2),
+    ("where", "{'状态':['借出','逾期']}", lambda r: r["total"] == 2),
+    ("where", "{’借用人‘:’李四‘}", lambda r: r["total"] == 1),
+])
+def test_where_accepts_single_quotes(tmp_path, key, text, check):
+    card = _card(tmp_path)
+    _ledger(card)
+    reply = card.dispatch("table_db", {"action": "query", "db": "t", "table": "台账",
+                                       "where": text.replace("’", "'").replace("‘", "'")
+                                       if "’" in text else text})
+    assert reply["ok"] is True, reply
+    assert check(reply)
+
+
+def test_set_and_records_accept_single_quotes(tmp_path):
+    card = _card(tmp_path)
+    _ledger(card)
+    added = card.dispatch("table_db", {"action": "append", "db": "t", "table": "台账",
+                                       "records": "[{'借用人':'王五','物品':'电钻'},{'借用人':'赵六'}]"})
+    assert added["inserted"] == 2
+    changed = card.dispatch("table_db", {"action": "update", "db": "t", "table": "台账",
+                                         "_id": added["ids"][0], "set": "{'状态':'借出','物品':null}"})
+    assert changed["record"]["状态"] == "借出" and "物品" not in changed["record"]
+
+
+def test_no_double_quote_in_any_field_description():
+    """The canvas inserts descriptions into placeholder="..." without escaping
+    quotes; one ASCII double quote cut the hint off at `例 {`."""
+    for key, spec in TOOLS[0]["inputSchema"]["properties"].items():
+        assert '"' not in spec.get("description", ""), key

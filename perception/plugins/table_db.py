@@ -118,6 +118,10 @@ _MIME_BY_MAGIC = (
 # * Per-action `required` is not checked by the canvas; dispatch() checks it.
 # * Dropdowns always send a value, so no enum here may change the meaning of an
 #   action that does not list it (`mode` is read by import only).
+# * NO ASCII double quote (") in a property description: the canvas puts the
+#   text into placeholder="..." / title="..." with an escaper that does not
+#   escape quotes (canvas.js _esc), so `例 {"姓名"...` showed as `例 {`.
+#   Examples use single quotes, which _parse_text_param accepts.
 # * `accept` greys out other file types in the 选择文件 dialog, which is why
 #   import (`path`, spreadsheets) and attach_file (`file`, anything) use two
 #   different fields.
@@ -134,7 +138,8 @@ ACTIONS = [
     ("attach_file", "给一条记录的文件列挂上或更换文件（图片/PDF/音频等）"),
     ("get_file", "取出文件，返回文件路径（给人脸/OCR 卡用，或让模型下载后读）"),
     ("export_files", "把「姓名+照片」导出成一个目录，用于批量录入人脸库"),
-    ("drop_table", "删除整张表及其文件（不可恢复）"),
+    ("drop_table", "删除一张表及其文件（不可恢复），confirm 填表名"),
+    ("drop_db", "删除整个库：库里所有表和文件一起删除（不可恢复），confirm 填库名"),
 ]
 
 _TABLE_FILES = ".xlsx,.xlsm,.csv,.tsv,.docx,.docm"
@@ -161,7 +166,7 @@ TOOLS: List[Dict[str, Any]] = [{
                 "description": "要做的操作。每个操作的作用见 oneOf 里的 description",
             },
             "db": {"type": "string",
-                   "description": "例 exam。库名，不填=default；填新名字会自动建库（英文/数字/-/_）"},
+                   "description": "例 exam。库名，不填=default；有哪些库先执行 list"},
             "table": {"type": "string",
                       "description": "例 名单。表名；不知道有哪些表，先执行 list"},
             "path": {
@@ -178,18 +183,21 @@ TOOLS: List[Dict[str, Any]] = [{
                 "description": "要挂上的文件（图片/PDF/音频等任意类型）。飞书文件填 files[].path",
             },
             "where": {"type": "object",
-                      "description": ('例 {"姓名":"张三"}。筛选条件，不填=全部；'
-                                      '{"状态":["借出","逾期"]}=其中之一，{"列":null}=为空')},
+                      "description": ("例 {'姓名':'张三'} 只要姓名=张三的行;不填=全部。"
+                                      "多个条件同时满足：{'状态':'借出','借用人':'张三'}；"
+                                      "等于其中之一：{'状态':['借出','逾期']}；为空：{'归还时间':null}；"
+                                      "可用 _id：{'_id':3}。单引号双引号都可以")},
             "_id": {"type": "integer",
                     "description": "例 3。记录编号，见 query/append 返回的 _id"},
             "set": {"type": "object",
-                    "description": ('例 {"状态":"已归还"}。要改的列和新值，没写的列不变；'
-                                    '值写 null 表示清空这一格')},
+                    "description": ("例 {'状态':'已归还'} 把状态改成已归还,其它列不变。"
+                                    "可同时改多列：{'状态':'已归还','归还时间':'11-20'}；"
+                                    "值写 null 表示清空这一格；文件列换文件用 attach_file")},
             "records": {
                 "type": "array", "items": {"type": "object"},
-                "description": ('例 [{"姓名":"张三"},{"姓名":"李四"}] 一个{}一条,填文字列。'
-                                '键是列名、值是内容；多条用英文逗号隔开；文件列不能在这里填'
-                                '（用 attach_file）；一次≤500条'),
+                "description": ("例 [{'姓名':'张三','状态':'借出'}] 方括号里一个{}是一条。"
+                                "多条：[{'姓名':'张三'},{'姓名':'李四'}]；键是列名、值是内容，"
+                                "没写的列留空；只能填文字列（文件用 attach_file）；一次≤500条"),
             },
             "columns": {
                 "type": "array",
@@ -216,7 +224,8 @@ TOOLS: List[Dict[str, Any]] = [{
             "mode": {
                 "type": "string",
                 "enum": ["create", "append"],
-                "description": "create（默认）= 按表头建新表；append = 追加到已有表（列名要对得上）",
+                "description": ("create（默认）：建新表，表已存在就报错不写；"
+                                "append：追加到已有的库和表，库或表不存在就报错不写"),
             },
             "header_row": {
                 "type": "integer", "minimum": 0,
@@ -225,7 +234,7 @@ TOOLS: List[Dict[str, Any]] = [{
             "dry_run": {"type": "boolean",
                         "description": "例 true。填 true 只预览不写库；不填=正式导入"},
             "confirm": {"type": "string",
-                        "description": "例 名单。再填一遍表名才会删除（防误删，不可恢复）"},
+                        "description": "例 名单。drop_table 再填一遍表名，drop_db 再填一遍库名"},
             "offset": {"type": "integer", "minimum": 0,
                        "description": "例 20。跳过前几条，用于翻页；不填=0"},
             "limit": {"type": "integer", "minimum": 1,
@@ -244,14 +253,16 @@ TOOLS: List[Dict[str, Any]] = [{
             "create": {
                 "params": ["db", "table", "columns"],
                 "required": ["table", "columns"],
-                "description": ("建空表，列类型只有 text / file。库不存在会自动新建；"
-                                "表已存在会报 table_exists。"),
+                "description": ("建空表，列类型只有 text / file。db 填一个还没有的名字会新建这个库"
+                                "（返回 db_created=true）；表已存在会报 table_exists。"),
             },
             "import": {
                 "params": ["db", "table", "path", "mode", "header_row", "dry_run"],
                 "required": ["table", "path"],
                 "description": (
                     "导入表格文件（xlsx/csv，兼容 Word 里的表格；单元格里的图片自动存成 file 列）。"
+                    "mode=create（默认）建新表，db 是新名字会新建库，表已存在报 table_exists；"
+                    "mode=append 追加到已有的表，库不存在报 unknown_db、表不存在报 unknown_table。"
                     "整批成功或整批不写。返回识别出的列、导入条数、前 3 条样例。"
                     "建议先 dry_run=true 给用户确认。"
                 ),
@@ -314,6 +325,14 @@ TOOLS: List[Dict[str, Any]] = [{
                 "description": (
                     "删除整张表及其文件（不可恢复）。confirm 必须再填一遍表名。"
                     "只在用户明确要求删除或重新导入时使用。"
+                ),
+            },
+            "drop_db": {
+                "params": ["db", "confirm"],
+                "required": ["db", "confirm"],
+                "description": (
+                    "删除整个库（库里所有表、记录和文件一起删，不可恢复）。confirm 必须再填一遍库名。"
+                    "只在用户明确要求时使用。"
                 ),
             },
             "info": {"params": ["db"], "description": "诊断：库列表、表、上限、库完整性。"},
@@ -380,6 +399,7 @@ class TableDbPlugin:
         action = args.get("action") if name == PREFIX else name
         handlers = {
             "list": self._do_list, "drop_table": self._do_drop_table,
+            "drop_db": self._do_drop_db,
             "create": self._do_create, "import": self._do_import,
             "append": self._do_append, "query": self._do_query,
             "update": self._do_update, "delete": self._do_delete,
@@ -397,7 +417,27 @@ class TableDbPlugin:
             return None
         with self._counter_lock:
             self._calls += 1
-        return self._safe(lambda given: handler(self._prepare(action, given)), args)
+        return self._safe(lambda given: handler(self._checked(action, self._prepare(action, given))),
+                          args)
+
+    # Actions that may bring a library into existence. Everything else names a
+    # library that must already be there: a typo in `db` must answer "no such
+    # library", not silently create an empty one.
+    _MAY_CREATE_DB = ("list", "create", "import")
+
+    def _checked(self, action: str, args: dict) -> dict:
+        if action in self._MAY_CREATE_DB and not (action == "import" and
+                                                   str(args.get("mode") or "").strip().lower()
+                                                   == "append"):
+            return args
+        db = check_db_name(args.get("db"))
+        names = self._store.databases()
+        if db not in names:
+            raise TableDbError("unknown_db", "没有库 %s。现有的库：%s。用 list 查看有哪些库和表；"
+                               "新建库请用 create 或 import（mode=create）" % (
+                                   db, "、".join(names) or "（还没有任何库）"),
+                               databases=names)
+        return args
 
     @staticmethod
     def _prepare(action: str, args: dict) -> dict:
@@ -533,8 +573,18 @@ class TableDbPlugin:
             databases.append({"db": name, "tables": self._store.overview(name),
                               "bytes": self._store.db_bytes(name),
                               "file": self._store.db_path(name)})
-        reply: Dict[str, Any] = {"ok": True, "count": len(databases),
-                                 "databases": databases}
+        # Summary first — counts and names in a few lines a person can read on
+        # the card — then the full nested detail.
+        reply: Dict[str, Any] = {
+            "ok": True,
+            "databases_count": len(databases),
+            "databases_list": [item["db"] for item in databases],
+            "tables_list": [{"db": item["db"], "count": len(item["tables"]),
+                             "table_list": [table["table"] for table in item["tables"]]}
+                            for item in databases],
+            "count": len(databases),
+            "databases": databases,
+        }
         if not databases:
             reply["detail"] = ("还没有任何库。用 import 导入一个表格，或 create 建表；"
                                "db 不填就是 default，填新名字会自动建库")
@@ -553,13 +603,28 @@ class TableDbPlugin:
         return {"ok": True, "db": db, "table": table, "dropped": True,
                 "rows": removed["rows"], "files": removed["files"]}
 
+    def _do_drop_db(self, args: dict) -> dict:
+        db = check_db_name(args.get("db"))
+        if str(args.get("confirm") or "").strip() != db:
+            raise bad_request("confirm 要再填一遍库名「%s」才会删除整个库（防止误删）" % db)
+        removed = self._store.drop_db(db)
+        shutil.rmtree(os.path.join(self._cache_dir, db), ignore_errors=True)
+        return {"ok": True, "db": db, "dropped": True, "tables": removed["tables"],
+                "table_list": removed["table_list"], "rows": removed["rows"],
+                "files": removed["files"]}
+
     # ── create ───────────────────────────────────────────────────────────────
 
     def _do_create(self, args: dict) -> dict:
         db, table = self._db_table(args)
         columns = check_columns(args.get("columns"), self._store.limits)
         new_db = db not in self._store.databases()
-        reply = self._store.create(db, table, columns)
+        try:
+            reply = self._store.create(db, table, columns)
+        except Exception:
+            if new_db:
+                self._store.remove_if_empty(db)
+            raise
         if new_db:
             # A library is just a name: it exists as soon as its first table does.
             reply["db_created"] = True
@@ -609,12 +674,13 @@ class TableDbPlugin:
 
         existing = self._store.columns(db, table)
         if mode == "create" and existing is not None:
-            raise TableDbError("table_exists", "表「%s」已经存在。追加用 mode=\"append\"，"
-                               "或换一个表名" % table)
+            raise TableDbError("table_exists", "库 %s 里已经有表「%s」，没有写入。要往里追加用 "
+                               "mode=append；要整表重来先 drop_table；或者换一个表名" % (db, table))
         if mode == "append":
+            warnings.append("append 不去重：同一份文件追加两次，表里就会有两份")
             if existing is None:
-                raise TableDbError("unknown_table", "表「%s」不存在；第一次导入用 mode=\"create\""
-                                   % table)
+                raise TableDbError("unknown_table", "库 %s 里没有表「%s」，没有写入。append 只能追加到"
+                                   "已有的表；第一次导入请用 mode=create" % (db, table))
             known = {column.name: column.type for column in existing}
             for name, kind in columns:
                 if name not in known:
@@ -665,10 +731,21 @@ class TableDbPlugin:
                 reply["warnings"] = warnings
             return reply
 
-        result = self._store.insert(db, table, records,
-                                    create_columns=columns if mode == "create" else None,
-                                    make_reply=make_reply,
-                                    row_numbers=numbers, row_word="行")
+        new_db = db not in self._store.databases()
+        try:
+            result = self._store.insert(db, table, records,
+                                        create_columns=columns if mode == "create" else None,
+                                        make_reply=make_reply,
+                                        row_numbers=numbers, row_word="行")
+        except Exception:
+            # The transaction rolled the table back, but opening the library
+            # created its file: a failed first import must not leave an empty
+            # library behind in `list`.
+            if new_db:
+                self._store.remove_if_empty(db)
+            raise
+        if new_db:
+            result["db_created"] = True
         log.info("[table_db] import %s/%s from %s: %s rows in %d ms", db, table,
                  escape_log_text(filename), result.get("imported"),
                  (time.time() - started) * 1000)
@@ -1000,9 +1077,9 @@ class TableDbPlugin:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 _PARAM_EXAMPLES = {
-    "where": '{"姓名":"张三"}',
-    "set": '{"状态":"已归还"}',
-    "records": '[{"姓名":"张三","状态":"借出"}]',
+    "where": "{'姓名':'张三'}",
+    "set": "{'状态':'已归还'}",
+    "records": "[{'姓名':'张三','状态':'借出'}]",
     "columns": '姓名,状态,照片:file  或  [{"name":"姓名","type":"text"}]',
     "profile_columns": '准考证号,身份证号',
 }
@@ -1023,7 +1100,8 @@ def _parse_text_param(key: str, text: str) -> Any:
     short comma form. Only if all of that fails is it a bad_request, and the
     message shows the accepted forms rather than a bare parser position.
     """
-    for candidate in (text, text.translate(_FULLWIDTH)):
+    folded = text.translate(_FULLWIDTH)
+    for candidate in (text, folded, folded.replace("'", '"')):
         try:
             value = json.loads(candidate)
         except ValueError:
@@ -1036,7 +1114,7 @@ def _parse_text_param(key: str, text: str) -> Any:
         names = _split_list(text.translate(_FULLWIDTH))
         if names:
             return [_column_spec(name) for name in names] if key == "columns" else names
-    raise bad_request("%s 的格式不对，收到 %r。正确写法：%s（逗号、引号、冒号要用英文半角）"
+    raise bad_request("%s 的格式不对，收到 %r。正确写法：%s（逗号、冒号用英文半角；引号单双都可以）"
                       % (key, text[:60], _PARAM_EXAMPLES[key]), column=key)
 
 

@@ -44,15 +44,17 @@
 
 ---
 
-## 三、12 个动作
+## 三、13 个动作
 
-除 `list` 外，每个动作都要传 `table`；`db` 可选，默认 `default`，**建议一律传你的 skill slug**。
+除 `list`、`drop_db` 外，每个动作都要传 `table`；`db` 可选，默认 `default`，**建议一律传你的 skill slug**。
+
+**库什么时候会被新建**：只有 `create`，以及 `import` 的 `mode=create`，在 `db` 填一个还没有的名字时会新建这个库（返回 `db_created: true`）。其它所有动作，`db` 必须是已有的库，否则报 `unknown_db`，并列出现有的库，不会因为库名打错而多出一个空库。一次失败的首次导入或建表也不会留下空库。
 
 | 动作 | 参数 | 返回 |
 |---|---|---|
-| `list` | （不填） | 所有库、每个库里的表、列类型、行数和文件数。**不知道库名、表名时先调它** |
+| `list` | （不填） | 先给汇总：`databases_count`、`databases_list`、`tables_list`（每个库的表数和表名）；然后是 `databases`：每张表的列类型、行数、文件数。**不知道库名、表名时先调它** |
 | `create` | `columns`：`[{"name":"姓名","type":"text"},{"name":"照片","type":"file"}]` | 列定义 |
-| `import` | `path`：飞书文件直接填 `files[].path`<br>`mode`：`create`（默认）或 `append`<br>`header_row`：表头在第几行（自动识别错了才填）<br>`dry_run`：`true` 表示只检查不写<br> | `columns`、`rows`、`imported`、`files`、`skipped_rows`（空行），以及 3 条 `sample` |
+| `import` | `path`：飞书文件直接填 `files[].path`<br>`mode`：`create`（默认，建新表；表已存在报 `table_exists`）或 `append`（追加到已有的表；库不存在报 `unknown_db`，表不存在报 `unknown_table`；不去重）<br>`header_row`：表头在第几行（自动识别错了才填）<br>`dry_run`：`true` 表示只检查不写<br> | `columns`、`rows`、`imported`、`files`、`skipped_rows`（空行），以及 3 条 `sample` |
 | `append` | `records`：`[{...}]`（不超过 500 条，只写文字列）<br> | `ids` |
 | `query` | `where`、`offset`、`limit`（默认 20，最多 200） | `total`、`count`、`has_more`、`next_offset`、`records` |
 | `update` | `_id`、`set`：`{"状态":"已归还"}`，值为 `null` 表示清空 | 修改后的完整记录 |
@@ -62,12 +64,13 @@
 | `get_file` | `file_id` | `path`：本容器里的临时文件，24 小时有效 |
 | `export_files` | `column`（文件列）、`name_column`、`profile_columns`、`where` | `dir`：照片加 `manifest.json`，交给 `face_recognition.register_by_corpus` |
 | `drop_table` | `confirm`：再填一遍表名 | 删除整张表及其文件（不可恢复），用于重新导入 |
+| `drop_db` | `db`（必填）、`confirm`：再填一遍库名 | 删除整个库：库里所有表、记录、文件一起删除（不可恢复），返回删掉的表名、行数、文件数 |
 
 **图片的三种放法都支持**：WPS 的嵌入单元格图片（`DISPIMG`）、浮动图片（按锚点归到对应行）、Excel 365 的「放在单元格中」图片（rich data）。
 超过 15 位、却按数字存储的号码（常见于身份证号），Excel 本身只保存了 15 位有效数字，后面几位已经丢失；导入时会在 `warnings` 里提醒，请用户把这一列改为文本格式后重新填写。
 
 **在画布上直接测试**：卡片上只有一个 action 下拉框、各个参数格子和一个「▶ 执行」按钮。
-对象和数组类型的格子要填 JSON 文本（例如 `{"姓名":"张三"}`），`columns` 和 `profile_columns` 也可以写成 `姓名,照片:file`。
+`where`、`set`、`records` 填 JSON 文本，**单引号和双引号都可以**，例如 `{'姓名':'张三'}`。画布的灰色提示里用的是单引号，因为画布显示提示时不转义双引号，双引号会把提示截断。`columns` 和 `profile_columns` 可以写成 `姓名,照片:file` 这样的逗号简写，中文标点也能识别。
 漏填必填项时，会返回 `bad_request` 并带上 `missing`。
 
 **`where` 只有三种写法**：
@@ -125,6 +128,7 @@ query(table=.., where=..) 拿到 照片.file_id → get_file(file_id) 得到 pat
 | reason | 什么时候出现 | skill 应该怎么做 |
 |---|---|---|
 | `bad_request` | 参数缺失或类型不对，`where` 写法不支持，往文件列写文字 | 按 `detail` 改参数 |
+| `unknown_db` | 库不存在（只有 create / import 的 create 模式会新建库） | 用 `list` 看有哪些库，或检查 `db` 有没有打错 |
 | `unknown_table` / `table_exists` | 表不存在 / 建表时表已存在 | 先 create 或 import；追加用 `mode="append"` |
 | `unknown_column` | 用了表里没有的列 | `detail` 里列出了现有的列 |
 | `not_found` | `_id` 或 `file_id` 不存在，或已删除 | 先 query 确认 |
