@@ -3012,6 +3012,11 @@ transcribed and TTS still speaks with the card running.
 
 ---
 
+## Cross-view object consistency
+
+Compare synchronized VOP detections from two calibrated views with registered depth.
+See [the Dashboard wiring and validation guide](docs/cross-view-object-consistency.md).
+
 ## Vision: `vop` (detection) and `visual_depth` (depth)
 
 By default, both run a **prebuilt TensorRT engine** fetched as a pinned bundle

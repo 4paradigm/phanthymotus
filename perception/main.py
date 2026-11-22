@@ -228,6 +228,11 @@ class PerceptionBundle:
                 log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
                           exc_info=True)
 
+        if plugins_cfg.get("cross_view_object_consistency", {}).get("enabled", False):
+            from plugins.cross_view_object_consistency import CrossViewObjectConsistencyPlugin
+            self._plugins.append(CrossViewObjectConsistencyPlugin(
+                plugins_cfg["cross_view_object_consistency"], executor))
+
         if plugins_cfg.get("measure", {}).get("enabled", False):
             from plugins.measure import MeasurePlugin
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))

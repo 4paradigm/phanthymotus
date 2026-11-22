@@ -476,14 +476,14 @@ class _VOPNode(Node):
         self._last_inference_time = now
         # Drop old frame if queue full (no backpressure)
         try:
-            self._frame_queue.put_nowait(msg.data)
+            self._frame_queue.put_nowait((msg.data, getattr(msg, "header", None)))
         except queue.Full:
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._frame_queue.put_nowait(msg.data)
+                self._frame_queue.put_nowait((msg.data, getattr(msg, "header", None)))
             except queue.Full:
                 pass
 
@@ -493,7 +493,7 @@ class _VOPNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                jpeg_bytes, header = self._frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             started = time.time()
@@ -508,7 +508,7 @@ class _VOPNode(Node):
                     outputs, meta, self._confidence
                 )
                 objects = self._extract_objects(boxes, scores, classes, frame)
-                self._publish_objects(objects, started)
+                self._publish_objects(objects, started, header=header, size=frame.shape[1::-1])
             except Exception as e:
                 log.error(f"[vop] inference error: {e}", exc_info=True)
 
@@ -559,7 +559,8 @@ class _VOPNode(Node):
         the one-shot photo actions, so both emit the same thing."""
         self._publish_objects(objects, started)
 
-    def _publish_objects(self, objects: list, started: Optional[float] = None):
+    def _publish_objects(self, objects: list, started: Optional[float] = None,
+                         *, header=None, size=None):
         self._detect_count += 1
         # `count` and `latency_ms` follow plugins/face.py: a consumer should not
         # have to len() the list to know whether anything was seen, and latency
@@ -576,6 +577,12 @@ class _VOPNode(Node):
             # arrival: queue wait is a function of the fps cap, not of how long
             # detection takes, and mixing them makes the number unreadable.
             payload["latency_ms"] = int((time.time() - started) * 1000)
+        from utils.frame_source import source_header
+
+        source = source_header(header)
+        if source is not None:
+            payload["source"] = source
+            payload["source_size"] = list(size)
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=False)
         self._pub.publish(msg)

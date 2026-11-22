@@ -1018,14 +1018,14 @@ class _DepthNode(Node):
         # Drop the stale frame rather than queue up: a depth map from two
         # seconds ago is worse than no depth map.
         try:
-            self._frame_queue.put_nowait(msg.data)
+            self._frame_queue.put_nowait((msg.data, getattr(msg, "header", None)))
         except queue.Full:
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._frame_queue.put_nowait(msg.data)
+                self._frame_queue.put_nowait((msg.data, getattr(msg, "header", None)))
             except queue.Full:
                 pass
 
@@ -1035,7 +1035,7 @@ class _DepthNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                jpeg_bytes, header = self._frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             try:
@@ -1056,7 +1056,7 @@ class _DepthNode(Node):
                     depth_m = cv2.resize(depth_m, (DEPTH_WIDTH, DEPTH_HEIGHT),
                                          interpolation=cv2.INTER_NEAREST)
                 depth_m = self._mask_lens_barrel(frame, depth_m)
-                self._publish(depth_m)
+                self._publish(depth_m, header=header)
             except Exception as e:
                 log.error(f"[visual_depth] inference error: {e}", exc_info=True)
 
@@ -1088,7 +1088,7 @@ class _DepthNode(Node):
         out[mask] = np.nan
         return out
 
-    def _publish(self, depth_m: np.ndarray, summary: Optional[dict] = None):
+    def _publish(self, depth_m: np.ndarray, summary: Optional[dict] = None, *, header=None):
         """Publish one depth map and its summary.
 
         `summary` is optional so a one-shot answer can reuse the richer stats it
@@ -1097,6 +1097,8 @@ class _DepthNode(Node):
         self._frame_count += 1
 
         depth_msg = CompressedImage()
+        if header is not None:
+            depth_msg.header = header
         depth_msg.format = "16UC1; compressedDepth zlib"
         depth_msg.data = encode_depth(depth_m, self._max_depth_m)
         self._depth_pub.publish(depth_msg)
