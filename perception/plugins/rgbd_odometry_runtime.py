@@ -643,6 +643,7 @@ class CaptureObservations:
         self.visual_sink = None
         self.external_gate = None
         self.external_previous = None
+        self.external_failure = None
         self.frames = OrderedDict()
         self.last_added = 0
         self.geometry_capture = None
@@ -798,16 +799,20 @@ class CaptureObservations:
                     gate.fault(reason, 'frame')
                 else:
                     gate.degrade(reason, now, stamp=stamp, native_lost=getattr(info, 'lost', False))
-                continue
-            sample = gate.accept(entry['pose'], info, now)
-            if gate.good and gate.last_stamp == stamp:
-                self.external_previous = candidate
-            elif not gate.good and gate.rejection is not None and eskf_visual is None:
-                # Preserve the recovery anchor reset for covariance failures
-                # that previously failed the shared validation.
-                self.external_previous = None
-            if sample is not None:
-                self.visual_sink(stamp, gate.segment, visual)
+            else:
+                sample = gate.accept(entry['pose'], info, now)
+                if gate.good and gate.last_stamp == stamp:
+                    self.external_previous = candidate
+                elif not gate.good and gate.rejection is not None and eskf_visual is None:
+                    # Preserve the recovery anchor reset for covariance failures
+                    # that previously failed the shared validation.
+                    self.external_previous = None
+                if sample is not None:
+                    self.visual_sink(stamp, gate.segment, visual)
+            if gate.state == 'lost' and (gate.last_pose is not None or gate.loss_kind in ('frame', 'clock')):
+                # Native joins can run ahead of an older capture waiting for IMU.
+                # Expose this terminal boundary only when the ordered drain reaches it.
+                entry['native_fault'] = (gate.reason, gate.loss_kind)
 
     def drain(self, now):
         if self.visual_sink is not None:
@@ -836,11 +841,15 @@ class CaptureObservations:
             visual_only_startup = self.fusion.filter is None and not self.fusion.samples
             if (not ready or (not coverage and not visual_only_startup)) and now < deadline:
                 break
-            if outputs and entry.get('frame_fault'):
+            if outputs and (entry.get('frame_fault') or
+                            (self.external_failure is None and entry.get('native_fault'))):
                 # The session publishes returned samples using the current
                 # filter state. Deliver earlier corrections before faulting.
+                # A handed-off native failure must not split later healthy ESKF work.
                 break
             self.frames.pop(stamp)
+            if entry.get('native_fault'):
+                self.external_failure = entry['native_fault']
             if entry.get('frame_fault'):
                 # The independent gate can inspect newer captures while the
                 # ESKF waits for IMU. Only this ordered drain faults the ESKF.
@@ -1597,6 +1606,13 @@ class RgbdSession:
         return getattr(self, 'fusion', None) is not None and getattr(self, 'fallback', None) is None
 
     def _check_fusion(self, now):
+        stream = getattr(self, 'external_stream', None)
+        failure = getattr(getattr(self, 'observations', None), 'external_failure', None)
+        if self._fusing() and failure is not None and stream is not None and stream.active:
+            # A live external track still needs its native visual producer. End
+            # this session through the supervisor, which retains the body fuser.
+            self.fusion.fault(*failure)
+            self.gate.fault(*failure)
         if (getattr(self, 'fusion', None) is not None and getattr(self, 'fallback', None) is None and
                 self.fusion.state == 'lost' and self.gate.state != 'lost'):
             if self.fusion.loss_kind in ('frame', 'clock', 'input'):
