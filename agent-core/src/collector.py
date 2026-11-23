@@ -67,6 +67,8 @@ def _is_log_type(ev: dict) -> bool:
 
 # ── 共享状态 ──────────────────────────────────────────────────────────────────
 _busy: bool = False
+_FeishuChat = tuple[str, str, str, int]  # channel, chat, sender, generation
+_current_trigger: dict = {}
 _cancel_event: asyncio.Event | None = None
 # 比 _cancel_event 窄：steer 模式下高优先级事件到达时置位，只打断"正在飞的 LLM
 # 请求"或"还没发出去、卡在排队里的 tool_call"，不像 _cancel_event 那样让整个 turn
@@ -247,10 +249,11 @@ def _pending_has_same_asr_text(asr_text: str) -> bool:
 
 # ── 公开接口 ──────────────────────────────────────────────────────────────────
 
-def set_busy(busy: bool):
+def set_busy(busy: bool, *, trigger: dict | None = None):
     """由 agent loop 调用：标记当前是否正在执行 turn。"""
-    global _busy
+    global _busy, _current_trigger
     _busy = busy
+    _current_trigger = trigger if busy and trigger is not None else {}
     if not busy:
         # turn 结束时立即排空所有 pending 队列，避免消息跨 turn 滞留
         _flush_all_pending()
@@ -260,6 +263,13 @@ def set_cancel_event(ev: asyncio.Event | None):
     """由 agent loop 调用：注册/清除当前 turn 的取消信号。"""
     global _cancel_event
     _cancel_event = ev
+
+
+def cancel_feishu_turn(channel_id: str, user_id: str):
+    """Stop inference for the sender who just cleared their Feishu context."""
+    chat = _current_trigger.get('_feishu_chat')
+    if _cancel_event is not None and chat and (chat[0], chat[2]) == (channel_id, user_id):
+        _cancel_event.set()
 
 
 def set_reconsider_event(ev: asyncio.Event | None):
@@ -297,9 +307,11 @@ async def drain_steering() -> list[dict]:
     items = []
     while not _steering_queue.empty():
         try:
-            items.append(_steering_queue.get_nowait())
+            ev = _steering_queue.get_nowait()
         except asyncio.QueueEmpty:
             break
+        if feishu_context_is_current(_feishu_chat([ev])):
+            items.append(ev)
     return items
 
 
@@ -326,7 +338,10 @@ async def next_trigger() -> dict:
     """阻塞等待下一批 P>0 事件（main agent 消费端）。"""
     # Fallback: 每次等待前再检查一次 pending 队列，防止遗漏
     _flush_all_pending()
-    return await _output.get()
+    while True:
+        trigger = await _output.get()
+        if feishu_context_is_current(trigger.get('_feishu_chat')):
+            return trigger
 
 
 def get_source_detail(source: str, limit: int = 20) -> list[dict]:
@@ -357,6 +372,38 @@ def _channel_payloads(events: list[dict]) -> list[dict]:
         except (ValueError, TypeError):
             continue
     return payloads
+
+
+def _feishu_chat(events: list[dict]) -> _FeishuChat | None:
+    for payload in _channel_payloads(events):
+        channel_id = payload.get('channel_id')
+        chat_id = payload.get('chat_id')
+        user_id = payload.get('user_id')
+        generation = payload.get('context_generation', 0)
+        if (payload.get('platform') == 'feishu'
+                and isinstance(channel_id, str) and channel_id
+                and isinstance(chat_id, str) and chat_id
+                and isinstance(user_id, str) and user_id
+                and isinstance(generation, int)):
+            return channel_id, chat_id, user_id, generation
+    for event in events:
+        if event.get('source', '').startswith('subagent:'):
+            from history_scope import from_metadata
+
+            payload = event.get('payload')
+            if isinstance(payload, dict):
+                scope = from_metadata(payload)
+                if scope is not None:
+                    return scope
+    return None
+
+
+def feishu_context_is_current(chat: _FeishuChat | None) -> bool:
+    if chat is None:
+        return True
+    from channel.manager import manager as channel_manager
+    channel_id, chat_id, user_id, generation = chat
+    return generation == channel_manager.chat_generation(channel_id, chat_id, user_id)
 
 
 def _bot_channel_payloads(events: list[dict]) -> list[dict]:
@@ -417,40 +464,62 @@ def _bot_trust_class(events: list[dict]) -> int:
     return 1 if has_bot_channel_event(events) else 0
 
 
+def _defer_channel_steering(ev: dict, feishu_chat: _FeishuChat | None) -> bool:
+    if has_bot_channel_event([ev]):
+        return True
+    current_chat = _current_trigger.get('_feishu_chat')
+    if feishu_chat is not None:
+        return (feishu_chat != current_chat or _current_trigger.get('_bot_channel_event', False)
+                or has_viewer_only_channel_event([ev]) != _current_trigger.get('_viewer_channel_event', False))
+    return current_chat is not None and bool(_channel_payloads([ev]))
+
+
 def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
-    """Keep trusted bots, other bots, and people in separate LLM turns."""
+    """Keep bot trust levels and Feishu senders in separate LLM turns."""
     batches = []
+    previous = None
     for ev in events:
-        key = ev.get('_chat_only_key') or _bot_trust_class([ev])
-        previous = batches[-1][0] if batches else {}
-        previous_key = previous.get('_chat_only_key') or _bot_trust_class([previous])
-        if not batches or key != previous_key:
+        chat = _feishu_chat([ev])
+        if not feishu_context_is_current(chat):
+            continue
+        viewer_only = chat is not None and has_viewer_only_channel_event([ev])
+        key = (ev.get('_chat_only_key'), _bot_trust_class([ev]), chat, viewer_only)
+        if key != previous:
             batches.append([])
+            previous = key
         batches[-1].append(ev)
     return batches
 
 
 def _chat_history_blocks(batch: list[dict]) -> str:
-    """Prepend each distinct (channel_id, chat_id)'s own recent recap (see
-    channel/manager.py:get_chat_history) ahead of this batch's <event> blocks.
-
-    The shared global turn history (event/llm.py:self._turns) doesn't separate
-    by chat — this gives the model an explicit, scoped reminder of what this
-    exact conversation said, so it's less likely to answer person A with
-    context that only came from person B.
-    """
+    """Prepend each conversation's recent exchanges to the batch's events."""
     from channel.manager import manager as channel_manager
     seen = set()
     blocks = []
-    for payload in _channel_payloads(batch):
+    payloads = _channel_payloads(batch)
+    feishu_message_ids = frozenset(
+        payload['message_id'] for payload in payloads
+        if payload.get('platform') == 'feishu' and isinstance(payload.get('message_id'), str)
+        and payload['message_id']
+    )
+    for payload in payloads:
         channel_id = payload.get('channel_id')
         chat_id = payload.get('chat_id')
         if not isinstance(channel_id, str) or not isinstance(chat_id, str):
             continue
-        if not channel_id or not chat_id or (channel_id, chat_id) in seen:
+        user_id = ''
+        if payload.get('platform') == 'feishu':
+            user_id = payload.get('user_id')
+            if not isinstance(user_id, str) or not user_id:
+                continue
+        history_key = (channel_id, chat_id, user_id)
+        if not channel_id or not chat_id or history_key in seen:
             continue
-        seen.add((channel_id, chat_id))
-        history = channel_manager.get_chat_history(channel_id, chat_id)
+        seen.add(history_key)
+        history = channel_manager.get_chat_history(
+            channel_id, chat_id, user_id=user_id,
+            exclude_message_ids=feishu_message_ids if user_id else frozenset(),
+        )
         if not history:
             continue
         lines = []
@@ -488,6 +557,7 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_bot_channel_event': bool(bot_payloads),
         '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
         '_viewer_channel_event': has_viewer_only_channel_event(batch),
+        '_feishu_chat': _feishu_chat(batch),
         '_channel_message_ids': channel_message_ids(batch),
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
@@ -869,6 +939,9 @@ async def _drain_loop():
             continue
         _note_ungated()
 
+        feishu_chat = _feishu_chat([ev])
+        if not feishu_context_is_current(feishu_chat):
+            continue
         if '/channel/request/' in source:
             from channel import chat_only
             from channel.manager import get_channel_config, manager
@@ -931,7 +1004,7 @@ async def _drain_loop():
 
                 # 按模式处理
                 if _interrupt_mode == 'steer':
-                    if has_bot_channel_event([ev]):
+                    if _defer_channel_steering(ev, feishu_chat):
                         _priority_pending.append(ev)
                         continue
                     # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过

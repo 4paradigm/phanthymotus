@@ -138,6 +138,8 @@ class SubagentManager:
 
     async def spawn(self, spec: SubagentSpec) -> str:
         """Create and queue a subagent. Returns agent_id."""
+        import history_scope
+
         if len(self._agents) >= self._cfg['max_total']:
             raise RuntimeError(f'Maximum subagent count ({self._cfg["max_total"]}) reached')
 
@@ -148,6 +150,11 @@ class SubagentManager:
         if spec.timeout_s < 0:
             spec.timeout_s = float(self._cfg['default_timeout_s'])
 
+        spec.metadata = {
+            **spec.metadata,
+            'history_feishu_scope': history_scope.current_feishu_scope.get(),
+            'history_origin_unknown': history_scope.current_origin_unknown.get(),
+        }
         agent = Subagent(
             spec=spec,
             compress_threshold=self._cfg['compress_threshold_chars'],
@@ -438,21 +445,20 @@ class SubagentManager:
         # 所有 subagent 完成时结论存 DB
         if result.status == 'completed' and result.output.strip():
             try:
-                import time as _time
-                from config import _get_conn
+                import chat_history
+                import history_scope
                 source_type = 'bg_monitor' if is_bg else 'user_task'
-                with _get_conn() as conn:
-                    conn.execute(
-                        'INSERT INTO subagent_conclusions (agent_id, goal, conclusion, source_type, created_at) '
-                        'VALUES (?, ?, ?, ?, ?)',
-                        (agent.id, agent.spec.goal[:200], result.output, source_type, _time.time())
-                    )
-                    conn.commit()
+                chat_history.save_conclusion(
+                    agent.id, agent.spec.goal[:200], result.output, source_type,
+                    feishu_scope=history_scope.archived_scope(agent.spec.metadata),
+                )
             except Exception as e:
                 print(f'[subagent:{agent.id}] save conclusion to DB failed: {e}')
 
         # 不需要本机决策的完成 → 只推前端，不唤醒 main agent
         _skip = notify_suppression_reason(agent.spec, result, is_bg)
+        if agent.spec.metadata.get('history_origin_unknown'):
+            _skip = _skip or 'restored task has no history provenance'
         if _skip:
             if _skip != 'bg':
                 print(f'[subagent:{agent.id}] not waking the local agent: {_skip}')
@@ -512,6 +518,7 @@ class SubagentManager:
                 'error': result.error,
                 'rounds_used': result.rounds_used,
                 'priority': agent.spec.priority,
+                'history_feishu_scope': agent.spec.metadata.get('history_feishu_scope'),
             },
         )
 
@@ -549,8 +556,11 @@ class SubagentManager:
             return
 
         for rec in records:
+            spec = rec['spec']
+            if 'history_feishu_scope' not in spec.metadata:
+                spec.metadata = {**spec.metadata, 'history_origin_unknown': True}
             agent = Subagent(
-                spec=rec['spec'],
+                spec=spec,
                 agent_id=rec['id'],
                 compress_threshold=self._cfg['compress_threshold_chars'],
             )

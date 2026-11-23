@@ -98,11 +98,14 @@ class Subagent:
             return
         try:
             import chat_history
+            import history_scope
             if not self.history_session_id:
                 kind = (chat_history.KIND_BG_SUBAGENT
                         if self.spec.goal.startswith('[bg]')
                         else chat_history.KIND_SUBAGENT)
-                self.history_session_id = chat_history.create_session(kind)
+                self.history_session_id = chat_history.create_session(
+                    kind, feishu_scope=history_scope.archived_scope(self.spec.metadata),
+                )
                 chat_history.update_summary(
                     self.history_session_id,
                     f'[subagent:{self.id}] {self.spec.goal[:80]}',
@@ -308,6 +311,8 @@ class Subagent:
         Returns:
             SubagentResult with final status and output
         """
+        import history_scope
+
         self.status = STATUS_RUNNING
         self.updated_at = time.time()
         t0 = time.time()
@@ -340,6 +345,10 @@ class Subagent:
         finish_output: str | None = None
         fail_reason: str | None = None
         _spans = []
+        scope_token = history_scope.current_feishu_scope.set(history_scope.from_metadata(self.spec.metadata))
+        origin_token = history_scope.current_origin_unknown.set(
+            bool(self.spec.metadata.get('history_origin_unknown')),
+        )
 
         try:
             for round_idx in range(self.spec.max_rounds):
@@ -592,6 +601,8 @@ class Subagent:
             return self.result
 
         finally:
+            history_scope.current_origin_unknown.reset(origin_token)
+            history_scope.current_feishu_scope.reset(scope_token)
             if _hop_token is not None:
                 from peer.delegation import current_hop_count
                 current_hop_count.reset(_hop_token)
@@ -752,25 +763,23 @@ class Subagent:
                 return 'ok'
             self._progress_reports.append(progress)
             print(f'[subagent:{self.id}] progress{"(urgent)" if urgent else ""}: {progress[:100]}')
-            if urgent:
+            if urgent and not self.spec.metadata.get('history_origin_unknown'):
                 # 紧急：直接进 event_bus → 触发 main agent
                 import event_bus
                 await event_bus.enqueue(
                     source=f'subagent:{self.id}/report',
                     text=progress,
+                    payload={'history_feishu_scope': self.spec.metadata.get('history_feishu_scope')},
                 )
             else:
                 # 非紧急：存入 DB 供 memory_recall 检索，不触发 main agent
                 try:
-                    import time as _time
-                    from config import _get_conn
-                    with _get_conn() as conn:
-                        conn.execute(
-                            'INSERT INTO subagent_conclusions (agent_id, goal, conclusion, source_type, created_at) '
-                            'VALUES (?, ?, ?, ?, ?)',
-                            (self.id, self.spec.goal[:100], progress, 'bg_monitor', _time.time())
-                        )
-                        conn.commit()
+                    import chat_history
+                    import history_scope
+                    chat_history.save_conclusion(
+                        self.id, self.spec.goal[:100], progress, 'bg_monitor',
+                        feishu_scope=history_scope.archived_scope(self.spec.metadata),
+                    )
                 except Exception as e:
                     print(f'[subagent:{self.id}] save report to DB failed: {e}')
             return 'ok'

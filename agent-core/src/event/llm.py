@@ -20,6 +20,7 @@ import time
 import typing
 
 import log
+import history_scope
 import config
 import client
 import event
@@ -1475,16 +1476,11 @@ async def _memory_recall(
                 params = []
                 for kw in keywords:
                     params.extend([f'%{kw}%', f'%{kw}%'])
-                if time_cutoff > 0:
-                    sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
-                           f'FROM subagent_conclusions WHERE ({where_clauses}) AND created_at > ? '
-                           f'ORDER BY created_at DESC LIMIT ?')
-                    params.extend([time_cutoff, limit])
-                else:
-                    sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
-                           f'FROM subagent_conclusions WHERE ({where_clauses}) '
-                           f'ORDER BY created_at DESC LIMIT ?')
-                    params.append(limit)
+                sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
+                       f'FROM subagent_conclusions WHERE ({where_clauses}) '
+                       'AND feishu_scope IN (?, ?) AND created_at >= ? '
+                       'ORDER BY created_at DESC LIMIT ?')
+                params.extend([*history_scope.searchable_scopes(), time_cutoff, limit])
                 rows = conn.execute(sql, params).fetchall()
                 for agent_id, goal, conclusion, source_type, ts in rows:
                     time_str = _dt.datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
@@ -1499,10 +1495,8 @@ async def _memory_recall(
     if source in ('all', 'conversation'):
         try:
             import chat_history
-            hist_results = chat_history.search(query, limit=limit)
+            hist_results = chat_history.search(query, limit=limit, since=time_cutoff)
             for r in hist_results:
-                if time_cutoff > 0 and r['ts'] < time_cutoff:
-                    continue
                 time_str = _dt.datetime.fromtimestamp(r['ts']).strftime('%m-%d %H:%M')
                 results.append({
                     'ts': r['ts'],
@@ -1618,6 +1612,7 @@ class Event:
         self._sys_tools:   dict       = {}
         self._summary: str | None     = None  # 压缩后的历史摘要
         self._session_id: str | None  = None  # chat history session
+        self._feishu_archive_id: str | None = None
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
         self._subagent_mgr = None             # SubagentManager instance
         self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
@@ -1698,7 +1693,7 @@ class Event:
             # 落盘的历史可能是修复之前写的：那时 tool 消息的 content 会是 dict，
             # 读回来就等于把同一个 400 一起续跑回来。所以在 restore 这一侧也过一遍。
             self._turns = [_sanitise_turn(t) for t in last['turns']]
-            self._session_id = last['session_id']
+            self._session_id = None if last.get('filtered_feishu') else last['session_id']
             print(f'[startup] resumed session {last["session_id"][:8]}... ({len(last["turns"])} turns)')
         else:
             self._session_id = None
@@ -1924,6 +1919,7 @@ class Event:
             ev = await collector.next_trigger()
             self._chat_only_active = bool(ev.get('_chat_only_channel'))
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
+            self._feishu_archive_id = None
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
             collector.set_cancel_event(cancel_ev)
@@ -1933,22 +1929,25 @@ class Event:
             reconsider_ev = asyncio.Event()
             collector.set_reconsider_event(reconsider_ev)
             collector.set_turn_priority(1 if ev.get('_urgent') else 0)
-            collector.set_busy(True)
+            collector.set_busy(True, trigger=ev)
             # Publish this turn's cancel signal so tools that block for a long time
             # can honour it. peer_delegate holds an HTTP connection for the remote
             # task's whole duration, and the checks below only run between rounds.
             from peer.delegation import current_cancel_event as _cancel_ctx
             _cancel_token = _cancel_ctx.set(cancel_ev)
+            scope_token = history_scope.current_feishu_scope.set(ev.get('_feishu_chat'))
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev, reconsider_event=reconsider_ev)
             except TurnCancelled:
-                print(f'[decision] turn cancelled by user message')
+                cleared = not collector.feishu_context_is_current(ev.get('_feishu_chat'))
+                reason = 'Feishu context reset' if cleared else 'user message'
+                print(f'[decision] turn cancelled by {reason}')
                 self._current_turn.append({
                     'role': 'assistant',
-                    'content': '[turn interrupted by user message]',
+                    'content': f'[turn interrupted by {reason}]',
                 })
                 # 中止正在进行的 TTS 播放和动作
-                if not self._chat_only_active:
+                if not cleared and not self._chat_only_active:
                     await self._interrupt_active_outputs()
                 await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
@@ -1967,6 +1966,7 @@ class Event:
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
                 _cancel_ctx.reset(_cancel_token)
+                history_scope.current_feishu_scope.reset(scope_token)
                 collector.set_cancel_event(None)
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
@@ -1979,6 +1979,24 @@ class Event:
                     self._save_current_turn(ev)
                 self._chat_only_active = False
 
+    def _persist_turn(self, turn: list[dict], turn_index: int, trigger_event: dict):
+        import chat_history
+        if trigger_event.get('_feishu_chat'):
+            if not self._feishu_archive_id:
+                self._feishu_archive_id = chat_history.create_session(
+                    chat_history.KIND_FEISHU, feishu_scope=history_scope.encode(trigger_event['_feishu_chat']),
+                )
+            session_id = self._feishu_archive_id
+            turn_index = 0
+        else:
+            if not self._session_id:
+                self._session_id = chat_history.create_session(chat_history.KIND_MAIN)
+            session_id = self._session_id
+        chat_history.save_turn(session_id, turn_index, turn)
+        summary_text = trigger_event.get('text') or trigger_event.get('source')
+        if summary_text:
+            chat_history.update_summary(session_id, summary_text)
+
     def _flush_current_turn(self, trigger_event: dict | None = None):
         """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
 
@@ -1988,18 +2006,10 @@ class Event:
         """
         if not self._current_turn:
             return
-        import chat_history
         try:
-            if not self._session_id:
-                self._session_id = chat_history.create_session(chat_history.KIND_MAIN)
             # 存盘的是截断过的副本 —— 和 turn 结束时那一份同一个规则，也避免把整轮
             # 未截断的 tool result 每轮重写一遍。原 turn 不能动，LLM 还要用完整内容。
-            chat_history.save_turn(
-                self._session_id, len(self._turns), _compact_turn(self._current_turn))
-            if trigger_event:
-                summary_text = trigger_event.get('text', '') or trigger_event.get('source', '')
-                if summary_text:
-                    chat_history.update_summary(self._session_id, summary_text)
+            self._persist_turn(_compact_turn(self._current_turn), len(self._turns), trigger_event or {})
         except Exception as e:
             print(f'[chat_history] flush_turn failed: {e}')
 
@@ -2008,18 +2018,16 @@ class Event:
         # 保存前 compact：截断大 tool results，减少 tier1 历史占用
         turn = _compact_turn(self._current_turn)
         self._current_turn[:] = turn
-        self._turns.append(turn)
-        # 持久化（延迟创建 session）
-        import chat_history
+        feishu_turn = bool(trigger_event.get('_feishu_chat'))
+        turn_index = len(self._turns)
+        if not feishu_turn:
+            self._turns.append(turn)
         try:
-            if not self._session_id:
-                self._session_id = chat_history.create_session()
-            chat_history.save_turn(self._session_id, len(self._turns) - 1, turn)
-            summary_text = trigger_event.get('text', '') or trigger_event.get('source', '')
-            if summary_text:
-                chat_history.update_summary(self._session_id, summary_text)
+            self._persist_turn(turn, turn_index, trigger_event)
         except Exception as e:
             print(f'[chat_history] save_turn failed: {e}')
+        if feishu_turn:
+            return
         # 裁剪：保留 tier1 + tier2 + 少量缓冲（压缩在 _maybe_compress 中处理）
         llm_cfg = config.main.get('event', {}).get('llm', {})
         tier1 = llm_cfg.get('tier1_turns', 6)
@@ -2285,6 +2293,11 @@ class Event:
         if chat_only_turn:
             reconsider_event = None
         tool_restricted = chat_only_turn or bot_restricted or viewer_restricted
+        feishu_chat = trigger_event.get('_feishu_chat')
+        feishu_turn = bool(feishu_chat)
+        feishu_context_reset = feishu_turn and feishu_chat[-1] > 0
+        use_shared_history = not (bot_restricted or feishu_turn)
+        narration_start = len(_pending_narration_feedback) if feishu_turn else 0
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
 
@@ -2480,7 +2493,7 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            history = [] if bot_restricted else self._build_history()
+            history = self._build_history() if use_shared_history else []
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
             current_history = history + _sanitize(_scrub(turn_messages))
 
@@ -2570,7 +2583,7 @@ class Event:
                 if kind == LLMErrorKind.CONTEXT_OVERFLOW and round_idx == 0:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
-                    if len(self._turns) > 2 and not bot_restricted:
+                    if use_shared_history and len(self._turns) > 2:
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
                         if self._summary:
@@ -2600,6 +2613,8 @@ class Event:
                         raise
                 else:
                     raise
+            if feishu_turn and cancel_event and cancel_event.is_set():
+                raise TurnCancelled("Interrupted before dispatching the Feishu model response")
             turn_messages.append(response)
             self._flush_current_turn(trigger_event)
             _flush_spans()
@@ -2685,8 +2700,16 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
+                if feishu_turn and cancel_event and cancel_event.is_set():
+                    raise TurnCancelled("Interrupted before dispatching a Feishu tool call")
+
                 if chat_only_turn:
                     result = await chat_only.dispatch(name, args, trigger_event)
+                elif feishu_context_reset and (
+                    name == 'raw_input_info' and isinstance(args, dict)
+                    and str(args.get('source', '')).startswith('dds:/channel/request')
+                ):
+                    result = '当前飞书上下文已清除，只能使用清除后收到的对话消息。'
                 elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
@@ -2996,9 +3019,9 @@ class Event:
             # 汇报的回灌在这里排空 —— 和 steering 同一个安全点。定时器可能在
             # assistant(tool_calls) 已入列、tool 结果还没入列的窗口触发，那时当场 append
             # 会造出 provider 会拒的消息序列。
-            while _pending_narration_feedback:
+            while len(_pending_narration_feedback) > narration_start:
                 turn_messages.append(
-                    _narration_feedback_message(_pending_narration_feedback.pop(0)))
+                    _narration_feedback_message(_pending_narration_feedback.pop(narration_start)))
 
             # 消息已经进 turn_messages 了，这次 reconsider 的目的达成 —— 不清的话下一次
             # client.call 会立刻抛 RoundReconsider 再 drain 一次空队列，白烧一次请求。
@@ -3038,7 +3061,8 @@ class Event:
             await push_event({'type': 'error', 'payload': {'message': f'[decision] {_missed_warn}'}})
 
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
-        await self._maybe_compress()
+        if not feishu_turn:
+            await self._maybe_compress()
 
         # 发布决策到 /decision_core DDS topic
         import ros2_bridge
