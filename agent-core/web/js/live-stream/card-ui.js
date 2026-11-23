@@ -1,6 +1,6 @@
 // A beginner-friendly, in-card guide for the existing live_stream MCP tool.
 // Account authorization always stays on the platform's own site; no credentials are logged.
-import { PLATFORMS, READINESS, getReadiness, getGuide, getGuideHelp, makeStreamUrl, makeXiaohongshuStreamUrl } from './platforms.js';
+import { PLATFORMS, READINESS, getReadiness, getGuide, getGuideHelp, makeStreamUrl, makeXiaohongshuStreamUrl, makeOtherStreamUrl } from './platforms.js';
 import { callLiveStream, saveLiveStreamConfig, authorizeStoredLiveStream, startApprovedLiveStream } from './api.js';
 
 const ACTIVE_STATES = new Set(['starting', 'streaming', 'stopping']);
@@ -47,6 +47,7 @@ export function mountLiveStreamCard(root, { mcpId, cardId, authorize }) {
             button(item.name, 'platform:' + id, 'ls-platform' + (id === state.platform ? ' selected' : ''))
           ).join('')}
         </div>
+        ${state.platform === 'other' ? '<p class="ls-hint">仅适用于支持第三方 RTMP/RTMPS 推流的平台。必须由平台提供推流服务器地址和推流码（Stream Key），仅有直播账号无法连接。</p>' : ''}
         ${button('下一步', 'to-readiness', 'ls-primary')}`;
     } else if (state.phase === 'readiness') {
       body = `<div class="ls-title">你现在准备到哪一步了？</div>
@@ -75,12 +76,13 @@ export function mountLiveStreamCard(root, { mcpId, cardId, authorize }) {
         ${state.showHelp && current.helpUrl ? '<a class="ls-link" data-guide-help-url target="_blank" rel="noopener noreferrer">查看官方操作说明 ↗</a>' : ''}
         ${back('guide-back')}`;
     } else if (state.phase === 'input') {
-      body = state.platform === 'xiaohongshu'
-        ? `<div class="ls-title">填写小红书推流信息</div>
-          <label class="ls-label" for="ls-server-${cardId}">服务器地址</label>
+      body = state.platform === 'xiaohongshu' || state.platform === 'other'
+        ? `<div class="ls-title">${state.platform === 'other' ? '填写其他平台推流信息' : '填写小红书推流信息'}</div>
+          ${state.platform === 'other' ? '<p class="ls-hint">需从平台官方后台获取 RTMP/RTMPS 服务器地址和推流码；不支持没有第三方推流功能的平台。请勿填写账号密码。</p>' : ''}
+          <label class="ls-label" for="ls-server-${cardId}">平台提供的推流服务器地址</label>
           <input id="ls-server-${cardId}" class="ls-input" data-input="server"
             type="text" autocomplete="off" spellcheck="false" placeholder="粘贴服务器地址">
-          <label class="ls-label" for="ls-key-${cardId}">直播推流码</label>
+          <label class="ls-label" for="ls-key-${cardId}">平台提供的推流码（Stream Key）</label>
           <input id="ls-key-${cardId}" class="ls-input" data-input="secret"
             type="password" autocomplete="off" spellcheck="false" placeholder="粘贴直播推流码">
           ${state.remote?.configured && state.remote?.platform === state.platform ? button('使用已保存的信息继续', 'use-saved', 'ls-secondary') : ''}
@@ -266,7 +268,9 @@ export function mountLiveStreamCard(root, { mcpId, cardId, authorize }) {
       if (action === 'save') {
         const url = state.platform === 'xiaohongshu'
           ? makeXiaohongshuStreamUrl(state.server, state.rawInput)
-          : makeStreamUrl(state.platform, state.rawInput);
+          : state.platform === 'other'
+            ? makeOtherStreamUrl(state.server, state.rawInput)
+            : makeStreamUrl(state.platform, state.rawInput);
         if (!(await authorize())) return;
         await saveLiveStreamConfig(mcpId, cardId, url);
         state.rawInput = '';
