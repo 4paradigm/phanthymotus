@@ -74,9 +74,19 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
     best_target_cost = (target_cost[rows, cols].min()
                         if target_cost is not None and target_cells is not None else None)
 
+    if best_target_cost is not None:
+        # Search toward the best rank first. The distance to its bounding box
+        # is a lower bound even when occupied cells force a detour. If none
+        # of that rank is reachable the search still exhausts the component.
+        top = target_cost[rows, cols] == best_target_cost
+        rr, cc = np.ogrid[:allowed.shape[0], :allowed.shape[1]]
+        dr = np.maximum(0, np.maximum(rows[top].min() - rr, rr - rows[top].max()))
+        dc = np.maximum(0, np.maximum(cols[top].min() - cc, cc - cols[top].max()))
+        ranked_distance = np.hypot(dr, dc).tolist()
+
     def distance_to_goals(point):
-        if target_cost is not None:
-            return 0.
+        if best_target_cost is not None:
+            return ranked_distance[point[0]][point[1]]
         row, col = point
         return math.hypot(max(goal_row - row, row - last_row, 0),
                           max(goal_col - col, col - last_col, 0))
@@ -105,9 +115,7 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
             continue
         if (goal_col <= col <= last_col and goal_row <= row <= last_row
                 and (target_cells is None or target_cells[current])):
-            # With ranked goals the queue is Dijkstra ordered. Reaching the
-            # globally best eligible rank first also minimizes walked cost
-            # for that rank, including the existing queue tie order.
+            # The heuristic vanishes on every best-ranked goal.
             if target_cost is None or target_cost[current] == best_target_cost:
                 return path_to(current)
             score = (target_cost[current], walked)

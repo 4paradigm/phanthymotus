@@ -613,7 +613,8 @@ def test_explicit_invalid_rotation_center_keeps_the_native_predictor_behavior():
 
 
 @pytest.mark.parametrize("veto", [False, True])
-def test_capped_straight_continuation_checks_visibility_before_early_return(veto):
+@pytest.mark.parametrize("prior_speed", [0., .15])
+def test_capped_straight_checks_visibility_before_early_return(veto, prior_speed):
     diagnostics = {}
     checked = []
 
@@ -621,15 +622,15 @@ def test_capped_straight_continuation_checks_visibility_before_early_return(veto
         checked.append(command)
         return dwa.CandidateCheck(not veto, "occluded_prefix" if veto else None)
 
-    choice = _run(((0., 0.), (1., 0.)), previous=(.5, 0., 0.),
-                  diagnostics=diagnostics, candidate_budget=dwa.CandidateBudget(64),
+    choice = _run(((0., 0.), (1., 0.)), previous=(prior_speed, 0., 0.), measured=(prior_speed, 0., 0.),
+                  x_limit=(0., .15), diagnostics=diagnostics, candidate_budget=dwa.CandidateBudget(64),
                   validate_candidate=visible)
-    assert checked.count((.5, 0., 0.)) == 1
+    assert checked.count((.15, 0., 0.)) == 1
     if veto:
         assert choice is None
         assert diagnostics["considered_candidates"] > 1
     else:
-        assert choice.command == (.5, 0., 0.) and choice.trace.stopped
+        assert choice.command == (.15, 0., 0.) and choice.trace.stopped
         assert diagnostics["considered_candidates"] == diagnostics["physical_evaluations"] == 1
 
 

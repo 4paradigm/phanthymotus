@@ -569,10 +569,11 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         if bounded and not scores:
             reject(rejection)
             continue
-        # Keep a capped straight command on a straight reference when the
+        # Start or continue a capped straight command on a straight reference when the
         # entire braking sweep has zero proximity cost. Reuse the physical
         # result in ordinary ranking if it is close to an obstacle.
-        if (ordinal == 0 and bounded and target is not None and cmd == previous == (x_speed, 0., 0.)
+        if (ordinal == 0 and bounded and target is not None and cmd == (x_speed, 0., 0.)
+                and (previous == cmd or (not any(previous) and x_speed == nominal))
                 and scores and scores[0][2] == 0 and target[0] > 0.
                 and abs(math.atan2(target[1], target[0])) <= .1
                 and all(f >= 0. and abs(r) < 1e-8 for f, r in references[0])):
