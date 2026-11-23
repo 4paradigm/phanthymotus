@@ -430,7 +430,7 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                     check_login()
                     if observed_methods:
                         raise BridgeFailure("query_method_mismatch", "已观察到匹配查询接口的请求，但请求方法不是 POST，请检查平台接口配置") from exc
-                    raise BridgeFailure("query_request_timeout", "点击查询后 2 秒内未观察到匹配的 POST 请求，请检查页面查询功能及接口匹配配置") from exc
+                    raise BridgeFailure("query_request_timeout", "未检测到访客查询请求，请确认已打开正确的访客列表网址；若网址正确，请稍后重试。") from exc
             check_login()
             return replay_auth_headers(captured_request.all_headers())
         except BridgeFailure:

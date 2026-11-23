@@ -84,6 +84,8 @@ class BridgeError(Exception):
             # Keep the user-facing message current even during a Windows
             # worker upgrade; older workers return the same stable code.
             message = "未检测到访客查询功能，请打开正确的访客列表网址"
+        elif code == "query_request_timeout":
+            message = "未检测到访客查询请求，请确认已打开正确的访客列表网址；若网址正确，请稍后重试。"
         super().__init__(message)
         self.code = code
 
@@ -431,7 +433,7 @@ class QLPrinterPlugin:
         definition = tool(
             TOOL_NAME,
             "actuator",
-            "查询当天未入场访客并打印访客贴。",
+            "查询当天未入场访客并打印访客贴。打印返回 accepted 时请等待最终结果；失败时向用户说明 error 中的中文原因。",
             action_schema(actions, properties),
         )
         definition['inputSchema']['x-completion'] = {
@@ -688,6 +690,14 @@ class QLPrinterPlugin:
         # An uncertain transport result must reuse the same Windows job key.
         # Include the destination and selection to avoid reusing it elsewhere.
         key = tuple(self._cfg[k] for k in ("bridge_url", "remote_start_user", "remote_start_port", "visitor_page_url", "printer_name")) + (name, host)
+        missing_message = (
+            f"未找到姓名为“{name}”、被访人为“{host}”的未入场访客，请核对访客姓名和被访人。"
+            if host else f"未找到姓名为“{name}”的未入场访客，请核对访客姓名。"
+        )
+        missing_result = {
+            "status": "not_found", "code": "visitor_not_found", "error": missing_message,
+            "name": name, "visits": [], "hint": missing_message,
+        }
         with self._lock:
             request_id = self._direct_request_ids.setdefault(key, f"direct-{uuid.uuid4().hex}")
             print_timeout_s = self._cfg["print_timeout_s"]
@@ -708,10 +718,7 @@ class QLPrinterPlugin:
             if exc.code == "not_found":
                 with self._lock:
                     self._direct_request_ids.pop(key, None)
-                return {
-                    "status": "not_found", "name": name, "visits": [],
-                    "hint": "今天的未入场列表中没有匹配访客，不能打印访客贴",
-                }
+                return missing_result
             raise
         if str(payload.get("code") or "") not in {"print_outcome_unknown", "status_unconfirmed"}:
             with self._lock:
@@ -720,10 +727,7 @@ class QLPrinterPlugin:
             return {"status": "printed", "request_id": request_id,
                     "say": "访客贴打好了，在前台打印机上"}
         if str(payload.get("code") or "") == "not_found":
-            return {
-                "status": "not_found", "name": name, "visits": [],
-                "hint": "今天的未入场列表中没有匹配访客，不能打印访客贴",
-            }
+            return missing_result
         return {
             "status": "failed",
             "code": str(payload.get("code") or "print_failed"),

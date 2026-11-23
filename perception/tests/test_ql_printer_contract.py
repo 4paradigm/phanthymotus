@@ -235,6 +235,31 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(second["status"], "printed")
         self.assertEqual(self.bridge.print_log, ["V1001"])
 
+    def test_missing_visitor_returns_chinese_error_for_completion(self):
+        result = self.call("print", name="2")
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["code"], "visitor_not_found")
+        self.assertEqual(result["error"], "未找到姓名为“2”的未入场访客，请核对访客姓名。")
+        self.assertEqual(self.bridge.print_log, [])
+
+    def test_missing_host_match_names_both_fields_in_chinese_error(self):
+        result = self.call("print", name="王磊", host="李四")
+        self.assertEqual(result["code"], "visitor_not_found")
+        self.assertEqual(result["error"], "未找到姓名为“王磊”、被访人为“李四”的未入场访客，请核对访客姓名和被访人。")
+        self.assertEqual(self.bridge.print_log, [])
+
+    def test_ssh_not_found_exception_returns_same_chinese_error(self):
+        with patch.object(BridgeClient, "request", side_effect=BridgeError("未匹配访客", "not_found")):
+            result = self.call("print", name="2")
+        self.assertEqual(result["code"], "visitor_not_found")
+        self.assertEqual(result["error"], "未找到姓名为“2”的未入场访客，请核对访客姓名。")
+
+    def test_unrelated_search_page_returns_plain_chinese_error(self):
+        with patch.object(BridgeClient, "request", side_effect=BridgeError("点击查询后 2 秒内未观察到匹配的 POST 请求，请检查页面查询功能及接口匹配配置", "query_request_timeout")):
+            result = self.call("print", name="王磊")
+        self.assertEqual(result["code"], "query_request_timeout")
+        self.assertEqual(result["error"], "未检测到访客查询请求，请确认已打开正确的访客列表网址；若网址正确，请稍后重试。")
+
     def test_direct_print_reuses_key_after_windows_printed_but_ssh_timed_out(self):
         original = BridgeClient.request
         request_ids = []

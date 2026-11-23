@@ -116,3 +116,4 @@ def test_unrelated_post_is_not_proof_of_endpoint_mismatch(browser):
     with pytest.raises(BridgeFailure) as caught:
         backend._ensure_login(page)
     assert caught.value.code == "query_request_timeout"
+    assert str(caught.value) == "未检测到访客查询请求，请确认已打开正确的访客列表网址；若网址正确，请稍后重试。"
