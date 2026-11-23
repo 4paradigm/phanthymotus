@@ -1273,10 +1273,11 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   // capability is baked in at build time — vop runs a TensorRT engine with a
   // frozen class list, so "confidence and fps" is the complete set of knobs and
   // the dialog read as though the tool had simply lost its configuration.
-  if (description) {
+  const configDescription = configSchema?.description || description;
+  if (configDescription) {
     const note = document.createElement('p');
     note.className = 'tool-config-desc';
-    note.textContent = description;
+    note.textContent = configDescription;
     bodyEl.appendChild(note);
   }
 

@@ -393,6 +393,11 @@ def _register_core_mcp(silent=False):
                 },
                 'configSchema': {
                     'type': 'object',
+                    'description': (
+                        'Outbound gateway for messaging platforms (Feishu / Telegram / Slack): sends '
+                        'text, images and files from the decision core to the selected channel. '
+                        'Use channel_request to receive messages from that channel.'
+                    ),
                     'properties': {
                         'channel_id': {
                             'type': 'string',
