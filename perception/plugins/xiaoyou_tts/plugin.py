@@ -290,6 +290,10 @@ class SpeechSession:
                 self._queue.task_done()
 
 
+def _tts_output_topic(input_topic):
+    return input_topic + '/tts' if input_topic else '/perception/tts'
+
+
 def _node(input_topic, backend, suffix, cfg):
     # ROS is needed only for topic delivery, not native loading/raw inference.
     from rclpy.node import Node
@@ -304,7 +308,7 @@ def _node(input_topic, backend, suffix, cfg):
         def __init__(self):
             super().__init__('xiaoyou_v6_' + suffix)
             self._input_topic = input_topic or ''
-            self._output_topic = self._input_topic + '/tts' if self._input_topic else '/perception/tts'
+            self._output_topic = _tts_output_topic(self._input_topic)
             self._pub = self.create_publisher(AudioChunk, self._output_topic, qos)
             self._sub = self.create_subscription(String, self._input_topic, self._text_cb, qos) if self._input_topic else None
             self.session = SpeechSession(backend, self._publish, complete, ready=self._ready,
@@ -391,6 +395,11 @@ class TTSPlugin:
         if frontend_error:
             state = 'error'
             identity['message'] = frontend_error
+        topics = [(node._input_topic, node._output_topic) for node in nodes]
+        if not topics:
+            # Canvas reads output ports before it starts the TTS instance.
+            input_topic = args.get('input_topic') or ''
+            topics = [(input_topic, _tts_output_topic(input_topic))]
         return {**identity, 'state': state,
                 'backend': backend, 'accelerated': bool(metadata.get('accelerated', False)),
                 'generation': metadata.get('streaming', 'natural-text-streaming'),
@@ -401,8 +410,8 @@ class TTSPlugin:
                 'language': self._cfg['language'], 'speaker_id': 0, 'speed': 1.0,
                 'startup_ready': not self._shutdown and not frontend_error,
                 'startup_timing': dict(self._startup_timing),
-                'topic_in': [{'topic': n._input_topic, 'format': 'data/json'} for n in nodes if n._input_topic],
-                'topic_out': [{'topic': n._output_topic, 'format': 'audio/pcm-16k'} for n in nodes],
+                'topic_in': [{'topic': source, 'format': 'data/json'} for source, _ in topics if source],
+                'topic_out': [{'topic': target, 'format': 'audio/pcm-16k'} for _, target in topics],
                 'desc': 'xiaoyou01 FP32 GPU speech; deployment acceptance is reported explicitly.'}
 
     def _start(self, args):
@@ -414,7 +423,7 @@ class TTSPlugin:
             if self._executor is None:
                 raise RuntimeError('A ROS executor is required for V6 topic delivery')
             # One publisher owns any output topic within this plugin.
-            output = topic + '/tts' if topic else '/perception/tts'
+            output = _tts_output_topic(topic)
             for other in list(self._nodes):
                 if self._nodes[other]._output_topic == output:
                     self._remove(other)
