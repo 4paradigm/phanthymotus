@@ -10,7 +10,6 @@
  *   Body: [float32 x, y, z] × N           (if has_z, 12 bytes/point)
  *      or [float32 x, y] × N              (if !has_z, 8 bytes/point, z=0)
  *
- * With flag bit6 the point array is followed by UTF-8 JSON [[name,x,y,z], ...].
  * Legacy protocol (16-byte header) still supported for backward compatibility.
  *
  * Renders a rainbow height-colored 3D point cloud with robot position indicator.
@@ -48,9 +47,6 @@ export const MappingRenderer = {
 
     const w = this._el.clientWidth || 400;
     const h = this._el.clientHeight || 300;
-
-    this._placeLabels = [];
-    this._placePayload = '';
 
     // Scene
     this._scene = new THREE.Scene();
@@ -103,7 +99,6 @@ export const MappingRenderer = {
     this._robotMesh = new THREE.Mesh(coneGeo, coneMat);
     this._scene.add(this._robotMesh);
 
-
     // Follow-robot toggle button
     this._followBtn = document.createElement('button');
     this._followBtn.style.cssText =
@@ -112,7 +107,7 @@ export const MappingRenderer = {
       'background:rgba(77,219,106,0.8);color:#fff;font-size:14px;cursor:pointer;' +
       'display:flex;align-items:center;justify-content:center;padding:0';
     this._followBtn.textContent = '\u2316'; // crosshair character
-    this._followBtn.title = '跟随位姿标记 / 自由浏览';
+    this._followBtn.title = 'Follow robot / Free browse';
     this._followBtn.addEventListener('click', () => {
       this._followRobot = !this._followRobot;
       this._updateFollowBtn();
@@ -133,12 +128,6 @@ export const MappingRenderer = {
       }
       this._controls.update();
       this._renderer.render(this._scene, this._camera);
-      for (const {label, world, projected} of this._placeLabels) {
-        projected.copy(world).project(this._camera);
-        label.hidden = projected.z < -1 || projected.z > 1;
-        label.style.left = ((projected.x + 1) * 50) + '%';
-        label.style.top = ((1 - projected.y) * 50) + '%';
-      }
     };
     animate();
   },
@@ -212,9 +201,6 @@ export const MappingRenderer = {
     const expectedBody = headerSize + numPoints * bytesPerPoint;
     if (byteLen < expectedBody) return;
 
-    const payload = flags & 64 ? new TextDecoder().decode(new Uint8Array(buffer, expectedBody)) : '';
-    if (payload !== (this._placePayload || '')) this._setPlaces(payload);
-
     const count = Math.min(numPoints, MAX_POINTS);
 
     // Parse points and compute Z range for coloring
@@ -276,25 +262,6 @@ export const MappingRenderer = {
     }
   },
 
-  _setPlaces(payload) {
-    let places;
-    try { places = payload ? JSON.parse(payload) : []; } catch { places = []; }
-    for (const item of this._placeLabels) item.label.remove();
-    this._placeLabels = [];
-    this._placePayload = payload;
-    if (!Array.isArray(places)) return;
-    for (const place of places) {
-      if (!Array.isArray(place) || place.length !== 4) continue;
-      const [name, x, y, z] = place;
-      if (typeof name !== 'string' || ![x, y, z].every(Number.isFinite)) continue;
-      const label = document.createElement('span');
-      label.textContent = '📍' + name;
-      label.style.cssText = 'position:absolute;transform:translate(-50%,-100%);color:white;background:#28313a;pointer-events:none;white-space:nowrap';
-      this._el.appendChild(label);
-      this._placeLabels.push({label, world: new THREE.Vector3(x, z, -y), projected: new THREE.Vector3()});
-    }
-  },
-
   onDataSilent(buffer) {
     this.onData(buffer);
   },
@@ -330,8 +297,6 @@ export const MappingRenderer = {
     this._renderer?.dispose();
     this._followBtn?.remove();
     this._el?.remove();
-    this._placeLabels = [];
-    this._placePayload = '';
     this._el = null;
     this._renderer = null;
     this._scene = null;

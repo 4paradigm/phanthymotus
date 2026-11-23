@@ -9,8 +9,7 @@ function renderer() {
     .replace(/^import .*;$/gm, '')
     .replace('export const MappingRenderer', 'globalThis.MappingRenderer');
   class Vector3 { constructor(...values) { this.values = values; } set(...values) { this.values = values; } }
-  const document = { createElement() { return { style: {}, remove() { this.removed = true; } }; } };
-  const context = vm.createContext({ document, TextDecoder, THREE: { Vector3 }, ArrayBuffer, DataView, Float32Array });
+  const context = vm.createContext({ THREE: { Vector3 }, ArrayBuffer, DataView, Float32Array });
   vm.runInContext(source, context);
   const r = context.MappingRenderer;
   r._positions = new Float32Array(3); r._colors = new Float32Array(3);
@@ -69,21 +68,4 @@ test('depth display packet and mapping packet share forward-left-up axes', () =>
   [3, -2, 1].forEach((value, i) => mappedView.setFloat32(17 + i * 4, value, true));
   map.onData(mapped);
   assert.deepEqual([...cloud._frames[0].pos], [...map._positions]);
-});
-
-test('named places use map axes and clear when the next map has no places', () => {
-  const r = renderer();
-  r._el = { appendChild() {} };
-  r._placeLabels = [];
-  const labels = new TextEncoder().encode(JSON.stringify([['入口', 4, 5, 6]]));
-  const marked = new Uint8Array(29 + labels.length);
-  marked.set(new Uint8Array(packet(67)));
-  marked.set(labels, 29);
-  r.onData(marked.buffer);
-  const marker = r._placeLabels[0];
-  assert.deepEqual(marker.world.values, [4, 6, -5]);
-  assert.equal(marker.label.textContent, '📍入口');
-  r.onData(packet(3));
-  assert.equal(marker.label.removed, true);
-  assert.equal(r._placeLabels.length, 0);
 });
