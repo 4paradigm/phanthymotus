@@ -1,6 +1,6 @@
 """Run the sidebar and drop handlers in Node without browser dependencies.
 
-Regression: opening tool details must not claim the canvas. A sidebar drag
+Regression: viewing tool details/configuration must not claim the canvas. A sidebar drag
 claims permission only when dropped, including when the claim is asynchronous.
 Run with pytest and Node.js on PATH.
 """
@@ -22,24 +22,80 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 class Element {
-  constructor() {
+  constructor(tagName = 'div') {
+    this.tagName = tagName.toUpperCase();
     this.listeners = {};
     this.children = {};
+    this.childNodes = [];
     this.dataset = {};
+    this.style = {};
+    this.attributes = {};
+    this.value = '';
     this.classes = new Set(['hidden']);
     this.classList = {
       add: name => this.classes.add(name),
       remove: name => this.classes.delete(name),
+      contains: name => this.classes.has(name),
+      toggle: (name, on = !this.classes.has(name)) => {
+        if (on) this.classes.add(name); else this.classes.delete(name);
+      },
     };
+  }
+  set className(value) { this.classes = new Set(value.split(/\s+/)); }
+  get className() { return [...this.classes].join(' '); }
+  set value(value) { this._value = String(value); }
+  get value() { return this._value; }
+  set innerHTML(value) { this.html = value; this.childNodes = []; this.children = {}; }
+  get innerHTML() { return this.html || ''; }
+  setAttribute(key, value) { this.attributes[key] = value; }
+  appendChild(child) {
+    child.parent = child.parentNode = this;
+    this.childNodes.push(child);
+    return child;
+  }
+  append(...children) { children.forEach(child => this.appendChild(child)); }
+  replaceChild(child, old) {
+    this.childNodes[this.childNodes.indexOf(old)] = child;
+    child.parent = child.parentNode = this;
+    if (old.id) elements[old.id] = child;
+  }
+  cloneNode() {
+    const clone = new Element(this.tagName);
+    Object.assign(clone, { id: this.id, className: this.className,
+      disabled: this.disabled, textContent: this.textContent });
+    return clone;
+  }
+  matches(selector) {
+    return selector.split(',').some(part => {
+      const tag = part.match(/^[a-z]+/i)?.[0];
+      if (tag && this.tagName !== tag.toUpperCase()) return false;
+      for (const match of part.matchAll(/\.([\w-]+)/g)) {
+        if (!this.classes.has(match[1])) return false;
+      }
+      for (const match of part.matchAll(/\[data-([\w-]+)(?:="([^"]*)")?\]/g)) {
+        const key = match[1].replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        if (!(key in this.dataset)) return false;
+        if (match[2] !== undefined && this.dataset[key] !== match[2]) return false;
+      }
+      return true;
+    });
+  }
+  querySelectorAll(selector) {
+    return this.childNodes.flatMap(child => [
+      ...(child.matches(selector) ? [child] : []), ...child.querySelectorAll(selector),
+    ]);
   }
   addEventListener(name, callback) { (this.listeners[name] ||= []).push(callback); }
   querySelector(selector) {
+    const actual = this.querySelectorAll(selector)[0];
+    if (actual) return actual;
     if (!this.children[selector]) {
       this.children[selector] = new Element();
       this.children[selector].parent = this;
     }
     return this.children[selector];
   }
+  closest(selector) { return this.matches(selector) ? this : this.parent?.closest(selector); }
   async fire(name, event = {}) {
     event.preventDefault ||= () => { event.defaultPrevented = true; };
     event.stopPropagation ||= () => { event.stopped = true; };
@@ -52,24 +108,44 @@ class Element {
 
 const elements = {};
 const document = {
-  createElement: () => new Element(),
-  getElementById: id => elements[id] ||= new Element(),
+  createElement: tag => new Element(tag),
+  getElementById: id => {
+    if (!elements[id]) { elements[id] = new Element(); elements[id].id = id; }
+    return elements[id];
+  },
 };
 let claims = 0;
 let canEdit = true;
+let editing = false;
+let projectActive = false;
+let mediaRequests = 0;
+const requests = [];
 const sandbox = {
   assert, document, console,
   ensureEdit: async () => { claims++; return canEdit; },
-  isEditor: () => false,
-  isProjectRunning: () => false,
+  isEditor: () => editing,
+  isProjectRunning: () => projectActive,
   cardsForTool: () => [],
   isDisplayOnly: () => false,
+  fetch: async (url, options = {}) => {
+    requests.push({ url, ...options });
+    return { ok: true, json: async () => ({ data: {} }) };
+  },
+  alert: message => { throw new Error(message); },
+  navigator: { mediaDevices: {
+    getUserMedia: async () => { mediaRequests++; return { getTracks: () => [] }; },
+    enumerateDevices: async () => [],
+  } },
 };
 vm.createContext(sandbox);
 const run = code => vm.runInContext(code, sandbox);
 const sidebar = fs.readFileSync(process.argv[1] + '/sidebar.js', 'utf8');
 run(sidebar.replace(/^import[\s\S]*?;/gm, '').replace(/^export\s+/gm, ''));
-run("_backdrop = document.getElementById('backdrop');");
+run("_backdrop = document.getElementById('backdrop'); _scroll = document.getElementById('sidebar-scroll');");
+const configOverlay = document.getElementById('tool-config-overlay');
+configOverlay.append(document.getElementById('tool-config-title'),
+  document.getElementById('tool-config-body'), document.getElementById('tool-config-save'),
+  document.getElementById('tool-config-close'), document.getElementById('tool-config-cancel'));
 const tool = { name: 'camera', type: 'sensor', description: 'Camera details',
   inputSchema: { type: 'object' } };
 sandbox.tool = tool;
@@ -249,4 +325,165 @@ def test_rejected_drop_preserves_preexisting_edit_permission(reason):
       assert.equal(claims, 0);
       assert.equal(releases, 0);
       assert.equal(sandbox._isEditor, true);
+    """)
+
+
+@pytest.mark.parametrize('builder', ['_buildChip', '_buildToolCard'])
+@pytest.mark.parametrize('occupied', [False, True])
+def test_sidebar_gear_is_readonly_without_claiming_permission(builder, occupied):
+    run_js(f"""
+      canEdit = {str(not occupied).lower()};
+      tool.configSchema = {{ properties: {{ mode: {{ type: 'string', default: 'default' }} }} }};
+      run("_toolConfigs['robot:camera'] = {{ mode: 'saved' }}");
+      const card = run('{builder}(mcp, tool)');
+      const gear = card.querySelector('{'.chip-config-btn' if builder == '_buildChip' else '.tool-card-config-btn'}');
+      await gear.fire('pointerdown');
+      await gear.fire('click');
+      assert.equal(configOverlay.classes.has('hidden'), false);
+      assert.equal(run('_configAccess.fields.disabled'), true);
+      assert.equal(run(`_configAccess.fields.querySelector('[data-key="mode"]').value`), 'saved');
+      const save = document.getElementById('tool-config-save');
+      assert.equal(save.disabled, true);
+      assert.equal(save.classes.has('hidden'), true);
+      // Invoke the handler directly too: the guard must hold beyond disabled UI.
+      await save.fire('click');
+      assert.equal(claims, 0);
+      assert.equal(requests.length, 0);
+      await document.getElementById('tool-config-cancel').fire('click');
+      assert.equal(configOverlay.classes.has('hidden'), true);
+      assert.equal(run("_toolConfigs['robot:camera'].mode"), 'saved');
+    """)
+
+
+@pytest.mark.parametrize('instance', [False, True])
+def test_instance_and_shared_config_save_still_work_for_existing_editor(instance):
+    run_js(f"""
+      editing = true;
+      const schema = {{ properties: {{
+        mode: {{ type: 'string', default: 'shared' }},
+        gain: {{ type: 'number', scope: 'instance', default: 0 }},
+        tags: {{ type: 'array', items: {{ type: 'string' }}, scope: 'instance', default: ['a', 'b'] }},
+      }} }};
+      if ({str(instance).lower()}) await sandbox.openInstanceConfigModal('robot', 'camera', 'card-a', schema);
+      else await sandbox.openToolConfigModal('robot', 'camera', schema);
+      assert.equal(run('_configAccess.fields.disabled'), false);
+      const save = document.getElementById('tool-config-save');
+      assert.equal(save.disabled, false);
+      assert.equal(save.classes.has('hidden'), false);
+      run(`_configAccess.fields.querySelector('[data-key="mode"]').value = "changed"`);
+      await save.fire('click');
+      assert.equal(claims, 0);
+      assert.equal(configOverlay.classes.has('hidden'), true);
+      const writes = requests.filter(r => r.method === 'PUT');
+      if ({str(instance).lower()}) {{
+        assert.deepEqual(writes.map(r => [r.url, JSON.parse(r.body)]), [
+          ['/api/canvas/tool-config/robot/camera/card-a', {{ gain: 0, tags: ['a', 'b'] }}],
+          ['/api/canvas/tool-config/robot/camera', {{ mode: 'changed' }}],
+        ]);
+      }} else {{
+        assert.deepEqual(writes.map(r => JSON.parse(r.body)), [{{ mode: 'changed' }}]);
+      }}
+    """)
+
+
+@pytest.mark.parametrize('instance', [False, True])
+def test_readonly_configuration_does_not_request_media_permission(instance):
+    run_js(f"""
+      const schema = {{ properties: {{
+        mic: {{ type: 'string', format: 'audio-input-device', scope: 'instance' }},
+        cam: {{ type: 'string', format: 'video-input-device', scope: 'instance' }},
+      }} }};
+      if ({str(instance).lower()}) await sandbox.openInstanceConfigModal('robot', 'camera', 'card-a', schema);
+      else await sandbox.openToolConfigModal('robot', 'camera', schema);
+      await document.getElementById('tool-config-save').fire('click');
+      assert.equal(run('_configAccess.fields.disabled'), true);
+      assert.equal(mediaRequests, 0);
+      assert.equal(claims, 0);
+      assert.equal(requests.length, 0);
+    """)
+
+
+@pytest.mark.parametrize('instance', [False, True])
+@pytest.mark.parametrize('editor', [False, True])
+def test_running_project_allows_readonly_configuration_view(instance, editor):
+    run_js(f"""
+      editing = {str(editor).lower()};
+      projectActive = true;
+      const schema = {{ properties: {{ mode: {{ type: 'string', default: 'saved' }} }} }};
+      if ({str(instance).lower()}) await sandbox.openInstanceConfigModal('robot', 'camera', 'card-a', schema);
+      else await sandbox.openToolConfigModal('robot', 'camera', schema);
+      assert.equal(configOverlay.classes.has('hidden'), false);
+      assert.equal(run('_configAccess.fields.disabled'), true);
+      await document.getElementById('tool-config-save').fire('click');
+      assert.equal(claims, 0);
+      assert.equal(requests.length, 0);
+    """)
+
+
+@pytest.mark.parametrize('reason', ['lock_lost', 'project_started'])
+@pytest.mark.parametrize('instance', [False, True])
+def test_open_config_becomes_readonly_and_does_not_reclaim_lock(instance, reason):
+    run_js(f"""
+      editing = true;
+      const schema = {{ properties: {{ mode: {{ type: 'string', default: 'saved' }} }} }};
+      if ({str(instance).lower()}) await sandbox.openInstanceConfigModal('robot', 'camera', 'card-a', schema);
+      else await sandbox.openToolConfigModal('robot', 'camera', schema);
+      if ('{reason}' === 'lock_lost') editing = false;
+      else projectActive = true;
+      sandbox.syncToolConfigPermissions();
+      assert.equal(run('_configAccess.fields.disabled'), true);
+      await document.getElementById('tool-config-save').fire('click');
+      assert.equal(claims, 0);
+      assert.equal(requests.length, 0);
+    """)
+
+
+def test_readonly_config_does_not_silently_become_writable():
+    run_js("""
+      const schema = { properties: { mode: { type: 'string', default: 'saved' } } };
+      await sandbox.openToolConfigModal('robot', 'camera', schema);
+      editing = true;
+      sandbox.syncToolConfigPermissions();
+      assert.equal(run('_configAccess.fields.disabled'), true);
+      await document.getElementById('tool-config-save').fire('click');
+      assert.equal(requests.length, 0);
+      await document.getElementById('tool-config-close').fire('click');
+      await sandbox.openToolConfigModal('robot', 'camera', schema);
+      assert.equal(run('_configAccess.fields.disabled'), false);
+    """)
+
+
+@pytest.mark.parametrize('editor', [False, True])
+def test_decision_core_live_configuration_still_requires_existing_editor(editor):
+    run_js(f"""
+      editing = {str(editor).lower()};
+      projectActive = true;
+      await sandbox.openToolConfigModal('agentcore', 'decision_core', {{
+        properties: {{ mode: {{ type: 'string', default: 'saved' }} }},
+      }});
+      assert.equal(run('_configAccess.fields.disabled'), {str(not editor).lower()});
+      await document.getElementById('tool-config-save').fire('click');
+      assert.equal(requests.length, {1 if editor else 0});
+      assert.equal(claims, 0);
+    """)
+
+
+def test_save_rechecks_ownership_and_stops_remaining_scope_writes():
+    run_js("""
+      editing = true;
+      await sandbox.openInstanceConfigModal('robot', 'camera', 'card-a', {
+        properties: {
+          mode: { type: 'string', default: 'shared' },
+          gain: { type: 'number', scope: 'instance', default: 0 },
+        },
+      });
+      sandbox.fetch = async (url, options) => {
+        requests.push({ url, ...options });
+        editing = false;
+        return { ok: true };
+      };
+      await document.getElementById('tool-config-save').fire('click');
+      assert.deepEqual(requests.map(r => r.url), ['/api/canvas/tool-config/robot/camera/card-a']);
+      assert.equal(run('_configAccess.fields.disabled'), true);
+      assert.equal(claims, 0);
     """)

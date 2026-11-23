@@ -14,7 +14,7 @@
 import { showToast } from './toast.js';
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired, syncToolConfigPermissions } from './sidebar.js';
 import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
 import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
@@ -390,6 +390,7 @@ async function _rearmBrowserSources() {
 function _applyProjectState(running) {
   _projectRunning = !!running;
   _projectStateKnown = true;
+  syncToolConfigPermissions();
   _syncProjectBtn();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
     btn.classList.toggle('locked', !_projectRunning);
@@ -3236,6 +3237,7 @@ function _createEditorBar() {
 }
 
 function _updateEditorUI() {
+  syncToolConfigPermissions();
   let bar = document.getElementById('canvas-editor-bar');
   if (!bar) bar = _createEditorBar();
   bar.classList.toggle('canvas-editor-bar--locked', !_isEditor && !!_currentEditor);

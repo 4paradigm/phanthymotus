@@ -741,6 +741,25 @@ html, body {
 }
 .chip-config-btn:hover { background: var(--bg-secondary); color: var(--text-primary); }
 
+.tool-config-fields {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+}
+.tool-config-readonly {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.tool-config-fields:disabled :is(input, select, textarea, button) {
+  cursor: default;
+}
+
 .tool-config-field {
   margin-bottom: 16px;
 }
