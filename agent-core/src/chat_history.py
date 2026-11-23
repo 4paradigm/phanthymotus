@@ -280,10 +280,20 @@ def search(query: str, limit: int = 10) -> list[dict]:
 
 # ── 重启续跑 ──────────────────────────────────────────────────────────────────
 
-_FEISHU_EVENT_RE = re.compile(
-    r'^<event source="dds:/channel/request/[^"]+" channel="channel:feishu"\s', re.M,
+_CHANNEL_EVENT_RE = re.compile(
+    r'^<event source="dds:/channel/request(?:/[^"\r\n]+)?"[^>\r\n]*>'
+    r'\r?\n(?P<payload>.*?)\r?\n</event>[ \t]*\r?$',
+    re.M | re.S,
 )
 _CHANNEL_NOTIFICATION_RE = re.compile(r'^\[system notification source=dds:/channel/request/[^\]]+\]\n')
+
+
+def _is_feishu_payload(text: str) -> bool:
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get('platform') == 'feishu'
 
 
 def _contains_feishu_event(turn: list[dict]) -> bool:
@@ -293,15 +303,12 @@ def _contains_feishu_event(turn: list[dict]) -> bool:
         content = message.get('content')
         if not isinstance(content, str):
             continue
-        if _FEISHU_EVENT_RE.search(content):
-            return True
         notice = _CHANNEL_NOTIFICATION_RE.match(content)
-        if notice:
-            try:
-                payload = json.loads(content[notice.end():])
-            except ValueError:
-                continue
-            if isinstance(payload, dict) and payload.get('platform') == 'feishu':
+        if notice and _is_feishu_payload(content[notice.end():]):
+            return True
+        for event in _CHANNEL_EVENT_RE.finditer(content):
+            # Older Agent Core versions could omit or mislabel the channel attribute.
+            if _is_feishu_payload(event.group('payload')):
                 return True
     return False
 

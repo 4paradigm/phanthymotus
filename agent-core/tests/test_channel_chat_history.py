@@ -318,15 +318,28 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
             '<event source="dds:/channel/request/feishu_r1" channel="channel:feishu" ts="time">\n'
             '{"platform":"feishu","text":"飞书私聊代号"}\n</event>'
         )}]
+        legacy_feishu = [
+            [{'role': 'user', 'content': (
+                f'会话开始\n<event source="dds:/channel/request/legacy"{attribute} ts="time">\n'
+                '{\n  "platform": "feishu",\n  "text": "旧版飞书消息"\n}\n</event>'
+            )}]
+            for attribute in ('', ' channel="channel"')
+        ]
+        telegram = [{'role': 'user', 'content': (
+            '<event source="dds:/channel/request/telegram" channel="channel" ts="time">\n'
+            '{"platform":"telegram","text":"Telegram 消息"}\n</event>'
+        )}]
         steered = [{'role': 'user', 'content': (
             '[system notification source=dds:/channel/request/feishu_r1]\n'
             '{"platform":"feishu","text":"飞书追加消息"}'
         )}]
-        for index, turn in enumerate((ordinary, feishu, steered)):
+        turns = [ordinary, feishu, *legacy_feishu, telegram, steered]
+        for index, turn in enumerate(turns):
             chat_history.save_turn(session, index, turn)
-        self.assertEqual(chat_history.get_last_session_turns()['turns'], [ordinary])
-        self.assertTrue(chat_history.get_last_session_turns()['filtered_feishu'])
-        self.assertEqual(chat_history.get_session_messages(session), [ordinary, feishu, steered])
+        restored = chat_history.get_last_session_turns()
+        self.assertEqual(restored['turns'], [ordinary, telegram])
+        self.assertTrue(restored['filtered_feishu'])
+        self.assertEqual(chat_history.get_session_messages(session), turns)
 
 
 if __name__ == '__main__':
