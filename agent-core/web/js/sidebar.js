@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, isEditor, addCardFromSidebar, cardsForTool } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
 import { openDeployPanel } from './deploy-panel.js';
@@ -48,7 +48,6 @@ let _modal    = null;
 
 // Cached per-tool config states: { "mcp_id:tool_name": { ... } }
 let _toolConfigs = {};
-let _configAccess = null;
 
 export function initSidebar() {
   _scroll  = document.getElementById('sidebar-scroll');
@@ -446,7 +445,6 @@ function _buildChip(mcp, tool) {
     _showDetail(mcp, tool);
   });
 
-  // The canvas claims edit permission on drop; browsing details stays read-only.
   chip.addEventListener('dragstart', (e) => {
     chip.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
@@ -589,7 +587,6 @@ function _buildToolCard(mcp, tool) {
   }
 
   // Drag (for canvas drop)
-  // The canvas claims edit permission on drop; browsing details stays read-only.
   card.addEventListener('dragstart', (e) => {
     card.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
@@ -684,18 +681,7 @@ function _readConfigValue(input, def) {
  * and released immediately just to read them — otherwise every device shows up
  * as an opaque id.
  */
-function _mediaDeviceInput(kind, key, saved, readOnly = false) {
-  // Viewing configuration must not request microphone/camera permissions or
-  // briefly open a stream just to populate device labels.
-  if (readOnly) {
-    const input = document.createElement('input');
-    input.className = 'tool-config-input';
-    input.dataset.key = key;
-    input.type = 'text';
-    input.value = saved;
-    input.placeholder = '-- Default --';
-    return input;
-  }
+function _mediaDeviceInput(kind, key, saved) {
   const constraint = kind === 'videoinput' ? { video: true } : { audio: true };
   const noun = kind === 'videoinput' ? 'Camera' : 'Microphone';
 
@@ -957,58 +943,21 @@ function _llmSourceInput(key, saved) {
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
-function _createConfigAccess(body, liveEditable = false) {
-  body.innerHTML = '';
-  const notice = document.createElement('p');
-  notice.className = 'tool-config-readonly';
-  notice.setAttribute('role', 'status');
-  const fields = document.createElement('fieldset');
-  fields.className = 'tool-config-fields';
-  body.append(notice, fields);
-  const access = { fields, notice, liveEditable, readOnly: false, saveBtn: null };
-  _configAccess = access;
-  syncToolConfigPermissions();
-  return access;
-}
-
-/** Keep open configuration dialogs read-only after ownership/run-state changes. */
-export function syncToolConfigPermissions() {
-  if (!_configAccess) return;
-  const access = _configAccess;
-  const running = isProjectRunning() && !access.liveEditable;
-  // A view opened without permission stays a view. Reopen after explicitly
-  // entering edit mode rather than silently making an existing view writable.
-  access.readOnly ||= !isEditor() || running;
-  access.fields.disabled = access.readOnly;
-  access.notice.classList.toggle('hidden', !access.readOnly);
-  access.notice.textContent = running
-    ? '只读查看。请先停止智能控制，再打开配置进行修改。'
-    : !isEditor()
-      ? '只读查看。请先关闭窗口，点击画布「编辑」，再打开配置进行修改。'
-      : '只读查看。重新打开配置后可修改。';
-  if (access.saveBtn) {
-    access.saveBtn.disabled = access.readOnly;
-    access.saveBtn.classList.toggle('hidden', access.readOnly);
-  }
-}
-
-function _canSaveConfig(access) {
-  if (access !== _configAccess) return false;
-  syncToolConfigPermissions();
-  return !access.readOnly;
-}
-
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
   // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
   // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
   const liveEditable = mcpId === 'agentcore' && toolName === 'decision_core';
+  if (isProjectRunning() && !liveEditable) {
+    alert('Stop agent before modifying');
+    return;
+  }
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
+  const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
-  const access = _createConfigAccess(document.getElementById('tool-config-body'), liveEditable);
-  const bodyEl = access.fields;
 
   titleEl.textContent = `Configure ${toolName}`;
+  bodyEl.innerHTML = '';
 
   const props = configSchema.properties || {};
   const required = configSchema.required || [];
@@ -1081,7 +1030,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
-        key, savedValues[key] || '', access.readOnly);
+        key, savedValues[key] || '');
     } else if (def.format === 'llm-source') {
       input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
     } else if (def.format === 'channel-select') {
@@ -1180,9 +1129,9 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   _applyShowWhen();
 
   // Handlers
-  const close = () => { _configAccess = null; overlay.classList.add('hidden'); };
+  const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {
-    if (!_canSaveConfig(access)) return;
+    if (!(await ensureEdit())) return;
     const values = {};
     for (const input of bodyEl.querySelectorAll('[data-key]')) {
       if (!input.value.trim()) continue;
@@ -1236,8 +1185,6 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   const newSaveBtn = saveBtn.cloneNode(true);
   saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
   newSaveBtn.addEventListener('click', save);
-  access.saveBtn = newSaveBtn;
-  syncToolConfigPermissions();
 
   // Close / cancel buttons
   const closeBtn = document.getElementById('tool-config-close');
@@ -1302,13 +1249,17 @@ function _hideDetail() {
  * Only shows fields with scope === "instance".
  */
 export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema, description) {
+  if (isProjectRunning()) {
+    alert('Stop agent before modifying');
+    return;
+  }
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
+  const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
-  const access = _createConfigAccess(document.getElementById('tool-config-body'));
-  const bodyEl = access.fields;
 
   titleEl.textContent = `Instance Config: ${toolName}`;
+  bodyEl.innerHTML = '';
 
   // The fields below state what can be *changed*; nothing else in this dialog
   // states what the tool is or what it is fixed to. That gap is invisible for a
@@ -1445,7 +1396,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
-        key, vals[key] || '', access.readOnly);
+        key, vals[key] || '');
     } else if (def.format === 'llm-source') {
       input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
     } else if (def.format === 'channel-select') {
@@ -1518,9 +1469,9 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     bodyEl.appendChild(empty);
   }
 
-  const close = () => { _configAccess = null; overlay.classList.add('hidden'); };
+  const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {
-    if (!_canSaveConfig(access)) return;
+    if (!(await ensureEdit())) return;
     const values = {};
     for (const input of bodyEl.querySelectorAll('[data-key]')) {
       if (!input.value.trim()) continue;
@@ -1552,7 +1503,6 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     if (sharedKeys.length) writes.push([base, sharedValues, `${mcpId}:${toolName}`]);
 
     for (const [url, body, cacheKey] of writes) {
-      if (!_canSaveConfig(access)) return;
       try {
         const resp = await fetch(url, {
           method: 'PUT',
@@ -1576,8 +1526,6 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const newSaveBtn = saveBtn.cloneNode(true);
   saveBtn.parentNode.replaceChild(newSaveBtn, saveBtn);
   newSaveBtn.addEventListener('click', save);
-  access.saveBtn = newSaveBtn;
-  syncToolConfigPermissions();
 
   const closeBtn = document.getElementById('tool-config-close');
   if (closeBtn) {
