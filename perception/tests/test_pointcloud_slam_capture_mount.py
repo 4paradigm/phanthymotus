@@ -133,3 +133,31 @@ def test_observation_labels_do_not_gate_numeric_cloud_stamp(change):
     from plugins.pointcloud_slam_capture_mount import validate_cloud_clock
     context = SimpleNamespace(normalized_clock_id=change,observation_stamp_ns=1,time_basis=change)
     validate_cloud_clock(context,'different',100,None)
+
+
+def test_late_subscription_uses_reported_previous_measurement_only_during_tf_delay():
+    s, pair = pairing()
+    diagnostic = packet(1_150_000_000)
+    matrix = diagnostic.pop('matrix')
+    diagnostic.update(status='unavailable', reason='extrapolation into the future',
+                      previous_measurement=dict(stamp_ns=900_000_000, matrix=matrix))
+    pair.mount(diagnostic, s, now=1.2, measurement_now_ns=1)
+    pair.cloud(1_100_000_000, 'camera_optical', [[1,2,3]], 1, s, now=1.2, measurement_now_ns=1)
+    frame, = s.accepted
+    assert frame.capture_context['extrinsic']['stamp_ns'] == 900_000_000
+    assert frame.capture_context['extrinsic']['association'] == 'previous_measurement'
+    pair.mount(dict(diagnostic, reason='disconnected frames'), s, now=1.2, measurement_now_ns=1)
+    assert pair.matrix_at(1_160_000_000, 'camera_optical') is None
+
+
+def test_legacy_mount_source_survives_many_temporary_misses_but_not_origin_change():
+    s, pair = pairing()
+    measured = packet(900_000_000)
+    pair.mount(measured, s, now=1., measurement_now_ns=1)
+    miss = dict(measured, matrix=None, status='unavailable', reason='extrapolation into the future')
+    for i in range(150):
+        pair.mount(dict(miss, stamp_ns=1_000_000_000+i), s, now=1., measurement_now_ns=1)
+    pair.cloud(1_100_000_000, 'camera_optical', [[1,2,3]], 1, s, now=1.2, measurement_now_ns=1)
+    assert s.accepted[0].capture_context['extrinsic']['stamp_ns'] == measured['stamp_ns']
+    pair.mount(dict(miss, epoch='another-mount', stamp_ns=1_200_000_000), s, now=1.2, measurement_now_ns=1)
+    assert pair.matrix_at(1_200_000_000, 'camera_optical') is None

@@ -126,26 +126,28 @@ def test_dense_chassis_run_has_one_continuity_token_at_aligned_scan_stamps():
     assert len(tokens) == 4 and len(tokens[0]) == 16 and len(set(tokens)) == 1
 
 
-def test_unpaired_scan_does_not_interrupt_a_certified_chassis_run():
+@pytest.mark.parametrize('source', [chassis, external_fusion])
+def test_unpaired_scan_does_not_interrupt_a_certified_body_run(source):
     unposed = []
     s = stream(max_pending=1, on_unlocalized_frame=lambda stamp, _, pose, *args: unposed.append((stamp, pose)))
-    s.odom(chassis(1000), now=1.)
+    s.odom(source(1000), now=1.)
     for ms in (1000, 1100, 1200):
         s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
     assert unposed == []
     assert s.status(now=1.2)['dropped_pending'] == 1
-    s.odom(chassis(1250, .04), now=1.25)
+    s.odom(source(1250, .04), now=1.25)
     first, resumed = (frame.pose.external_continuity for frame in s.accepted)
     assert first and resumed == first
 
 
+@pytest.mark.parametrize('source', [chassis, external_fusion])
 @pytest.mark.parametrize('lease_delay', [0., 1.65])
-def test_delayed_measured_chassis_brackets_within_original_cloud_lifetime(lease_delay):
+def test_delayed_measured_body_pose_brackets_within_original_cloud_lifetime(source, lease_delay):
     missing = []
     s = stream(max_age_s=2, on_unlocalized_frame=lambda stamp, *args: missing.append(stamp))
-    s.odom(chassis(1000), now=2.65, received=2.65-lease_delay)
+    s.odom(source(1000), now=2.65, received=2.65-lease_delay)
     s.cloud(1_050_000_000, 'camera', [[0, 0, 1]], now=2.66, received=1.1)
-    s.odom(chassis(1100, .02), now=2.75, received=2.75-lease_delay)
+    s.odom(source(1100, .02), now=2.75, received=2.75-lease_delay)
     assert not missing
     assert [frame.pose.position[0] for frame in s.accepted] == pytest.approx([.01])
     # Silence beyond the configured horizon still retires this source run.
@@ -610,3 +612,19 @@ def test_verified_chassis_clock_switch_keeps_only_continuous_spatial_run(segment
     if continuous:
         assert before.chassis_origin == after.chassis_origin
         assert list(s._poses) == [after]
+
+
+def test_fused_inline_tf_delay_carries_original_measured_mount_into_map():
+    s = stream(pose_capture_mount=True)
+    sample = external_fusion(1000)
+    matrix = np.eye(4)
+    matrix[1, 3] = .5
+    sample['vendor']['camera_mount'] = {'packet': dict(stamp_ns=1_000_000_000,
+        parent_frame='body', child_frame='camera', status='unavailable',
+        reason='extrapolation into the future',
+        previous_measurement=dict(stamp_ns=800_000_000, matrix=matrix.tolist()))}
+    s.odom(sample, now=1.)
+    s.cloud(1_000_000_000, 'camera', [[0, 0, 1]], now=1.)
+    frame, = s.accepted
+    assert frame.capture_context['extrinsic']['stamp_ns'] == 800_000_000
+    np.testing.assert_array_equal(frame.child_from_cloud, matrix)

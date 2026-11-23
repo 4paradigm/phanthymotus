@@ -11,7 +11,7 @@ from .camera_geometry import camera_transform
 from .pointcloud_slam_alignment import align_pose
 from .pointcloud_slam_odom import decode_slam_odom, decode_slam_prediction
 from .pointcloud_slam_transforms import rigid as _rigid, within_measured_motion_bounds
-from .rgbd_body_mount import CaptureMounts
+from .pointcloud_slam_capture_mount import MappingMounts
 
 
 class SlamStream:
@@ -76,8 +76,8 @@ class SlamStream:
                 self.continuity_token == self._last_admitted_run)
 
     @property
-    def _measured_chassis_run(self):
-        return self._measured_run is not None and self._measured_run[1].chassis_origin is not None
+    def _measured_body_run(self):
+        return self._measured_run is not None and self._measured_run[0][-1]
 
     def _lose(self, now):
         """Retire unavailable poses and offer the latest fresh scan for registration."""
@@ -98,9 +98,9 @@ class SlamStream:
             self._offer_unlocalized(latest, now)
 
     def _offer_unlocalized(self, pending, now):
-        live_chassis_run = (self._measured_chassis_run and
+        live_body_run = (self._measured_body_run and
                             self.continuity_token == self._last_admitted_run)
-        if self._live_visual_run or live_chassis_run:
+        if self._live_visual_run or live_body_run:
             # A live, witnessed pose run can still lack a bracket for one scan.
             # Skip that scan without sending a false pose outage to RTAB-Map.
             # A real outage clears the run before offering scans for recovery.
@@ -144,7 +144,7 @@ class SlamStream:
         if pose.prediction_anchor_ns is None:
             previous = self._measured_run
             pose = self._track_measured_run(sample, pose, context)
-            if self._measured_chassis_run:
+            if self._measured_body_run:
                 # A queued measurement can still bracket a fresh scan. Detect
                 # source silence from delivered progress, not time spent queued.
                 progressed = (previous is None or previous[0] != self._measured_run[0] or
@@ -187,7 +187,7 @@ class SlamStream:
             return
         history = self._pose_mounts.get(child)
         if history is None or history.declaration['parent_frame'] != pose.child_frame_id:
-            history = CaptureMounts(dict(topic='external_fusion', parent_frame=pose.child_frame_id,
+            history = MappingMounts(dict(topic='external_fusion', parent_frame=pose.child_frame_id,
                                          child_frame=child), child, None)
             self._pose_mounts[child] = history
         try:
@@ -366,16 +366,25 @@ class SlamStream:
                     context['measurement'].get('child_from_cloud') is not None):
                 return dict(context, pose_capture_mount=True)
             history = self._pose_mounts.get(frame)
-            matrix = history.matrix_at(stamp) if history is not None else None
+            color_from_depth = None
             if (history is None and self._color_from_depth is not None and
                     frame == self.cloud_frame and len(self._pose_mounts) == 1):
-                # The VO mount names its color optical child while an
-                # unregistered cloud retains the depth optical coordinates.
-                color = next(iter(self._pose_mounts.values())).matrix_at(stamp)
-                if color is not None:
-                    matrix = color @ camera_transform(self._color_from_depth)
-            if matrix is not None:
-                return dict(child_from_cloud=matrix.tolist(), pose_capture_mount=True)
+                history = next(iter(self._pose_mounts.values()))
+                color_from_depth = self._color_from_depth
+            if history is not None:
+                matrix = history.matrix_at(stamp)
+                evidence = None
+                if matrix is None:
+                    evidence = history.delayed_measurement()
+                    if evidence:
+                        matrix = _rigid(evidence['matrix'])
+                if matrix is not None:
+                    if color_from_depth is not None:
+                        matrix = matrix @ camera_transform(color_from_depth)
+                    result = dict(child_from_cloud=matrix.tolist(), pose_capture_mount=True)
+                    if evidence:
+                        result['extrinsic'] = deepcopy(evidence)
+                    return result
             return None
         return self._nearest_context(stamp)
 
@@ -441,8 +450,8 @@ class SlamStream:
         # Give late visual results a bounded opportunity to pair with the scan.
         wait_s = min(1.5, self.max_age_s)
         # Projection and input delivery consume the same original ingress budget.
-        # A measured chassis can still bracket the scan within that budget.
-        pose_wait_s = self.max_age_s if self._measured_chassis_run else wait_s
+        # Measured body odometry can still bracket the scan within that budget.
+        pose_wait_s = self.max_age_s if self._measured_body_run else wait_s
         scan_wait_s = self.max_age_s if self._live_visual_run else pose_wait_s
         if can_localize and self._last_received is not None and now-self._last_received >= pose_wait_s:
             self._lose(now)
@@ -457,7 +466,7 @@ class SlamStream:
         while self._pending:
             pending = self._pending.popleft()
             stamp, cloud, received, context = pending
-            if can_localize and (self._live_visual_run or self._measured_chassis_run) and now-received > self.max_age_s:
+            if can_localize and (self._live_visual_run or self._measured_body_run) and now-received > self.max_age_s:
                 self._dropped_pending += 1
                 continue
             try:
