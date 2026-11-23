@@ -302,6 +302,7 @@ class _State:
     motion_since_visual: bool = False
     motion_model: tuple | None = None
     visual_carry: tuple | None = None
+    corroborated_attitude_since: int | None = None
 
     @property
     def covariance(self):
@@ -468,6 +469,7 @@ class ExternalOdometry:
                 continue
             increment_covariance = None
             seconds_to_knot = 0.
+            fixed_attitude = False
             bracket = (self._pose_bracket(times, t0, t1)
                        if left.pose is None or right.pose is None else None)
             if bracket is not None:
@@ -504,10 +506,12 @@ class ExternalOdometry:
                 if velocity is None:
                     continue
                 mask = _ANGULAR & left.mask & right.mask
+                fixed_attitude = mask[3:].all()
                 covariance = left.covariance
             elif left.pose is not None and right.pose is not None:
                 velocity, increment_covariance = self._pose_interval(t0, t1, left, right, clipped_end, overlap)
                 mask = left.mask & right.mask
+                fixed_attitude = mask[3:].all() and _origin_attitude(left, right, t1-t0) is not None
                 covariance = left.covariance
             elif left.twist is not None and right.twist is not None:
                 mask = left.mask & right.mask
@@ -517,18 +521,26 @@ class ExternalOdometry:
                 continue
             if mask.any():
                 yield (np.where(mask, velocity, 0.), overlap/1e9, mask, covariance,
-                       increment_covariance, seconds_to_knot)
+                       increment_covariance, seconds_to_knot, fixed_attitude)
 
-    def _learned_step(self, learner, velocity, dt, observed):
+    def _learned_step(self, learner, velocity, dt, observed, fixed_attitude):
         # Delayed visual measurements often replay the same measured motion.
         # The prior can move without changing its body increment or adjoint.
-        key = (learner.parameters.tobytes(), velocity.tobytes(), dt, observed.tobytes())
+        key = (learner.parameters.tobytes(), velocity.tobytes(), dt, observed.tobytes(), fixed_attitude)
         step = self._learned_steps.get(key)
         if step is None:
-            twist = learner.corrected_velocity(velocity, observed)
+            calibrated = observed
+            if fixed_attitude:
+                calibrated = observed.copy()
+                calibrated[3:] = False
+            twist = learner.corrected_velocity(velocity, calibrated)
+            if fixed_attitude:
+                # Independently corroborated angular increments already measure
+                # body motion. A visual fit cannot add angular drift to them.
+                twist[3:] = velocity[3:]
             delta = se3_exp(twist * dt)
             differential = se3_right_jacobian(twist * dt) if learner.enabled else None
-            step = (twist, delta, _adjoint(np.linalg.inv(delta)), differential)
+            step = (twist, delta, _adjoint(np.linalg.inv(delta)), differential, calibrated)
             self._learned_steps[key] = step
             if len(self._learned_steps) > _MAX_EVENTS:
                 self._learned_steps.popitem(last=False)
@@ -550,11 +562,15 @@ class ExternalOdometry:
             learner = ExternalMotionLearner(enabled=learner.enabled)
         mask = np.zeros(6, dtype=bool)
         twist = None
+        corroborated_span = 0.
         pieces = self._intervals(motion_times, state.stamp, stamp)
-        for velocity, dt, observed, covariance, increment, seconds_to_knot in pieces:
-            twist, delta, adjoint, differential = self._learned_step(learner, velocity, dt, observed)
+        for velocity, dt, observed, covariance, increment, seconds_to_knot, fixed_attitude in pieces:
+            twist, delta, adjoint, differential, calibrated = self._learned_step(
+                learner, velocity, dt, observed, fixed_attitude)
             transform = transform @ delta
-            scales = np.exp(learner.parameters[:6]) * observed
+            if fixed_attitude:
+                corroborated_span += dt
+            scales = np.exp(np.where(calibrated, learner.parameters[:6], 0.)) * observed
             if increment is None:
                 # Preserve the stream's variance-per-second propagation while
                 # retaining its full spatial covariance and learned unit scale.
@@ -572,11 +588,17 @@ class ExternalOdometry:
             noise = adjoint @ noise @ adjoint.T + process_noise
             if learner.enabled:
                 sensitivity = (adjoint @ sensitivity +
-                               differential @ learner.velocity_parameter_jacobian(velocity, observed)*dt)
+                               differential @ learner.velocity_parameter_jacobian(velocity, calibrated)*dt)
             mask |= observed
+        attitude_since = state.corroborated_attitude_since
+        if stamp > state.stamp:
+            if abs(corroborated_span - (stamp-state.stamp)/1e9) > 1e-9:
+                attitude_since = None
+            elif attitude_since is None:
+                attitude_since = state.stamp
         interval_update = mask.any()
         return replace(state, stamp=stamp, transform=transform, noise=noise, sensitivity=sensitivity,
-                       learner=learner, motion_model=model,
+                       learner=learner, motion_model=model, corroborated_attitude_since=attitude_since,
                        mask=mask if interval_update else state.mask, twist=twist,
                        last_update='external' if interval_update else None,
                        motion_since_visual=state.motion_since_visual or bool(interval_update))
@@ -618,6 +640,13 @@ class ExternalOdometry:
         residual = se3_log(np.linalg.inv(predicted) @ target)
         diag = np.diag(state.covariance)
         gain = np.clip(diag / (diag + variance), 0., .8)
+        if (same_segment and state.corroborated_attitude_since is not None and
+                state.visual[0] >= state.corroborated_attitude_since):
+            # The independent pose and gyro cover the whole visual interval.
+            # Use the visual position, without interpreting its tilt as
+            # angular motion or coupling that tilt into the translation residual.
+            gain[3:] = 0.
+            residual[:3] = predicted[:3, :3].T @ (target[:3, 3] - predicted[:3, 3])
         correction = gain * residual
         applied = np.clip(correction, -.05, .05)
         increment = se3_exp(applied)
@@ -644,7 +673,9 @@ class ExternalOdometry:
         training = visual
         previous = state.training[0]
         if learner.enabled and same_segment and state.stamp-previous >= 100_000_000:
-            intervals = [piece[:3] for piece in self._intervals(motion_times, previous, state.stamp)]
+            intervals = [(velocity, dt, observed, fixed_attitude)
+                         for velocity, dt, observed, _, _, _, fixed_attitude
+                         in self._intervals(motion_times, previous, state.stamp)]
             if intervals and abs(sum(x[1] for x in intervals)-(state.stamp-previous)/1e9) < 1e-6:
                 learner = learner.checkpoint()
                 delta = np.linalg.inv(state.training[2]) @ observed

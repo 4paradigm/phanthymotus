@@ -143,11 +143,11 @@ class ExternalMotionLearner:
                 self.window and start_ns < self.window[-1][1]):
             return False
         pieces = []
-        for velocity, duration, observed in intervals:
+        for velocity, duration, observed, *attitude in intervals:
             if not np.isfinite(duration) or duration <= 0 or len(pieces) >= _MAX_INTERVALS:
                 return False
             raw, mask = _velocity(velocity, observed)
-            pieces.append((raw, mask, duration))
+            pieces.append((raw, mask, duration, bool(attitude and attitude[0])))
         if not pieces or abs(sum(piece[2] for piece in pieces) - (end_ns-start_ns)/1e9) > 1e-6:
             return False
         axes = np.logical_and.reduce([piece[1] for piece in pieces])
@@ -210,19 +210,26 @@ class ExternalMotionLearner:
         steps = max(len(row[2]) for row in self.window)
         raw, mask = np.zeros((steps, count, 6)), np.zeros((steps, count, 6), dtype=bool)
         durations = np.zeros((steps, count, 1))
+        fixed_attitude = np.zeros((steps, count, 3), dtype=bool)
         axes = np.stack([row[3] for row in self.window])
         target = np.stack([row[4] for row in self.window])
         sigmas = np.stack([row[5] for row in self.window])
         for sample, row in enumerate(self.window):
-            for step, (velocity, observed, duration) in enumerate(row[2]):
+            for step, (velocity, observed, duration, fixed) in enumerate(row[2]):
                 raw[step, sample], mask[step, sample], durations[step, sample, 0] = velocity, observed, duration
+                fixed_attitude[step, sample] = fixed
         partial = ~np.all(axes, axis=1)
+        # Keep measured angular motion in the SE(3) translation model while
+        # withholding rotation fitting across a protected interval.
+        residual_axes = axes.copy()
+        residual_axes[:, 3:] &= ~fixed_attitude.any(axis=0)
         partial_target = se3_log(target[partial])
 
         def evaluate(normalized):
             parameters = normalized * _PARAMETER_SCALE
             velocities = (np.exp(parameters[:, None, None, :6]) * raw +
                           parameters[:, None, None, 6:]) * mask
+            velocities[..., 3:] = np.where(fixed_attitude, raw[..., 3:], velocities[..., 3:])
             pose = np.eye(4)
             for increment in np.swapaxes(se3_exp(velocities * durations), 0, 1):
                 pose = pose @ increment
@@ -236,7 +243,7 @@ class ExternalMotionLearner:
             # With a partial twist, compare only the reported body components.
             # Unreported motion must not turn into residuals on absent axes.
             residual[:, partial] = partial_target - se3_log(pose[:, partial])
-            return np.where(axes, residual / sigmas, 0.)
+            return np.where(residual_axes, residual / sigmas, 0.)
 
         return evaluate
 

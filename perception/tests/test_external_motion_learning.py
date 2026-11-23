@@ -325,3 +325,19 @@ def test_subnoise_jitter_about_zero_preserves_unobserved_scale():
     assert learner.info()["bias"][0] == pytest.approx(.024, abs=1e-5)
     assert learner.info()["scale"][0] == pytest.approx(1.)
     assert learner.covariance[0, 0] == pytest.approx(prior_scale_variance)
+
+
+def test_corroborated_attitude_stays_in_translation_model_without_training_angular_bias():
+    learner = ExternalMotionLearner()
+    for index in range(16):
+        sign = (-1)**index
+        rate = np.array([sign*.7, .2, 0., 0., 0., sign*.8])
+        measured = rate.copy()
+        measured[:3] *= [1.1, .9, 1.]
+        target = se3_exp(measured*.4)
+        target[:3, :3] = target[:3, :3] @ se3_exp([0., 0., 0., .15, 0., 0.])[:3, :3]
+        start = index*400_000_000
+        learner.add(start, start+400_000_000, [(rate, .4, None, True)], target)
+    assert learner.rank > 0
+    np.testing.assert_allclose(learner.info()['scale'][3:], 1.)
+    np.testing.assert_allclose(learner.info()['bias'][3:], 0.)

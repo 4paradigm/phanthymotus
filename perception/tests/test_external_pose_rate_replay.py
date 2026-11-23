@@ -113,8 +113,8 @@ def test_calibration_once_and_training_retain_the_raw_angular_pieces():
     np.testing.assert_allclose(engine.current.transform, rotation([0, 0, .04]), atol=1e-12)
     engine.vision(stamp(.4), 'native', engine.current.transform)
     pieces = engine.current.learner.window[-1][2]
-    np.testing.assert_allclose([u[5] for u, _, _ in pieces], [1.5, -1.5])
-    np.testing.assert_allclose([dt for _, _, dt in pieces], [.2, .2])
+    np.testing.assert_allclose([piece[0][5] for piece in pieces], [1.5, -1.5])
+    np.testing.assert_allclose([piece[2] for piece in pieces], [.2, .2])
 
 
 @pytest.mark.parametrize('replace', [False, True])
@@ -231,3 +231,39 @@ def test_subdividing_calibrated_turn_preserves_additive_noise(scales, bias):
     mapped = from_knot @ units @ to_knot
     expected = from_start @ from_start.T + .5 * (mapped @ growth @ mapped.T + units @ growth @ units.T)
     np.testing.assert_allclose(state.noise, expected, rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize('rates,preserved', [
+    ((.8, .8), True),
+    ((None, None), False),
+    ((-1.5, -1.5), False),
+])
+def test_pose_attitude_uses_gyro_agreement_before_applying_learned_bias(rates, preserved):
+    engine = ExternalOdometry()
+    engine.base.learner.parameters[5] = np.log(1.5)
+    engine.base.learner.parameters[11] = -.15
+    engine.base.learner.parameters[6] = .2
+    for time_s, rate in zip((0, .1), rates):
+        engine.motion(*sample(time_s, None if rate is None else [0, 0, rate],
+                              rotation([0, 0, .8*time_s])))
+    state = engine.current
+    np.testing.assert_allclose(state.transform[:3, :3],
+        rotation([0, 0, (.8 if preserved else 1.05)*.1])[:3, :3], atol=1e-12)
+    assert np.linalg.norm(state.transform[:3, 3]) > .019  # Linear calibration still applies.
+    np.testing.assert_allclose(state.twist[5], .8 if preserved else 1.05, atol=1e-12)
+    assert bool(np.all(state.sensitivity[:, [5, 11]] == 0.)) is preserved
+
+
+@pytest.mark.parametrize('rate, expected_roll', [(0., 0.), (None, .05)])
+def test_corroborated_rotation_prevents_visual_tilt_but_allows_translation(rate, expected_roll):
+    engine = ExternalOdometry(learning=False)
+    gyro = None if rate is None else [rate, 0., 0.]
+    engine.motion(*sample(0, gyro, np.eye(4)))
+    engine.vision(stamp(0), 'native', np.eye(4))
+    engine.motion(*sample(.1, gyro, np.eye(4)))
+    visual = rotation([.3, 0., 0.])
+    visual[0, 3] = .1
+    engine.vision(stamp(.1), 'native', visual)
+    np.testing.assert_allclose(engine.current.transform[:3, :3],
+                               rotation([expected_roll, 0., 0.])[:3, :3], atol=1e-12)
+    assert engine.current.transform[0, 3] > .04

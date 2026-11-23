@@ -429,8 +429,9 @@ class ExternalOdometryInput:
             signature.update(value.tobytes())
         for start, end, pieces, axes, target, noise in learner.window:
             signature.update(f'{start}:{end}:{len(pieces)};'.encode())
-            for velocity, observed, duration in pieces:
-                signature.update(velocity.tobytes() + observed.tobytes() + np.float64(duration).tobytes())
+            for velocity, observed, duration, fixed_attitude in pieces:
+                signature.update(velocity.tobytes() + observed.tobytes() + np.float64(duration).tobytes()
+                                 + bytes((fixed_attitude,)))
             signature.update(axes.tobytes() + target.tobytes() + noise.tobytes())
         key = (learner.last_solve_ns, learner.effective_after_ns, signature.digest())
         if key in self.learning_results:
