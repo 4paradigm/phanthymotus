@@ -207,6 +207,77 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_a', user_id='ou_b')[0]['text'],
                          '给另一人的回复')
 
+    async def test_clear_stops_its_active_turn_and_sends_receipt_after_in_flight_reply(self):
+        self.manager.active_input_channels.add('feishu_r1')
+        self.manager._set_last_context('feishu_r1', 'oc_b', 'ou_a', message_id='om_old',
+                                       context_user_id='ou_a')
+        turn_started = asyncio.Event()
+        send_started = asyncio.Event()
+        finish_send = asyncio.Event()
+        sent_ids = []
+
+        async def send(message):
+            if message.reply_to_message_id == 'om_old':
+                send_started.set()
+                await finish_send.wait()
+            sent_ids.append(message.reply_to_message_id)
+
+        from event.llm import Event, TurnCancelled
+
+        core = Event()
+
+        async def run_turn(_trigger, *, cancel_event, reconsider_event):
+            turn_started.set()
+            await cancel_event.wait()
+            raise TurnCancelled('Test Feishu reset')
+
+        self.manager._adapters['feishu_r1'] = mock.Mock(platform='feishu', send_message=send)
+        msg = InboundMessage('feishu', 'feishu_r1', 'ou_a', 'oc_a', 'Alice', '/clear',
+                             message_id='om_clear', chat_type='p2p')
+        trigger = {'_feishu_chat': ('feishu_r1', 'oc_b', 'ou_a', 0)}
+        with (
+            mock.patch('channel.manager.manager', self.manager),
+            mock.patch.object(self.manager, 'sync_from_canvas'),
+            mock.patch('channel.acl.get_user', return_value={'role': 'operator'}),
+            mock.patch.object(collector, 'next_trigger',
+                              new=mock.AsyncMock(side_effect=[trigger, asyncio.CancelledError()])),
+            mock.patch.object(core, '_one_turn', side_effect=run_turn),
+            mock.patch.object(core, '_save_current_turn'),
+            mock.patch.object(core, '_interrupt_active_outputs', new_callable=mock.AsyncMock) as interrupt,
+            mock.patch.object(sys.modules['event.llm'], 'push_event', new_callable=mock.AsyncMock),
+            mock.patch('hooks.fire', new_callable=mock.AsyncMock),
+        ):
+            loop = asyncio.create_task(core.run_forever())
+            await asyncio.wait_for(turn_started.wait(), timeout=2)
+            sending = asyncio.create_task(self.manager.send_to_channel(
+                'feishu_r1', '上一轮正在发送的回复', source_message_id='om_old',
+            ))
+            await asyncio.wait_for(send_started.wait(), timeout=2)
+            clearing = asyncio.create_task(self.manager._on_inbound_message(msg))
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(loop, timeout=2)
+            self.assertEqual(sent_ids, [])
+            interrupt.assert_not_awaited()
+
+            finish_send.set()
+            await asyncio.wait_for(asyncio.gather(sending, clearing), timeout=2)
+            late = await self.manager.send_to_channel(
+                'feishu_r1', '清除后尝试发送的旧回复', source_message_id='om_old',
+            )
+        self.assertEqual(sent_ids, ['om_old', 'om_clear'])
+        self.assertIn('context was cleared', late)
+
+    def test_clear_leaves_another_sender_turn_running(self):
+        cancel = asyncio.Event()
+        with (
+            mock.patch.object(collector, '_cancel_event', cancel),
+            mock.patch.object(collector, '_current_trigger', {
+                '_feishu_chat': ('feishu_r1', 'oc_a', 'ou_b', 0),
+            }),
+        ):
+            collector.cancel_feishu_turn('feishu_r1', 'ou_a')
+        self.assertFalse(cancel.is_set())
+
     async def test_queued_trigger_is_discarded_only_for_the_sender_who_cleared(self):
         def event(user_id, generation, text, chat_id='oc_a'):
             return {

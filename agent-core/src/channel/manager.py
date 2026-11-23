@@ -14,6 +14,7 @@ import json
 import math
 import re
 import time
+from contextlib import nullcontext
 
 import config
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError
@@ -235,6 +236,10 @@ class ChannelManager:
         self._chat_only_pending: dict[tuple[str, str, str], tuple[str, str]] = {}
         self._starting: set[str] = set()
         self._mention_rate: dict[tuple, list[float]] = {}
+        self._feishu_reply_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+    def _feishu_reply_lock(self, channel_id: str, user_id: str) -> asyncio.Lock:
+        return self._feishu_reply_locks.setdefault((channel_id, user_id), asyncio.Lock())
 
     def _trusted_bot_id(self, msg: InboundMessage) -> str:
         """Return the configured alias for an exact Feishu bot/group principal."""
@@ -831,14 +836,22 @@ class ChannelManager:
             allowed, _ = acl.check_permission(msg.platform, msg.user_id, required_role='operator')
             if allowed:
                 self._clear_user_context(msg.channel_id, msg.user_id)
+                from collector import cancel_feishu_turn
+                cancel_feishu_turn(msg.channel_id, msg.user_id)
             adapter = self._adapters.get(msg.channel_id)
             if adapter:
-                await adapter.send_message(OutboundMessage(
+                receipt = OutboundMessage(
                     chat_id=msg.chat_id,
                     text=('已清除你在此飞书渠道的全部上下文。' if allowed
                           else '你没有清除上下文的权限。此操作需要 operator 或 owner 角色。'),
                     reply_to_message_id=msg.message_id,
-                ))
+                )
+                if allowed:
+                    # Let a send already handed to Feishu finish before acknowledging the reset.
+                    async with self._feishu_reply_lock(msg.channel_id, msg.user_id):
+                        await adapter.send_message(receipt)
+                else:
+                    await adapter.send_message(receipt)
             return
 
         # 4. Store last conversation context for reply routing (persisted)
@@ -1039,14 +1052,22 @@ class ChannelManager:
 
         chat_id = ctx['chat_id']
         try:
-            await adapter.send_message(OutboundMessage(
+            outbound = OutboundMessage(
                 chat_id=chat_id,
                 text=text,
                 files=attachments,
                 mention_open_id=mention_open_id,
                 expect_reply=expect_reply,
                 reply_to_message_id=ctx.get('message_id', ''),
-            ))
+            )
+            feishu_user = ctx['user_id'] if adapter.platform == 'feishu' and source_message_id else ''
+            send_lock = self._feishu_reply_lock(channel_id, feishu_user) if feishu_user else nullcontext()
+            async with send_lock:
+                if feishu_user and ctx.get('context_generation', 0) != self.chat_generation(
+                    channel_id, chat_id, feishu_user,
+                ):
+                    return 'Error: the triggering Feishu context was cleared.'
+                await adapter.send_message(outbound)
             parts = []
             if text:
                 parts.append(f'{len(text)} chars')

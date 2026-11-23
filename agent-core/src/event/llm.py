@@ -1945,13 +1945,15 @@ class Event:
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev, reconsider_event=reconsider_ev)
             except TurnCancelled:
-                print(f'[decision] turn cancelled by user message')
+                cleared = not collector.feishu_context_is_current(ev.get('_feishu_chat'))
+                reason = 'Feishu context reset' if cleared else 'user message'
+                print(f'[decision] turn cancelled by {reason}')
                 self._current_turn.append({
                     'role': 'assistant',
-                    'content': '[turn interrupted by user message]',
+                    'content': f'[turn interrupted by {reason}]',
                 })
                 # 中止正在进行的 TTS 播放和动作
-                if not self._chat_only_active:
+                if not cleared and not self._chat_only_active:
                     await self._interrupt_active_outputs()
                 await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
@@ -2616,6 +2618,8 @@ class Event:
                         raise
                 else:
                     raise
+            if feishu_turn and cancel_event and cancel_event.is_set():
+                raise TurnCancelled("Interrupted before dispatching the Feishu model response")
             turn_messages.append(response)
             self._flush_current_turn(trigger_event)
             _flush_spans()
@@ -2700,6 +2704,9 @@ class Event:
                     'mcp_id':  name.split('__')[1] if name.startswith('mcp__') else '',
                     'payload': {'tool': name, 'args': args},
                 })
+
+                if feishu_turn and cancel_event and cancel_event.is_set():
+                    raise TurnCancelled("Interrupted before dispatching a Feishu tool call")
 
                 if chat_only_turn:
                     result = await chat_only.dispatch(name, args, trigger_event)

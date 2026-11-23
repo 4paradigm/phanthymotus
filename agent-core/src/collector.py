@@ -265,6 +265,13 @@ def set_cancel_event(ev: asyncio.Event | None):
     _cancel_event = ev
 
 
+def cancel_feishu_turn(channel_id: str, user_id: str):
+    """Stop inference for the sender who just cleared their Feishu context."""
+    chat = _current_trigger.get('_feishu_chat')
+    if _cancel_event is not None and chat and (chat[0], chat[2]) == (channel_id, user_id):
+        _cancel_event.set()
+
+
 def set_reconsider_event(ev: asyncio.Event | None):
     """由 agent loop 调用：注册/清除当前 turn 的 reconsider 信号（见类型定义处注释）。"""
     global _reconsider_event
@@ -303,7 +310,7 @@ async def drain_steering() -> list[dict]:
             ev = _steering_queue.get_nowait()
         except asyncio.QueueEmpty:
             break
-        if _feishu_chat_is_current(_feishu_chat([ev])):
+        if feishu_context_is_current(_feishu_chat([ev])):
             items.append(ev)
     return items
 
@@ -333,7 +340,7 @@ async def next_trigger() -> dict:
     _flush_all_pending()
     while True:
         trigger = await _output.get()
-        if _feishu_chat_is_current(trigger.get('_feishu_chat')):
+        if feishu_context_is_current(trigger.get('_feishu_chat')):
             return trigger
 
 
@@ -382,7 +389,7 @@ def _feishu_chat(events: list[dict]) -> _FeishuChat | None:
     return None
 
 
-def _feishu_chat_is_current(chat: _FeishuChat | None) -> bool:
+def feishu_context_is_current(chat: _FeishuChat | None) -> bool:
     if chat is None:
         return True
     from channel.manager import manager as channel_manager
@@ -464,7 +471,7 @@ def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
     previous = None
     for ev in events:
         chat = _feishu_chat([ev])
-        if not _feishu_chat_is_current(chat):
+        if not feishu_context_is_current(chat):
             continue
         viewer_only = chat is not None and has_viewer_only_channel_event([ev])
         key = (ev.get('_chat_only_key'), _bot_trust_class([ev]), chat, viewer_only)
@@ -924,7 +931,7 @@ async def _drain_loop():
         _note_ungated()
 
         feishu_chat = _feishu_chat([ev])
-        if not _feishu_chat_is_current(feishu_chat):
+        if not feishu_context_is_current(feishu_chat):
             continue
         if '/channel/request/' in source:
             from channel import chat_only
