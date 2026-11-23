@@ -9,6 +9,7 @@ from config import _get_conn
 
 
 KIND_MAIN = 'main'
+KIND_FEISHU = 'feishu'
 KIND_SUBAGENT = 'subagent'
 KIND_BG_SUBAGENT = 'bg_subagent'
 
@@ -279,13 +280,40 @@ def search(query: str, limit: int = 10) -> list[dict]:
 
 # ── 重启续跑 ──────────────────────────────────────────────────────────────────
 
+_FEISHU_EVENT_RE = re.compile(
+    r'^<event source="dds:/channel/request/[^"]+" channel="channel:feishu"\s', re.M,
+)
+_CHANNEL_NOTIFICATION_RE = re.compile(r'^\[system notification source=dds:/channel/request/[^\]]+\]\n')
+
+
+def _contains_feishu_event(turn: list[dict]) -> bool:
+    for message in turn:
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        content = message.get('content')
+        if not isinstance(content, str):
+            continue
+        if _FEISHU_EVENT_RE.search(content):
+            return True
+        notice = _CHANNEL_NOTIFICATION_RE.match(content)
+        if notice:
+            try:
+                payload = json.loads(content[notice.end():])
+            except ValueError:
+                continue
+            if isinstance(payload, dict) and payload.get('platform') == 'feishu':
+                return True
+    return False
+
+
 def get_last_session_turns(limit: int = 10) -> dict | None:
     """获取主代理最近一个 session 的最后 N 轮，用于重启续跑。
 
     只认 main：子代理的对话也存在同一张表里，而"最近的一个 session"现在几乎总是
     某个后台子代理的 —— 它们每轮都落盘。续跑到那上面，主代理会把一段后台监控的
     transcript 当成自己的历史接着往下写，并且之后每个 turn 都追加进那个会话。
-    老记录的 kind 列是迁移时统一填的 'main'，所以还要排掉带 `[subagent:` 前缀的。
+    老记录的 kind 列是迁移时统一填的 'main'，所以还要排掉带 `[subagent:` 前缀的，
+    并跳过旧版本写进 main 的飞书回合。
     """
     with _get_conn() as conn:
         row = conn.execute(
@@ -303,4 +331,10 @@ def get_last_session_turns(limit: int = 10) -> dict | None:
     if not rows:
         return None
     turns = [json.loads(r[0]) for r in reversed(rows)]
-    return {'session_id': session_id, 'turns': turns}
+    shared_turns = [turn for turn in turns if not _contains_feishu_event(turn)]
+    return {
+        'session_id': session_id,
+        'turns': shared_turns,
+        # Start a new writable session if filtering has shifted old turn indices.
+        'filtered_feishu': len(shared_turns) != len(turns),
+    }

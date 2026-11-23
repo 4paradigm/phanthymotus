@@ -280,35 +280,47 @@ class ChannelManager:
 
     # ── Per-chat context recap ───────────────────────────────────────────────
 
-    def _chat_history_state(self, channel_id: str, chat_id: str) -> tuple[dict, dict, dict]:
+    def _chat_history_state(self, channel_id: str, chat_id: str, user_id: str = '') -> tuple[dict, dict]:
         all_history = config.main.get('channel_chat_history', {})
         if not isinstance(all_history, dict):
             all_history = {}
         channel_history = all_history.get(channel_id)
         if not isinstance(channel_history, dict):
             channel_history = {}
+        all_history[channel_id] = channel_history
         state = channel_history.get(chat_id)
         if isinstance(state, list):  # 升级前直接保存消息列表
             state = {'entries': state}
         elif not isinstance(state, dict):
             state = {}
-        return all_history, channel_history, state
+        channel_history[chat_id] = state
+        if user_id:
+            # Older chat-wide entries had no reliable owner, so never use them as a user's history.
+            users = state.get('users')
+            if not isinstance(users, dict):
+                users = {}
+            state['users'] = users
+            state = users.get(user_id)
+            if not isinstance(state, dict):
+                state = {}
+            users[user_id] = state
+        return all_history, state
 
-    def chat_generation(self, channel_id: str, chat_id: str) -> int:
-        _, _, state = self._chat_history_state(channel_id, chat_id)
+    def chat_generation(self, channel_id: str, chat_id: str, user_id: str) -> int:
+        _, state = self._chat_history_state(channel_id, chat_id, user_id)
         return state.get('generation', 0)
 
-    def _clear_chat_history(self, channel_id: str, chat_id: str):
-        all_history, channel_history, state = self._chat_history_state(channel_id, chat_id)
-        channel_history[chat_id] = {'generation': state.get('generation', 0) + 1, 'entries': []}
-        all_history[channel_id] = channel_history
+    def _clear_chat_history(self, channel_id: str, chat_id: str, user_id: str):
+        all_history, state = self._chat_history_state(channel_id, chat_id, user_id)
+        state.update(generation=state.get('generation', 0) + 1, entries=[])
         config.main['channel_chat_history'] = all_history
 
     def _record_chat_exchange(self, channel_id: str, chat_id: str, role: str, text: str, *,
-                              user_label: str = '', source_generation: int | None = None):
+                              user_id: str = '', user_label: str = '',
+                              source_generation: int | None = None):
         if not channel_id or not chat_id or not text:
             return
-        all_history, channel_history, state = self._chat_history_state(channel_id, chat_id)
+        all_history, state = self._chat_history_state(channel_id, chat_id, user_id)
         if source_generation is not None and source_generation != state.get('generation', 0):
             return  # 清除前触发的回复即使稍后发送成功，也不带入新上下文
         entries = state.get('entries')
@@ -320,14 +332,14 @@ class ChannelManager:
             'user_label': user_label,
             'ts': time.time(),
         }]
-        channel_history[chat_id] = {**state, 'entries': entries[-_CHAT_HISTORY_LIMIT:]}
-        all_history[channel_id] = channel_history
+        state['entries'] = entries[-_CHAT_HISTORY_LIMIT:]
         config.main['channel_chat_history'] = all_history
 
-    def get_chat_history(self, channel_id: str, chat_id: str, limit: int = 6) -> list[dict]:
+    def get_chat_history(self, channel_id: str, chat_id: str, limit: int = 6, *,
+                         user_id: str = '') -> list[dict]:
         """Return this chat's own recent exchanges (oldest first), independent of the
         shared global turn history."""
-        _, _, state = self._chat_history_state(channel_id, chat_id)
+        _, state = self._chat_history_state(channel_id, chat_id, user_id)
         entries = state.get('entries')
         if not isinstance(entries, list):
             return []
@@ -346,7 +358,7 @@ class ChannelManager:
     def _set_last_context(self, channel_id: str, chat_id: str, user_id: str, *,
                           message_id: str = '', sender_type: str = 'user',
                           chat_type: str = '', expect_reply: bool | None = None,
-                          context_generation: int = 0):
+                          context_generation: int = 0, context_user_id: str = ''):
         """Persist conversation context for a channel.
 
         带 ts —— 「最近一次会话」必须靠时间戳判断：dict 就地更新不改插入顺序，
@@ -360,6 +372,7 @@ class ChannelManager:
             'chat_type': chat_type,
             'expect_reply': expect_reply,
             'context_generation': context_generation,
+            'context_user_id': context_user_id,
             'ts': time.time(),
         }
         ctx = self._get_last_context()
@@ -726,6 +739,9 @@ class ChannelManager:
 
     async def _on_inbound_message(self, msg: InboundMessage):
         """Handle incoming platform message."""
+        feishu = msg.platform == 'feishu'
+        if feishu and (not msg.chat_id or not msg.user_id):
+            return
         # Sync active channels from canvas
         self.sync_from_canvas()
 
@@ -781,18 +797,24 @@ class ChannelManager:
                 return  # 静默丢弃
 
         if self._is_feishu_reset(msg):
-            self._clear_chat_history(msg.channel_id, msg.chat_id)
+            allowed, _ = acl.check_permission(msg.platform, msg.user_id, required_role='operator')
+            if allowed:
+                self._clear_chat_history(msg.channel_id, msg.chat_id, msg.user_id)
             adapter = self._adapters.get(msg.channel_id)
             if adapter:
                 await adapter.send_message(OutboundMessage(
-                    chat_id=msg.chat_id, text='已清除当前会话的上下文。'
+                    chat_id=msg.chat_id,
+                    text=('已清除你在当前会话的上下文。' if allowed
+                          else '你没有清除上下文的权限。此操作需要 operator 或 owner 角色。'),
+                    reply_to_message_id=msg.message_id,
                 ))
             return
 
         # 4. Store last conversation context for reply routing (persisted)
         context_generation = (
-            self.chat_generation(msg.channel_id, msg.chat_id) if msg.platform == 'feishu' else 0
+            self.chat_generation(msg.channel_id, msg.chat_id, msg.user_id) if feishu else 0
         )
+        context_user_id = msg.user_id if feishu else ''
         self._set_last_context(
             msg.channel_id, msg.chat_id, msg.user_id,
             message_id=msg.message_id,
@@ -800,8 +822,10 @@ class ChannelManager:
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
             context_generation=context_generation,
+            context_user_id=context_user_id,
         )
         self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
+                                   user_id=context_user_id,
                                    user_label=msg.display_name or msg.user_id)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
@@ -827,7 +851,7 @@ class ChannelManager:
             payload['files'] = files
         if private_chat:
             payload['chat_only'] = True
-        if msg.platform == 'feishu':
+        if feishu:
             payload['context_generation'] = context_generation
         if trusted_bot_id:
             self._record_trusted_bot_message(payload)
@@ -1002,10 +1026,12 @@ class ChannelManager:
             result = f'Reply sent to {channel_id} ({"; ".join(parts) or "empty"})'
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
-            if not mention_open_id:
+            context_user_id = ctx.get('context_user_id', '')
+            if not mention_open_id and (adapter.platform != 'feishu' or context_user_id):
                 # Bot-to-bot mentions aren't this chat's own human-facing conversation —
                 # keep the recap scoped to the human/channel side of the exchange.
                 self._record_chat_exchange(channel_id, chat_id, 'assistant', text,
+                                           user_id=context_user_id,
                                            source_generation=ctx.get('context_generation', 0))
             return result
         except PartialSendError as e:

@@ -112,6 +112,15 @@ class FeishuAdapterBotEventTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.received[0].expect_reply)
         self.assertTrue(self.received[1].expect_reply)
 
+    async def test_missing_bot_identity_does_not_mark_mention_as_self(self):
+        self.adapter._bot_open_id = ''
+        event = _raw_bot_event('om_human', mentions=[{'key': '@_user_1', 'open_id': ''}])
+        event['sender_type'] = 'user'
+        await self.adapter._process_event(event)
+
+        self.assertEqual(len(self.received), 1)
+        self.assertFalse(self.received[0].mentions[0]['is_self'])
+
     async def test_human_messages_remain_compatible_and_bot_feature_defaults_closed(self):
         human = _raw_bot_event('om_human', chat_type='p2p', mentions=[])
         human['sender_type'] = 'user'

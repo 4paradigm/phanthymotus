@@ -1618,6 +1618,7 @@ class Event:
         self._sys_tools:   dict       = {}
         self._summary: str | None     = None  # 压缩后的历史摘要
         self._session_id: str | None  = None  # chat history session
+        self._feishu_archive_id: str | None = None
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
         self._subagent_mgr = None             # SubagentManager instance
         self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
@@ -1698,7 +1699,7 @@ class Event:
             # 落盘的历史可能是修复之前写的：那时 tool 消息的 content 会是 dict，
             # 读回来就等于把同一个 400 一起续跑回来。所以在 restore 这一侧也过一遍。
             self._turns = [_sanitise_turn(t) for t in last['turns']]
-            self._session_id = last['session_id']
+            self._session_id = None if last.get('filtered_feishu') else last['session_id']
             print(f'[startup] resumed session {last["session_id"][:8]}... ({len(last["turns"])} turns)')
         else:
             self._session_id = None
@@ -1924,6 +1925,7 @@ class Event:
             ev = await collector.next_trigger()
             self._chat_only_active = bool(ev.get('_chat_only_channel'))
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
+            self._feishu_archive_id = None
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
             collector.set_cancel_event(cancel_ev)
@@ -1979,6 +1981,22 @@ class Event:
                     self._save_current_turn(ev)
                 self._chat_only_active = False
 
+    def _persist_turn(self, turn: list[dict], turn_index: int, trigger_event: dict):
+        import chat_history
+        if trigger_event.get('_feishu_chat'):
+            if not self._feishu_archive_id:
+                self._feishu_archive_id = chat_history.create_session(chat_history.KIND_FEISHU)
+            session_id = self._feishu_archive_id
+            turn_index = 0
+        else:
+            if not self._session_id:
+                self._session_id = chat_history.create_session(chat_history.KIND_MAIN)
+            session_id = self._session_id
+        chat_history.save_turn(session_id, turn_index, turn)
+        summary_text = trigger_event.get('text') or trigger_event.get('source')
+        if summary_text:
+            chat_history.update_summary(session_id, summary_text)
+
     def _flush_current_turn(self, trigger_event: dict | None = None):
         """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
 
@@ -1988,18 +2006,10 @@ class Event:
         """
         if not self._current_turn:
             return
-        import chat_history
         try:
-            if not self._session_id:
-                self._session_id = chat_history.create_session(chat_history.KIND_MAIN)
             # 存盘的是截断过的副本 —— 和 turn 结束时那一份同一个规则，也避免把整轮
             # 未截断的 tool result 每轮重写一遍。原 turn 不能动，LLM 还要用完整内容。
-            chat_history.save_turn(
-                self._session_id, len(self._turns), _compact_turn(self._current_turn))
-            if trigger_event:
-                summary_text = trigger_event.get('text', '') or trigger_event.get('source', '')
-                if summary_text:
-                    chat_history.update_summary(self._session_id, summary_text)
+            self._persist_turn(_compact_turn(self._current_turn), len(self._turns), trigger_event or {})
         except Exception as e:
             print(f'[chat_history] flush_turn failed: {e}')
 
@@ -2008,18 +2018,16 @@ class Event:
         # 保存前 compact：截断大 tool results，减少 tier1 历史占用
         turn = _compact_turn(self._current_turn)
         self._current_turn[:] = turn
-        self._turns.append(turn)
-        # 持久化（延迟创建 session）
-        import chat_history
+        feishu_turn = bool(trigger_event.get('_feishu_chat'))
+        turn_index = len(self._turns)
+        if not feishu_turn:
+            self._turns.append(turn)
         try:
-            if not self._session_id:
-                self._session_id = chat_history.create_session()
-            chat_history.save_turn(self._session_id, len(self._turns) - 1, turn)
-            summary_text = trigger_event.get('text', '') or trigger_event.get('source', '')
-            if summary_text:
-                chat_history.update_summary(self._session_id, summary_text)
+            self._persist_turn(turn, turn_index, trigger_event)
         except Exception as e:
             print(f'[chat_history] save_turn failed: {e}')
+        if feishu_turn:
+            return
         # 裁剪：保留 tier1 + tier2 + 少量缓冲（压缩在 _maybe_compress 中处理）
         llm_cfg = config.main.get('event', {}).get('llm', {})
         tier1 = llm_cfg.get('tier1_turns', 6)

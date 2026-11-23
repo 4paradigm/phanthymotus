@@ -67,7 +67,7 @@ def _is_log_type(ev: dict) -> bool:
 
 # ── 共享状态 ──────────────────────────────────────────────────────────────────
 _busy: bool = False
-_FeishuChat = tuple[str, str, int]
+_FeishuChat = tuple[str, str, str, int]  # channel, chat, sender, generation
 _current_trigger: dict = {}
 _cancel_event: asyncio.Event | None = None
 # 比 _cancel_event 窄：steer 模式下高优先级事件到达时置位，只打断"正在飞的 LLM
@@ -371,12 +371,14 @@ def _feishu_chat(events: list[dict]) -> _FeishuChat | None:
     for payload in _channel_payloads(events):
         channel_id = payload.get('channel_id')
         chat_id = payload.get('chat_id')
+        user_id = payload.get('user_id')
         generation = payload.get('context_generation', 0)
         if (payload.get('platform') == 'feishu'
                 and isinstance(channel_id, str) and channel_id
                 and isinstance(chat_id, str) and chat_id
+                and isinstance(user_id, str) and user_id
                 and isinstance(generation, int)):
-            return channel_id, chat_id, generation
+            return channel_id, chat_id, user_id, generation
     return None
 
 
@@ -384,8 +386,8 @@ def _feishu_chat_is_current(chat: _FeishuChat | None) -> bool:
     if chat is None:
         return True
     from channel.manager import manager as channel_manager
-    channel_id, chat_id, generation = chat
-    return generation == channel_manager.chat_generation(channel_id, chat_id)
+    channel_id, chat_id, user_id, generation = chat
+    return generation == channel_manager.chat_generation(channel_id, chat_id, user_id)
 
 
 def _bot_channel_payloads(events: list[dict]) -> list[dict]:
@@ -457,7 +459,7 @@ def _defer_channel_steering(ev: dict, feishu_chat: _FeishuChat | None) -> bool:
 
 
 def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
-    """Keep bot trust levels and Feishu conversations in separate LLM turns."""
+    """Keep bot trust levels and Feishu senders in separate LLM turns."""
     batches = []
     previous = None
     for ev in events:
@@ -483,10 +485,16 @@ def _chat_history_blocks(batch: list[dict]) -> str:
         chat_id = payload.get('chat_id')
         if not isinstance(channel_id, str) or not isinstance(chat_id, str):
             continue
-        if not channel_id or not chat_id or (channel_id, chat_id) in seen:
+        user_id = ''
+        if payload.get('platform') == 'feishu':
+            user_id = payload.get('user_id')
+            if not isinstance(user_id, str) or not user_id:
+                continue
+        history_key = (channel_id, chat_id, user_id)
+        if not channel_id or not chat_id or history_key in seen:
             continue
-        seen.add((channel_id, chat_id))
-        history = channel_manager.get_chat_history(channel_id, chat_id)
+        seen.add(history_key)
+        history = channel_manager.get_chat_history(channel_id, chat_id, user_id=user_id)
         if not history:
             continue
         lines = []
