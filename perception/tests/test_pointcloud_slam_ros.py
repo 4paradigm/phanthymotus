@@ -1071,3 +1071,31 @@ def test_place_uses_recent_native_pose_and_follows_optimized_anchor(node):
         node.change_place('过期', remove=False)
     assert node.change_place('入口', remove=True) == []
     assert not published(node, '/pointcloud_slam/map')[0].messages[-1][12] & 64
+
+
+def test_mark_between_native_keyframes_uses_same_run_body_displacement(node):
+    from test_pointcloud_slam_stream import chassis
+    node._odom(NS(data=json.dumps(chassis(1000))))
+    node._cloud(cloud())
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    segment = node._active
+    header = NS(frame_id='map', stamp=NS(sec=1, nanosec=0))
+    orientation = NS(x=0., y=0., z=2**-.5, w=2**-.5)
+    origin = NS(position=NS(x=5., y=6., z=1.), orientation=orientation)
+    graph = NS(header=header, poses_id=[3], poses=[origin], links=[])
+    info = NS(header=header, ref_id=3, loop_closure_id=0, proximity_detection_id=0,
+              stats_keys=['Motus/RecoveryState/', 'Motus/Relocalizations/', 'Motus/VisualInliers/'],
+              stats_values=[0, 0, 0])
+    node._native_info(info, segment)
+    node._native_graph(graph, segment)
+    for ms in range(1100, 5100, 100):
+        node._measurement_clock_ns = lambda: ms * 1_000_000
+        node._odom(NS(data=json.dumps(chassis(ms, (ms - 1000) / 1000))))
+    place, = node.change_place('门', remove=False)
+    assert [place[k] for k in ('x', 'y', 'z')] == pytest.approx([5., 10., 1.])
+    origin.position.y = 7.
+    node._native_graph(graph, segment)
+    assert segment['places'][0]['y'] == pytest.approx(11.)
+    node._odom(NS(data=json.dumps(chassis(5100, 0., segment='reset'))))
+    with pytest.raises(ValueError, match='continuity lost'):
+        node.change_place('错图', remove=False)

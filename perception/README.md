@@ -8,6 +8,23 @@ Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
+## Measured body odometry for fusion and SLAM
+
+A driver publishing `motus.odom/1` can declare a measured body pose in
+`vendor.motus_slam` with `pose_reference="body"`, `pose_kind="measured"`
+and a boolean `planar`. Use `true` for x, y and yaw or `false` for a full
+spatial pose. Report the tracking status, spatial `segment_id`, measurement
+`stamp_ns` and `stamp_source="measurement"` alongside the pose frame IDs.
+Direct SLAM continuity also uses the source topic and clock ID.
+The legacy chassis declaration remains supported. Kinematic estimates can
+continue through the ordinary fusion path with visual correction.
+
+When changing a clock mapping while retaining a spatial origin, report the new
+`measurement.clock_epoch`, keep `source_generation` equal to that origin's
+`segment_id`, and supply a stable `source_clock`, integer `source_stamp`,
+`source_unit` (s, ms, us or ns), and a named, verified mapping. The gateway
+checks elapsed device time and measured motion across that transition.
+
 ## Audio Requirements for ASR
 
 The ASR plugin (VAD + speech recognition) has strict requirements on the audio stream it receives. Any mic driver that does not meet these requirements will produce no output.

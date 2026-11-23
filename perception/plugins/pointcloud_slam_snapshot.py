@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .pointcloud_slam_preview import encode_mapping
+from .pointcloud_slam_preview import encode_mapping, update_place_position
 
 log = logging.getLogger(__name__)
 
@@ -216,7 +216,7 @@ def rebuild(database_path, *, max_points, fallback=None, places=()):
             for place in places:
                 anchor = optimized.get(place.get('node_id'))
                 if anchor is not None:
-                    place['x'], place['y'], place['z'] = map(float, anchor[:3, 3])
+                    update_place_position(place, anchor)
         return packet
     except Exception as error:  # never break saving because diagnostics failed
         log.warning('keeping preview snapshot, database rebuild failed: %s', error)

@@ -10,6 +10,7 @@ import uuid
 import numpy as np
 
 from .external_motion_learning import ExternalMotionLearner, se3_exp, se3_log, se3_right_jacobian
+from .pointcloud_slam_contract import declares_measured_body
 from .pointcloud_slam_transforms import rigid, within_measured_motion_bounds
 from .rgbd_fusion import quaternion
 from .rgbd_imu import rotation_from_quaternion
@@ -18,6 +19,9 @@ _HISTORY_NS = 10_000_000_000
 _MAX_EVENTS = 512
 _MAX_INTERVAL_NS = 1_500_000_000
 _ATTITUDE_INTERVAL_NS = 250_000_000
+_MEASURED_PLANAR = ('measured_planar_chassis',)
+_MEASURED_SPATIAL = ('measured_spatial_body',)
+_MEASURED_MODELS = (_MEASURED_PLANAR, _MEASURED_SPATIAL)
 _FULL = np.ones(6, dtype=bool)
 _ANGULAR = np.array([False, False, False, True, True, True])
 _DEFAULT_VARIANCE = np.square([.025, .025, .035, .03, .03, .03])
@@ -175,7 +179,13 @@ def decode_motion(packet, receipt_ns):
                 pass  # Attitude continuity is optional evidence.
     if pose is not None and mount is not None:
         pose = pose @ np.linalg.inv(mount)
-    planar = packet.get('motion_model') == 'planar'
+    measured_body = (pose is not None and declares_measured_body(quality) and
+                     (quality.get('planar') is True or quality.get('pose_kind') == 'measured') and
+                     quality.get('status') == 'tracking' and quality.get('stamp_source') == 'measurement' and
+                     quality.get('stamp_ns') == stamp - offset and
+                     all(isinstance(v, str) and v for v in (quality.get('segment_id'), record.get('frame_id'),
+                                                             record.get('child_frame_id'))))
+    planar = quality['planar'] if measured_body else packet.get('motion_model') == 'planar'
     pose_mask = np.array([True, True, False, False, False, True]) if planar else _FULL
     twist, mask = None, pose_mask if pose is not None else np.zeros(6, dtype=bool)
     covariance = np.diag(_DEFAULT_VARIANCE)
@@ -200,9 +210,20 @@ def decode_motion(packet, receipt_ns):
         raise ValueError('no usable external pose or twist')
     origin = (record.get('frame_id'), record.get('child_frame_id')) if pose is not None else ()
     model = ('planar' if planar else 'pose',) if pose is not None else ('twist',) if twist is not None else None
+    if measured_body:
+        model = _MEASURED_PLANAR if planar else _MEASURED_SPATIAL
+        origin += (quality['segment_id'],)
     return stamp, Motion(pose, twist, mask, origin, reset, covariance, model,
                          process_covariance, np.eye(4) if mount is None else mount,
                          body_angular_velocity)
+
+
+def _continuous_chassis(left, right, interval_ns):
+    if right.reset or left.model != right.model or left.origin != right.origin or not 0 < interval_ns <= _MAX_INTERVAL_NS:
+        return False
+    distance = np.linalg.norm(right.pose[:3, 3] - left.pose[:3, 3])
+    cosine = (np.sum(left.pose[:3, :3] * right.pose[:3, :3]) - 1.) / 2.
+    return within_measured_motion_bounds(distance, np.arccos(np.clip(cosine, -1., 1.)), interval_ns / 1e9)
 
 
 def _origin_attitude(left, right, duration_ns):
@@ -303,6 +324,8 @@ class _State:
     motion_model: tuple | None = None
     visual_carry: tuple | None = None
     corroborated_attitude_since: int | None = None
+    last_chassis: tuple | None = None
+    chassis_break_ns: int | None = None
 
     @property
     def covariance(self):
@@ -472,6 +495,10 @@ class ExternalOdometry:
             fixed_attitude = False
             bracket = (self._pose_bracket(times, t0, t1)
                        if left.pose is None or right.pose is None else None)
+            if bracket is not None or (left.pose is not None and right.pose is not None):
+                first_stamp, last_stamp, a, b = bracket or (t0, t1, left, right)
+                if a.model == b.model and a.model in _MEASURED_MODELS and not _continuous_chassis(a, b, last_stamp-first_stamp):
+                    continue
             if bracket is not None:
                 p0, p1, pose_left, pose_right = bracket
                 bounds = (p0, p1)
@@ -523,17 +550,19 @@ class ExternalOdometry:
                 yield (np.where(mask, velocity, 0.), overlap/1e9, mask, covariance,
                        increment_covariance, seconds_to_knot, fixed_attitude)
 
-    def _learned_step(self, learner, velocity, dt, observed, fixed_attitude):
+    def _learned_step(self, learner, velocity, dt, observed, fixed_attitude, measured_chassis):
         # Delayed visual measurements often replay the same measured motion.
         # The prior can move without changing its body increment or adjoint.
-        key = (learner.parameters.tobytes(), velocity.tobytes(), dt, observed.tobytes(), fixed_attitude)
+        key = (learner.parameters.tobytes(), velocity.tobytes(), dt, observed.tobytes(), fixed_attitude, measured_chassis)
         step = self._learned_steps.get(key)
         if step is None:
             calibrated = observed
             if fixed_attitude:
                 calibrated = observed.copy()
                 calibrated[3:] = False
-            twist = learner.corrected_velocity(velocity, calibrated)
+            if measured_chassis:
+                calibrated = np.zeros(6, dtype=bool)
+            twist = velocity.copy() if measured_chassis else learner.corrected_velocity(velocity, calibrated)
             if fixed_attitude:
                 # Independently corroborated angular increments already measure
                 # body motion. A visual fit cannot add angular drift to them.
@@ -566,7 +595,7 @@ class ExternalOdometry:
         pieces = self._intervals(motion_times, state.stamp, stamp)
         for velocity, dt, observed, covariance, increment, seconds_to_knot, fixed_attitude in pieces:
             twist, delta, adjoint, differential, calibrated = self._learned_step(
-                learner, velocity, dt, observed, fixed_attitude)
+                learner, velocity, dt, observed, fixed_attitude, model in _MEASURED_MODELS)
             transform = transform @ delta
             if fixed_attitude:
                 corroborated_span += dt
@@ -596,9 +625,15 @@ class ExternalOdometry:
                 attitude_since = None
             elif attitude_since is None:
                 attitude_since = state.stamp
+        last_chassis, chassis_break = state.last_chassis, state.chassis_break_ns
+        if motion is not None and motion.model in _MEASURED_MODELS:
+            if last_chassis is not None and not _continuous_chassis(last_chassis[1], motion, stamp-last_chassis[0]):
+                chassis_break = stamp
+            last_chassis = (stamp, motion)
         interval_update = mask.any()
         return replace(state, stamp=stamp, transform=transform, noise=noise, sensitivity=sensitivity,
                        learner=learner, motion_model=model, corroborated_attitude_since=attitude_since,
+                       last_chassis=last_chassis, chassis_break_ns=chassis_break,
                        mask=mask if interval_update else state.mask, twist=twist,
                        last_update='external' if interval_update else None,
                        motion_since_visual=state.motion_since_visual or bool(interval_update))
@@ -608,7 +643,12 @@ class ExternalOdometry:
         visual = (state.stamp, segment, observed, variance)
         same_segment = state.visual is not None and state.visual[1] == segment
         alignment = state.alignments.get(segment)
-        if alignment is None:
+        # A measured chassis interval already supplies the body displacement.
+        # Align this visual observation to it so vision can take over from
+        # this pose if the next chassis measurement is missing.
+        chassis_interval = (state.motion_model in _MEASURED_MODELS and
+                            state.last_update == 'external' and state.mask[[0, 1, 5]].all())
+        if alignment is None or chassis_interval:
             seeded = state.mask is None
             transform = observed if seeded else state.transform
             alignments = dict(state.alignments, **{segment: transform @ np.linalg.inv(observed)})
@@ -765,6 +805,9 @@ class ExternalOdometry:
         size = max(np.linalg.norm(correction[:3]), np.linalg.norm(correction[3:]))
         return advanced @ se3_exp(correction * (step/size)) if size > step else pose
 
+    def segment_id(self, state):
+        return self.segment if state.chassis_break_ns is None else f'{self.segment}_{state.chassis_break_ns}'
+
     def output(self, state=None):
         if state is None:
             state = self.current
@@ -780,8 +823,9 @@ class ExternalOdometry:
         if self._slewing_output:
             unapplied = _world_pose_offset(pose, state.transform)
             covariance += np.outer(unapplied, unapplied)
+        segment = self.segment_id(state)
         fused = dict(position=pose[:3, 3].tolist(), quaternion=quaternion(pose[:3, :3]),
-                     frame_id=self.segment+'_odom', child_frame_id=self.body_frame,
+                     frame_id=segment+'_odom', child_frame_id=self.body_frame,
                      covariance=covariance.ravel().tolist())
         twist = ([float(value) if observed else None for value, observed in zip(state.twist, state.mask)]
                  if state.twist is not None and state.last_update == 'external' else [None]*6)
@@ -789,7 +833,7 @@ class ExternalOdometry:
                     twist=twist, units=dict(length='m', linear='m/s', angular='rad/s'),
                     vendor=dict(source='rgbd_external_fusion', pose_reference='body', reason=None,
                                 motus_slam=dict(status='tracking', stamp_source='measurement', stamp_ns=state.stamp,
-                                                segment_id=self.segment, pose_source='external_fusion',
+                                                segment_id=segment, pose_source='external_fusion',
                                                 pose_reference='body'),
                                 external_fusion=dict(update=state.last_update, observed=state.mask.tolist(),
                                                      learning=state.learner.info())))

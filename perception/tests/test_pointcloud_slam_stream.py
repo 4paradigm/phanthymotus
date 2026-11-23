@@ -596,7 +596,8 @@ def test_pose_loss_offers_newest_pending_scan_to_recovery_once():
     ('a', .05, 1100, True), ('reset', .05, 1100, False),
     ('a', 2., 1100, False), ('a', .05, 900, False),
 ])
-def test_verified_chassis_clock_switch_keeps_only_continuous_spatial_run(segment, x, source_ms, continuous):
+@pytest.mark.parametrize('generic', [False, True])
+def test_verified_chassis_clock_switch_keeps_only_continuous_spatial_run(segment, x, source_ms, continuous, generic):
     s = stream()
     for wall, device, epoch, origin, position in [
             (1000, 1000, 'first', 'a', 0.), (800, source_ms, 'second', segment, x)]:
@@ -605,6 +606,11 @@ def test_verified_chassis_clock_switch_keeps_only_continuous_spatial_run(segment
             clock_epoch=epoch, source_generation=origin, source_clock='slamware_uptime_ms',
             source_unit='ms', source_stamp=device, mapping=dict(verified=True,
                 method='chassis_clock_request_interval_slew'))
+        if generic:
+            quality = sample['vendor']['motus_slam']
+            quality.update(pose_kind='measured', pose_source='body_tracker', planar=False)
+            quality['measurement'].update(source_clock='hardware_ticks', source_unit='us',
+                                          source_stamp=device*1000, mapping=dict(verified=True, method='sync'))
         s.odom(sample, now=device/1000)
         s.cloud(wall*1_000_000, 'camera', [[0, 0, 1]], now=device/1000)
     before, after = [frame.pose for frame in s.accepted]

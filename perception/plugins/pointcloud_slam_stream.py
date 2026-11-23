@@ -9,6 +9,7 @@ import numpy as np
 
 from .camera_geometry import camera_transform
 from .pointcloud_slam_alignment import align_pose
+from .pointcloud_slam_contract import declares_measured_body
 from .pointcloud_slam_odom import decode_slam_odom, decode_slam_prediction
 from .pointcloud_slam_transforms import rigid as _rigid, within_measured_motion_bounds
 from .pointcloud_slam_capture_mount import MappingMounts
@@ -206,8 +207,7 @@ class SlamStream:
             # The fusion card owns its body's local origin across visual resets.
             # Only actual motion samples carry its main pose.
             return self._remember_measured_run(pose, ('external_fusion', *pose.external_origin, True))
-        chassis = (isinstance(quality, dict) and quality.get('pose_source') == 'chassis_odometry' and
-                   quality.get('pose_reference') == 'body')
+        chassis = declares_measured_body(quality)
         visual = (isinstance(vendor, dict) and vendor.get('source') == 'rtabmap_rgbd_odometry' and
                   self._witnessed_visual(vendor, pose, context))
         origin = (pose.segment_id, pose.frame_id, pose.child_frame_id, pose.clock_id,
@@ -223,18 +223,18 @@ class SlamStream:
         reference = quality.get('clock_reference')
         fusion = vendor.get('fusion')
         epoch = measurement.get('clock_epoch')
-        device_ms = measurement.get('source_stamp')
-        # This driver keeps its spatial generation when only its verified
-        # uptime-to-host mapping changes. Other epoch declarations keep their
-        # original meaning.
+        source_stamp = measurement.get('source_stamp')
+        source_clock = measurement.get('source_clock')
+        unit = measurement.get('source_unit')
+        ns_per_unit = {'ns': 1, 'us': 1000, 'ms': 1_000_000, 's': 1_000_000_000}
+        # A clock mapping may change independently of the spatial generation.
         if (chassis and measurement.get('source_generation') == pose.segment_id and
-                measurement.get('source_clock') == 'slamware_uptime_ms' and measurement.get('source_unit') == 'ms' and
-                isinstance(epoch, str) and epoch and type(device_ms) is int and device_ms > 0 and
-                isinstance(mapping, dict) and mapping.get('method') == 'chassis_clock_request_interval_slew' and
+                isinstance(source_clock, str) and source_clock and isinstance(unit, str) and unit in ns_per_unit and
+                isinstance(epoch, str) and epoch and type(source_stamp) is int and source_stamp > 0 and
+                isinstance(mapping, dict) and isinstance(mapping.get('method'), str) and mapping['method'] and
                 mapping.get('verified') is True):
-            pose = replace(pose, chassis_clock_epoch=epoch, chassis_device_ms=device_ms)
-            # Before a clock switch this driver used its segment ID as the
-            # epoch. Keep that original native gauge, including for saved maps.
+            pose = replace(pose, chassis_clock_epoch=epoch, device_stamp_ns=source_stamp * ns_per_unit[unit])
+            # Keep the original native gauge, including for saved maps.
             epoch = pose.segment_id
         origin += (epoch, measurement.get('source_generation'),
                    measurement.get('source_clock'), reference.get('domain_id') if isinstance(reference, dict) else None,
@@ -267,7 +267,7 @@ class SlamStream:
             if clock_switched:
                 # Discard old time brackets and queued work, keeping the spatial
                 # witness only if source time and measured motion both agree.
-                dt = (pose.chassis_device_ms - previous.chassis_device_ms) / 1000.
+                dt = (pose.device_stamp_ns - previous.device_stamp_ns) / 1e9
                 self._poses.clear()
                 self._pose_anchor = None
                 self._dropped_pending += len(self._pending) + len(self._unmatched_clouds)

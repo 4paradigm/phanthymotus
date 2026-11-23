@@ -25,6 +25,15 @@ class SpatialSlamError(ValueError):
 
 
 
+def declares_measured_body(quality):
+    """Accept a producer's body-pose declaration, including the legacy chassis profile."""
+    if not isinstance(quality, dict) or quality.get('pose_reference') != 'body':
+        return False
+    if 'pose_kind' in quality:
+        return quality['pose_kind'] == 'measured' and type(quality.get('planar')) is bool
+    return quality.get('pose_source') == 'chassis_odometry'
+
+
 def _number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False

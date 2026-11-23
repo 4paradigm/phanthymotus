@@ -136,9 +136,9 @@ def test_saved_loop_geometry_uses_optimized_poses_instead_of_raw_odometry(tmp_pa
         (2, _pose_blob(1, 0), _cloud_blob([[0, 0, 3]]), None, None, None),
     ], links=[(1, 2)])
     _optimized(database, {1: _pose_blob(0, 0), 2: _pose_blob(.02, 0)})
-    place = dict(name='入口', node_id=2, x=1., y=0., z=0.)
+    place = dict(name='入口', node_id=2, node_offset=[.4, .2, 0.], x=1.4, y=.2, z=0.)
     packet = module.rebuild(database, max_points=100, fallback=_fallback(), places=[place])
-    assert np.allclose([place['x'], place['y'], place['z']], [.02, 0., 0.])
+    assert np.allclose([place['x'], place['y'], place['z']], [.42, .2, 0.])
     points = _decode(packet)[4]
     assert len(points) == 2
     assert np.max(points[:, 0])-np.min(points[:, 0]) < .03

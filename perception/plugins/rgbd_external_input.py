@@ -551,7 +551,7 @@ class ExternalOdometryInput:
 
     def info(self):
         result = dict(self.status, active=self.active, dropped_events=self.dropped, last_error=self.last_error,
-                      learning_budget_skips=0, segment_id=self.fuser.segment)
+                      learning_budget_skips=0, segment_id=self.fuser.segment_id(self.fuser.current))
         published = result.pop('published_at', None)
         result.update(status='initializing', reason=None)
         if self.active and 'stamp_ns' not in result and self.stale_motion_stamp is not None:

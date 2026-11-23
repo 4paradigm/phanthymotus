@@ -43,6 +43,13 @@ def encode_mapping(points, pose, *, max_points, pose_reference=None):
     return struct.pack('<fffBI', matrix[0, 3], matrix[1, 3], display_yaw, flags, len(xyz)) + xyz.tobytes()
 
 
+def update_place_position(place, node_pose):
+    position = node_pose[:3, 3]
+    if 'node_offset' in place:
+        position = position + node_pose[:3, :3] @ place['node_offset']
+    place['x'], place['y'], place['z'] = map(float, position)
+
+
 def with_places(packet, places):
     """Bit 6 adds UTF-8 JSON labels after the unchanged XYZ payload."""
     if not places:

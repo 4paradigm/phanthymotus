@@ -28,7 +28,7 @@ class PoseSample:
     visual_origin: tuple = None
     external_origin: tuple = None
     chassis_clock_epoch: str = None
-    chassis_device_ms: int = None
+    device_stamp_ns: int = None
 
     @property
     def declared_origin(self):

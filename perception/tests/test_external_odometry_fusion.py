@@ -742,3 +742,71 @@ def test_replay_event_limit_freezes_complete_pose_bracket(monkeypatch):
             assert not feed(engine, .1, reset=True)
             assert engine.pending_output_states(NS)[-1].stamp == engine.current.stamp
         assert engine.current.transform[0, 3] == pytest.approx(i*.05)
+
+
+@pytest.mark.parametrize('generic', [False, True])
+def test_measured_planar_chassis_keeps_its_motion_through_visual_updates(generic):
+    engine = ExternalOdometry()
+    for step in range(5):
+        sample = packet(step * .2, 10. + step * .2)
+        sample['vendor'] = {'motus_slam': dict(status='tracking', planar=True,
+            pose_reference='body', pose_source='chassis_odometry', segment_id='one',
+            stamp_source='measurement', stamp_ns=sample['stamp_ns'])}
+        if generic:
+            sample['vendor']['motus_slam'].update(pose_kind='measured', pose_source='body_tracker')
+        engine.motion(*decode_motion(sample, 1))
+        visual = pose_at(step * .3)
+        pitch = step * .04
+        visual[:3, :3] = [[np.cos(pitch), 0., np.sin(pitch)], [0., 1., 0.],
+                           [-np.sin(pitch), 0., np.cos(pitch)]]
+        visual[2, 3] = step * .1
+        engine.vision(sample['stamp_ns'], 'camera', visual)
+    np.testing.assert_allclose(engine.current.transform, pose_at(.8), atol=1e-9)
+    # Without a closing chassis measurement, visual motion still advances the map.
+    engine.vision(sample['stamp_ns'] + 100_000_000, 'camera', visual @ pose_at(.1))
+    np.testing.assert_allclose(engine.current.transform, pose_at(.9), atol=1e-9)
+
+
+@pytest.mark.parametrize('origin', ['one', 'reset'])
+def test_measured_chassis_does_not_integrate_a_pose_jump(origin):
+    engine = ExternalOdometry()
+    for step, (x, segment) in enumerate([(0., 'one'), (.1, 'one'), (20., origin)]):
+        sample = packet(step * .1, x)
+        sample['vendor'] = {'motus_slam': dict(status='tracking', planar=True, pose_reference='body',
+            pose_source='chassis_odometry', segment_id=segment, stamp_source='measurement',
+            stamp_ns=sample['stamp_ns'])}
+        engine.motion(*decode_motion(sample, 1))
+        if step == 1:
+            previous = decode_slam_odom(engine.output())
+    np.testing.assert_allclose(engine.current.transform, pose_at(.1))
+    assert engine.current.last_update is None
+    sample['stamp_ns'] += 100_000_000
+    sample['vendor']['motus_slam']['stamp_ns'] = sample['stamp_ns']
+    sample['pose']['position'][0] += .1
+    engine.motion(*decode_motion(sample, 1))
+    resumed = decode_slam_odom(engine.output())
+    assert resumed.external_origin != previous.external_origin
+    assert resumed.position == pytest.approx((.2, 0., 0.))
+
+def test_measured_spatial_body_preserves_height_and_roll():
+    engine = ExternalOdometry()
+    for step in range(5):
+        sample = packet(step*.1, step*.05)
+        angle = step*.03
+        sample['pose'].update(position=[step*.05, 0., step*.02],
+                              quaternion=[np.sin(angle/2), 0., 0., np.cos(angle/2)])
+        sample['vendor'] = {'motus_slam': dict(status='tracking', planar=False,
+            pose_reference='body', pose_kind='measured', segment_id='one',
+            stamp_source='measurement', stamp_ns=sample['stamp_ns'])}
+        engine.motion(*decode_motion(sample, 1))
+        engine.vision(sample['stamp_ns'], 'camera', pose_at(step*.3))
+    np.testing.assert_allclose(engine.current.transform[:3, 3], [.2, 0., .08], atol=1e-9)
+    assert engine.current.transform[2, 1] == pytest.approx(np.sin(.12))
+
+
+def test_explicit_estimate_overrides_legacy_chassis_declaration():
+    sample = packet(0., 0.)
+    sample['vendor'] = {'motus_slam': dict(status='tracking', planar=True, pose_kind='estimated',
+        pose_reference='body', pose_source='chassis_odometry', segment_id='one',
+        stamp_source='measurement', stamp_ns=sample['stamp_ns'])}
+    assert decode_motion(sample, 1)[1].model == ('pose',)

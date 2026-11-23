@@ -26,7 +26,7 @@ from std_msgs.msg import String, UInt8MultiArray
 from .pointcloud_slam_rtabmap import RtabmapProcess, paired_sensor_odom
 from .pointcloud_slam_watchdog import BackendProgress
 from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
-from .pointcloud_slam_preview import PREVIEW_TOPIC, with_places
+from .pointcloud_slam_preview import PREVIEW_TOPIC, with_places, update_place_position
 from .pointcloud_slam_stream import SlamStream
 from .pointcloud_slam_transforms import rigid, pose_matrix
 from .pointcloud_slam_motion import ScanMotion, MotionPending
@@ -523,7 +523,7 @@ class RtabmapNode(Node):
             pose_reference=getattr(pose, 'pose_reference', None),
             process=process, snapshot=restored.get('snapshot') if restored else None,
             places=deepcopy(restored.get('places', [])) if restored else [],
-            graph=None, cloud=None, finalized=False, closing=False,
+            submitted_poses=OrderedDict(), place_anchor=None, graph=None, cloud=None, finalized=False, closing=False,
             native_loop_closures=0, native_proximity_detections=0, native_updates=0,
             native_recovery={'state': 'unavailable'},
             last_info=None, subscriptions=[], last_preview=0., preview_key=None,
@@ -686,6 +686,11 @@ class RtabmapNode(Node):
             self._forwarded += 1
             segment['forwarded'] += 1
             with self._result_lock:
+                if measured is not None and measured.external_continuity is not None:
+                    submitted = segment['submitted_poses']
+                    submitted[stamp] = measured
+                    if len(submitted) > self.stream.max_pending + 32:
+                        submitted.popitem(last=False)
                 segment['progress'].forward(stamp,self._receipt_clock())
             self._covariance_source = ('inertial_guess' if predicted else 'native_visual' if pose is None else
                 'upstream' if pose.covariance is not None else 'backend_default')
@@ -1052,13 +1057,18 @@ class RtabmapNode(Node):
             with self._result_lock:
                 segment['graph'] = (stamp, msg.header.frame_id, pose)
                 segment['graph_node'] = msg.poses_id[index]
+                anchor = segment.get('place_anchor')
+                if anchor is not None:
+                    node, _, source = anchor
+                    segment['place_anchor'] = ((node, _native_pose(msg.poses[msg.poses_id.index(node)]), source)
+                                               if node in nodes else None)
+                self._confirm_place_anchor(segment)
                 if segment.get('places'):
                     positions = dict(zip(msg.poses_id, msg.poses))
                     for place in segment['places']:
                         anchor = positions.get(place.get('node_id'))
                         if anchor is not None:
-                            point = anchor.position
-                            place.update(x=point.x, y=point.y, z=point.z)
+                            update_place_position(place, _native_pose(anchor))
                 segment['progress'].graph(stamp, self._receipt_clock(), nodes, links)
             self._publish_snapshot(segment)
             self._native_accepted('graph')
@@ -1093,8 +1103,17 @@ class RtabmapNode(Node):
             segment['preview_pending'] = True
             self._flush_preview(segment)
 
+    @staticmethod
+    def _confirm_place_anchor(segment):
+        graph = segment.get('graph')
+        if (graph and segment['native_recovery']['state'] == 'external' and
+                segment.get('current_ref') == (segment['graph_node'], graph[0])):
+            source = segment['submitted_poses'].get(graph[0])
+            if source is not None:
+                segment['place_anchor'] = (segment['graph_node'], graph[2], source)
+
     def change_place(self, name, *, remove):
-        with self._result_lock:
+        with self._lock, self._result_lock:
             segment = self._active
             if not segment or self._stopped() or segment['closing']:
                 raise ValueError('no active map segment')
@@ -1109,14 +1128,31 @@ class RtabmapNode(Node):
                     raise ValueError('place name already in use')
                 graph = segment['graph']
                 now = self._measurement_clock_ns()
-                if (not graph or now is None or
-                        not -self._settings['max_future_skew_ms'] * 1e6 <= now - graph[0] <= self.stream.max_age_s * 1e9 or
-                        segment['native_recovery']['state'] in ('searching', 'unavailable') or
-                        segment.get('current_ref') != (segment['graph_node'], graph[0])):
-                    raise ValueError('current mapped pose unavailable')
-                x, y, z = map(float, graph[2][:3, 3])
-                places.append(dict(name=name, x=x, y=y, z=z, node_id=segment['graph_node'],
-                                   segment_id=segment['segment_id']))
+                state = segment['native_recovery']['state']
+                if not graph or now is None or state in ('searching', 'unavailable'):
+                    raise ValueError('current mapped pose unavailable: no localized map pose')
+                anchor = segment.get('place_anchor') if state == 'external' else None
+                place = dict(name=name, segment_id=segment['segment_id'])
+                if anchor is not None:
+                    node_id, map_pose, source = anchor
+                    current = self.stream._pose_anchor
+                    if (current is None or current.stamp_ns < source.stamp_ns or
+                            current.external_continuity != source.external_continuity or
+                            self.stream.continuity_token != source.external_continuity):
+                        raise ValueError('current mapped pose unavailable: odometry continuity lost')
+                    stamp = current.stamp_ns
+                    local = np.linalg.solve(pose_matrix(source), [*current.position, 1.])
+                    place['node_offset'] = local[:3].tolist()
+                else:
+                    stamp, _, map_pose = graph
+                    node_id = segment['graph_node']
+                    if segment.get('current_ref') != (node_id, stamp):
+                        raise ValueError('current mapped pose unavailable: awaiting native map reference')
+                if not -self._settings['max_future_skew_ms'] * 1e6 <= now - stamp <= self.stream.max_age_s * 1e9:
+                    raise ValueError('current mapped pose unavailable: position is stale')
+                place['node_id'] = node_id
+                update_place_position(place, map_pose)
+                places.append(place)
             segment['preview_pending'] = segment['snapshot'] is not None
             segment['last_preview'] = 0.
             self._flush_preview(segment)
@@ -1172,6 +1208,9 @@ class RtabmapNode(Node):
             if valid_ref or has_recovery_state:
                 try:
                     segment['current_ref'] = (msg.ref_id, self._stamp(msg))
+                    if segment['native_recovery']['state'] != 'external':
+                        segment['place_anchor'] = None
+                    self._confirm_place_anchor(segment)
                     segment['progress'].activity(self._stamp(msg),self._receipt_clock())
                 except AttributeError:
                     pass  # No stamped activity evidence in this native message.
