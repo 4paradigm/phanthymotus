@@ -538,6 +538,38 @@ _CALENDAR_QUANTITY = re.compile(
 _HOLIDAY_DURATION = re.compile(r"[ \t]*(?:连休|放假|休假)[ \t]*[0-9一二三四五六七八九十两]+[ \t]*天")
 _WEEKDAY = re.compile(r"[ \t]*(?:是[ \t]*)?(?:星期|周|礼拜)[一二三四五六日天](?![0-9一二三四五六七八九十])")
 _ADJACENT_MATH = "=+×÷*/^≥≤≠<>|"
+_CHINESE_DATE_FIELD_BEFORE_COMMA = re.compile(
+    r"(?:日期|日程|日历)[ \t]*(?:[是为][ \t]*)?(?:[:：][ \t]*)?"
+    r"(?P<date>[0-9]{4}(?:[ \t]*年[ \t]*[0-9]{1,2}[ \t]*月[ \t]*[0-9]{1,2}[ \t]*[日号]"
+    r"|(?P<sep>[./-])[0-9]{1,2}(?P=sep)[0-9]{1,2}))"
+    + r"(?:" + _WEEKDAY.pattern + r")?[ \t]*[,，]$"
+)
+_CALENDAR_RANGE_NONDATE_TAIL = re.compile(
+    r"[ \t]*(?:(?:的|是|为|表示|实际(?:上)?是|这是|属于|[（(])[ \t]*)?"
+    r"(?:[一二两三][道个项][ \t]*)?"
+    r"(?:等于|大于|小于|公式|算式|分数|比例|比值|计算(?:公式|结果)|差(?:值|是|为|多少)|"
+    r"(?:之|之间的)(?:差|比值|比(?!较))|相[加减乘除]|[加减乘除]以|加上|减去|运算|杯|"
+    r"(?i:(?:KiB|MiB|GiB|TiB)\b))"
+)
+_CALENDAR_MATH_COMMAND = re.compile(
+    r"^[ \t]*(?:请[ \t]*)?(?:先[ \t]*)?(?:求(?:差值|比值|算式的值)|"
+    r"计算(?:一下)?(?=[ \t]*[0-9(（]|[ \t]*(?:结果|差值|比值|算式)|[ \t]*[,，。！？!?]?$))"
+)
+
+
+def _chinese_date_field_before_comma(clause):
+    field = _CHINESE_DATE_FIELD_BEFORE_COMMA.search(clause)
+    if field is None:
+        return None
+    try:
+        return date(*(int(part) for part in re.findall(r'[0-9]+', field['date'])))
+    except ValueError:
+        return None
+
+
+def _is_short_slash_range(match):
+    return (match is not None and match['last'] is not None
+            and match['first'].count('/') == match['last'].count('/') == 1)
 
 def _english_calendar_tail(text, extra_quantity):
     if _CALENDAR_CLOSED.match(text):
@@ -553,7 +585,7 @@ def _english_calendar_tail(text, extra_quantity):
     return valid_hour and int(clock["m"]) < 60 and int(clock["s"] or "0") < 60
 
 
-def _calendar_fields(text, extra_quantity):
+def _calendar_fields(text, extra_quantity, *, previous_date=None):
     """Yield calendar offsets and validated endpoints before arithmetic claims them."""
     identifiers = None
     for match in _CALENDAR_FIELD.finditer(text):
@@ -611,10 +643,24 @@ def _calendar_fields(text, extra_quantity):
                      and (_WEEKDAY.match(right.lstrip(" \t(（"))
                           or not text[match.end():].strip(' \t\r\n.)]）】"”。,，!?！？;；'))))
         )
-        if (cue is None and not (weekday or dotted_prose or short_context)
+        continued_range = (
+            previous_date is not None and _is_short_slash_range(match)
+            and text[:match.start()].strip() in ('', '从', '在', '自')
+            and not _CALENDAR_RANGE_NONDATE_TAIL.match(right)
+        )
+        if (cue is None and not (weekday or dotted_prose or short_context or continued_range)
                 and (last is None or (not has_year and not _HOLIDAY_DURATION.match(right)))):
             continue
         year, month, day = parts if has_year else (2000, *parts)
+        if continued_range:
+            year = previous_date.year
+            end_month = int(last.split('/')[0])
+            if end_month < month:
+                # Infer a year transition only at the year boundary with a nearby anchor.
+                if (month != 12 and end_month != 1) or end_month < previous_date.month < month:
+                    continue
+                if previous_date.month <= end_month:
+                    year -= 1
         try:
             start = date(year, month, day)
             endpoints = [(start, has_year)]
@@ -632,7 +678,7 @@ def _calendar_fields(text, extra_quantity):
         yield match.start(), match.end(), endpoints
 
 
-def _calendar_spans(text, language, verbalize_number, *, extra_quantity=None):
+def _calendar_spans(text, language, verbalize_number, *, extra_quantity=None, previous_date=None):
     """Read additional calendar forms for callers that opt into them."""
     language = language.upper()
     zh = language == "ZH"
@@ -644,7 +690,7 @@ def _calendar_spans(text, language, verbalize_number, *, extra_quantity=None):
         words = f"{_MONTHS[value.month]} {_DAYS[value.day]}"
         return words + " " + verbalize_number(str(value.year), language) if has_year else words
 
-    for start, end, endpoints in _calendar_fields(text, extra_quantity):
+    for start, end, endpoints in _calendar_fields(text, extra_quantity, previous_date=previous_date if zh else None):
         if zh or endpoints[0][1] or len(endpoints) == 1:
             yield start, end, ("至" if zh else " to ").join(speak(*part) for part in endpoints)
 
@@ -734,10 +780,10 @@ def _percent_and_angle_spans(text, language, verbalize_number):
         yield start, end, spoken
 
 
-def _read_calendar_fields(text, language):
+def _read_calendar_fields(text, language, *, previous_date=None):
     return _replace_spans(text, _calendar_spans(
         text, language, lambda value, lang: speak_number(value, lang.lower()),
-        extra_quantity=_CALENDAR_EXTRA_QUANTITY))
+        extra_quantity=_CALENDAR_EXTRA_QUANTITY, previous_date=previous_date))
 
 
 def _read_prose_measures(text, language):
@@ -943,7 +989,11 @@ def _clauses(text):
  thousands=[m.span()for m in re.finditer(r'[0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?',text)]
  previous=0
  for m in re.finditer(r'[。！？!?；;，,\n]+|\.(?=\s|[\u3400-\u9fff]|$)',text):
-  if any(a<=m.start()<b for a,b in thousands)or(text[m.start():m.end()]==','and m.start()>0 and m.end()<len(text)and text[m.start()-1].isdigit()and text[m.end()].isdigit()):continue
+  if any(a<=m.start()<b for a,b in thousands):continue
+  if (m.group()==',' and 0<m.start() and m.end()<len(text)
+      and text[m.start()-1].isdigit() and text[m.end()].isdigit()
+      and not (_is_short_slash_range(_CALENDAR_FIELD.match(text,m.end()))
+               and _chinese_date_field_before_comma(text[previous:m.end()]))):continue
   yield text[previous:m.end()];previous=m.end()
  if previous<len(text):yield text[previous:]
 
@@ -974,7 +1024,7 @@ def _decimal_identifier_readings(text, language):
             reading = read_numeric_literal(text[start:end], language)
         yield start, end, reading
 
-def _normalize_clause(chunk,lang):
+def _normalize_clause(chunk,lang,*,previous_date=None):
  def iso_datetime(match):
   clock = match['clock']
   seconds = match['seconds']
@@ -1002,7 +1052,7 @@ def _normalize_clause(chunk,lang):
   operator = SHARED_OPERATORS['=' if match['op'] == '==' else match['op']][lang == 'en']
   return f"{name} {operator} "
  chunk = _METRIC_COMPARISON.sub(metric_comparison, chunk)
- chunk=_read_calendar_fields(chunk,lang)
+ chunk=_read_calendar_fields(chunk,lang,previous_date=previous_date)
  currencies=r'(?:CNY|RMB|USD|EUR|人民币|美元|欧元|￥|¥|\$|€)'
  money_prefix=re.compile(_LEFT+r'(?P<code>'+currencies+r')[ \t]*(?P<n>'+_NUMBER+r')'+_RIGHT,re.I)
  money_suffix=re.compile(_LEFT+r'(?P<n>'+_NUMBER+r')[ \t]*(?P<code>CNY|RMB|USD|EUR|人民币|美元|欧元)'+_RIGHT,re.I)
@@ -1207,13 +1257,22 @@ def normalize_context(text,language='auto',*,auto_fallback=None):
  protected,mapping=_protect(_preserve_line_boundaries(text))
  protected=protected.translate(_FULLWIDTH_ASCII)
  fallback=_language(text.translate(_FULLWIDTH_ASCII),language,'zh')if auto_fallback is None else auto_fallback;parts=[]
+ previous_date=None
+ previous_math_command=False
+ clauses=list(_clauses(protected))
  try:
-  for clause in _clauses(protected):
+  for index,clause in enumerate(clauses):
    if language in ('zh','en'):lang=language
    else:
     carrier=_natural_language(clause);lang=carrier or fallback
     if carrier is not None:fallback=carrier
-   parts.append(_normalize_clause(clause,lang))
+   comma=clause.endswith((',', '，'))
+   if (previous_date is not None and comma and index+1<len(clauses)
+       and _CALENDAR_MATH_COMMAND.match(clauses[index+1])):
+    previous_date=None
+   parts.append(_normalize_clause(clause,lang,previous_date=previous_date))
+   previous_date=_chinese_date_field_before_comma(clause)if lang=='zh'and not previous_math_command else None
+   previous_math_command=comma and bool(_CALENDAR_MATH_COMMAND.match(clause))
  except ValueError as e:raise NumericNormalizationError(str(e))from e
  # Finish the current V6 static-normalization contract exactly once.
  result=unicodedata.normalize('NFKC',''.join(parts)).strip();result=re.sub(r'\s+',' ',result);result=result.replace('·',' ').replace('–','—')
