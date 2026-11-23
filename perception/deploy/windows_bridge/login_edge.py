@@ -31,10 +31,10 @@ def main():
             str(profile), channel="msedge", headless=False, args=["--no-first-run"]
         )
         page = context.pages[0] if context.pages else context.new_page()
-        start_url = str(edge.get("list_url") or "about:blank")
-        if start_url != "about:blank":
-            page.goto(start_url, wait_until="domcontentloaded")
-        print("请在打开的 Edge 中打开并登录访客平台，确认能看到访客列表后关闭 Edge。")
+        # Setup starts blank; the operator chooses the website, even when
+        # a previous visitor URL remains in the saved configuration.
+        page.goto("about:blank")
+        print("请自行输入访客系统网址并登录，打开访客列表后在卡片中选择该网页并保存。")
         print("首次部署请先用管理员 PowerShell 运行 setup_edge_printing.ps1。")
         print("它只负责关闭浏览器自动添加的日期、网址和页码。")
         print("现场已确认 Logo、二维码不依赖背景图形；自动打印会等待页面内容渲染完成。")
