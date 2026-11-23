@@ -59,6 +59,7 @@ class ExternalOdometryInput:
         self.events = queue.Queue(maxsize=_MAX_PENDING_EVENTS)
         self.event_lock = threading.Lock()
         self.event_sequence = 0
+        self.pending_static_mount = None
         self.evicted_motion_boundaries = deque(maxlen=_MAX_PENDING_EVENTS)
         self.evicted_mounts = deque(maxlen=_MAX_PENDING_EVENTS)
         self.mount_eviction_fault = False
@@ -108,23 +109,41 @@ class ExternalOdometryInput:
         with self.event_lock:
             if self.closed:
                 return
+            self.event_sequence += 1
+            if event[0] in ('mount', 'mount_fault'):
+                packet = event[1]
+                if (event[0] == 'mount' and isinstance(packet, dict) and packet.get('mode') == 'static' and
+                        packet.get('status') == 'available' and packet.get('matrix') is not None and
+                        type(packet.get('stamp_ns')) is int):
+                    # Pack consecutive identical static mounts into one queue
+                    # entry. Preserve every capture stamp and receipt time.
+                    geometry = {k: v for k, v in packet.items() if k != 'stamp_ns'}
+                    sample = (self.event_sequence, packet['stamp_ns'], event[2])
+                    pending = self.pending_static_mount
+                    if pending is not None and pending[1] == geometry and len(pending[2]) < _MAX_PENDING_EVENTS:
+                        pending[2].append(sample)
+                        return
+                    event = self.pending_static_mount = ('static_mounts', geometry, [sample])
+                else:
+                    self.pending_static_mount = None
             if self.events.full():
                 try:
                     sequence, oldest = self.events.get_nowait()
                 except queue.Empty:
                     pass
                 else:
-                    self.dropped += 1
+                    self.dropped += len(oldest[2]) if oldest[0] == 'static_mounts' else 1
+                    if oldest is self.pending_static_mount:
+                        self.pending_static_mount = None
                     if self._is_motion_boundary(oldest):
                         _, source, stamp, motion = oldest
                         # A dropped twist cannot stand in for the interval before it.
                         boundary = 'evicted_motion', source, stamp, replace(motion, reset=True)
                         self.evicted_motion_boundaries.append((sequence, boundary))
-                    elif oldest[0] in ('mount', 'mount_fault'):
+                    elif oldest[0] in ('mount', 'mount_fault', 'static_mounts'):
                         if len(self.evicted_mounts) == self.evicted_mounts.maxlen:
                             self.mount_eviction_fault = True
                         self.evicted_mounts.append((sequence, oldest))
-            self.event_sequence += 1
             self.events.put_nowait((self.event_sequence, event))
 
     @staticmethod
@@ -138,6 +157,7 @@ class ExternalOdometryInput:
             return []
         wall_now = time.time_ns()
         with self.event_lock:
+            self.pending_static_mount = None
             while not self.events.empty():
                 batch.append(self.events.get_nowait())
             # The head was taken before acquiring this lock. A producer can
@@ -147,11 +167,19 @@ class ExternalOdometryInput:
             batch.extend(self.evicted_mounts)
             self.evicted_motion_boundaries.clear()
             self.evicted_mounts.clear()
+            expanded = []
+            for sequence, event in batch:
+                if event[0] == 'static_mounts':
+                    geometry, samples = event[1:]
+                    expanded.extend((seq, ('mount', dict(geometry, stamp_ns=stamp), receipt))
+                                    for seq, stamp, receipt in samples)
+                else:
+                    expanded.append((sequence, event))
             # A pose can still complete a retained interval after a worker wait.
             # Check motion eligibility when applying the batch's measured frontier.
-            ready = [event for _, event in sorted(batch, key=lambda item: item[0])
+            ready = [event for _, event in sorted(expanded, key=lambda item: item[0])
                      if event[0] != 'visual' or self._visual_time_valid(event[1], wall_now)]
-            self.dropped += len(batch) - len(ready)
+            self.dropped += len(expanded) - len(ready)
             if self.mount_eviction_fault:
                 # The lost packet may have invalidated any retained bracket.
                 # Clear after this batch's numeric evidence, so its surviving

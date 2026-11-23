@@ -659,7 +659,8 @@ class RtabmapNode(Node):
                     gauge = measured.chassis_origin or measured.declared_origin
                     origin = hashlib.blake2b(json.dumps(gauge).encode(), digest_size=16).digest()
                     payload = b'MOTUSCH1' + origin + (run or bytes(16))
-                elif self._scan_origin_recovery:
+                elif self._scan_origin_recovery or (
+                        measured.visual_origin is not None and measured.external_continuity is None):
                     origin = hashlib.blake2b(json.dumps(measured.visual_origin).encode(), digest_size=16).digest()
                     payload = b'MOTUSOR1' + origin
                 elif self._raw_scan_input and run is None:

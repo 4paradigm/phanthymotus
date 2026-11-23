@@ -208,8 +208,15 @@ class SlamStream:
             # Only actual motion samples carry its main pose.
             return self._remember_measured_run(pose, ('external_fusion', *pose.external_origin, True))
         chassis = declares_measured_body(quality)
-        visual = (isinstance(vendor, dict) and vendor.get('source') == 'rtabmap_rgbd_odometry' and
-                  self._witnessed_visual(vendor, pose, context))
+        visual_source = isinstance(vendor, dict) and vendor.get('source') == 'rtabmap_rgbd_odometry'
+        visual = visual_source and self._witnessed_visual(vendor, pose, context)
+        mount = quality.get('extrinsic') if isinstance(quality, dict) else None
+        if (visual_source and not visual and isinstance(mount, dict) and
+                pose.segment_id and pose.frame_id and pose.child_frame_id and
+                mount.get('parent_frame') == pose.child_frame_id):
+            # A driver can declare its own coordinate origin without the
+            # local RGB-D registry's evidence for continuity.
+            pose = replace(pose, visual_origin=(pose.segment_id, pose.frame_id, pose.child_frame_id))
         origin = (pose.segment_id, pose.frame_id, pose.child_frame_id, pose.clock_id,
                   quality.get('source_topic') if chassis else vendor.get('source') if visual else None)
         if (not isinstance(quality, dict) or not (chassis or visual) or

@@ -51,6 +51,46 @@ def samples(stream):
     return [decode_slam_odom(json.loads(message)) for message in stream.publisher.messages]
 
 
+def test_repeated_static_mounts_do_not_displace_leg_odometry(streams):
+    create, now, _ = streams
+    stream = create()
+    # Bumi's recording has about 40 static mount messages and 20 leg poses per
+    # second. Reproduce a slow consumer without relying on wall-clock sleeps.
+    for index in range(60):
+        stamp = START + index*24_000_000
+        now[0] = stamp + 10_000_000
+        mount(stream, stamp, 0., mode='static', status='available', epoch='one')
+        if index % 2 == 0:
+            motion(stream, stamp)
+    stream.visual(START+20*24_000_000, 'native', native_pose(0.))
+    flush(stream)
+
+    assert stream.dropped == 0
+    assert len(stream.fuser.raw_motion) == 30
+    assert stream.mounts.last_stamp == START + 59*24_000_000
+    assert START+20*24_000_000 in stream.fuser.raw_vision
+
+
+def test_static_mount_batch_preserves_amendments_and_source_boundaries(streams):
+    create, now, _ = streams
+    stream = create()
+    now[0] = START + 130_000_000
+    valid = dict(mode='static', status='available', epoch='one')
+    mount(stream, START, 0., **valid)
+    mount(stream, START+24_000_000, 0., **valid)
+    mount(stream, START+48_000_000, None, mode='static', status='unavailable', epoch='one')
+    mount(stream, START+72_000_000, 0., **valid)
+    mount(stream, START+96_000_000, 25., **valid)
+    mount(stream, START+120_000_000, 25., mode='static', status='available', epoch='two')
+    flush(stream)
+
+    np.testing.assert_allclose(stream.mounts.matrix_at(START+12_000_000), rotation(0.))
+    assert stream.mounts.matrix_at(START+48_000_000) is None
+    np.testing.assert_allclose(stream.mounts.matrix_at(START+72_000_000), rotation(0.))
+    np.testing.assert_allclose(stream.mounts.matrix_at(START+96_000_000), rotation(25.))
+    assert stream.mounts.matrix_at(START+108_000_000) is None
+
+
 @pytest.fixture
 def streams(sessions, monkeypatch):
     _, now, _ = sessions

@@ -165,6 +165,31 @@ def test_native_envelope_carries_only_witnessed_measured_visual_runs(rgb_node):
     assert not getattr(delayed, 'user_data', None)
 
 
+def test_native_envelope_carries_driver_visual_origin_without_a_continuity_claim(rgb_node):
+    import zlib
+    from test_pointcloud_slam_stream import odom
+
+    n = rgb_node
+    for index, (ms, segment) in enumerate(((1000, 'first'), (1100, 'first'), (1200, 'new')), 1):
+        stamp = ms * 1_000_000
+        sample = odom(ms, .01*index, segment)
+        sample['pose']['frame_id'] = segment+'_odom'
+        sample['pose']['child_frame_id'] = segment+'_base'
+        sample['vendor'] = dict(source='rtabmap_rgbd_odometry', status='tracking', segment_id=segment,
+            pose_reference='body', motus_slam=dict(status='tracking', segment_id=segment, stamp_ns=stamp,
+                extrinsic=dict(mode='static', parent_frame=segment+'_base', child_frame='camera',
+                               matrix=np.eye(4).tolist())))
+        n._measurement_clock_ns = lambda t=stamp: t
+        n._odom(NS(data=json.dumps(sample)))
+        n._cloud(cloud(stamp))
+        assert _wait_until(lambda: n.status()['forwarded_clouds'] == index)
+
+    first, second, restarted = published(n, '/sensor_data')[0].raw_messages
+    origins = [zlib.decompress(bytes(getattr(msg, 'user_data', b''))[:-12])
+               if getattr(msg, 'user_data', None) else b'' for msg in (first, second, restarted)]
+    assert all(origin.startswith(b'MOTUSOR1') and len(origin) == 24 for origin in origins)
+    assert origins[0] == origins[1] != origins[2]
+
 
 def rgb_camera():
     return {'schema': 'motus.camera/1', 'topic': '/rgb', 'format': 'image/jpeg',
