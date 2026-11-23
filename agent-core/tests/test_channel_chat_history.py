@@ -510,6 +510,88 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('handoverprobe old', await _search_history('handoverprobe'))
         self.assertNotIn('[subagent:', await _memory_recall('handoverprobe', source='subagent'))
 
+    async def test_upgrade_backfills_known_shared_archives_only(self):
+        import sqlite3
+        import chat_history
+        from event.llm import _memory_recall, _search_history
+
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = os.path.join(directory, 'legacy.db')
+            legacy = sqlite3.connect(db_path)
+            with legacy:
+                legacy.executescript('''
+                    CREATE TABLE chat_sessions (
+                        id TEXT PRIMARY KEY, started_at REAL NOT NULL, ended_at REAL,
+                        summary TEXT DEFAULT '', turn_count INTEGER, kind TEXT);
+                    CREATE TABLE chat_messages (
+                        id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER,
+                        messages TEXT, created_at REAL);
+                    CREATE TABLE subagent_conclusions (
+                        id INTEGER PRIMARY KEY, agent_id TEXT, goal TEXT, conclusion TEXT,
+                        source_type TEXT, created_at REAL);
+                ''')
+                chat_history._ensure_fts(legacy)
+                for session_id, kind, summary, text, agent_id in [
+                    ('ordinary', 'main', '', '<event source="dds:/remote_control/message" '
+                     'channel="remote_web" ts="time">\nmessage: upgradeprobe public\n</event>', 'ace00001'),
+                    ('mixed', 'main', '', '<event source="dds:/remote_control/message" ts="time">\n'
+                     'message: upgradeprobe mixed ordinary message\n</event>\n'
+                     '<event source="dds:/channel/request/legacy" ts="time">\n'
+                     '{"platform":"feishu","text":"upgradeprobe private"}\n</event>', 'ace00002'),
+                    ('feishu', 'feishu', '', 'upgradeprobe unlabelled', None),
+                    ('raw-read', 'main', '', 'upgradeprobe archived channel read', None),
+                    ('ordinary-subagent', 'subagent', '[subagent:ace00001]', 'upgradeprobe helper', None),
+                ]:
+                    turn = [{'role': 'user', 'content': text}]
+                    if agent_id:
+                        turn.extend([
+                            {'role': 'assistant', 'tool_calls': [
+                                {'id': 'spawn', 'function': {'name': 'subagent_spawn'}},
+                            ]},
+                            {'role': 'tool', 'tool_call_id': 'spawn',
+                             'content': f'子代理已创建: id={agent_id}, priority=2'},
+                        ])
+                    if session_id == 'raw-read':
+                        turn.append({'role': 'assistant', 'tool_calls': [{'id': 'read', 'function': {
+                            'name': 'raw_input_info',
+                            'arguments': '{"source":"dds:/channel/request/legacy"}',
+                        }}]})
+                    raw = json.dumps(turn, ensure_ascii=False)
+                    legacy.execute('INSERT INTO chat_sessions VALUES (?, 1, ?, ?, 1, ?)',
+                                   (session_id, 1 if session_id == 'ordinary' else 2, summary, kind))
+                    row = legacy.execute(
+                        'INSERT INTO chat_messages (session_id, turn_index, messages, created_at) VALUES (?, 0, ?, 1)',
+                        (session_id, raw),
+                    )
+                    legacy.execute('INSERT INTO chat_messages_fts(rowid, content) VALUES (?, ?)',
+                                   (row.lastrowid, raw))
+                for agent_id, result in [('ace00001', 'public conclusion'),
+                                         ('ace00002', 'private conclusion'), ('unknown', 'unknown conclusion')]:
+                    legacy.execute(
+                        'INSERT INTO subagent_conclusions (agent_id, goal, conclusion, source_type, created_at) '
+                        "VALUES (?, 'upgradeprobe', ?, 'user_task', 1)", (agent_id, result),
+                    )
+            legacy.close()
+
+            with mock.patch.object(config, 'DB_PATH', db_path):
+                result = await _search_history('upgradeprobe')
+                self.assertIn('upgradeprobe public', result)
+                self.assertIn('upgradeprobe helper', result)
+                self.assertNotIn('upgradeprobe mixed ordinary message', result)
+                self.assertNotIn('upgradeprobe private', result)
+                self.assertNotIn('upgradeprobe unlabelled', result)
+                self.assertNotIn('upgradeprobe archived channel read', result)
+                conclusions = await _memory_recall('upgradeprobe', source='subagent')
+                self.assertIn('public conclusion', conclusions)
+                self.assertNotIn('private conclusion', conclusions)
+                self.assertNotIn('unknown conclusion', conclusions)
+                conn = config._get_conn()
+                config._ensure_schema(conn)  # Reopening or retrying must keep the classification.
+                self.assertEqual(await _search_history('upgradeprobe'), result)
+                self.assertEqual(chat_history.get_last_session_turns()['session_id'], 'ordinary')
+                self.assertTrue(chat_history.get_session_messages('mixed'))
+                conn.close()
+
     def test_legacy_feishu_turn_is_excluded_when_restoring_shared_history(self):
         import chat_history
 

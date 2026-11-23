@@ -270,6 +270,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_peer_audit_ts ON peer_audit(ts)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_peer_audit_peer ON peer_audit(peer_id)')
+    from chat_history import backfill_legacy_history_scopes
+
+    backfill_legacy_history_scopes(conn)
     conn.commit()
 
 

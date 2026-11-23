@@ -302,7 +302,124 @@ _CHANNEL_EVENT_RE = re.compile(
     r'\r?\n(?P<payload>.*?)\r?\n</event>[ \t]*\r?$',
     re.M | re.S,
 )
-_CHANNEL_NOTIFICATION_RE = re.compile(r'^\[system notification source=dds:/channel/request/[^\]]+\]\n')
+_CHANNEL_NOTIFICATION_RE = re.compile(r'^\[system notification source=dds:/channel/request(?:/[^\]\r\n]+)?\]\n')
+_CHANNEL_EVENT_START_RE = re.compile(r'^<event source="dds:/channel/request[/"\s]', re.M)
+_SUBAGENT_SUMMARY_RE = re.compile(r'^\[subagent:([a-f0-9]{8})\]')
+_SPAWN_RESULT_RE = re.compile(r'^子代理已创建: id=([a-f0-9]{8}),')
+
+
+def _explicit_non_feishu(text: str) -> bool:
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return False
+    return (isinstance(payload, dict) and isinstance(payload.get('platform'), str)
+            and payload['platform'].strip().lower() not in ('feishu', ''))
+
+
+def _legacy_main_is_shared(turns: list[list[dict]]) -> bool:
+    for turn in turns:
+        for message in turn:
+            if not isinstance(message, dict):
+                return False
+            calls = message.get('tool_calls')
+            if message.get('role') == 'assistant' and isinstance(calls, list):
+                # Old raw channel reads could leave Feishu data in tool results
+                # even when the turn was triggered by a different source.
+                for call in calls:
+                    function = call.get('function') if isinstance(call, dict) else None
+                    if (isinstance(function, dict) and function.get('name') == 'raw_input_info'
+                            and '/channel/request' in str(function.get('arguments', ''))):
+                        return False
+            if message.get('role') != 'user':
+                continue
+            content = message.get('content')
+            if not isinstance(content, str):
+                continue
+            if ('channel="channel:feishu"' in content or 'source=subagent:' in content
+                    or '<event source="subagent:' in content):
+                return False  # No sender provenance on legacy channel or subagent notifications.
+            notice = _CHANNEL_NOTIFICATION_RE.match(content)
+            if notice and not _explicit_non_feishu(content[notice.end():]):
+                return False
+            channel_events = list(_CHANNEL_EVENT_RE.finditer(content))
+            if (len(channel_events) != len(_CHANNEL_EVENT_START_RE.findall(content))
+                    or any(not _explicit_non_feishu(event.group('payload')) for event in channel_events)):
+                return False
+    return True
+
+
+def _legacy_spawned_agents(turns: list[list[dict]]) -> set[str]:
+    agents = set()
+    for turn in turns:
+        spawn_calls = {
+            call['id'] for message in turn if isinstance(message, dict)
+            and message.get('role') == 'assistant'
+            and isinstance(message.get('tool_calls'), list)
+            for call in message['tool_calls']
+            if isinstance(call, dict) and isinstance(call.get('id'), str)
+            and isinstance(call.get('function'), dict)
+            and call['function'].get('name') == 'subagent_spawn'
+        }
+        for message in turn:
+            if (isinstance(message, dict) and message.get('role') == 'tool'
+                    and isinstance(message.get('tool_call_id'), str)
+                    and message.get('tool_call_id') in spawn_calls
+                    and isinstance(message.get('content'), str)):
+                match = _SPAWN_RESULT_RE.match(message['content'])
+                if match:
+                    agents.add(match[1])
+    return agents
+
+
+def backfill_legacy_history_scopes(conn) -> None:
+    """Classify old archives once without making unknown Feishu material searchable."""
+    key = 'migration.history_scope_backfill_v1'
+    if conn.execute('SELECT 1 FROM config WHERE key=?', (key,)).fetchone():
+        return
+    if not conn.execute('INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)',
+                        (key, 'true')).rowcount:
+        return
+
+    shared_sessions, shared_agents, uncertain_agents = [], set(), set()
+    sessions = conn.execute(
+        'SELECT id, kind, summary FROM chat_sessions WHERE feishu_scope IS NULL'
+    )
+    for session_id, kind, summary in sessions:
+        if kind not in (KIND_MAIN, KIND_FEISHU) or (summary or '').startswith('[subagent:'):
+            continue
+        try:
+            turns = [json.loads(raw) for (raw,) in conn.execute(
+                'SELECT messages FROM chat_messages WHERE session_id=?', (session_id,),
+            )]
+        except (ValueError, TypeError):
+            continue
+        if not turns or not all(isinstance(turn, list) for turn in turns):
+            continue
+        agents = _legacy_spawned_agents(turns)
+        if kind == KIND_MAIN and _legacy_main_is_shared(turns):
+            shared_sessions.append(session_id)
+            shared_agents.update(agents)
+        else:
+            uncertain_agents.update(agents)
+
+    shared_agents.difference_update(uncertain_agents)
+    for session_id, summary in conn.execute(
+        'SELECT id, summary FROM chat_sessions WHERE feishu_scope IS NULL '
+        "AND kind IN ('main', 'subagent', 'bg_subagent') AND summary LIKE ?",
+        ('[subagent:%',),
+    ):
+        match = _SUBAGENT_SUMMARY_RE.match(summary)
+        if match and match[1] in shared_agents:
+            shared_sessions.append(session_id)
+    conn.executemany(
+        'UPDATE chat_sessions SET feishu_scope=? WHERE id=? AND feishu_scope IS NULL',
+        ((history_scope.UNSCOPED, session_id) for session_id in shared_sessions),
+    )
+    conn.executemany(
+        'UPDATE subagent_conclusions SET feishu_scope=? WHERE agent_id=? AND feishu_scope IS NULL',
+        ((history_scope.UNSCOPED, agent_id) for agent_id in shared_agents),
+    )
 
 
 def _is_feishu_payload(text: str) -> bool:
@@ -337,7 +454,7 @@ def get_last_session_turns(limit: int = 10) -> dict | None:
     某个后台子代理的 —— 它们每轮都落盘。续跑到那上面，主代理会把一段后台监控的
     transcript 当成自己的历史接着往下写，并且之后每个 turn 都追加进那个会话。
     老记录的 kind 列是迁移时统一填的 'main'，所以还要排掉带 `[subagent:` 前缀的，
-    并跳过旧版本写进 main 的飞书回合。如果整个会话都是飞书回合，继续查找更早的会话。
+    并跳过来源未确认的旧会话及旧版本写进 main 的飞书回合。
     """
     if limit == 0:
         return None
@@ -345,8 +462,9 @@ def get_last_session_turns(limit: int = 10) -> dict | None:
     with _get_conn() as conn:
         sessions = conn.execute(
             "SELECT id FROM chat_sessions WHERE turn_count > 0 "
-            "AND kind = 'main' AND summary NOT LIKE '[subagent:%' "
-            'ORDER BY COALESCE(ended_at, started_at) DESC'
+            "AND kind = 'main' AND feishu_scope = ? AND summary NOT LIKE '[subagent:%' "
+            'ORDER BY COALESCE(ended_at, started_at) DESC',
+            (history_scope.UNSCOPED,),
         )
         for (session_id,) in sessions:
             shared_turns = []
