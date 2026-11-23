@@ -698,7 +698,8 @@ class CaptureObservations:
                 entry['frame_fault'] = True
                 # A wrong-frame duplicate supersedes an earlier native decision.
                 # The ordered native drain must see the latched boundary once.
-                entry.pop('native_observation', None)
+                entry.pop('native_processed', None)
+                entry.pop('eskf_observation', None)
             self.counts[kind+'_joined'] += 1
             if completes:
                 self.native_delays.append(max(0, now-entry['added']))
@@ -711,7 +712,7 @@ class CaptureObservations:
                     self.fusion.native_processing_p95_ns = int(np.percentile(self.native_delays, 95))
         return self.drain(now)
 
-    def _visual(self, stamp, entry):
+    def _joined_visual(self, entry):
         msg, info = entry.get('pose'), entry.get('info')
         if (entry.get('frame_fault') or
                 (msg is not None and _native_frame_changed(msg, self.fusion.segment, self.fusion.frame))):
@@ -730,10 +731,19 @@ class CaptureObservations:
                         frame_id=msg.header.frame_id, child_frame_id=msg.child_frame_id,
                         covariance=list(msg.pose.covariance), quality_weight=max(1., 50./info.inliers))
             pose_values(pose)
-            observation_covariance(pose)
             return pose, None
         except (ValueError, TypeError, AttributeError, np.linalg.LinAlgError):
             return None, 'invalid visual pose or covariance'
+
+    def _visual(self, pose, reason):
+        """Apply the ESKF covariance limits to a joined visual pose."""
+        if pose is None:
+            return None, reason
+        try:
+            observation_covariance(pose)
+        except (ValueError, TypeError, AttributeError, np.linalg.LinAlgError):
+            return None, 'invalid visual pose or covariance'
+        return pose, None
 
     def _native_gate(self, now):
         gate = self.external_gate
@@ -760,13 +770,16 @@ class CaptureObservations:
         # A complete native pair can serve the external filter even while an
         # earlier ESKF capture is waiting for IMU or depth registration.
         for stamp, entry in self.frames.items():
-            if 'native_observation' in entry:
+            if entry.get('native_processed'):
                 continue
             info = entry.get('info')
             if (('pose' not in entry or info is None) and not getattr(info, 'lost', False)
                     and now < entry['deadline']):
                 break  # Preserve capture order for native continuity checks.
-            visual, reason = entry['native_observation'] = self._visual(stamp, entry)
+            visual, reason = self._joined_visual(entry)
+            entry['native_processed'] = True
+            eskf_visual, eskf_reason = self._visual(visual, reason)
+            entry['eskf_observation'] = (eskf_visual, eskf_reason)
             gate = self._native_gate(now)
             gate.input(stamp, now_ns=now)
             if visual is not None:
@@ -789,6 +802,10 @@ class CaptureObservations:
             sample = gate.accept(entry['pose'], info, now)
             if gate.good and gate.last_stamp == stamp:
                 self.external_previous = candidate
+            elif not gate.good and gate.rejection is not None and eskf_visual is None:
+                # Preserve the recovery anchor reset for covariance failures
+                # that previously failed the shared validation.
+                self.external_previous = None
             if sample is not None:
                 self.visual_sink(stamp, gate.segment, visual)
 
@@ -845,7 +862,7 @@ class CaptureObservations:
                 self.counts['native_tracking_lost'] += 1
             if not coverage:
                 self.counts['imu_uncovered'] += 1
-            visual, reason = entry.get('native_observation') or self._visual(stamp, entry)
+            visual, reason = entry.get('eskf_observation') or self._visual(*self._joined_visual(entry))
             if age > MAX_FRAME_AGE_NS and (visual is None or not coverage):
                 # An older submitted frame is useful only with a matching
                 # measured correction and IMU coverage at its original stamp.

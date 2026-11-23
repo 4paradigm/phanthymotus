@@ -7,7 +7,7 @@ import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -24,7 +24,14 @@ _FUTURE_TOLERANCE_NS = 50_000_000
 _OUTPUT_TIMEOUT_S = 1.5
 _OUTPUT_TIMEOUT_NS = int(_OUTPUT_TIMEOUT_S * 1_000_000_000)
 _MAX_PENDING_EVENTS = 64
-_MAX_QUEUE_DELAY_S = .2
+
+
+@dataclass
+class _NativeVisual:
+    segment: str
+    pose: dict
+    key: tuple
+    projected_live: bool = False
 
 
 class ExternalOdometryInput:
@@ -98,28 +105,27 @@ class ExternalOdometryInput:
             raise
 
     def _offer(self, event):
-        received = time.monotonic()
         with self.event_lock:
             if self.closed:
                 return
             if self.events.full():
                 try:
-                    sequence, received_at, oldest = self.events.get_nowait()
+                    sequence, oldest = self.events.get_nowait()
                 except queue.Empty:
                     pass
                 else:
                     self.dropped += 1
                     if self._is_motion_boundary(oldest):
-                        kind, source, stamp, motion = oldest
+                        _, source, stamp, motion = oldest
                         # A dropped twist cannot stand in for the interval before it.
-                        boundary = kind, source, stamp, replace(motion, reset=True)
-                        self.evicted_motion_boundaries.append((sequence, received_at, boundary))
+                        boundary = 'evicted_motion', source, stamp, replace(motion, reset=True)
+                        self.evicted_motion_boundaries.append((sequence, boundary))
                     elif oldest[0] in ('mount', 'mount_fault'):
                         if len(self.evicted_mounts) == self.evicted_mounts.maxlen:
                             self.mount_eviction_fault = True
-                        self.evicted_mounts.append((sequence, received_at, oldest))
+                        self.evicted_mounts.append((sequence, oldest))
             self.event_sequence += 1
-            self.events.put_nowait((self.event_sequence, received, event))
+            self.events.put_nowait((self.event_sequence, event))
 
     @staticmethod
     def _is_motion_boundary(event):
@@ -130,14 +136,10 @@ class ExternalOdometryInput:
             batch = [self.events.get(timeout=.05)]
         except queue.Empty:
             return []
-        cutoff = time.monotonic() - _MAX_QUEUE_DELAY_S
         wall_now = time.time_ns()
         with self.event_lock:
             while not self.events.empty():
                 batch.append(self.events.get_nowait())
-            for _, _, (_, source, stamp, _) in self.evicted_motion_boundaries:
-                if self._motion_time_valid(source, stamp, wall_now):
-                    self.motion_cutoffs[source] = max(self.motion_cutoffs.get(source, 0), stamp)
             # The head was taken before acquiring this lock. A producer can
             # evict a later event in between; merge all retained ingress records
             # by their sequence instead of prepending that newer boundary.
@@ -145,20 +147,10 @@ class ExternalOdometryInput:
             batch.extend(self.evicted_mounts)
             self.evicted_motion_boundaries.clear()
             self.evicted_mounts.clear()
-            ready = []
-            for _, received, event in sorted(batch, key=lambda item: item[0]):
-                if event[0] == 'visual':
-                    # Accepted captures can still correct retained history even
-                    # after they become too old for direct publication.
-                    keep = self._visual_time_valid(event[1], wall_now)
-                else:
-                    # Mount evidence, including unavailable boundaries, belongs
-                    # to those captures. Its storage is bounded by the queue.
-                    keep = (event[0] in ('mount', 'mount_fault') or received >= cutoff or self._is_motion_boundary(event)
-                            or (event[0] == 'motion' and event[3].pose is not None
-                                and 0 <= wall_now - event[2] <= _OUTPUT_TIMEOUT_NS))
-                if keep:
-                    ready.append(event)
+            # A pose can still complete a retained interval after a worker wait.
+            # Check motion eligibility when applying the batch's measured frontier.
+            ready = [event for _, event in sorted(batch, key=lambda item: item[0])
+                     if event[0] != 'visual' or self._visual_time_valid(event[1], wall_now)]
             self.dropped += len(batch) - len(ready)
             if self.mount_eviction_fault:
                 # The lost packet may have invalidated any retained bracket.
@@ -185,12 +177,20 @@ class ExternalOdometryInput:
         age = now - stamp
         if -_FUTURE_TOLERANCE_NS <= age <= _OUTPUT_TIMEOUT_NS:
             return True
+        if age < -_FUTURE_TOLERANCE_NS or source != self.selected:
+            return False
         # Old measurements can amend a selected timeline inside its replay
         # window. A fresh leading edge may still be ahead of us in the queue.
-        latest = max(self.latest_motion_stamp, self.fuser.current.stamp)
+        if at_receipt:
+            latest = max(self.latest_motion_stamp, self.fuser.current.stamp)
+        else:
+            # Only a surviving projection that was accepted live can lead
+            # motion. Frozen owners are already behind the strict base cutoff.
+            visual = max((t for t, owner in self.native_visual.items()
+                          if owner.projected_live and t in self.fuser.raw_vision), default=0)
+            latest = max(self.latest_motion_stamp, visual)
         oldest = max(latest, now-_OUTPUT_TIMEOUT_NS) - REPLAY_HISTORY_NS
-        return (age > _OUTPUT_TIMEOUT_NS and source == self.selected and
-                stamp >= oldest and stamp > self.fuser.base.stamp and
+        return (stamp >= oldest and stamp > self.fuser.base.stamp and
                 (at_receipt or stamp <= latest))
 
     def _record_time_rejection(self, source, stamp, now):
@@ -273,7 +273,7 @@ class ExternalOdometryInput:
                         changed = {self.mounts.observe(*values)}
                 finally:
                     self._replay_visuals(changed)
-        elif kind == 'motion':
+        elif kind in ('motion', 'evicted_motion'):
             source, stamp, motion = values
             if self.selected is not None and self.selected != source:
                 return
@@ -281,6 +281,9 @@ class ExternalOdometryInput:
             if not self._motion_time_valid(source, stamp, now):
                 self._record_time_rejection(source, stamp, now)
                 return
+            if kind == 'evicted_motion':
+                # A current observation may have made this queued cut replayable.
+                self.motion_cutoffs[source] = max(self.motion_cutoffs.get(source, 0), stamp)
             if (stamp < self.candidate_floors.get(source, 0) or
                     (not motion.reset and stamp < self.motion_cutoffs.get(source, 0))):
                 # A late sample must not bridge an interval cut by an eviction.
@@ -366,23 +369,26 @@ class ExternalOdometryInput:
         camera, _ = body_pose_observation(pose, np.eye(4))
         key = (segment, camera.tobytes())
         prior = self.native_visual.get(stamp)
-        if prior is not None and prior[2] >= key:
+        if prior is not None and prior.key >= key:
             return True
-        self.native_visual[stamp] = (segment, deepcopy(pose), key)
+        self.native_visual[stamp] = _NativeVisual(segment, deepcopy(pose), key)
         if self.mounts is not None:
             self.mounts.retain((stamp,), replace=False)
         return self._project_visual(stamp)
 
     def _project_visual(self, stamp):
-        segment, pose, _ = self.native_visual[stamp]
+        owner = self.native_visual[stamp]
         mount = self._camera_mount(stamp)
         if mount is None:
-            self.fuser.revise_vision(stamp, segment, None)
-            self.pending_visual[stamp] = (segment, pose)
+            self.fuser.revise_vision(stamp, owner.segment, None)
+            self.pending_visual[stamp] = (owner.segment, owner.pose)
             return False
-        body, variance = body_pose_observation(pose, rigid(mount))
+        body, variance = body_pose_observation(owner.pose, rigid(mount))
         self.pending_visual.pop(stamp, None)
-        self.fuser.revise_vision(stamp, segment, body, variance)
+        age = time.time_ns() - stamp
+        changed = self.fuser.revise_vision(stamp, owner.segment, body, variance)
+        if changed and -_FUTURE_TOLERANCE_NS <= age <= _OUTPUT_TIMEOUT_NS:
+            owner.projected_live = True
         self.accepted_visual.add(stamp)
         return True
 
@@ -488,18 +494,29 @@ class ExternalOdometryInput:
         current, delayed = [], []
         now = time.time_ns()
         for event in observations:
-            target = (delayed if event[0] == 'visual' and type(event[1]) is int
-                      and now-event[1] > _OUTPUT_TIMEOUT_NS else current)
-            target.append(event)
+            stamp = event[1] if event[0] == 'visual' else event[2]
+            if type(stamp) is int and now-stamp > _OUTPUT_TIMEOUT_NS:
+                delayed.append((stamp, event))
+            else:
+                current.append(event)
         with self.fuser.batch():
             if mounts_received:
                 # Revise accepted projections as well as captures still waiting
                 # for evidence, against the complete mount batch.
                 self._replay_visuals(None if mount_fault else changed_mounts)
+            # An evicted live cut also applies to earlier ingress records.
+            # Historical cuts are checked in capture order after the live batch.
+            for event in current:
+                if event[0] == 'evicted_motion':
+                    _, source, stamp, _ = event
+                    if self._motion_time_valid(source, stamp, time.time_ns()):
+                        self.motion_cutoffs[source] = max(self.motion_cutoffs.get(source, 0), stamp)
             # Stage live observations first, then old corrections newest first.
             # Only accepted measurements may advance the replay floor while the
             # batch defers rebuilding fuser.current until all inputs are staged.
-            for event in [*current, *sorted(delayed, key=lambda item: item[1], reverse=True)]:
+            delayed.sort(key=lambda item: item[0], reverse=True)
+            current.extend(event for _, event in delayed)
+            for event in current:
                 try:
                     self._apply(event, publish=False)
                 except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:

@@ -226,7 +226,39 @@ def _origin_attitude(left, right, duration_ns):
     return measured / seconds
 
 
-def _pose_increment_covariance(left, right, velocity, elapsed_s, fraction, at_measured_end):
+def _angular_pose_profile(stamps, samples):
+    """Raw body screws between physical rate knots, anchored at both measured poses."""
+    left, right = samples[0], samples[-1]
+    if (not left.mask.all() or not right.mask.all() or left.body_angular_velocity is None or
+            any(not np.array_equal(sample.mask, _ANGULAR) for sample in samples[1:-1])):
+        return {}
+    rates = np.array([left.body_angular_velocity, *(sample.twist[3:] for sample in samples[1:-1])])
+    if not np.isfinite(rates).all():
+        return {}
+    elapsed = np.array([stamp - stamps[0] for stamp in stamps])
+    durations = np.diff(elapsed) / 1e9
+    increments = np.zeros((len(durations), 6))
+    increments[:, 3:] = rates * durations[:, None]
+    integrated = [np.eye(3)]
+    for rotation in se3_exp(increments)[:, :3, :3]:
+        integrated.append(integrated[-1] @ rotation)
+
+    delta = np.linalg.inv(left.pose) @ right.pose
+    residual = np.eye(4)
+    residual[:3, :3] = integrated[-1].T @ delta[:3, :3]
+    fractions = (elapsed / elapsed[-1])[:, None]
+    # Preserve the original body screw's translation at each physical knot.
+    poses = left.pose @ se3_exp(fractions * se3_log(delta))
+    correction = se3_exp(fractions * se3_log(residual))
+    poses[:, :3, :3] = left.pose[:3, :3] @ np.array(integrated) @ correction[:, :3, :3]
+    poses[0], poses[-1] = left.pose, right.pose
+    velocities = se3_log(np.linalg.inv(poses[:-1]) @ poses[1:]) / durations[:, None]
+    return {stamp: (stamp, pose.copy(), velocity.copy()) for stamp, pose, velocity in
+            zip(stamps[:-1], poses[:-1], velocities)}
+
+
+def _pose_increment_covariance(left, right, velocity, elapsed_s, fraction, at_measured_end,
+                               step_origin=None):
     """Map the growth in upstream odometry axes into the step's end body axes."""
     start, end = left.process_covariance, right.process_covariance
     mount = right.body_from_sensor
@@ -247,7 +279,8 @@ def _pose_increment_covariance(left, right, velocity, elapsed_s, fraction, at_me
             # The accumulator describes error at the measured endpoint. Split
             # its growth in that tangent, then carry it back along the remaining
             # motion so later propagation cannot add the same lever arm twice.
-            body = left.pose @ se3_exp(velocity * elapsed_s)
+            origin = left.pose if step_origin is None else step_origin
+            body = origin @ se3_exp(velocity * elapsed_s)
             transport = _adjoint(np.linalg.inv(body) @ right.pose) @ transport
         step = transport @ (growth * fraction) @ transport.T
     return .5 * step + .5 * step.T if np.isfinite(step).all() else None
@@ -284,6 +317,7 @@ class ExternalOdometry:
         self.solve_learning = solve_learning
         self.raw_motion = {}
         self.raw_vision = {}
+        self._pose_profiles = {}
         self._pose_intervals = OrderedDict()
         self._learned_steps = OrderedDict()
         self.checkpoints = {}
@@ -324,6 +358,10 @@ class ExternalOdometry:
             first = self._pose_start(times, index-1)
             if first is not None:
                 previous = times[first]
+        if index < len(times):
+            # Any interior amendment can change the residual at every knot.
+            self._pose_profiles = {bounds: profile for bounds, profile in self._pose_profiles.items()
+                                   if not bounds[0] <= stamp <= bounds[1]}
         self.raw_motion[stamp] = motion
         self._changed(previous+1)
         return True
@@ -362,18 +400,22 @@ class ExternalOdometry:
         if next_visual is not None:
             self._rebuild(next_visual)
 
-    def _pose_interval(self, t0, t1, left, right, end, overlap):
+    def _pose_interval(self, t0, t1, left, right, end, overlap, knot=None):
         # A visual correction can replay these exact measured intervals many
         # times. A replacement at the same timestamp invalidates either end.
         key = (t0, t1, end, overlap)
         cached = self._pose_intervals.get(key)
-        if cached is not None and cached[0] is left and cached[1] is right:
+        if cached is not None and cached[0] is left and cached[1] is right and cached[2] is knot:
             self._pose_intervals.move_to_end(key)
-            return cached[2], cached[3]
-        velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / ((t1-t0) / 1e9)
-        covariance = _pose_increment_covariance(left, right, velocity, (end-t0)/1e9,
-                                                overlap/(t1-t0), end == t1)
-        self._pose_intervals[key] = (left, right, velocity, covariance)
+            return cached[3], cached[4]
+        if knot is None:
+            start, origin = t0, left.pose
+            velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / ((t1-t0) / 1e9)
+        else:
+            start, origin, velocity = knot
+        covariance = _pose_increment_covariance(left, right, velocity, (end-start)/1e9,
+                                                overlap/(t1-t0), end == t1, origin)
+        self._pose_intervals[key] = (left, right, knot, velocity, covariance)
         self._pose_intervals.move_to_end(key)
         if len(self._pose_intervals) > _MAX_EVENTS:
             self._pose_intervals.popitem(last=False)
@@ -423,12 +465,23 @@ class ExternalOdometry:
             if overlap <= 0:
                 continue
             increment_covariance = None
+            seconds_to_knot = 0.
             bracket = (self._pose_bracket(times, t0, t1)
                        if left.pose is None or right.pose is None else None)
             if bracket is not None:
                 p0, p1, pose_left, pose_right = bracket
+                bounds = (p0, p1)
+                if bounds not in self._pose_profiles:
+                    stamps = times[bisect_left(times, p0):bisect_right(times, p1)]
+                    self._pose_profiles[bounds] = _angular_pose_profile(
+                        stamps, [self.raw_motion[t] for t in stamps])
+                knot = self._pose_profiles[bounds].get(t0)
+                # Map each shaped piece's covariance into the physical end
+                # tangent before applying any learned scales or clipping.
+                noise_end = t1 if knot is not None else clipped_end
+                seconds_to_knot = (noise_end - clipped_end) / 1e9
                 velocity, increment_covariance = self._pose_interval(
-                    p0, p1, pose_left, pose_right, clipped_end, overlap)
+                    p0, p1, pose_left, pose_right, noise_end, overlap, knot)
                 mask = pose_left.mask & pose_right.mask
                 covariance = pose_left.covariance
             elif left.model != right.model:
@@ -436,7 +489,9 @@ class ExternalOdometry:
                 # can carry gyro through loss or recovery of translation.
                 pose, partial = (left, right) if left.pose is not None else (right, left)
                 if (pose.body_angular_velocity is None or partial.twist is None or
-                        partial.mask[:3].any() or left.reset):
+                        partial.mask[:3].any()):
+                    continue
+                if left.reset and t1-t0 > _ATTITUDE_INTERVAL_NS:
                     continue
                 rate = left.twist[3:] if left.twist is not None else left.body_angular_velocity
                 velocity = np.r_[np.zeros(3), rate]
@@ -459,7 +514,8 @@ class ExternalOdometry:
             else:
                 continue
             if mask.any():
-                yield np.where(mask, velocity, 0.), overlap/1e9, mask, covariance, increment_covariance
+                yield (np.where(mask, velocity, 0.), overlap/1e9, mask, covariance,
+                       increment_covariance, seconds_to_knot)
 
     def _learned_step(self, learner, velocity, dt, observed):
         # Delayed visual measurements often replay the same measured motion.
@@ -492,7 +548,8 @@ class ExternalOdometry:
             learner = ExternalMotionLearner(enabled=learner.enabled)
         mask = np.zeros(6, dtype=bool)
         twist = None
-        for velocity, dt, observed, covariance, increment in self._intervals(motion_times, state.stamp, stamp):
+        pieces = self._intervals(motion_times, state.stamp, stamp)
+        for velocity, dt, observed, covariance, increment, seconds_to_knot in pieces:
             twist, delta, adjoint, differential = self._learned_step(learner, velocity, dt, observed)
             transform = transform @ delta
             scales = np.exp(learner.parameters[:6]) * observed
@@ -504,6 +561,11 @@ class ExternalOdometry:
                 # The increment already covers dt. Apply the learned velocity
                 # scales and retain the default uncertainty on unobserved axes.
                 process_noise = increment * np.outer(scales, scales)
+                if seconds_to_knot:
+                    # Later propagation uses this calibrated screw. Transport
+                    # the knot's share back to the current clip in its tangent.
+                    transport = _adjoint(se3_exp(twist * seconds_to_knot))
+                    process_noise = transport @ process_noise @ transport.T
             process_noise = process_noise + np.diag(np.where(observed, 0., .25 * dt))
             noise = adjoint @ noise @ adjoint.T + process_noise
             if learner.enabled:
@@ -580,8 +642,7 @@ class ExternalOdometry:
         training = visual
         previous = state.training[0]
         if learner.enabled and same_segment and state.stamp-previous >= 100_000_000:
-            intervals = [(u, dt, mask) for u, dt, mask, _, _ in
-                         self._intervals(motion_times, previous, state.stamp)]
+            intervals = [piece[:3] for piece in self._intervals(motion_times, previous, state.stamp)]
             if intervals and abs(sum(x[1] for x in intervals)-(state.stamp-previous)/1e9) < 1e-6:
                 learner = learner.checkpoint()
                 delta = np.linalg.inv(state.training[2]) @ observed
@@ -632,6 +693,8 @@ class ExternalOdometry:
                 bracket = self._pose_bracket(times, capacity_cut, capacity_cut)
                 cut = bracket[1] if bracket is not None else capacity_cut
         if cut > self.base.stamp:
+            self._pose_profiles = {bounds: profile for bounds, profile in self._pose_profiles.items()
+                                   if bounds[1] > cut}
             self.base = self.checkpoints[cut]
             predecessor = max((stamp for stamp in times if stamp <= cut), default=cut)
             self.raw_motion = {stamp: event for stamp, event in self.raw_motion.items() if stamp >= predecessor}

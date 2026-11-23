@@ -133,8 +133,11 @@ def test_fusion_queue_keeps_recent_events_and_skips_expired_work(sessions, monke
         source.callback(NS(data=json.dumps(packet(.4, .4))))
         enqueued_at[0] += .5
         now[0] = 3_000_000_000
-        source.callback(NS(data=json.dumps(packet(.9, .9))))
-        assert [event[2] for event in stream._take_ready()] == [1_900_000_000]
+        # This backlog has no accepted frontier. Queue residence alone cannot
+        # turn the 1.4 s packet into the initial motion sample.
+        stream._apply_ready(stream._take_ready())
+        assert not stream.fuser.raw_motion
+        assert not stream.publisher.messages
         assert stream.dropped == 5
         for t in (1.9, 1.95):
             source.callback(NS(data=json.dumps(packet(t, t))))
@@ -205,8 +208,10 @@ def test_fusion_backlog_keeps_measured_pose_brackets_without_publishing_stale_po
         now[0] = 2_950_000_000
         stream._apply_ready(stream._take_ready())
         stamps = [json.loads(msg)['vendor']['motus_slam']['stamp_ns'] for msg in stream.publisher.messages]
-        assert stamps == [2_700_000_000, 2_800_000_000]
-        assert stream.dropped == 2
+        assert stamps == [2_600_000_000, 2_700_000_000, 2_800_000_000]
+        positions = [json.loads(msg)['pose']['position'][0] for msg in stream.publisher.messages]
+        assert positions == pytest.approx([1.6, 1.7, 1.8])
+        assert stream.dropped == 0
     finally:
         stream.close()
 
