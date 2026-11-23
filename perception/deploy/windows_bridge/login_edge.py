@@ -47,7 +47,13 @@ def main():
                     break
                 if not context.pages:
                     break
-                time.sleep(1)
+                # Let Playwright dispatch navigation/new-tab events even when
+                # all known tabs are about:blank (no title() calls below).
+                try:
+                    context.pages[0].wait_for_timeout(1000)
+                except Exception:
+                    if not context.pages:
+                        break
                 current_pages = []
                 for candidate in context.pages:
                     url = candidate.url
@@ -57,9 +63,15 @@ def main():
                         except Exception:
                             title = url
                         current_pages.append({"title": title or url, "url": url})
-                if current_pages:
-                    last_pages = current_pages
-                    pages_path.write_text(json.dumps(last_pages, ensure_ascii=False), encoding="utf-8")
+                last_pages = current_pages
+                # Publish a complete snapshot so SSH never reads partial JSON.
+                temporary = pages_path.with_suffix('.tmp')
+                temporary.write_text(json.dumps(last_pages, ensure_ascii=False), encoding="utf-8")
+                try:
+                    temporary.replace(pages_path)
+                except PermissionError:
+                    # A Windows reader may briefly hold the destination open.
+                    pass
         else:
             input("完成后回到此窗口，按回车保存登录状态并退出：")
         context.close()

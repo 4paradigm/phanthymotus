@@ -1024,11 +1024,15 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       const pageInput = bodyEl.querySelector('[data-key="visitor_page_url"]');
       if (pageInput && Array.isArray(result.pages)) {
         const savedPage = pageInput.value;
-        pageInput.replaceChildren(new Option('请选择已登录且能看到访客列表的网页', ''));
-        for (const page of result.pages) pageInput.add(new Option(`${page.title || '访客网页'} — ${page.url}`, page.url));
+        const options = [new Option('请选择已登录且能看到访客列表的网页', '')];
+        for (const page of result.pages) options.push(new Option(`${page.title || '访客网页'} — ${page.url}`, page.url));
         // Discovery is a snapshot, not a live browser or login-state check.
-        if (savedPage && !result.pages.some(page => page.url === savedPage)) pageInput.add(new Option(`${savedPage}（已选择，本次未获取到）`, savedPage));
-        pageInput.value = savedPage;
+        if (savedPage && !result.pages.some(page => page.url === savedPage)) options.push(new Option(`${savedPage}（已选择，本次未获取到）`, savedPage));
+        const signature = items => JSON.stringify(Array.from(items, option => [option.text, option.value]));
+        if (signature(pageInput.children) !== signature(options)) {
+          pageInput.replaceChildren(...options);
+          pageInput.value = savedPage;
+        }
       }
       return true;
     } catch (error) {
@@ -1110,9 +1114,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
 
   const pollChoices = async () => {
     if (!alive()) return;
-    // Avoid replacing an open native select while the user is choosing.
-    if (!installing && document.activeElement !== input &&
-        document.activeElement !== bodyEl.querySelector('[data-key="visitor_page_url"]')) {
+    if (!installing) {
       await loadPrinters(true);
     }
     if (alive()) setTimeout(pollChoices, 2500);
