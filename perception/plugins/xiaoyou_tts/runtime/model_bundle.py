@@ -29,7 +29,7 @@ _RELEASE_FRONTEND_SHA = '650f908b1f9ef473656e537630b8c2823b7a3633ff8a562745cc5d7
 NORMALIZATION_REVISION = '01yuewen-contextual-polyphones-compact-20261118'
 
 NORMALIZATION_MODULE_SHAS = {
-    'frontend/numbers.py': '8087a8d364c8861b935e9b9df5f363df441f2e65870745b51ff7c993df45453a',
+    'frontend/numbers.py': '83786a1a9cfb7e84c023ebc50dfe348753dcebad91d14884f533e45fb9744cfe',
 }
 # The immutable model manifest records the source from its original export.
 # The installed frontend is verified against the current hashes above.

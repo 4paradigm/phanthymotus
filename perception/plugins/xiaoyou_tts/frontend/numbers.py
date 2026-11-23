@@ -1164,13 +1164,47 @@ def _normalize_clause(chunk,lang):
  chunk=numeric.sub(simple,chunk)
  return normalize_math(normalize_general(chunk,lang),lang)
 
+_PARAGRAPH_OR_FIELD = re.compile(
+    r'[ \t]*(?:\n|[A-Za-z\u3400-\u9fff][A-Za-z0-9\u3400-\u9fff -]{0,18}[:：]'
+    r'(?:[ \t]+(?=\S)|(?=[^\s/:\\])))'
+)
+
+
+def _preserve_line_boundaries(text):
+    """Keep explicit paragraph or field boundaries after Chinese prose."""
+    if '\n' not in text and '\r' not in text:
+        return text
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    lines = _fc_top_level_commas(text, '\n') or ()
+    breaks = [i for i in lines if _PARAGRAPH_OR_FIELD.match(text, i + 1)]
+    if not breaks:
+        return text
+    protected = protected_spans(text) + _protected_spans(text)
+    parts = []
+    start = 0
+    for end in breaks:
+        if not _safe_boundary(protected, end):
+            continue
+        line = text[start:end].rstrip()
+        spoken = line.rstrip(_FIRST_SENTENCE_CLOSERS).rstrip()
+        normalized = unicodedata.normalize('NFKC', spoken)
+        if (normalized and normalized[-1] not in '.。!?,、:;–—'
+                and re.search(r'[\u3400-\u9fff]', normalized)
+                and not re.fullmatch(_FC_CJK_NUMBER, normalized)):
+            line += '。'
+        parts.append(line)
+        start = end + 1
+    parts.append(text[start:])
+    return ' '.join(parts)
+
+
 def normalize_context(text,language='auto',*,auto_fallback=None):
  """Apply typed, math and Unicode normalization before restoring masked literals."""
  if not isinstance(text,str):raise TypeError('text must be str')
  if language not in ['auto','mixed','zh','en']:raise NumericNormalizationError('language must be auto/mixed/zh/en')
  if len(text)>20000:raise NumericNormalizationError('Input exceeds bounded20000 characters')
  _validate_auto_fallback(auto_fallback)
- protected,mapping=_protect(text)
+ protected,mapping=_protect(_preserve_line_boundaries(text))
  protected=protected.translate(_FULLWIDTH_ASCII)
  fallback=_language(text.translate(_FULLWIDTH_ASCII),language,'zh')if auto_fallback is None else auto_fallback;parts=[]
  try:
