@@ -289,6 +289,7 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                     "/n",
                     printer_name,
                 ],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -307,7 +308,8 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
         )
         try:
             return subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", preamble + command],
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", preamble + command],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
