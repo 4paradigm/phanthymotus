@@ -2880,7 +2880,7 @@ class NaviPlugin:
         staged = self._staged_diagnostic
         return staged[1] if staged is not None and staged[0] == message["seq"] else None
 
-    def _dwa_event(self, identity, event, reason=None, *, packet=None):
+    def _dwa_event(self, identity, event, reason=None, *, packet=None, write_ms=None):
         publication = dict(decision_id=identity.decision_id, epoch=identity.epoch, state_id=identity.state_id,
                            target=identity.target, action_id=identity.action_id, event=event, reason=reason)
         detail = self._dwa_veto_detail
@@ -2901,6 +2901,8 @@ class NaviPlugin:
                     trace[key] = publication[key]
         if packet is not None:
             wire = dict(wire_seq=packet["seq"], wire_values=list(packet["values"]))
+            if write_ms is not None:
+                wire.update(write_ms=write_ms, admission_remaining_ms=packet["stamp_ms"] + packet["ttl_ms"] - write_ms)
             publication.update(wire)
             if current:
                 trace.update(wire)
@@ -3391,7 +3393,7 @@ class NaviPlugin:
                 self._dwa_last_published = origin.identity
             totals["published_packets"] = totals.get("published_packets", 0) + 1
         if moving and diagnostic is not None:
-            self._dwa_event(diagnostic, "published", packet=message)
+            self._dwa_event(diagnostic, "published", packet=message, write_ms=write_ms)
         elif not moving and (origin is not None or self._config.local_controller == "dwa"):
             totals["stop_packets"] = totals.get("stop_packets", 0) + 1
             reason = stop_reason or (diagnostic.veto_reason if diagnostic is not None else None) or "policy_stop"

@@ -123,3 +123,13 @@ def test_checked_opening_can_search_past_the_nearest_obstacle_plane():
     assert route is not None
     assert route.points[-1][0] >= 1.
     assert local_path.opening_route(frame, occupied, geometry, .22, near, (3., 0.)) is None
+
+
+def test_offset_opening_reference_is_centred_while_body_overlaps_jambs():
+    scene = _scene(body=True, opening=(.15, .85))
+    _, geometry, plane, _ = scene
+    route = _opening(scene)
+    crossing = [right for forward, right in route.points if forward >= plane - geometry.front]
+    assert len(crossing) > 2
+    assert crossing == pytest.approx([.5] * len(crossing), abs=local_path.RESOLUTION)
+    assert max(crossing) - min(crossing) < 1e-8

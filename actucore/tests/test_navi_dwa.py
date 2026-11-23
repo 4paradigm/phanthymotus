@@ -610,3 +610,38 @@ def test_explicit_invalid_rotation_center_keeps_the_native_predictor_behavior():
     # reject an input that reaches that original behavior.
     body = replace(camera, footprint=replace(footprint, mode="body"), rotation_center=17)
     assert cache.get(body, cmd) == (body.predict(cmd), False)
+
+
+@pytest.mark.parametrize("veto", [False, True])
+def test_capped_straight_continuation_checks_visibility_before_early_return(veto):
+    diagnostics = {}
+    checked = []
+
+    def visible(command, poses, duration):
+        checked.append(command)
+        return dwa.CandidateCheck(not veto, "occluded_prefix" if veto else None)
+
+    choice = _run(((0., 0.), (1., 0.)), previous=(.5, 0., 0.),
+                  diagnostics=diagnostics, candidate_budget=dwa.CandidateBudget(64),
+                  validate_candidate=visible)
+    assert checked.count((.5, 0., 0.)) == 1
+    if veto:
+        assert choice is None
+        assert diagnostics["considered_candidates"] > 1
+    else:
+        assert choice.command == (.5, 0., 0.) and choice.trace.stopped
+        assert diagnostics["considered_candidates"] == diagnostics["physical_evaluations"] == 1
+
+
+def test_guidance_penalizes_driving_parallel_to_an_offset_lane():
+    command = (.15, 0., 0.)
+    trace = dwa._predict(command, command, horizon=1., dt=.05,
+                         acceleration=(1., 1., 1.), braking=(1., 1., 1.), stop=True)
+    def heading(offset):
+        score, _, _ = dwa.score_candidate(
+            command, trace, None, ((0., offset), (.7, offset)), command,
+            half_width=.26, limits=((0., .15), (0., 0.), (-1., 1.)),
+            progress_scale=.2, target=None, guidance=True)
+        return score.heading
+
+    assert heading(.10) > heading(0.)

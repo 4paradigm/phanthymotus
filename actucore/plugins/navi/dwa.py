@@ -348,8 +348,13 @@ def _score_route(points, coverage):
     return tuple(result)
 
 
-def _preferred_command(points, nominal, horizon, yaw_limit):
+def _preferred_command(points, nominal, horizon, yaw_limit, *, differential=False):
     dx, dy = next(((f, r) for f, r in points[1:] if math.hypot(f, r) >= .45), points[-1])
+    if differential and dx > 0.:
+        # The circular arc from the body pivot to the lookahead point has
+        # curvature 2*y / distance^2. Right in the grid is negative yaw.
+        yaw = -2. * nominal * dy / (dx*dx + dy*dy)
+        return nominal, 0., min(yaw_limit[1], max(yaw_limit[0], yaw))
     angle = math.atan2(dy, dx)
     turn = min(abs(angle) / max(.4, horizon), abs(yaw_limit[0]) if angle > 0. else yaw_limit[1])
     return max(0., nominal * math.cos(angle)), -nominal * math.sin(angle), -math.copysign(turn, angle)
@@ -374,6 +379,10 @@ def score_candidate(command, trace, check, reference, previous, *, half_width, l
         initial_position = _project_to_route(start_body[:2], reference, segments)[0]
     progress = end_position - initial_position
     desired_heading = math.atan2(tangent[1], tangent[0])
+    if guidance and end_position < segments[-1].walked + segments[-1].length - local_path.RESOLUTION:
+        # Aim back onto the route. Its tangent alone can reward driving
+        # parallel to a shifted doorway approach with the body off-centre.
+        desired_heading = math.atan2(reference[-1][1] - end_pose[1], reference[-1][0] - end_pose[0])
     heading_error = abs(math.remainder(end_pose[2] - desired_heading, math.tau))
     initial_error = abs(math.remainder(poses[0][2] - desired_heading, math.tau))
     turns_toward_route = command[0] == command[1] == 0. and heading_error < initial_error - 1e-10
@@ -468,12 +477,17 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     # references see the same window and score normalization.
     speed = max(math.hypot(x_speed, y_speed), math.hypot(*measured[:2]), math.hypot(*previous[:2]))
     coverage = max(.45, speed * horizon)
+    if guidance:
+        # Include the body length so bends are visible before the leading corners enter them.
+        coverage += geometry.front + geometry.rear
     references = tuple(_score_route(ref, coverage) for ref in routes)
     if any(ref is None for ref in references):
         return None
     progress_scale = max(.2, min(1.0, math.hypot(x_speed, y_speed) * horizon))
     nominal = min(max(x_speed, y_speed), .35)
-    preferred = tuple(_preferred_command(ref, nominal, horizon, yaw_limit) for ref in references)
+    preferred = tuple(_preferred_command(ref, nominal, horizon, yaw_limit,
+                                         differential=guidance and not y_speed and footprint_mode == "body")
+                      for ref in references)
 
     budget = candidate_budget if candidate_budget is not None else CandidateBudget(max_candidates)
     slots = min(budget.remaining, max_candidates)
@@ -494,12 +508,31 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     def reject(reason):
         rejected[reason] = rejected.get(reason, 0) + 1
 
+    def admissible(cmd):
+        prediction, check = outcomes[cmd]
+        if check is None:
+            check = context.evaluate(prediction)
+            outcomes[cmd] = prediction, check
+            diag["physical_evaluations"] += 1
+        if not check.accepted:
+            reason = "collision" if legacy_camera and check.reason == "footprint_collision" else check.reason
+            reject(reason)
+            return None
+        poses = prediction.camera_poses if footprint_mode == "camera_approx" else prediction.body_poses
+        if validate_candidate is not None:
+            checked = validate_candidate(cmd, poses, prediction.duration)
+            if not checked.accepted:
+                reject(checked.reason or "candidate_guard")
+                return None
+        return prediction, check, poses
+
     best = None
     scores_by_reference = [0] * len(references)
     segments_by_reference = tuple(_route_segments(ref) for ref in references)
     initial_positions = None
     bounded = candidate_budget is not None
     entries = []
+    straight_check = None
     for ordinal, cmd in enumerate(commands):
         if cmd in outcomes:
             prediction, check = outcomes[cmd]
@@ -536,6 +569,24 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         if bounded and not scores:
             reject(rejection)
             continue
+        # Keep a capped straight command on a straight reference when the
+        # entire braking sweep has zero proximity cost. Reuse the physical
+        # result in ordinary ranking if it is close to an obstacle.
+        if (ordinal == 0 and bounded and target is not None and cmd == previous == (x_speed, 0., 0.)
+                and scores and scores[0][2] == 0 and target[0] > 0.
+                and abs(math.atan2(target[1], target[0])) <= .1
+                and all(f >= 0. and abs(r) < 1e-8 for f, r in references[0])):
+            checked = admissible(cmd)
+            if checked is None:
+                continue
+            straight_check = checked
+            if _obstacle_score(checked[1]) == 0.:
+                prediction, check, poses = checked
+                components, progress, index = scores[0]
+                diag.update(admissible_candidates=1, reference_scores=sum(scores_by_reference),
+                            scores_by_reference=scores_by_reference, reason=None)
+                return Choice(cmd, poses[:prediction.moving_count], components.total, progress,
+                              check.min_clearance_m, prediction, check, components, index)
         lower = min(((score.total, index, ordinal) for score, _, index in scores), default=(math.inf, 0, ordinal))
         entries.append((lower, ordinal, cmd, scores, rejection))
 
@@ -548,21 +599,10 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         if bounded and best_key is not None and lower >= best_key:
             diag["bound_skips"] += len(entries) - position
             break
-        prediction, check = outcomes[cmd]
-        if check is None:
-            check = context.evaluate(prediction)
-            outcomes[cmd] = prediction, check
-            diag["physical_evaluations"] += 1
-        if not check.accepted:
-            reason = "collision" if legacy_camera and check.reason == "footprint_collision" else check.reason
-            reject(reason)
+        checked = straight_check if ordinal == 0 and straight_check is not None else admissible(cmd)
+        if checked is None:
             continue
-        poses = prediction.camera_poses if footprint_mode == "camera_approx" else prediction.body_poses
-        if validate_candidate is not None:
-            checked = validate_candidate(cmd, poses, prediction.duration)
-            if not checked.accepted:
-                reject(checked.reason or "candidate_guard")
-                continue
+        prediction, check, poses = checked
         if not scores:
             reject(rejection)
             continue

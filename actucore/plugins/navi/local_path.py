@@ -1221,7 +1221,12 @@ def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allo
             continue
         # The caller takes the longest safe prefix and checks it again after turning.
         end = min(plane + geometry.rear + .25, FORWARD[-1, 0] - geometry.front)
-        points = tuple((forward, forward * middle / plane)
+        # Centre a tight detour before the front reaches the jambs and
+        # hold that line until the rear clears. This is only a reference.
+        entry = plane - geometry.front - RESOLUTION
+        align = (allow_detour and entry > RESOLUTION
+                 and hi - lo - RESOLUTION < 2 * (half_width + geometry.half_length))
+        points = tuple((forward, middle * min(1., forward / entry) if align else forward * middle / plane)
                        for forward in np.arange(0., end + 1e-9, RESOLUTION))
         return Detour(None, points, geometry)
     return None

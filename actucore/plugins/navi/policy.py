@@ -3475,7 +3475,6 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
         optical_target = (forward, right)
         target = local_path.target_in_grid(geometry, forward, right)
     keep = _keepout_m(config)
-    blocked = local_path.route_obstacles(grid, geometry, keep, allow_unknown=True)
     # Prefer an A* passing lane with enough room for the turn to settle.
     # A tight passage may still have a feasible shorter leg at the normal width.
     plane = ahead * geometry.base_from_optical[0, 2] + geometry.base_from_optical[0, 3]
@@ -3613,6 +3612,7 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             return False
 
     horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
+    blocked = local_path.route_obstacles(grid, geometry, keep, allow_unknown=True)
     turn_occupied = occupied | scan.views[-1][3]
     for plan, require_observed, _ in route_candidates:
         visible, preview = visible_plan(plan)
