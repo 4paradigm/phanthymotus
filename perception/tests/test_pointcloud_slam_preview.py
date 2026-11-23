@@ -46,3 +46,16 @@ def test_mapping_rejects_marker_outside_wire_float_range():
     pose[0, 3] = 1e40
     with pytest.raises(ValueError):
         preview.encode_mapping([[0, 0, 0]], pose, max_points=1, pose_reference='body')
+
+
+def test_directed_place_uses_map_yaw_and_shares_the_preview_budget():
+    base = preview.encode_mapping([[3., 4., 5.]], np.eye(4), max_points=2000)
+    place = dict(x=1., y=-2., z=.3, yaw=math.pi / 2)
+    packet = preview.with_places(base, [place], max_points=2000)
+    points = np.frombuffer(packet, '<f4', offset=17).reshape(-1, 3)
+    assert len(points) == struct.unpack_from('<I', packet, 13)[0] == 1 + 1218
+    assert points[0].tolist() == [3., 4., 5.]
+    assert np.max(points[1:, 1]) == pytest.approx(-2. + .55)
+    assert np.max(points[1:, 2]) == pytest.approx(.3 + .82)
+    bounded = preview.with_places(base, [place] * 6, max_points=20)
+    assert len(bounded) == 17 + 12 * 20

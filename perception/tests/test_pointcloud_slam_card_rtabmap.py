@@ -204,7 +204,8 @@ def test_places_use_current_session_and_persist_in_selected_map(card):
     assert call(card, 'stop_mapping')['state'] == 'saved'
     assert call(card, 'select_map', map_name='Hall')['state'] == 'map_selected'
     packets = card._view.publishers[0].messages
-    assert json.loads(packets[-1][29:]) == [['入口', 2., -1., .2]]
+    assert struct.unpack_from('<I', packets[-1], 13)[0] == 1 + 480
+    assert struct.unpack_from('<fff', packets[-1], 29) == pytest.approx((2.14, -1., .24))
     assert call(card, 'tag_place', tag_name='旧位置')['state'] == 'error'
     assert call(card, 'untag_place', tag_name='入口')['places'] == []
     assert len(packets[-1]) == 29

@@ -713,7 +713,8 @@ class PointCloudSlamPlugin:
                 if not snapshots:
                     raise ValueError('saved map has no viewable snapshot')
                 view = SavedMapView(map_id, revision, entry['name'], snapshots,
-                                    interval_s=self._config['preview_interval_s'])
+                                    interval_s=self._config['preview_interval_s'],
+                                    max_points=self._config['preview_max_points'])
                 # A new publisher must not start before the old one is closed.
                 self._close_view()
                 try:

@@ -1054,7 +1054,8 @@ def test_place_uses_recent_native_pose_and_follows_optimized_anchor(node):
     assert (place['node_id'], place['x'], place['y'], place['z']) == (7, 2., 3., 4.)
     packet = bytes(published(node, '/pointcloud_slam/map')[0].messages[-1])
     _, _, _, flags, count = struct.unpack('<fffBI', packet[:17])
-    assert flags & 64 and json.loads(packet[17 + 12 * count:]) == [['入口', 2., 3., 4.]]
+    assert not flags & 64 and len(packet) == 17 + 12 * count
+    assert count > struct.unpack_from('<I', segment['snapshot'], 13)[0]
     with pytest.raises(ValueError, match='already in use'):
         node.change_place('入口', remove=False)
     positions[0].position.x = 8.
@@ -1070,7 +1071,7 @@ def test_place_uses_recent_native_pose_and_follows_optimized_anchor(node):
     with pytest.raises(ValueError, match='current mapped pose'):
         node.change_place('过期', remove=False)
     assert node.change_place('入口', remove=True) == []
-    assert not published(node, '/pointcloud_slam/map')[0].messages[-1][12] & 64
+    assert bytes(published(node, '/pointcloud_slam/map')[0].messages[-1]) == segment['snapshot']
 
 
 def test_mark_between_native_keyframes_uses_same_run_body_displacement(node):
@@ -1093,6 +1094,7 @@ def test_mark_between_native_keyframes_uses_same_run_body_displacement(node):
         node._odom(NS(data=json.dumps(chassis(ms, (ms - 1000) / 1000))))
     place, = node.change_place('门', remove=False)
     assert [place[k] for k in ('x', 'y', 'z')] == pytest.approx([5., 10., 1.])
+    assert place['yaw'] == pytest.approx(np.pi / 2)
     origin.position.y = 7.
     node._native_graph(graph, segment)
     assert segment['places'][0]['y'] == pytest.approx(11.)

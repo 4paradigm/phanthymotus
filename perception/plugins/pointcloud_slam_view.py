@@ -11,7 +11,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import UInt8MultiArray
 
-from .pointcloud_slam_preview import PREVIEW_TOPIC, historical_mapping, with_places
+from .pointcloud_slam_preview import DEFAULT_PREVIEW_POINTS, PREVIEW_TOPIC, historical_mapping, with_places
 
 _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                   history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -19,12 +19,13 @@ _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
 
 
 class SavedMapView(Node):
-    def __init__(self, map_id, revision, name, snapshots, *, interval_s=1):
+    def __init__(self, map_id, revision, name, snapshots, *, interval_s=1, max_points=DEFAULT_PREVIEW_POINTS):
         super().__init__('pointcloud_slam_map_view')
         self._lock = threading.Lock()
         self._closed = False
         self._timer = None
         self._interval = interval_s
+        self._max_points = max_points
         self._outputs = []
         self._publisher = None
         self._packet = self._base_packet = None
@@ -65,7 +66,7 @@ class SavedMapView(Node):
 
     def set_places(self, places):
         with self._lock:
-            self._packet = with_places(self._base_packet, places)
+            self._packet = with_places(self._base_packet, places, max_points=self._max_points)
         if self._timer is not None:
             self._publish()
 

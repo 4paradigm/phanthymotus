@@ -1,5 +1,4 @@
 """Bounded snapshots in Core's existing sensor/mapping wire format."""
-import json
 import math
 import struct
 
@@ -50,14 +49,53 @@ def update_place_position(place, node_pose):
         position = position + node_pose[:3, :3] @ place['node_offset']
     place['x'], place['y'], place['z'] = map(float, position)
 
+    if 'node_forward' in place:
+        direction = node_pose[:3, :3] @ place['node_forward']
+        if np.linalg.norm(direction[:2]) > 1e-6:
+            place['yaw'] = math.atan2(direction[1], direction[0])
+        else:
+            place.pop('yaw', None)
 
-def with_places(packet, places):
-    """Bit 6 adds UTF-8 JSON labels after the unchanged XYZ payload."""
+
+# Same map-scale pillar, shaft and triangular head as Tianyi's spatial map.
+_PILLAR = np.array([(0.14 * math.cos(a), 0.14 * math.sin(a), z)
+                    for z in np.linspace(.04, .82, 20)
+                    for a in np.arange(24) * math.tau / 24])
+_ARROW = np.array([(d, side, .14 + dz) for d in np.linspace(0, .38, 28)
+                  for side in (-.035, 0., .035) for dz in (-.025, 0., .025)] +
+                 [(d, side * .16 * (.55 - d) / .25, .14 + dz)
+                  for d in np.linspace(.30, .55, 18) for side in np.linspace(-1, 1, 9)
+                  for dz in (-.03, 0., .03)])
+_DIRECTED = np.vstack((_PILLAR, _ARROW))
+
+
+def with_places(packet, places, *, max_points):
+    """Compose display-only XYZ geometry from the clean map snapshot."""
     if not places:
         return packet
-    labels = [[p['name'], p['x'], p['y'], p.get('z', 0)] for p in places]
-    return (packet[:12] + bytes([packet[12] | 64]) + packet[13:] +
-            json.dumps(labels, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode())
+    base = np.frombuffer(packet, dtype='<f4', offset=17).reshape(-1, 3)
+    # Use spare capacity first. On a full map keep most points for the scene.
+    budget = max(1, max_points // 4, max_points - len(base))
+    markers = []
+    for i, place in enumerate(places):
+        quota = (i + 1) * budget // len(places) - i * budget // len(places)
+        if not quota:
+            continue
+        yaw = place.get('yaw')
+        shape = _PILLAR if yaw is None else _DIRECTED
+        indices = np.linspace(0, len(shape) - 1, min(quota, len(shape)), dtype=int)
+        points = shape[indices]
+        if yaw is not None:
+            c, s = math.cos(yaw), math.sin(yaw)
+            arrow = points[np.searchsorted(indices, len(_PILLAR)):, :2]
+            arrow[:] = arrow @ [[c, s], [-s, c]]
+        points += [place['x'], place['y'], place.get('z', 0.)]
+        markers.append(points)
+    keep = max_points - sum(map(len, markers))
+    if len(base) > keep:
+        base = base[np.linspace(0, len(base) - 1, keep, dtype=int)]
+    xyz = np.concatenate([base, *markers]).astype('<f4')
+    return packet[:13] + struct.pack('<I', len(xyz)) + xyz.tobytes()
 
 
 def historical_mapping(packet):

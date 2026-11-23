@@ -1133,6 +1133,8 @@ class RtabmapNode(Node):
                     raise ValueError('current mapped pose unavailable: no localized map pose')
                 anchor = segment.get('place_anchor') if state == 'external' else None
                 place = dict(name=name, segment_id=segment['segment_id'])
+                axis = {'body': 0, 'camera_optical': 2}.get(segment.get('pose_reference'))
+                forward = np.eye(3)[:, axis] if axis is not None else None
                 if anchor is not None:
                     node_id, map_pose, source = anchor
                     current = self.stream._pose_anchor
@@ -1141,8 +1143,10 @@ class RtabmapNode(Node):
                             self.stream.continuity_token != source.external_continuity):
                         raise ValueError('current mapped pose unavailable: odometry continuity lost')
                     stamp = current.stamp_ns
-                    local = np.linalg.solve(pose_matrix(source), [*current.position, 1.])
-                    place['node_offset'] = local[:3].tolist()
+                    relative = np.linalg.solve(pose_matrix(source), pose_matrix(current))
+                    place['node_offset'] = relative[:3, 3].tolist()
+                    if forward is not None:
+                        forward = relative[:3, :3] @ forward
                 else:
                     stamp, _, map_pose = graph
                     node_id = segment['graph_node']
@@ -1150,6 +1154,8 @@ class RtabmapNode(Node):
                         raise ValueError('current mapped pose unavailable: awaiting native map reference')
                 if not -self._settings['max_future_skew_ms'] * 1e6 <= now - stamp <= self.stream.max_age_s * 1e9:
                     raise ValueError('current mapped pose unavailable: position is stale')
+                if forward is not None:
+                    place['node_forward'] = forward.tolist()
                 place['node_id'] = node_id
                 update_place_position(place, map_pose)
                 places.append(place)
@@ -1168,7 +1174,9 @@ class RtabmapNode(Node):
                 return
             segment['last_preview'] = now
             segment['preview_pending'] = False
-            message = UInt8MultiArray(); message.data = array('B', with_places(segment['snapshot'], segment.get('places')))
+            message = UInt8MultiArray()
+            message.data = array('B', with_places(segment['snapshot'], segment.get('places'),
+                                                  max_points=self._settings['preview_max_points']))
             self._map_pub.publish(message)
 
     def _native_info(self, msg, segment):
