@@ -253,8 +253,13 @@ export const MappingRenderer = {
 
     // Update geometry
     const geo = this._points.geometry;
-    geo.attributes.position.needsUpdate = true;
-    geo.attributes.color.needsUpdate = true;
+    if (count > 0) {
+      for (const attribute of [geo.attributes.position, geo.attributes.color]) {
+        attribute.clearUpdateRanges();
+        attribute.addUpdateRange(0, count * 3);
+        attribute.needsUpdate = true;
+      }
+    }
     geo.setDrawRange(0, count);
 
     // Update robot position and orientation

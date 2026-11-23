@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 
 from utils.dds_transport import receive_environment
+from .pointcloud_slam_preview import DEFAULT_PREVIEW_POINTS
 
 
 def resolve_executable():
@@ -69,7 +70,7 @@ def mapping_parameters(database_path, namespace, settings):
         # A native envelope always contains the scan, with optional images.
         parameters.update(subscribe_sensor_data=True, subscribe_scan_cloud=False,
                           qos_sensor_data=1, motus_visual_recovery=True,
-                          motus_preview_max_points=int(settings.get('preview_max_points', 40000)),
+                          motus_preview_max_points=int(settings.get('preview_max_points', DEFAULT_PREVIEW_POINTS)),
                           motus_preview_interval=float(settings.get('preview_interval_s', 1.)))
     if settings.get('rgb_input') is not None:
         # Follow the default 2 Hz metric cloud stream so that successive

@@ -8,6 +8,7 @@ import numpy as np
 from .pointcloud_slam_transforms import rigid
 
 # One stable canvas output for both live and archived maps.
+DEFAULT_PREVIEW_POINTS = 20_000
 PREVIEW_TOPIC = '/pointcloud_slam/map'
 
 # Additive v2 flags; xyz payload and existing display-yaw convention are unchanged.

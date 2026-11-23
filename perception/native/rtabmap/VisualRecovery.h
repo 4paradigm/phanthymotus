@@ -1,6 +1,7 @@
 // Optional SensorData recovery using the pinned RTAB-Map algorithms.
 // Coordinates: native_odom <- visual_odom / external_odom. No robot/frame policy.
 #pragma once
+#include "WallAlignment.h"
 #include <rtabmap/core/Rtabmap.h>
 #include <rtabmap/core/Memory.h>
 #include <rtabmap/core/Signature.h>
@@ -102,6 +103,7 @@ public:
         recoveryNode_=recoveryAnchor_=recoveryInliers_=0;
         if(visualLossStamp_>0. && !(data.stamp()>visualLossStamp_))
         {
+            walls_.reset();
             // Reject delayed observations before they can alter F2M. A clock
             // regression also invalidates the pending same-gauge recovery.
             visualLossStamp_=0.; visualAlignment_.reset(); visualInliers_=0;
@@ -111,6 +113,7 @@ public:
         if(!chassis.empty()) sawChassis_=true;
         if(!takePayload(data,"MOTUSRAW",8).empty())
         {
+            walls_.reset();
             // Legacy scan-only inputs have no declared gauge. Once this stream
             // declares one, an unmarked pose cannot move the established map.
             if(sawChassis_ || external.isNull())
@@ -140,6 +143,7 @@ public:
             sameOrigin=externalOrigin_ && origin==*externalOrigin_;
             if((externalOrigin_ || !chassis.empty()) && !sameOrigin && !map.getLocalOptimizedPoses().empty())
             {
+                walls_.reset();
                 // A new odometry gauge needs an independent map constraint.
                 state_=Searching; odom_.setNull(); visualInliers_=0;
                 waiting_=true;
@@ -186,6 +190,7 @@ public:
         const bool continuousExternal=(witnessedRun || (chassis.empty() && sameOrigin)) &&
             (!waiting_ || recentOutage || (witnessedRun && witnessedGap)) &&
             !localizationMode_ && continuousMotion(external,data.stamp(),scanGap);
+        if(!continuousExternal) walls_.reset();
         const bool waitForChassis=external.isNull() && (externalRun_ || externalOrigin_) && !localizationMode_ &&
             externalAge>0. && externalAge<=maxExternalScanGap_ &&
             (!chassisOutageStart_ || recentOutage || witnessedGap) &&
@@ -419,6 +424,7 @@ public:
                 }
                 else accepted=map.process(data,odom_,covariance,velocity,acceptedStats);
                 if(accepted) rememberScan(map,data);
+                if(accepted && continuousExternal) walls_.observe(map,data);
                 // Chassis-only growth preserves any pending visual recovery.
                 if(accepted && tracked) rememberVisualAlignment(data.stamp(),visual,info);
                 // A mature first keyframe establishes a gauge, but doesn't yet measure motion.
@@ -1045,6 +1051,7 @@ private:
         for(int i=0;i<6;++i) if(c.at<double>(i,i)<=0) return false;
         return true;
     }
+    WallAlignment walls_;
     std::unique_ptr<rtabmap::Odometry> estimator_;
     std::unique_ptr<rtabmap::RegistrationIcp> inertialIcp_,scanIcp_,revisitIcp_;
     rtabmap::RegistrationIcp neighborIcp_;

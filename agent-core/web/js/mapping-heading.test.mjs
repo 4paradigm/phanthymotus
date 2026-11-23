@@ -14,7 +14,12 @@ function renderer() {
   vm.runInContext(source, context);
   const r = context.MappingRenderer;
   r._positions = new Float32Array(3); r._colors = new Float32Array(3);
-  r._points = { geometry: { attributes: { position: {}, color: {} }, setDrawRange() {} } };
+  const attribute = () => ({
+    ranges: [],
+    clearUpdateRanges() { this.ranges = []; },
+    addUpdateRange(start, count) { this.ranges.push([start, count]); },
+  });
+  r._points = { geometry: { attributes: { position: attribute(), color: attribute() }, setDrawRange() {} } };
   r._robotMesh = { visible: true, position: new Vector3(), rotation: new Vector3() };
   r._markerLabel = { textContent: '' };
   return r;
@@ -32,6 +37,10 @@ test('mapped camera heading renders without a text overlay', () => {
   assert.equal(r._robotMesh.visible, true);
   assert.ok(Math.abs(r._robotMesh.rotation.values[1] - .7) < 1e-6);
   assert.deepEqual([...r._positions], [1, 3, -2]);
+  for (const attribute of Object.values(r._points.geometry.attributes)) {
+    assert.deepEqual(attribute.ranges, [[0, 3]]);
+    assert.equal(attribute.needsUpdate, true);
+  }
 });
 test('body, unavailable, and legacy markers preserve visibility without text', () => {
   const r = renderer();

@@ -13,7 +13,7 @@ import uuid
 from .pointcloud_slam_config import discover_runtime_geometry, reconcile_explicit_extrinsic
 from .pointcloud_slam_contract import SpatialSlamError, validate_slam_capability
 from .pointcloud_slam_input import InputContractError, resolve_inputs
-from .pointcloud_slam_preview import PREVIEW_TOPIC
+from .pointcloud_slam_preview import DEFAULT_PREVIEW_POINTS, PREVIEW_TOPIC
 from .pointcloud_slam_ros import RtabmapNode, discover_input_bindings
 from .pointcloud_slam_rtabmap import require_runtime
 from .pointcloud_slam_transforms import rigid
@@ -27,7 +27,7 @@ _DEFAULTS = {'max_gap_ms': 200, 'max_age_s': 2,
              'max_pending': 10, 'max_cloud_points': 1000000,
              'voxel_size_m': .08, 'max_working_nodes': 3000, 'max_update_ms': 3000,
              'max_disk_bytes': 2147483648, 'reserve_bytes': 1073741824,
-             'preview_interval_s': 1, 'preview_max_points': 40000, 'native_parameters': {}}
+             'preview_interval_s': 1, 'preview_max_points': DEFAULT_PREVIEW_POINTS, 'native_parameters': {}}
 _RETIRED = {'robot', 'input_policy', 'clock_relation_verified', 'extrinsic_calibrated',
             'preview_enabled', 'preview_backend', 'preview_geometry', 'preview_relocalization',
             'preview_odom_sigmas', 'archive_name', 'restore_archive',

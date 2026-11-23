@@ -26,7 +26,7 @@ from std_msgs.msg import String, UInt8MultiArray
 from .pointcloud_slam_rtabmap import RtabmapProcess, paired_sensor_odom
 from .pointcloud_slam_watchdog import BackendProgress
 from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
-from .pointcloud_slam_preview import PREVIEW_TOPIC, with_places, update_place_position
+from .pointcloud_slam_preview import DEFAULT_PREVIEW_POINTS, PREVIEW_TOPIC, with_places, update_place_position
 from .pointcloud_slam_stream import SlamStream
 from .pointcloud_slam_transforms import rigid, pose_matrix
 from .pointcloud_slam_motion import ScanMotion, MotionPending
@@ -168,7 +168,7 @@ class RtabmapNode(Node):
                                      on_decoded=self._reserve_decoded_rgb)
         for key, default in dict(voxel_size_m=.08, max_working_nodes=3000, max_update_ms=3000,
                 max_disk_bytes=2*1024**3, reserve_bytes=1024**3,
-                preview_interval_s=1., preview_max_points=40000).items():
+                preview_interval_s=1., preview_max_points=DEFAULT_PREVIEW_POINTS).items():
             self._settings.setdefault(key, default)
         for key in ('max_working_nodes', 'max_disk_bytes', 'preview_max_points'):
             if type(self._settings[key]) is not int or self._settings[key] <= 0:
