@@ -890,3 +890,39 @@ def test_duplicate_unstamped_receipt_preserves_its_fixed_window_and_order(monkey
     snapshot[0] = objects, depth, odom, bad_receipt
     card._dispatch_command()
     assert [p["values"] for p in packets] == [message["values"]]
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_missing_target_veto_hands_off_to_search(monkeypatch, recover):
+    card, packets, clock, snapshot, motion = selected_card(monkeypatch, live_target=True)
+    original = snapshot[0][0]
+
+    def observe(stamp, objects):
+        advance_snapshot(snapshot, clock, stamp, vx=0.)
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = dict(objects, timestamp=stamp / 1000), depth, odom, stamp
+
+    observe(1010, absent_target_payload("empty"))
+    card._publish_command(motion)
+    assert card._dwa_publication["reason"] == "target_missing"
+    observe(1020, absent_target_payload("empty"))
+    for _ in range(3):
+        message = card.next_command()
+        assert message is None or not any(message["values"])
+    # A retransmitted detector payload can have a later local receipt.
+    advance_snapshot(snapshot, clock, 1030, vx=0.)
+    duplicate, depth, odom, _ = snapshot[0]
+    snapshot[0] = duplicate, depth, odom, 1030
+    message = card.next_command()
+    assert message is None or not any(message["values"])
+    for stamp in ((1050, 1100, 1150) if recover else (1050,)):
+        observe(stamp, original if recover else absent_target_payload("empty"))
+        message = card.next_command()
+        if message:
+            card._publish_command(message)
+    twist = packets[-1]["values"]
+    if recover:
+        assert card._state.reacquire_generation is None
+        assert twist[0] > 0
+    else:
+        assert twist[:5] == [0.] * 5 and twist[5] != 0

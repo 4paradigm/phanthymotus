@@ -2432,7 +2432,8 @@ class NaviPlugin:
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
                                    dt=dt, control_period_s=control_period_s, command_dt_s=coverage,
-                                   command_interrupted=bool(deadline and tick > deadline), dwa_admission_ms=admission_ms)
+                                   command_interrupted=bool(deadline and tick > deadline), dwa_admission_ms=admission_ms,
+                                   objects_ms=objects_ms)
         now = time.time()
         scan = self._state.active_scan
         self._last_decision = decision
@@ -2962,6 +2963,12 @@ class NaviPlugin:
         # An older queued command must not rewrite a newer planner decision.
         if origin.state_id != id(state) or trace.get("decision_id") != origin.acceptance.decision_id:
             return
+        if reason == "target_missing" and origin.generation is not None and state.reacquire_generation is None:
+            state.reacquire_generation = origin.generation
+            state.reacquire_receipt_ms = int(time.time() * 1000)
+            with self._obs_lock:
+                state.reacquire_source = observation_source(self._objects)
+            state.missing_frames = 0
         if trace.get("accepted_twist") is not None and self._dwa_last_published != origin.identity:
             state.dwa_totals["accepted_ticks"] = max(0, state.dwa_totals.get("accepted_ticks", 0) - 1)
         trace.update(accepted_twist=None, controller_used="stop", veto_reason=reason)

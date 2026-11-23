@@ -71,7 +71,7 @@ from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, CAMERA_OCCUPANCY_M
                           NearProjection, SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW,
                           TURN_SPEED_REDUCTION, confirmed_square_coverage, relative_pose_at)
 from .depth import has_valid_returns
-from .track import AssociationSnapshot, ObservationFrame, Track, Tracker, observation_transform
+from .track import AssociationSnapshot, ObservationFrame, Track, Tracker, observation_source, observation_transform
 from . import local_path
 from . import dwa
 from . import motion as motion_model
@@ -792,6 +792,9 @@ class State:
     uses_received_speed: bool = False
     command_tail: tuple = (0., 0., 0.)
     command_tail_s: float = 0.
+    reacquire_generation: int | None = None
+    reacquire_receipt_ms: int = 0
+    reacquire_source: float | None = None
     missing_frames: int = 0
     last_seen_side: float = 1.0          # +1 target was right, -1 it was left
     searching_for_s: float = 0.0
@@ -1307,7 +1310,7 @@ def camera_odometry_inputs(config, state, depth, odom):
 
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float, control_period_s: float | None = None, command_dt_s: float | None = None,
-         command_interrupted: bool = False, dwa_admission_ms: int = 0) -> Decision:
+         command_interrupted: bool = False, dwa_admission_ms: int = 0, objects_ms: int = 0) -> Decision:
     depth, odom = camera_odometry_inputs(config, state, depth, odom)
     state.dwa_admission_ms = dwa_admission_ms
     state.dwa_odom = odom if config.local_controller == "dwa" else None
@@ -1365,7 +1368,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
         else:
             depth = dict(depth, body_mount_required=False)
     scan_before, phase_before = state.active_scan, state.active_scan.phase
-    decision = _decide(detections, depth, odom, config, state, dt, control_period_s=control_period_s)
+    decision = _decide(detections, depth, odom, config, state, dt, control_period_s=control_period_s, objects_ms=objects_ms)
     scan = state.active_scan
     if (decision.status == AVOIDING and decision.values is not None and not any(decision.values)
             and scan.phase == "brake" and (scan is not scan_before or phase_before != "brake")
@@ -1744,7 +1747,7 @@ def _obstacle_reference(odom, depth):
 
 
 def _decide(detections, depth, odom, config: Config, state: State,
-            dt: float, *, control_period_s: float | None) -> Decision:
+            dt: float, *, control_period_s: float | None, objects_ms=0) -> Decision:
     """One tick.
 
     `detections` — vop's latest payload, or None if stale/absent.
@@ -1950,6 +1953,29 @@ def _decide(detections, depth, odom, config: Config, state: State,
                            and max(feedback[0], state.commanded[0]) > STILL_LINEAR)
             scan.update_near_obstacles(scan_depth, geometry, obstacle_pose, _keepout_m(config), reach,
                                        approaching=approaching)
+        if state.reacquire_generation is not None:
+            source = observation_source(detections)
+            fresh = (detections is not None and objects_ms > state.reacquire_receipt_ms
+                     and (state.reacquire_source is None or
+                          (source is not None and source > state.reacquire_source)))
+            if fresh:
+                state.reacquire_receipt_ms, state.reacquire_source = objects_ms, source
+            if (fresh and track is not None and track.generation == state.reacquire_generation
+                    and current_target_observed(state)):
+                state.reacquire_generation = None
+                state.missing_frames = 0
+                state.searching_for_s = state.searched_rad = 0.
+            else:
+                if scan.active or scan.result_frame or state.detour_leg is not None:
+                    _reset_detour_route(state)
+                if fresh and state.missing_frames < config.lost_frames:
+                    state.missing_frames += 1
+                if depth is None or state.missing_frames < min(2, config.lost_frames):
+                    return Decision(_twist(0., 0., 0.), SEARCHING, "等待新的原目标观测")
+                # Publication already rejected the approach. Two independent misses
+                # confirm the loss without restarting the normal occlusion grace.
+                state.missing_frames = max(state.missing_frames, config.lost_frames)
+                return _search_for_target(depth, config, state, dt, odom)
         reviewing_observation = (target_fix is not None and feedback is not None
                                  and geometry is not None and geometry.horizontal is not None
                                  and ((freeze_goal and not (scan.active and scan.route_segment)) or reobserved_target or (
