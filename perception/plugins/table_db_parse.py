@@ -78,6 +78,7 @@ from xml.etree import ElementTree as ET
 REASON_UNSUPPORTED = "unsupported_format"
 REASON_LEGACY = "legacy_format"
 REASON_UNREADABLE = "unreadable"
+REASON_TOO_LARGE = "too_large"
 REASON_EMPTY = "empty"
 REASON_NO_DOC = "unknown_document"
 REASON_NO_TABLE = "unknown_table"
@@ -1410,9 +1411,61 @@ def read_csv(data: bytes, limits: Limits) -> Document:
 
 # ── entry point ──────────────────────────────────────────────────────────────
 
+# Bounds on what an OOXML archive may expand to. The import cap (64 MiB) is on
+# the *compressed* upload; a tiny, highly compressible xlsx can declare
+# gigabytes of XML, and reading one member whole would OOM this container.
+# Real workbooks sit far below every one of these: a 20 000-row sheet is tens
+# of MB of XML, and Office compresses XML around 10-20x.
+MAX_ZIP_MEMBERS = 10000
+MAX_ZIP_MEMBER_BYTES = 256 * 1024 * 1024
+MAX_ZIP_TOTAL_BYTES = 1024 * 1024 * 1024
+MAX_ZIP_RATIO = 200          # uncompressed / compressed, per member over 1 MiB
+
+
+class _BoundedZip(zipfile.ZipFile):
+    """ZipFile whose read() never returns more than a member's declared size.
+
+    The declared sizes are checked up front (`_open_zip`); this enforces them,
+    so an archive that lies in its headers is cut off at the declared size
+    instead of being trusted. zipfile itself raises BadZipFile on a CRC or
+    length mismatch at the end of a member, but only after inflating it.
+    """
+
+    def read(self, name, pwd=None):  # noqa: D401 - same contract as ZipFile.read
+        info = name if isinstance(name, zipfile.ZipInfo) else self.getinfo(name)
+        limit = min(info.file_size, MAX_ZIP_MEMBER_BYTES)
+        with self.open(info, "r", pwd=pwd) as handle:
+            data = handle.read(limit + 1)
+        if len(data) > limit:
+            raise ParseError(REASON_UNREADABLE,
+                             "文件里的 %s 解压后超过声明的大小，文件可能已损坏或被篡改" % info.filename)
+        return data
+
+
+def check_zip_bounds(zf: zipfile.ZipFile) -> None:
+    """Refuse an archive whose declared expansion exceeds the bounds above."""
+    infos = zf.infolist()
+    if len(infos) > MAX_ZIP_MEMBERS:
+        raise ParseError(REASON_TOO_LARGE, "文件里有 %d 个部件，超过上限 %d，不像正常的 Office 文档"
+                         % (len(infos), MAX_ZIP_MEMBERS))
+    total = 0
+    for info in infos:
+        if info.file_size > MAX_ZIP_MEMBER_BYTES:
+            raise ParseError(REASON_TOO_LARGE, "文件里的 %s 解压后 %d 字节，超过单个部件上限 %d"
+                             % (info.filename, info.file_size, MAX_ZIP_MEMBER_BYTES))
+        if (info.file_size > 1024 * 1024
+                and info.file_size > MAX_ZIP_RATIO * max(info.compress_size, 1)):
+            raise ParseError(REASON_TOO_LARGE, "文件里的 %s 压缩比异常（%d 倍），拒绝解压"
+                             % (info.filename, info.file_size // max(info.compress_size, 1)))
+        total += info.file_size
+    if total > MAX_ZIP_TOTAL_BYTES:
+        raise ParseError(REASON_TOO_LARGE, "文件解压后共 %d 字节，超过上限 %d"
+                         % (total, MAX_ZIP_TOTAL_BYTES))
+
+
 def _open_zip(data: bytes) -> zipfile.ZipFile:
     try:
-        return zipfile.ZipFile(io.BytesIO(data))
+        zf = _BoundedZip(io.BytesIO(data))
     except zipfile.BadZipFile as error:
         raise ParseError(
             REASON_UNREADABLE,
@@ -1420,6 +1473,11 @@ def _open_zip(data: bytes) -> zipfile.ZipFile:
             "常见原因：文件扩展名被改过、下载不完整、或者其实是网页/错误页"
             % error,
         ) from error
+    check_zip_bounds(zf)
+    return zf
+
+
+open_bounded_zip = _open_zip
 
 
 def sniff_kind(data: bytes, filename: str) -> str:

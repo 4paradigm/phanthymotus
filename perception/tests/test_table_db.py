@@ -651,7 +651,7 @@ def test_get_file_explains_how_agent_core_can_read_it(tmp_path):
 
     hint = got["agent_core"]
     assert hint["local_path"].startswith("/tmp/") and hint["local_path"] in hint["download"]
-    url = hint["download"].split()[-1]
+    url = hint["download"].split()[-1].strip("'")
     assert url.startswith("http://localhost:15720/table_db/file/t/")
     status, body, mime, name = card.handle_http_get(url[len("http://localhost:15720"):])
     assert (status, body, mime) == (200, PNG_B, "image/png") and name
@@ -780,3 +780,110 @@ def test_no_double_quote_in_any_field_description():
     quotes; one ASCII double quote cut the hint off at `例 {`."""
     for key, spec in TOOLS[0]["inputSchema"]["properties"].items():
         assert '"' not in spec.get("description", ""), key
+
+
+# ── review of PR #429: signed links, zip bombs ───────────────────────────────
+
+def _served(card, url, headers=None):
+    route = url[url.index("/table_db/file/"):]
+    return card.handle_http_get(route, headers or {})
+
+
+def test_file_links_open_without_a_token_configured(tmp_path, monkeypatch):
+    monkeypatch.delenv("ACCESS_TOKEN", raising=False)
+    import utils.file_intake as intake
+    monkeypatch.setattr(intake, "_ENV_CANDIDATES", ())
+    card = _card(tmp_path)
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    got = _call(card, "get_file", table="名单", _id=2)
+
+    assert "sig=" not in got["url"]
+    assert _served(card, got["url"])[0] == 200
+
+
+def test_with_access_token_issued_links_are_signed_and_open(tmp_path, monkeypatch):
+    """Every consumer of the link (browser, *_by_url, the model's curl) gets 200
+    with a token configured — none of them can send X-Access-Token."""
+    monkeypatch.setenv("ACCESS_TOKEN", "s3cret")
+    card = _card(tmp_path)
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    got = _call(card, "get_file", table="名单", _id=2)
+
+    assert "sig=" in got["url"]
+    assert (_served(card, got["url"])[0], _served(card, got["url"])[1]) == (200, PNG_B)
+    curl_url = got["agent_core"]["download"].split()[-1].strip("'")
+    assert "sig=" in curl_url and _served(card, curl_url)[0] == 200
+
+    bare = got["url"].split("?")[0]
+    assert _served(card, bare)[0] == 401                                   # unsigned
+    assert _served(card, bare + "?sig=" + "0" * 32)[0] == 401              # forged
+    other = bare.rsplit("f_", 1)[0] + "f_1?" + got["url"].split("?")[1]
+    assert _served(card, other)[0] == 401                                  # sig of f_2 on f_1
+    assert _served(card, bare, {"X-Access-Token": "s3cret"})[0] == 200     # header still works
+    assert _served(card, bare, {"X-Access-Token": "wrong"})[0] == 401
+
+
+def _zip_with(member, size, compress=True):
+    import io as _io
+    import zipfile
+
+    buffer = _io.BytesIO()
+    mode = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
+    with zipfile.ZipFile(buffer, "w", mode) as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("xl/workbook.xml", "<workbook/>")
+        archive.writestr(member, b"<" * size)
+    return buffer.getvalue()
+
+
+def test_zip_bomb_is_refused_before_it_is_inflated(tmp_path, monkeypatch):
+    import plugins.table_db_parse as parse
+
+    # A member far over the declared ratio: 40 MB of one byte compresses ~1000x.
+    bomb = _zip_with("xl/worksheets/sheet1.xml", 40 * 1024 * 1024)
+    assert len(bomb) < 200 * 1024
+    card = _card(tmp_path)
+    reply = _call(card, "import", table="x", path=_write(tmp_path, "bomb.xlsx", bomb))
+    assert reply["ok"] is False and reply["reason"] == "too_large" and reply["written"] == 0
+    assert "压缩比" in reply["detail"]
+
+    # Per-member and total ceilings, checked from the central directory alone.
+    monkeypatch.setattr(parse, "MAX_ZIP_MEMBER_BYTES", 1000)
+    big = _zip_with("xl/worksheets/sheet1.xml", 5000, compress=False)
+    with pytest.raises(parse.ParseError) as caught:
+        parse.open_bounded_zip(big)
+    assert caught.value.reason == "too_large"
+    monkeypatch.setattr(parse, "MAX_ZIP_MEMBER_BYTES", 10 ** 9)
+    monkeypatch.setattr(parse, "MAX_ZIP_TOTAL_BYTES", 1000)
+    with pytest.raises(parse.ParseError):
+        parse.open_bounded_zip(big)
+
+
+def test_zip_member_lying_about_its_size_is_cut_off(tmp_path):
+    import plugins.table_db_parse as parse
+
+    data = bytearray(_zip_with("xl/worksheets/sheet1.xml", 5000, compress=False))
+    # Rewrite the declared uncompressed size of the last member (central
+    # directory and local header) to 100 bytes, keeping the real 5000 inside.
+    import io
+    import struct
+    import zipfile
+    archive = zipfile.ZipFile(io.BytesIO(bytes(data)))
+    info = archive.getinfo("xl/worksheets/sheet1.xml")
+    archive.close()
+    local = info.header_offset
+    struct.pack_into("<I", data, local + 22, 100)
+    central = bytes(data).rfind(b"PK\x01\x02")
+    struct.pack_into("<I", data, central + 24, 100)
+    zf = parse.open_bounded_zip(bytes(data))
+    with pytest.raises((parse.ParseError, zipfile.BadZipFile)):
+        zf.read("xl/worksheets/sheet1.xml")
+
+
+def test_real_workbooks_still_open_under_the_bounds(tmp_path):
+    import plugins.table_db_parse as parse
+
+    zf = parse.open_bounded_zip(ROSTER)
+    assert "xl/workbook.xml" in zf.namelist()
+    card = _card(tmp_path)
+    assert _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))["imported"] == 3

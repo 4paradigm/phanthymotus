@@ -419,20 +419,17 @@ def make_handler():
                             _sse_clients.remove(client_queue)
                 return
             # Plugins may serve a GET route of their own (table_db hands stored
-            # files to agent-core, which cannot read this container's /models).
-            # Same token rule as /file/upload: enforced only when ACCESS_TOKEN is set.
+            # files to browsers, vision cards and agent-core, none of which can
+            # read this container's /models). The plugin authorises the request
+            # itself: its links are consumed by clients that cannot add headers,
+            # so it signs them (see TableDbPlugin.handle_http_get).
             for plugin in (_bundle._plugins if _bundle is not None else []):
                 handler = getattr(plugin, "handle_http_get", None)
                 if handler is None:
                     continue
-                served = handler(self.path)
+                served = handler(self.path, dict(self.headers))
                 if served is None:
                     continue
-                from utils.file_intake import access_token
-                token = access_token()
-                if token and self.headers.get("X-Access-Token", "") != token:
-                    self._send(401, '{"error":"bad token"}')
-                    return
                 status, body, content_type, filename = served
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)

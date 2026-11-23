@@ -39,6 +39,7 @@ and hides start/stop/info from the model.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import mimetypes
@@ -59,6 +60,7 @@ from plugins.table_db_parse import (
     LEGACY_SUFFIXES,
     ParseError,
     SUPPORTED_SUFFIXES,
+    open_bounded_zip,
     Limits,
     column_letter,
     parse_document,
@@ -701,7 +703,7 @@ class TableDbPlugin:
 
         archive = None
         if document.kind in ("xlsx", "docx"):
-            archive = zipfile.ZipFile(io.BytesIO(data))
+            archive = open_bounded_zip(data)
         kinds = dict(columns)
         if existing is not None:
             kinds.update({column.name: column.type for column in existing})
@@ -952,7 +954,7 @@ class TableDbPlugin:
             raise TableDbError("not_found", "库 %s 里没有文件 f_%d" % (db, fid))
         name, mime, data = found[fid]
         path = self._write_cache(db, fid, name, mime, data)
-        route = "%s/%s/f_%d" % (HTTP_FILE_PREFIX, db, fid)
+        route = self._signed_route(db, fid)
         url = self._public_url() + route
         local = "/tmp/table_db_%s_%s" % (db, os.path.basename(path))
         reply: Dict[str, Any] = {
@@ -969,7 +971,7 @@ class TableDbPlugin:
             # open it (it only reads its own /work and /tmp), so the model fetches
             # the file over localhost HTTP first.
             "agent_core": {
-                "download": "curl -sf -o %s %s%s" % (local, self._http_base, route),
+                "download": "curl -sf -o %s '%s%s'" % (local, self._http_base, route),
                 "local_path": local,
                 "note": "模型自己要看这个文件：用 Bash 执行 download，再 Read local_path",
             },
@@ -1000,17 +1002,57 @@ class TableDbPlugin:
         return "http://%s:%s" % (address, port)
 
     # ── file download over HTTP (GET /table_db/file/<db>/<file_id>) ──────────
+    #
+    # Authorisation is in the URL itself, not in a header: the consumers of this
+    # link — a browser, face/ocr/vop *_by_url, a curl the model runs — cannot add
+    # an X-Access-Token header, so a header check made every advertised link a
+    # 401 the moment ACCESS_TOKEN was set. When a token is configured, get_file
+    # signs the path with it (HMAC-SHA256, `?sig=`), and only a link this card
+    # issued opens. Without a token the service is gated by reachability, like
+    # /file/upload and tools/call, and the link carries no signature.
 
-    def handle_http_get(self, url_path: str) -> Optional[Tuple[int, bytes, str, str]]:
-        """Serve one stored file to agent-core, or None if the path is not ours.
+    @staticmethod
+    def _token() -> str:
+        from utils.file_intake import access_token
+        return access_token()
+
+    def _signature(self, path: str) -> str:
+        token = self._token()
+        if not token:
+            return ""
+        return hmac.new(token.encode("utf-8"), path.encode("utf-8"),
+                        hashlib.sha256).hexdigest()[:32]
+
+    def _signed_route(self, db: str, fid: int) -> str:
+        path = "%s/%s/f_%d" % (HTTP_FILE_PREFIX, db, fid)
+        sig = self._signature(path)
+        return path + ("?sig=" + sig if sig else "")
+
+    def handle_http_get(self, url_path: str,
+                        headers: Optional[Dict[str, str]] = None
+                        ) -> Optional[Tuple[int, bytes, str, str]]:
+        """Serve one stored file, or None if the path is not ours.
 
         Returns (status, body, content_type, filename). Only `<db>/<f_N>` is
         accepted — both validated exactly as the tool would — so the URL names
-        a row in the store, never a filesystem path.
+        a row in the store, never a filesystem path. When ACCESS_TOKEN is set,
+        a valid `sig` (from get_file) or the X-Access-Token header is required.
         """
-        route = url_path.split("?", 1)[0]
+        route, _, query = url_path.partition("?")
         if not route.startswith(HTTP_FILE_PREFIX + "/"):
             return None
+        token = self._token()
+        if token:
+            given = ""
+            for pair in query.split("&"):
+                if pair.startswith("sig="):
+                    given = pair[4:]
+            expected = self._signature(route)
+            header = (headers or {}).get("X-Access-Token", "")
+            if not (hmac.compare_digest(given, expected)
+                    or (header and hmac.compare_digest(header, token))):
+                return 401, b"missing or invalid signature: get a fresh url from get_file", \
+                    "text/plain; charset=utf-8", ""
         parts = route[len(HTTP_FILE_PREFIX) + 1:].split("/")
         try:
             if len(parts) != 2:
