@@ -1589,4 +1589,59 @@ def test_only_contiguous_exactly_stationary_feedback_preserves_a_check(change):
         current["motion_pose"] = None
     old_revision = plugin._motion_inputs(None, None, prior)
     new_revision = plugin._motion_inputs(target, depth, current)
-    assert plugin._stationary_feedback_update(old_revision, new_revision, 350) == (change == "stationary")
+    assert plugin._continuous_feedback_update(old_revision, new_revision, 350, stationary=True) == (change == "stationary")
+
+
+def test_old_certified_obstacles_cover_only_expired_prefix_of_identical_memory():
+    def view(stamp):
+        return stamp, None, (), (), ((stamp - 10, None),)
+
+    early, late, newest = view(1000), view(1100), view(1200)
+    before = ("frame", (early, late))
+    now = 1000 + policy.MAP_AGE_MS
+    assert plugin._only_expired_views(before, ("frame", (late,)), now)
+    assert not plugin._only_expired_views(before, ("frame", (late,)), now - 20)
+    assert not plugin._only_expired_views(before, ("other", (late,)), now)
+    assert not plugin._only_expired_views(before, ("frame", (late, newest)), now)
+    assert not plugin._only_expired_views(before, ("frame", (early,)), now)
+    assert not plugin._only_expired_views(before, ("frame", (newest,)), now)
+    assert not plugin._only_expired_views(before, ("frame", ()), now + 200)
+
+
+@pytest.mark.parametrize("body", [True, False])
+@pytest.mark.parametrize("jump", [-.65, .65])
+def test_pose_reset_during_publication_cannot_shift_the_checked_scene(monkeypatch, body, jump):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=body, live_target=True)
+    objects, depth, odom, stamp = snapshot[0]
+    pose = plugin.odom_mod.PlanarPose(1000, ("odom",), 0., 0., 0.)
+    snapshot[0] = objects, depth, dict(odom, motion_pose=pose, obstacle_pose=pose), stamp
+    message = card.next_command()
+    assert message["values"][0] > 0
+    advance_snapshot(snapshot, clock, 1020)
+    objects, depth, odom, stamp = snapshot[0]
+    changed = replace(pose, x=jump, stamp_ms=1020)
+    history = odom["velocity_history"] + ((1020, 1020, (.1, 0., 0.)),)
+    snapshot[0] = objects, depth, dict(odom, motion_pose=changed, obstacle_pose=changed, velocity_history=history), stamp
+    if body:
+        card._publish_command(message)
+    else:
+        card._stage_command(message, card._output_epoch)
+    assert packets[-1]["values"] == [0.] * 6
+    assert card._dwa_publication["reason"] == "geometry_mismatch"
+
+
+@pytest.mark.parametrize("body", [True, False])
+@pytest.mark.parametrize("obstacle", [True, False])
+def test_filtered_feedback_sweep_agrees_with_exact_registered_scene(monkeypatch, body, obstacle):
+    card, _, clock, snapshot, message = selected_card(monkeypatch, body=body, live_target=True)
+    check = card._staged_dwa_command[1].forward_check
+    advance_snapshot(snapshot, clock, 1050, obstacle=obstacle, vx=.105)
+    outcomes = []
+    for filtered in (False, True):
+        diagnostics = {}
+        verified = card._recheck_dwa_motion(check, message["values"], 800, clock[0], snapshot[0], renew=False,
+                                            diagnostics=diagnostics, bounds_only=filtered)
+        assert verified is not None
+        outcomes.append((verified[:3], diagnostics.get("reason")))
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0][0][2] == (not obstacle)

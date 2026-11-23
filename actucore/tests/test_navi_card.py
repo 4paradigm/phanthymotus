@@ -2851,3 +2851,16 @@ def test_dwa_instance_values_survive_card_restart(monkeypatch, saved_controller)
     finally:
         card._stop()
 
+
+
+def test_decision_log_preserves_bends_and_reversals_within_log_budget():
+    route = [(x / 20, 0.) for x in range(80)]
+    route += [(3.95, y / 20) for y in range(12)] + [(3.95, .5)]
+    trace = {"decision_id": 350, "reference": route, "topology_reference": route}
+    record = json.loads(navi_plugin._decision_log(trace))
+    assert record["reference"] == [[0., 0.], [3.95, 0.], [3.95, .55], [3.95, .5]]
+    assert trace["reference"] is route and len(route) == 93
+    trace["attempts"] = [{"reason": "no_reference"}] * 250
+    message = navi_plugin._decision_log(trace)
+    assert len(message.encode()) <= 3800
+    assert json.loads(message)["attempts_count"] == 250

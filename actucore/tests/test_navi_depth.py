@@ -683,3 +683,15 @@ def test_only_received_immutable_pixels_can_share_a_projection():
     mutable_projection = DepthProjection.received(mutable, ground)
     assert DepthProjection.for_observation(dict(map=mutable, ground=ground,
                                                 grid_projection=mutable_projection)) is not mutable_projection
+
+
+def test_repeated_depth_revisions_preserve_pixel_order_and_mutable_edits():
+    from plugins.navi.local_path import array_revision
+
+    pixels = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    frozen = np.frombuffer(pixels.tobytes(), dtype=pixels.dtype).reshape(pixels.shape)
+    for view in (frozen, frozen[1:], frozen.T, frozen[:, ::-1], pixels):
+        assert array_revision(view) == (view.shape, view.dtype.str, hash(view.tobytes()))
+    revision = array_revision(pixels)
+    pixels[0, 0] += 1
+    assert array_revision(pixels) != revision

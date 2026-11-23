@@ -68,6 +68,38 @@ TOPIC_FORMAT = "control/velocity"
 _DESCRIPTOR_EVERY = 50
 
 
+def _decision_log(trace):
+    # logsafe caps lines at about 4 KiB. Report route corners instead of every
+    # collinear grid sample; the card state retains the original references.
+    record = trace.copy()
+    for key in ("reference", "topology_reference"):
+        if not record.get(key):
+            continue
+        corners = []
+        for f, r in record[key]:
+            point = (round(1000 * f), round(1000 * r))
+            if corners and corners[-1] == point:
+                continue
+            if len(corners) >= 2:
+                a, b = corners[-2:]
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                nx, ny = point[0] - b[0], point[1] - b[1]
+                if dx * ny == dy * nx and dx * nx + dy * ny > 0:
+                    corners.pop()
+            corners.append(point)
+        record[key] = [(x / 1000, y / 1000) for x, y in corners]
+    message = json.dumps(record, ensure_ascii=False)
+    if len(message.encode()) > 3800:
+        # Keep a parseable decision and its aggregate rejection counts even
+        # for long winding paths and repeated searches.
+        for key in ("topology_reference", "reference", "attempts"):
+            if key in record:
+                record[key + "_count"] = len(trace[key] or ())
+                del record[key]
+        message = json.dumps(record, ensure_ascii=False)
+    return message
+
+
 def _motion_inputs(objects, depth, odom):
     depth, odom = depth or {}, odom or {}
     return ((local_path.array_revision(depth.get("map")), local_path.array_revision(depth.get("ground")),
@@ -83,34 +115,89 @@ def _motion_inputs(objects, depth, odom):
              if isinstance(objects, dict) else None))
 
 
-def _stationary_feedback_update(before, after, max_gap_ms):
-    """Only odometry clocks advanced during validation of an unchanged scene."""
+def _only_expired_views(before, after, now_ms):
+    """Dropping expired oldest obstacle layers cannot invalidate the earlier sweep."""
+    if before == after:
+        return True
+    if not before or not after or before[:-1] != after[:-1]:
+        return False
+    previous, current = before[-1], after[-1]
+    removed = len(previous) - len(current)
+    if not current or removed <= 0 or previous[removed:] != current:
+        return False
+    return all(now_ms - (view[4][0][0] if view[4] else view[0]) > policy_mod.MAP_AGE_MS
+               for view in previous[:removed])
+
+
+def _feedback_pose_jump(before, after, gap_ms, config):
+    """A new stamp within a continuous interval cannot rebase the world by metres."""
+    if not before or before[1] == after[1]:
+        return False
+    old, new = before[1], after[1]
+    if old[1] is None or new[1] is None or not 0 <= new[1] - old[1] <= gap_ms:
+        return False
+    if not old[5] or not new[5] or old[5][-1] not in new[5] or new[5][-1][1] != new[1]:
+        return False
+    overlap = new[5].index(old[5][-1]) + 1
+    if (new[5][:overlap] != old[5][-overlap:] or overlap == len(new[5]) or old[5][-1][1] != old[1]
+            or any(row[2] is None for row in new[5][overlap:])):
+        return False
+    rates = [row[2] for row in new[5] if row[2] is not None]
+    speed = max([math.hypot(config.vx_max, config.vy_max)] + [math.hypot(*v[:2]) for v in rates])
+    yaw_rate = max([config.wz_max] + [abs(v[2]) for v in rates])
+    for previous, current in zip(old[3:5], new[3:5]):
+        if (previous is None or current is None or previous.frame != current.frame
+                or not 0 <= current.stamp_ms - previous.stamp_ms <= gap_ms):
+            continue
+        # The full tolerated sampling interval accommodates asynchronous speed
+        # and pose reports. A grid cell absorbs translational quantisation.
+        if (math.hypot(current.x - previous.x, current.y - previous.y) > speed * gap_ms / 1000 + local_path.RESOLUTION
+                or abs(math.remainder(current.yaw - previous.yaw, math.tau)) > yaw_rate * gap_ms / 1000 + 1e-9):
+            return True
+    return False
+
+
+def _continuous_feedback_update(before, after, max_gap_ms, *, stationary):
+    """Verify overlapping, ordered feedback in one pose frame and an unchanged scene."""
     if before[0] != after[0] or before[2] != after[2]:
         return False
     old_twist, old_id, old_stamp, old_pose, old_obstacle, old_history = before[1]
     twist, sample_id, stamp, pose, obstacle, history = after[1]
     stopped = (0., 0., 0.)
-    if (old_twist != stopped or twist != stopped or old_id is None or sample_id is None
+    if (old_twist is None or twist is None or (stationary and not old_twist == twist == stopped)
+            or old_id is None or sample_id is None
             or not 0 < sample_id - old_id <= max_gap_ms or not old_history or not history
             or pose is None or old_pose is None or (stamp is None) != (old_stamp is None)
             or (stamp is not None and not 0 <= stamp - old_stamp <= max_gap_ms)):
         return False
+    rates = [row[2] for row in history if row[2] is not None]
+    if not rates:
+        return False
+    # Pose and speed are sampled separately. Even the entire allowed input
+    # gap at the largest measured rate must reach the new pose in this frame.
+    reach = max_gap_ms / 1000 * max(math.hypot(*v[:2]) for v in rates)
+    turn = max_gap_ms / 1000 * max(abs(v[2]) for v in rates)
     for previous, current in ((old_pose, pose), (old_obstacle, obstacle)):
         if previous is None and current is None:
             continue
         if (previous is None or current is None or not 0 <= current.stamp_ms - previous.stamp_ms <= max_gap_ms
-                or replace(previous, stamp_ms=current.stamp_ms) != current):
+                or previous.frame != current.frame
+                or ((stationary or previous.stamp_ms == current.stamp_ms)
+                    and replace(previous, stamp_ms=current.stamp_ms) != current)
+                or math.hypot(current.x - previous.x, current.y - previous.y) > reach
+                or abs(math.remainder(current.yaw - previous.yaw, math.tau)) > turn):
             return False
     if old_history[-1] not in history:
         return False
     overlap = history.index(old_history[-1]) + 1
-    if (history[:overlap] != old_history[-overlap:] or old_history[-1][1:] != (old_id, stopped)
-            or history[-1][1] != sample_id):
+    if (history[:overlap] != old_history[-overlap:] or old_history[-1][1:] != (old_id, old_twist)
+            or history[-1][1:] != (sample_id, twist)):
         return False
     receipt, source, _ = old_history[-1]
     for next_receipt, next_source, next_twist in history[overlap:]:
         if (next_source is None or not 0 <= next_source - source <= max_gap_ms
-                or not 0 <= next_receipt - receipt <= max_gap_ms or next_twist != stopped):
+                or not 0 <= next_receipt - receipt <= max_gap_ms or next_twist is None
+                or (stationary and next_twist != stopped)):
             return False
         receipt, source = next_receipt, next_source
     return True
@@ -2149,7 +2236,7 @@ class NaviPlugin:
                                  target=check.target, config=config, original_receipt=original_receipt)
 
     def _recheck_dwa_motion(self, check, values, max_age, now_ms, snapshot, *, renew, diagnostics,
-                            handoff_deadline_ms=None):
+                            handoff_deadline_ms=None, bounds_only=False):
         """Reuse the selected physical proof within its window or rebuild a complete stop."""
         config, state = self._config, self._state
         scan, guard = state.active_scan, check.motion_guard
@@ -2197,6 +2284,8 @@ class NaviPlugin:
         command = tuple(values[i] for i in (0, 1, 5))
         previous = self._wire_twist if self._wire_twist is not None else check.previous_twist
         revision = _motion_inputs(objects, depth, odom)
+        if _feedback_pose_jump(check.input_revision, revision, config.max_feedback_gap_ms, config):
+            return reject("geometry_mismatch")
         sources = policy_mod.dwa_scene_sources(scan, now_ms, odom)
         memory_revision = sources.revision
         target_revision = policy_mod.dwa_target_revision(state)
@@ -2311,9 +2400,36 @@ class NaviPlugin:
                                            latency_s=admission, geometry=geometry, mode=guard.footprint.mode,
                                            acceleration=motion._DEFAULT_ACCELERATION, braking=motion._DEFAULT_BRAKING)
         result = motion.evaluate_motion(
-            prediction, footprint=guard.footprint, occupied=occupied, remembered=remembered,
+            prediction, footprint=guard.footprint, occupied=() if bounds_only else occupied,
+            remembered=() if bounds_only else remembered,
             supported_region=local_path.SUPPORTED_REGION, original_goal=goal,
             stop_distance_m=config.stop_distance_m + goal_error)
+        if bounds_only and result.accepted:
+            # A separated bounding box proves the complete swept stop is clear,
+            # including each cell's radius and its *new* registration uncertainty.
+            (lo_f, lo_r), (hi_f, hi_r) = result.swept_bounds
+            def nearby(layers):
+                close = []
+                for layer in layers:
+                    if layer is None or not layer.centers.size:
+                        continue
+                    extent = (local_path.RESOLUTION / 2 * (abs(math.cos(layer.yaw)) + abs(math.sin(layer.yaw)))
+                              + layer.alignment_error + 1e-9)
+                    f, r = layer.centers.T
+                    mask = ((lo_f - extent <= f) & (f <= hi_f + extent)
+                            & (lo_r - extent <= r) & (r <= hi_r + extent))
+                    if mask.any():
+                        close.append(layer if mask.all() else replace(layer, centers=layer.centers[mask]))
+                return tuple(close)
+
+            near_observed, near_remembered = nearby(occupied), nearby(remembered)
+            if near_observed or near_remembered:
+                result = motion.evaluate_motion(
+                    prediction, footprint=guard.footprint, occupied=near_observed, remembered=near_remembered,
+                    supported_region=local_path.SUPPORTED_REGION, original_goal=goal,
+                    stop_distance_m=config.stop_distance_m + goal_error)
+            # Culled cells can still have been closest. Keep a conservative lower bound.
+            result = replace(result, min_clearance_m=min(0., result.min_clearance_m))
         if live_point is not None:
             point = local_path.target_in_grid(geometry, *live_point)
             front_constraint = tuple(view.points(point)), view.error(math.hypot(*point))
@@ -2357,6 +2473,22 @@ class NaviPlugin:
                         front_required=check.front_required if target_pending else front_required,
                         guard_horizon_s=prediction.duration)
         return obs_ms, deadline, True, newer
+
+    def _new_observation_after_duplicate(self, check, depth, odom, objects_ms, latest, now_ms):
+        """Recover a slow first plan only with a newly measured, associated detection."""
+        guard = check.planning_guard
+        track, anchor = self._state.tracker.track, self._state.goal_anchor
+        source = observation_source(latest[0])
+        if (guard is None or guard.probe_region or guard.association is not None or track is None
+                or not track.observed or track.accepted_detection or not track.navigation_range_known
+                or track.generation != guard.generation or track.source is None or check.target_source != track.source
+                or (anchor is not None and (anchor.generation != track.generation or anchor.target_missing))
+                or source is None or source <= track.source or not objects_ms < latest[3] <= now_ms):
+            return None
+        measured = policy_mod.target_body_pose(guard.checked_ms, odom, guard.measured, depth.get("obstacle_capture_pose"))
+        guard = replace(guard, association=track.snapshot(guard.checked_ms), association_pose=measured)
+        return replace(check, planning_guard=guard, motion_guard=guard, target_receipt_ms=objects_ms,
+                       target_ms=objects_ms, renewable=True)
 
     def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False,
                          snapshot=None, diagnostics=None, renew=True, handoff_deadline_ms=None):
@@ -2578,20 +2710,33 @@ class NaviPlugin:
                          and values == decision.values else None)
         short_prefix = (prefix_deadline is not None
                         and prefix_deadline - now_ms <= 2000 * control_period_s)
-        if (forward_check is not None and forward_check.renewable and bounded_age
+        latest = None
+        recheck = forward_check
+        if (bounded_age and short_prefix and origin is not None and not origin.acceptance.angle_controlled
+                and forward_check is not None and not forward_check.renewable):
+            latest = self._observation_snapshot(with_capture_timing=True)
+            recheck = self._new_observation_after_duplicate(forward_check, depth, odom, objects_ms, latest, now_ms)
+        if (recheck is not None and recheck.renewable and bounded_age
                 and (short_prefix or obs_ms + max_age - now_ms < 1000 * control_period_s)):
             original_deadline = min(obs_ms + max_age, now_ms + self._ttl_ms)
             if prefix_deadline is not None:
                 original_deadline = min(original_deadline, prefix_deadline)
             recheck_diagnostics = {}
-            refreshed = self._recheck_forward(forward_check, values, max_age, now_ms,
-                                              allow_same_depth=short_prefix, diagnostics=recheck_diagnostics)
+            if recheck is forward_check:
+                refreshed = self._recheck_forward(recheck, values, max_age, now_ms, allow_same_depth=short_prefix,
+                                                  diagnostics=recheck_diagnostics)
+            else:
+                refreshed = self._recheck_dwa_motion(recheck, values, max_age, now_ms, latest, renew=True,
+                                                     diagnostics=recheck_diagnostics, bounds_only=True)
             now = time.time()
             now_ms = int(now * 1000)
             stale = max_age <= now_ms - obs_ms
             if refreshed is not None and refreshed[0] <= now_ms < refreshed[1]:
                 checked_obs_ms, checked_deadline, clear, newer = refreshed
-                if clear and checked_deadline > original_deadline:
+                if (clear and checked_deadline > original_deadline and (recheck is forward_check or (
+                        newer.target_ms == latest[3] and newer.target_source == observation_source(latest[0])))):
+                    if recheck is not forward_check:
+                        origin = replace(origin, acceptance=replace(origin.acceptance, motion_guard=newer.motion_guard))
                     obs_ms, recheck_deadline, forward_check = checked_obs_ms, checked_deadline, newer
                     recheck_note = "已用新深度复检" if newer.frame_id != depth["frame_id"] else "已用新反馈复检"
                     decision.reason = f"{decision.reason}，{recheck_note}"
@@ -2714,7 +2859,7 @@ class NaviPlugin:
             self._command_window = (0., 0.)
         self._remember_decision(message, epoch, action_id, publication_veto if origin is None else None)
         if self._config.local_controller == "dwa":
-            log.info("navi dwa decision: %s", json.dumps(self._state.dwa_trace, ensure_ascii=False))
+            log.info("navi dwa decision: %s", _decision_log(self._state.dwa_trace))
         return message
 
     def _command_message(self, values, now, obs_ms):
@@ -3066,14 +3211,34 @@ class NaviPlugin:
             checked_receipt = snapshot[3]
             snapshot = self._observation_snapshot(with_capture_timing=True)
             revision = _motion_inputs(*snapshot[:3])
-            same_scene = revision == newer.input_revision or (
-                checked_receipt == snapshot[3] and _stationary_feedback_update(
-                    newer.input_revision, revision, min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)))
-            if (same_scene and newer.matches_target_receipt(snapshot[3])
-                    and (not renew or snapshot[3] == newer.target_receipt_ms)
-                    and policy_mod.dwa_memory_revision(self._state.active_scan, now_ms) == newer.memory_revision
+            if (newer.matches_target_receipt(snapshot[3]) and (not renew or snapshot[3] == newer.target_receipt_ms)
+                    and _only_expired_views(newer.memory_revision, policy_mod.dwa_memory_revision(
+                        self._state.active_scan, now_ms), now_ms)
                     and policy_mod.dwa_target_revision(self._state) == newer.target_revision):
-                return None, checked
+                gap = min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)
+                if revision == newer.input_revision or (checked_receipt == snapshot[3] and _continuous_feedback_update(
+                        newer.input_revision, revision, gap, stationary=True)):
+                    return None, checked
+                if (checked_receipt == snapshot[3] and _continuous_feedback_update(
+                        newer.input_revision, revision, gap, stationary=False)):
+                    # Depth and target stayed fixed while odometry advanced. Reuse
+                    # the projected pixels, register every layer on the new pose and
+                    # recheck the latest complete stop inside the existing deadline.
+                    guard = newer.motion_guard
+                    fixed = (replace(newer, motion_guard=replace(guard, deadline_ms=checked[1]))
+                             if guard.deadline_ms > checked[1] else newer)
+                    compact = self._recheck_dwa_motion(fixed, values, max_age, now_ms, snapshot, renew=False,
+                                                       diagnostics={}, handoff_deadline_ms=handoff_deadline,
+                                                       bounds_only=True)
+                    if compact is not None and compact[2]:
+                        latest = self._observation_snapshot(with_capture_timing=True)
+                        now_ms = int(time.time() * 1000)
+                        if (compact[0] <= now_ms < compact[1] and _motion_inputs(*latest[:3]) == revision
+                                and latest[3] == snapshot[3] and _only_expired_views(compact[3].memory_revision,
+                                    policy_mod.dwa_memory_revision(self._state.active_scan, now_ms), now_ms)
+                                and policy_mod.dwa_target_revision(self._state) == compact[3].target_revision):
+                            return None, compact
+                        snapshot = latest
             check = newer
         return "stale_observation", None
 

@@ -764,7 +764,14 @@ class GridTransform:
 def array_revision(array):
     if array is None:
         return None
-    return array.shape, array.dtype.str, hash(array.tobytes())
+    # The depth decoder owns immutable bytes. Hash the backing allocation so
+    # Python reuses its digest when the two timers inspect the same exposure.
+    backing = array.base
+    if isinstance(backing, np.ndarray):
+        backing = backing.base
+    if not (isinstance(backing, bytes) and array.flags.c_contiguous and array.nbytes == len(backing)):
+        backing = array.tobytes()
+    return array.shape, array.dtype.str, hash(backing)
 
 
 def clearance_margin(half_width):

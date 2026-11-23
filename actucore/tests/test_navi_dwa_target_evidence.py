@@ -1023,3 +1023,34 @@ def test_visible_person_without_front_fix(monkeypatch, box_depth, can_advance, v
         assert packets[-1]["values"][1:] == [0.] * 5
     else:
         assert packets[-1]["values"] == [0.] * 6
+
+
+@pytest.mark.parametrize("update", ["match", "same", "unrelated", "blocked", "future_receipt"])
+def test_slow_duplicate_plan_uses_independent_new_target_and_physical_check(monkeypatch, update):
+    from plugins.navi import policy
+
+    card, packets, clock, snapshot, _ = selected_card(monkeypatch, live_target=True)
+    old_objects = snapshot[0][0]
+    advance_snapshot(snapshot, clock, 1100)
+    step = policy.step
+
+    def slow_step(**kwargs):
+        decision = step(**kwargs)
+        assert decision.dwa_acceptance is not None and not decision.dwa_acceptance.target_observed
+        assert card._state.tracker.track.observed and not card._state.tracker.track.accepted_detection
+        advance_snapshot(snapshot, clock, 1480, obstacle=update == "blocked")
+        _, depth, odom, _ = snapshot[0]
+        objects = old_objects if update == "same" else dict(old_objects, timestamp=1.47)
+        if update == "unrelated":
+            objects = dict(objects, objects=[])
+        snapshot[0] = objects, depth, odom, {"same": 1000, "future_receipt": 1580}.get(update, 1470)
+        return decision
+
+    monkeypatch.setattr(policy, "step", slow_step)
+    message = card.next_command()
+    card._publish_command(message)
+    assert (packets[-1]["values"][0] > 0.) == (update == "match")
+    if update == "match":
+        assert packets[-1]["obs_stamp_ms"] == 1470
+        assert card._wire_dwa_origin.forward_check.target_source == 1.47
+    assert not card._state.tracker.track.accepted_detection
