@@ -386,6 +386,7 @@ class ActiveScan:
     buffered_odom: bool = False
     pose_origin: PlanarPose | None = None
     pose_registration: tuple[PlanarPose, PlanarPose] | None = None
+    pose_reference_missing: bool = False
     pose_feedback_since_ms: int = 0
     control_ms: int = 0
     turn_stop_ms: int | None = None
@@ -421,6 +422,41 @@ class ActiveScan:
     def buffered_turn(self):
         return (self.receipt_only and self.buffered_odom and self.pose_origin is None
                 and self.advance_m is not None and self.phase == "turn")
+
+    def relative_inputs_after_pose_gap(self, depth, odom):
+        """Keep camera-relative planning on its measured frame after optional pose restarts."""
+        if (not self.pose_reference_missing or not self.receipt_only or self.pose_registration is None
+                or not self.poses or not odom):
+            return depth, odom
+        expected = self.pose_registration[1].frame
+        absolute = odom.get("obstacle_pose") or odom.get("motion_pose")
+        if absolute is None or absolute.frame == expected:
+            return depth, odom
+        history = odom.get("velocity_history")
+        if not history or planar_feedback({axis: odom.get(axis) for axis in ("vx", "vy", "wz")}) is None:
+            return depth, odom
+        previous, previous_source = self.poses[-1][0], self.odom_source
+        received = odom.get("received_ms")
+        if received is None or not 0 <= received - previous <= self.max_feedback_gap_ms:
+            return depth, odom
+        for stamp, source, twist in history:
+            if previous < stamp <= received:
+                if twist is None or (source is not None and previous_source is not None
+                                     and not 0 <= source - previous_source <= self.max_feedback_gap_ms):
+                    return depth, odom
+                previous = stamp
+                if source is not None:
+                    previous_source = source
+        if previous != received:
+            return depth, odom
+        odom = dict(odom)
+        odom.pop("obstacle_pose", None)
+        odom.pop("motion_pose", None)
+        capture = (depth or {}).get("obstacle_capture_pose")
+        if capture is not None and capture.frame != expected:
+            depth = dict(depth)
+            depth.pop("obstacle_capture_pose")
+        return depth, odom
 
     def update(self, depth, odom, geometry, *, receipt_only=False, max_depth_age_ms=500, follow_leg=False):
         """Update measured motion and the latest usable depth observation."""
@@ -484,6 +520,11 @@ class ActiveScan:
                 paired = self._pose_at(absolute.stamp_ms)
                 if paired is not None:
                     self.pose_registration = self._relative_near_pose(absolute.stamp_ms, paired), absolute
+            if self.pose_registration is not None:
+                if absolute is None and history:
+                    self.pose_reference_missing = True
+                elif absolute is not None and absolute.frame == self.pose_registration[1].frame:
+                    self.pose_reference_missing = False
         timeout = 2 * SCAN_TIMEOUT_MS if self.receipt_only else SCAN_TIMEOUT_MS
         if self.phase in ("brake", "turn", "return") and stamp - self.start_ms > timeout:
             return self.interrupt("主动观察：观测超时，停车")
@@ -577,6 +618,7 @@ class ActiveScan:
         self.dwa_failures, self.dwa_view = 0, None
         self.motion_frame = object()
         self.pose_registration = None
+        self.pose_reference_missing = False
         self.poses.clear()
         return hold
 
@@ -1382,6 +1424,7 @@ class ActiveScan:
         self.pose = (0., 0., 0.)
         self.pose_origin = None
         self.pose_registration = None
+        self.pose_reference_missing = False
         self.registered_history = ()
         self.pose_feedback_since_ms = 0
         self.turn_stop_ms = None

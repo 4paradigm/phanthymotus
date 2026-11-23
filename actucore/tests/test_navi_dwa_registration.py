@@ -65,6 +65,33 @@ def test_absolute_frame_reset_cannot_relabel_relative_occupied_history(field):
     assert state.dwa_trace['fallback_reason'] == 'geometry_mismatch'
 
 
+@pytest.mark.parametrize("mount_fallback", [False, True])
+@pytest.mark.parametrize("complete_twist", [False, True])
+def test_relative_feedback_bridges_optional_absolute_pose_after_a_dropout(mount_fallback, complete_twist):
+    config, state, sample, step = measured_case()
+    assert step(0)[0].dwa_acceptance
+    assert step(1, absolute=True)[0].dwa_acceptance
+    assert step(2)[0].dwa_acceptance
+    old_reference = state.active_scan.pose_registration
+    new_world = ("restarted_odom", *WORLD[1:])
+    depth, odom = sample(3, absolute=True, frame=new_world)
+    if mount_fallback:
+        depth["body_mount_required"] = True
+        state.use_body_mount = False
+    if not complete_twist:
+        odom.update(wz=None, pose_feedback=(.1, 0., 0.))
+    result = policy.step(detections=None, depth=depth, odom=odom, config=config,
+                         state=state, dt=.1, dwa_admission_ms=100)
+    if not complete_twist:
+        assert result.dwa_acceptance is None
+        assert state.dwa_trace["fallback_reason"] == "geometry_mismatch"
+        return
+    assert result.dwa_acceptance is not None
+    assert state.active_scan.pose_registration == old_reference
+    assert result.dwa_acceptance.motion_guard.pose.frame == WORLD
+    assert state.active_scan.registered_history
+
+
 @pytest.mark.parametrize("offset_ms", [-1000, 1000])
 def test_uncovered_absolute_time_cannot_register_old_relative_obstacles(offset_ms):
     _, state, _, step = measured_case()

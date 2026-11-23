@@ -1905,6 +1905,7 @@ class NaviPlugin:
                         odom["velocity_history"] = tuple(self._velocity_history)
                 if self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
                     odom = {**odom, "stamp_ms": self._odom_ms}
+        depth, odom = policy_mod.camera_odometry_inputs(self._config, self._state, depth, odom)
         return objects, depth, odom, objects_ms
 
     def _forward_check(self, decision, previous_twist, depth, odom, objects_ms, *, renewable=True,

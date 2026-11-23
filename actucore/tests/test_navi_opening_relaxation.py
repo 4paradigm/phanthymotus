@@ -111,3 +111,15 @@ def test_legacy_opening_gate_keeps_its_original_target_line_rule(body):
     frame, geometry, plane, grid = _scene(body=body)
     assert local_path.opening_route(frame, grid[1], geometry, .22, plane, (3., 0.)) is not None
     assert local_path.opening_route(frame, grid[1], geometry, .22, plane, (3., 1.2)) is None
+
+
+def test_checked_opening_can_search_past_the_nearest_obstacle_plane():
+    frame, geometry, _, (_, occupied) = _scene(body=False)
+    # A near hit controls braking but does not locate the two jambs.
+    near = .25
+    occupied = occupied.copy()
+    occupied[np.argmin(np.abs(local_path.FORWARD[:, 0] - near)), local_path.START[1]] = True
+    route = local_path.opening_route(frame, occupied, geometry, .22, near, (3., 0.), True)
+    assert route is not None
+    assert route.points[-1][0] >= 1.
+    assert local_path.opening_route(frame, occupied, geometry, .22, near, (3., 0.)) is None

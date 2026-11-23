@@ -1155,6 +1155,22 @@ def opening_route(frame, occupied, geometry, half_width, plane, target, allow_de
     if (plane <= geometry.front or target is None or target[0] <= plane
             or geometry.horizontal is None or geometry.vertical is None or geometry.base_from_optical[0, 2] <= 0.):
         return None
+    route = _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour)
+    if route is not None or not allow_detour:
+        return route
+    # The nearest obstacle determines braking. Its depth can be the edge of a
+    # much nearer object, so it need not be a usable plane for checking jambs.
+    depths = FORWARD[occupied.any(axis=1), 0]
+    nearby = depths[(depths >= plane + RESOLUTION)
+                    & (depths < min(target[0], plane + 1.5))]
+    for probe in nearby[::2]:
+        route = _opening_at_plane(frame, occupied, geometry, half_width, probe, target, True)
+        if route is not None:
+            return route
+    return None
+
+
+def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour):
     band = occupied & (abs(FORWARD - plane) <= .10)
     cols = np.flatnonzero(band.any(axis=0))
     if allow_detour:

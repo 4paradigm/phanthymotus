@@ -1296,9 +1296,17 @@ def _band_of(bearing: float) -> str:
     return "center"
 
 
+def camera_odometry_inputs(config, state, depth, odom):
+    if (config.local_controller == "dwa" and config.scan_geometry is None
+            and (state.use_body_mount is False or not (depth or {}).get("body_mount_required"))):
+        return state.active_scan.relative_inputs_after_pose_gap(depth, odom)
+    return depth, odom
+
+
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float, control_period_s: float | None = None, command_dt_s: float | None = None,
          command_interrupted: bool = False, dwa_admission_ms: int = 0) -> Decision:
+    depth, odom = camera_odometry_inputs(config, state, depth, odom)
     state.dwa_admission_ms = dwa_admission_ms
     state.dwa_odom = odom if config.local_controller == "dwa" else None
     if config.local_controller == "dwa":
