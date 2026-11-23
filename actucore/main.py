@@ -147,6 +147,11 @@ class ActuCoreBundle:
             self._plugins.append(AutonomousTaskPlugin(plugins_cfg["autonomous_task"], executor))
             log.info("AutonomousTaskPlugin loaded")
 
+        if plugins_cfg.get("eef", {}).get("enabled", False):
+            from plugins.eef import EefPlugin
+            self._plugins.append(EefPlugin(plugins_cfg["eef"], executor))
+            log.info("EefPlugin loaded")
+
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 

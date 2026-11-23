@@ -1,16 +1,18 @@
 """Check the model boundary without a network or a ROS installation."""
 
+import base64
 import io
 import json
 import pathlib
 import sys
 import urllib.error
 import urllib.request
+from unittest.mock import Mock
 
 import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-from plugins.autonomous_task.model import InvalidDecisionError, Model
+from plugins.autonomous_task.model import InvalidDecisionError, Model, TransientModelError
 
 
 def message(text):
@@ -29,8 +31,8 @@ def reply(*items):
 
 def measured(**values):
     return {"control_interface": {"frame": "fixture_base",
-                                  "tip_frames": {"left": "left_tool", "right": "right_tool"},
-                                  "opening_m": [0., .115]}, **values}
+                                  "tip_frames": {"left": "left_tool", "right": "right_tool"}},
+            "opening_range_mm_by_arm": {"left": [0., 115.], "right": [0., 110.]}, **values}
 
 
 @pytest.fixture
@@ -56,12 +58,12 @@ def test_responses_request_uses_wired_rgb_state_history_and_selected_arm_tools(m
         assert body["model"] == "azure-openai/gpt-6-astra"
         assert body["parallel_tool_calls"] is False
         assert {tool["name"] for tool in body["tools"]} == {
-            f"{side}_{action}" for side in arms for action in ("move_to", "move_by", "set_gripper")}
+            f"{side}_{action}" for side in arms for action in ("move_by", "set_gripper")}
         for spec in body["tools"]:
             props = spec["parameters"]["properties"]
             assert "duration_s" not in props
             if spec["name"].endswith("_set_gripper"):
-                assert props["opening_mm"]["maximum"] == 115
+                assert props["opening_mm"]["maximum"] == (115 if spec["name"].startswith("left_") else 110)
                 assert props["opening_mm"]["minimum"] == 0
         content = body["input"][0]["content"]
         context = json.loads(content[0]["text"])
@@ -76,11 +78,10 @@ def test_responses_request_uses_wired_rgb_state_history_and_selected_arm_tools(m
 
 
 @pytest.mark.parametrize("bad", [
-    reply(call("right_move_to", {})),
+    reply(call("right_move_by", {"translation_m": [.01, 0, 0], "rotation_vector_rad": [0, 0, 0]})),
     reply(call("left_set_gripper", {"opening_mm": 0}), call("left_set_gripper", {"opening_mm": 85})),
     reply(call("left_move_by", {"translation_m": [.08, .08, 0], "rotation_vector_rad": [0, 0, 0]})),
     reply(call("left_move_by", {"translation_m": [0, 0, .01], "rotation_vector_rad": [.5, .5, 0]})),
-    reply(call("left_move_to", {"position_m": [1, 0, 0], "quaternion_xyzw": [1, 1, 0, 0]})),
     reply(call("left_move_by", {"translation_m": [0, 0, .01], "rotation_vector_rad": [0, 0, 0], "duration_s": 4})),
     reply(call("left_set_gripper", {"opening_mm": False})),
     reply(call("left_set_gripper", {"opening_mm": float("nan")})),
@@ -96,6 +97,26 @@ def test_rejects_incomplete_ambiguous_or_out_of_contract_decisions(monkeypatch, 
     monkeypatch.setattr(model, "_post", lambda body: bad)
     with pytest.raises(ValueError):
         model.decide("lift", ("left",), {"head": b"now"}, measured(), [])
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_rejects_retired_absolute_tool_even_on_an_enabled_arm(monkeypatch, model, side):
+    pose = {"position_m": [.11, .23, .34], "quaternion_xyzw": [0, 0, 0, 1]}
+    monkeypatch.setattr(model, "_post", lambda body: reply(call(f"{side}_move_to", pose)))
+    with pytest.raises(ValueError, match="tools offered"):
+        model.decide("lift", ("left", "right"), {"head": b"now"}, measured(), [])
+
+
+def test_truncated_tool_call_requires_reobservation_even_if_arguments_look_complete(monkeypatch, model):
+    response = {**reply(call("left_set_gripper", {"opening_mm": 20})), "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"}}
+    monkeypatch.setattr(model, "_post", lambda _: response)
+    with pytest.raises(InvalidDecisionError, match="max_output_tokens"):
+        model.decide("grasp", ["left"], {"head": b"now"}, measured(), [])
+    response["incomplete_details"]["reason"] = "content_filter"
+    with pytest.raises(ValueError, match="content_filter") as exc:
+        model.decide("grasp", ["left"], {"head": b"after"}, measured(), [])
+    assert not isinstance(exc.value, InvalidDecisionError)
 
 
 @pytest.mark.parametrize("decoration", ["{}", "```json\n{}\n```", "```\n{}\n```"])
@@ -179,9 +200,130 @@ def test_http_error_does_not_expose_provider_body(monkeypatch, model):
     def failed(request, timeout):
         raise urllib.error.HTTPError(request.full_url, 401, "test-key", {}, io.BytesIO(b"test-key"))
     monkeypatch.setattr(urllib.request, "urlopen", failed)
+    model.model_log = Mock()
     with pytest.raises(RuntimeError, match="HTTP 401") as exc:
         model.decide("lift", ("left",), {"head": b"now"}, measured(), [])
     assert "test-key" not in str(exc.value)
+    request_event, error_event = model.model_log.append.call_args_list
+    assert b"test-key" not in request_event.kwargs["raw_body"]
+    assert error_event.kwargs["provider_response"]["body"] == "[REDACTED]"
+
+
+def test_model_log_matches_actual_multimodal_requests_and_unparsed_responses(monkeypatch, model):
+    from PIL import Image
+
+    stream = io.BytesIO()
+    Image.new("RGB", (32, 32), "blue").save(stream, format="JPEG")
+    jpeg = stream.getvalue()
+    responses = [
+        {**reply(call("left_set_gripper", {"opening_mm": 18})), "id": "resp_1",
+         "usage": {"output_tokens": 42, "output_tokens_details": {"reasoning_tokens": 12}}},
+        {**reply(message("原始回复")), "id": "resp_2", "model": "wrong/model",
+         "provider_metadata": {"custom": ["完整保留", 3]}},
+    ]
+    model.model_log = Mock()
+    wire_requests = []
+    wire_responses = [("\n" + json.dumps(v, ensure_ascii=False, indent=2) + " \n").encode() for v in responses]
+    wire_responses[0] = wire_responses[0].replace(b'"output_tokens": 42', b'"output_tokens": 42.0e0')
+    def serve(request, timeout):
+        index = len(wire_requests)
+        body = json.loads(request.data)
+        wire_requests.append(request.data)
+        calls = model.model_log.append.call_args_list
+        assert len(calls) == 2 * index + 1
+        assert calls[-1].args == ("request",) and calls[-1].kwargs["payload"] == body
+        assert calls[-1].kwargs["raw_body"] is request.data
+        return io.BytesIO(wire_responses[index])
+    monkeypatch.setattr(urllib.request, "urlopen", serve)
+    assert model.decide("抓取", ["left"], {"head": jpeg}, measured(), [])[0] == "left_set_gripper"
+    with pytest.raises(ValueError, match="model_name"):
+        model.review("抓取", ["left"], {"left_wrist": jpeg}, measured(), [])
+    for i, phase in enumerate(("decide", "review")):
+        request_event, response_event = model.model_log.append.call_args_list[2*i:2*i+2]
+        assert request_event.kwargs == {"step": i+1, "phase": phase, "payload": json.loads(wire_requests[i]),
+                                        "raw_body": wire_requests[i]}
+        assert response_event.args == ("response",)
+        assert response_event.kwargs == {"step": i+1, "phase": phase, "payload": responses[i],
+                                         "raw_body": wire_responses[i]}
+        images = [part["image_url"] for part in json.loads(wire_requests[i])["input"][0]["content"]
+                  if part["type"] == "input_image"]
+        assert len(images) == i + 1  # Review contains both the initial and fresh observation.
+        for image in images:
+            prefix, data = image.split(",")
+            assert prefix == "data:image/jpeg;base64" and base64.b64decode(data, validate=True) == jpeg
+    assert len(model.model_log.append.call_args_list) == 4
+
+
+@pytest.mark.parametrize("case", ["rate_limit", "invalid_json", "binary", "connection"])
+def test_model_log_records_one_error_with_actual_http_body_when_available(monkeypatch, model, case):
+    rate_body = b'{"error": {"code":"busy", "message":"retry"}}'
+    error_body = b"<!doctype html>gateway unavailable"
+    binary_body = b"\xff\xfe\x00"
+    def serve(request, timeout):
+        if case == "connection":
+            raise urllib.error.URLError("unavailable")
+        if case == "rate_limit":
+            raise urllib.error.HTTPError(request.full_url, 429, "busy", {"X-Test": "private header"},
+                                         io.BytesIO(rate_body))
+        source = io.BytesIO(binary_body if case == "binary" else error_body)
+        source.status = 200
+        return source
+    monkeypatch.setattr(urllib.request, "urlopen", serve)
+    model.model_log = Mock()
+    expected = TransientModelError if case in ("rate_limit", "connection") else ValueError
+    with pytest.raises(expected) as exc:
+        model.decide("inspect", ["left"], {"head": b"frame"}, measured(), [])
+    request_event, *responses, error_event = model.model_log.append.call_args_list
+    assert request_event.args == ("request",) and error_event.args == ("error",)
+    fields = error_event.kwargs
+    assert (fields["phase"], fields["step"]) == ("decide", 1)
+    assert fields["error"] == {"type": type(exc.value).__name__, "message": str(exc.value)}
+    if case == "rate_limit":
+        response, = responses
+        assert response.args == ("response",)
+        assert response.kwargs == {"step": 1, "phase": "decide", "payload": json.loads(rate_body), "raw_body": rate_body}
+        assert fields["provider_response"] == {"http_status": 429}
+        return
+    assert not responses
+    if case == "connection":
+        assert "provider_response" not in fields
+    else:
+        status, body, encoding = {
+            "invalid_json": (200, error_body.decode(), "utf-8"),
+            "binary": (200, base64.b64encode(binary_body).decode(), "base64"),
+        }[case]
+        assert fields["provider_response"] == {"http_status": status, "body": body, "body_encoding": encoding}
+
+
+@pytest.mark.parametrize("body,headers,expected", [
+    (b'{"error":"test\\u002dkey"}', {}, "redacted"),
+    (b'{"retry":true}', {"Content-Length": "110"}, "partial"),
+    (b'{}' + b' ' * 40, {}, "partial"),
+    (b'{"invalid":NaN}', {}, "invalid"),
+    (b'null', {}, "null"),
+])
+def test_http_error_response_file_requires_a_complete_json_body(monkeypatch, model, body, headers, expected):
+    monkeypatch.setattr("plugins.autonomous_task.model._MAX_RESPONSE_BYTES", 32)
+    def serve(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 503, "busy", headers, io.BytesIO(body))
+    monkeypatch.setattr(urllib.request, "urlopen", serve)
+    model.model_log = Mock()
+    with pytest.raises(TransientModelError):
+        model.decide("inspect", ["left"], {"head": b"frame"}, measured(), [])
+    _, *responses, error = model.model_log.append.call_args_list
+    details = error.kwargs["provider_response"]
+    if expected == "partial":
+        assert not responses and details["truncated"] is True
+    elif expected == "invalid":
+        assert not responses and details["body"] == body.decode()
+    else:
+        response, = responses
+        assert response.args == ("response",)
+        if expected == "null":
+            assert response.kwargs["payload"] is None and response.kwargs["raw_body"] == body
+        else:
+            assert details["credential_redacted"] is True
+            assert json.loads(response.kwargs["raw_body"]) == response.kwargs["payload"] == {"error": "[REDACTED]"}
 
 
 @pytest.mark.parametrize("retry_after_opening", [False, True])
@@ -234,11 +376,73 @@ def test_review_keeps_gripper_and_motion_evidence_after_recent_images_expire(mon
         expected = {"jaws_narrowed": (2, 3), "first_measured_tcp_translation": (3, 4),
                     "furthest_measured_tcp": (5, 6), "jaws_widened": (7, 8)}
     assert actual == expected
+    normal = payloads[-2]["input"][0]["content"]
+    evidence = json.loads(normal[0]["text"])["measured_event_observations"]
+    assert {e["measured_event"]: (e["before_observation"], e["after_observation"]) for e in evidence} == {
+        name: expected[name] for name in ("jaws_narrowed", "first_measured_tcp_translation")}
+    assert all(e["camera"] == "head" for e in evidence)
+    for event in evidence:
+        for key in ("before_observation", "after_observation"):
+            assert {"type": "input_text", "text": f"HISTORICAL observation {event[key]}: head RGB"} in normal
     labels = [p["text"] for p in parts[1:] if p["type"] == "input_text"]
     assert len(labels) <= 10
     for step in {1} | {i for pair in expected.values() for i in pair}:
         assert f"HISTORICAL observation {step}: head RGB" in labels
     assert labels[-1] == "CURRENT observation 21: head RGB"
+
+
+@pytest.mark.parametrize("cameras,expected_left,expected_right", [
+    (("head", "left_wrist", "right_wrist"), "left_wrist", "right_wrist"),
+    (("head", "left_wrist"), "left_wrist", "head"),
+    (("right_wrist",), "right_wrist", "right_wrist"),
+])
+def test_ordinary_decision_pairs_grasp_images_with_their_actual_arm_and_camera(
+        monkeypatch, model, cameras, expected_left, expected_right):
+    import base64
+
+    payloads = []
+    def post(payload):
+        payloads.append(payload)
+        return reply(message('{"status":"observe","reason":"compare visible contact surfaces"}'))
+    monkeypatch.setattr(model, "_post", post)
+    arms = ("left", "right")
+    history = []
+    states = {a: {"gripper": {"opening_mm": 60.}, "eef": {"position_m": [0., 0., 0.]}} for a in arms}
+    actions = {3: ("left", "set_gripper", {"opening_mm": 8.}),
+               4: ("left", "move_by", {"position_m": [0., .015, 0.]}),
+               6: ("right", "set_gripper", {"opening_mm": 10.}),
+               8: ("right", "move_by", {"position_m": [.02, 0., 0.]})}
+    for step in range(1, 16):
+        views = {c: f"{step}-{c}".encode() for c in cameras}
+        model.decide("inspect grasp", arms, views, measured(arms=states), history)
+        item = {"step": step, "tool": "observe"}
+        if step in actions:
+            arm, tool, actual = actions[step]
+            item.update(tool=f"{arm}_{tool}", feedback={"actual": actual, "status": "completed", "motion_sent": True})
+            states = {**states, arm: {**states[arm], "gripper" if tool == "set_gripper" else "eef": actual}}
+        history.append(item)
+
+    parts = payloads[-1]["input"][0]["content"]
+    evidence = json.loads(parts[0]["text"])["measured_event_observations"]
+    assert [(e["arm"], e["measured_event"], e["camera"], e["before_observation"], e["after_observation"])
+            for e in evidence] == [
+        ("left", "jaws_narrowed", expected_left, 3, 4),
+        ("left", "first_measured_tcp_translation", expected_left, 4, 5),
+        ("right", "jaws_narrowed", expected_right, 6, 7),
+        ("right", "first_measured_tcp_translation", expected_right, 8, 9)]
+    captions = [p["text"] for p in parts[1:] if p["type"] == "input_text"]
+    assert len(captions) == len(set(captions))
+    assert sum(s.startswith("HISTORICAL") for s in captions) <= 3 * len(cameras) + 4 * len(arms)
+    for label, image in zip(parts[1::2], parts[2::2]):
+        _, _, number, camera, _ = label["text"].split()
+        step = int(number.strip(":"))
+        assert base64.b64decode(image["image_url"].split(",")[1]) == f"{step}-{camera}".encode()
+        if 3 <= step <= 5:
+            assert camera == expected_left
+        elif 6 <= step <= 9:
+            assert camera == expected_right
+    assert f"HISTORICAL observation 4: {expected_left} RGB" in captions
+    assert len([s for s in captions if s.startswith("CURRENT observation 15:")]) == len(cameras)
 
 
 def test_observe_two_native_regions_with_fresh_full_views(monkeypatch, model):
@@ -270,7 +474,7 @@ def test_observe_two_native_regions_with_fresh_full_views(monkeypatch, model):
     assert [m["bbox_pixels"] for m in args["crops"]] == [[20, 15, 60, 45], [0, 0, 40, 30]]
     model.decide("move", ["left"], fresh, state, [])
     for payload in payloads:
-        assert {t["name"] for t in payload["tools"]} == {"left_move_to", "left_move_by", "left_set_gripper"}
+        assert {t["name"] for t in payload["tools"]} == {"left_move_by", "left_set_gripper"}
     parts = payloads[-1]["input"][0]["content"]
     historical = [i for i, p in enumerate(parts) if p.get("text", "").startswith("HISTORICAL native crop")]
     assert len(historical) == 2
@@ -319,10 +523,19 @@ def test_transient_model_retry_keeps_crop_source_step_and_takes_new_images(monke
             raise TransientModelError("timeout")
         return reply(message('{"status":"observe","reason":"核查最新全景"}'))
     monkeypatch.setattr(model, "_post", post)
+    model.model_log = Mock()
     model.decide("inspect", ["left"], {"head": stream.getvalue()}, measured(), [])
     with pytest.raises(TransientModelError):
         model.decide("inspect", ["left"], {"head": b"second"}, measured(), [])
     model.decide("inspect", ["left"], {"head": b"third"}, measured(), [])
+    events = model.model_log.append.call_args_list
+    assert [(event.args[0], event.kwargs["step"]) for event in events] == [
+        ("request", 1), ("response", 1), ("request", 2), ("error", 2), ("request", 3), ("response", 3)]
+    assert [event.kwargs["payload"] for event in events[::2]] == payloads
+    pngs = [part["image_url"] for part in events[4].kwargs["payload"]["input"][0]["content"]
+            if part.get("image_url", "").startswith("data:image/png;base64,")]
+    with Image.open(io.BytesIO(base64.b64decode(pngs[0].split(",")[1], validate=True))) as image:
+        assert image.format == "PNG" and image.size == (32, 32)
     for index, payload in enumerate(payloads[1:], start=2):
         texts = [p.get("text", "") for p in payload["input"][0]["content"]]
         detail, = [s for s in texts if s.startswith("HISTORICAL native crop ")]
@@ -401,7 +614,7 @@ def test_model_receives_unmoved_targets_and_can_select_a_new_approach_orientatio
 
 @pytest.mark.parametrize("tool,update,review", [
     ("left_set_gripper", {}, False),
-    ("left_move_to", {"status": "outcome_unknown"}, False),
+    ("left_move_by", {"status": "outcome_unknown"}, False),
     ("left_move_by", {"motion_sent": False}, False),
     ("left_move_by", {"feedback_frames": 1}, False),
     ("left_move_by", {"state_stamp_ms": 1000}, False),

@@ -30,17 +30,27 @@ def test_ports_and_binding_are_independent_of_order_and_missing_wires():
 def test_generic_topics_require_a_declared_or_configured_mount():
     args = {"input_topics": ["/a", "/robot/measure", "/b"],
             "camera_info": {"/a": {"id": "fixture/right_wrist", "format": "image/jpeg"}}}
-    assert resolve_inputs(args, {"head_topic": "/b"}) == (
+    assert resolve_inputs(args, {"head_topic": "/b", "state_topic": "/retired/observations"}) == (
         "/robot/measure", {"head": "/b", "right_wrist": "/a"})
-    with pytest.raises(ValueError, match="ambiguous"):
-        resolve_inputs(args, {})
-    with pytest.raises(ValueError, match="not connected"):
-        resolve_inputs(args, {"state_topic": "/unwired"})
-    with pytest.raises(ValueError, match="Conflicting"):
-        resolve_inputs(args, {"head_topic": "/a", "state_topic": "/robot/measure"})
-    with pytest.raises(ValueError, match="Unknown camera role for /b"):
-        resolve_inputs(args, {"state_topic": "/robot/measure"})
 
+    with pytest.raises(ValueError) as ambiguous:
+        resolve_inputs(args, {"state_topic": "/robot/measure"})
+    assert "state_topic" not in str(ambiguous.value)
+    assert "head_topic" in str(ambiguous.value)
+
+    identified = {**args, "input_topics": ["/a", "/robot/state/eef", "/b"]}
+    with pytest.raises(ValueError, match="Conflicting"):
+        resolve_inputs(identified, {"head_topic": "/a"})
+    with pytest.raises(ValueError, match="Unknown camera role for /b"):
+        resolve_inputs(identified, {})
+
+
+def test_state_connection_must_be_present_and_unique():
+    camera = {"input_topic": "/image", "camera_info": {"/image": {"id": "head_camera"}}}
+    with pytest.raises(ValueError, match="state/eef"):
+        resolve_inputs(camera, {})
+    with pytest.raises(ValueError, match="state/eef"):
+        resolve_inputs({"input_topics": ["/a/state/eef", "/b/state/eef"]}, {})
 
 
 class Node:

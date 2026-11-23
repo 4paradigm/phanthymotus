@@ -38,19 +38,15 @@ def resolve_inputs(args, cfg):
     declarations = args.get("camera_info") or {}
     if not isinstance(declarations, dict):
         raise ValueError("camera_info must be keyed by input topic")
-    state = cfg.get("state_topic")
-    if state:
-        if state not in topics:
-            raise ValueError(f"Configured state/eef topic {state} is not connected")
-    else:
-        camera_topics = {cfg.get(role + "_topic") for role in _LABELS}
-        candidates = [t for t in topics if t not in camera_topics and t not in declarations]
-        named = [t for t in candidates if t.endswith("/state/eef")]
-        if len(named or candidates) != 1:
-            raise ValueError("Connect one state/eef input; configure state_topic for ambiguous wiring")
-        state, = named or candidates
-    if state in declarations or any(cfg.get(role + "_topic") == state for role in _LABELS):
-        raise ValueError("A camera and state/eef cannot share the same input topic")
+    camera_topics = {cfg.get(role + "_topic") for role in _LABELS}
+    candidates = [t for t in topics if t not in declarations and t not in camera_topics]
+    if not candidates:
+        raise ValueError("Connect one state/eef input from the state card")
+    named = [t for t in candidates if t.endswith("/state/eef")]
+    if len(named or candidates) != 1:
+        raise ValueError("Cannot identify one state/eef input. Connect one state source and assign "
+                         "unidentified cameras using head_topic, left_wrist_topic or right_wrist_topic")
+    state, = named or candidates
     return state, resolve_cameras([t for t in topics if t != state], declarations, cfg)
 
 

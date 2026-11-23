@@ -12,38 +12,74 @@
 | 输入 4 | 末端状态 | `state/eef` | 连接上游 `eef_state` 的实测状态输出 |
 | 输出 1 | 末端控制 | `control/eef` | 连接下游 `servo_eef` 的绝对目标输入 |
 
-执行视觉任务至少接一路相机。相机数与启用哪只手可以独立选择。卡片只在决策和复核时取图，每次等已接入的各路相机提供新 JPEG。模型需要局部细节时可以请求原图裁剪。下一轮会同时看到注明来源的历史裁剪和新拍的全景。
+执行视觉任务至少接一路相机。相机数与启用哪只手可以独立选择。卡片只在决策和复核时取图，每次等已接入的各路相机提供新 JPEG。重新对准时，模型还可看到该臂最近一次闭爪和首次实测平移前后的成对历史图，优先使用对应腕部相机。模型需要局部细节时可以请求原图裁剪。下一轮会同时看到注明来源的历史裁剪和新拍的全景。
 
-TRON2 左臂实验接入 `camera`、`camera_left` 和 `/limx_tron2/state/eef`，输出连到 `/limx_tron2/control/eef`。驱动的 `control_interface` 给出消息版本、参考系、左右 TCP 名称、各组起点和长度，以及开口范围。如需显式指定接线，可使用 `head_topic`、`left_wrist_topic`、`right_wrist_topic`、`state_topic` 和 `control_topic`。
+在画布上将 `eef_state` 的 `state/eef` 输出接到本卡，再把本卡的 `control/eef` 输出接到 `servo_eef`。启动时，本卡订阅上游状态话题，`servo_eef` 沿连线订阅本卡发布的 `/actucore/autonomous_task/control/eef`。驱动的 `control_interface` 给出消息版本、参考系、左右 TCP 名称、各组起点和长度，以及开口范围。TRON2 左臂实验还接入头部和左腕相机。相机声明了安装位置时会自动识别；位置不明确时，在 `head_topic`、`left_wrist_topic` 或 `right_wrist_topic` 中填写对应的已接话题。
 
-在卡片配置中填写 `base_url`、`key` 和 `model_name`。模型服务须提供支持图像和函数调用的 Responses API。`arm_mode` 默认为 `left`，也可选 `right` 或 `both`。可用 `frame_description` 说明当前安装中已知的坐标轴方向、夹爪和视角约定，模型每一轮都能读到。需要留存实验时，可在部署 YAML 中设置 `record_dir`。卡片按任务保存模型看到的 JPEG、动作与观测记录、最终状态。
+在左侧工具栏打开 `autonomous_task` 的设置齿轮，依次填写 **LLM API URL**、**LLM API Key**、**LLM 模型名称**。在 Settings 保存 Key 后，再次打开时密码框显示圆点；更换 Key 时在同一框内输入新值并保存。模型服务须提供支持图像和函数调用的 Responses API。
+
+在同一设置中选择 `arm_mode`，可选 `left`（默认）、`right` 或 `both`。这些设置及相机映射、`frame_description` 均由同一 ActuCore 服务的 `autonomous_task` 卡片共享。每个新任务使用提交时的手臂模式。可用 `frame_description` 说明安装中的坐标轴方向、夹爪和视角约定。需要留存实验时，可在部署 YAML 中设置 `record_dir`，按任务保存 JPEG、动作与观测记录和最终状态。
+
+从按实例保存配置的旧版升级时，将在用的设置保存到本工具的共享配置行，再清理旧实例行里的同名字段。Core 在启动时会重放已保存的配置，遗留的实例值可能覆盖新保存的共享值。
 
 ## MCP 调用
 
 启动画布后，通过 MCP 工具 `autonomous_task` 的 `submit` 提交任务。
 
 ```json
-{"action":"submit","instruction":"把胶带抓起来，向左移动约 5 厘米，再放下","arm_mode":"left","request_id":"tape-transfer-01"}
+{"action":"submit","instruction":"把胶带抓起来，向左移动约 5 厘米，再放下","request_id":"tape-transfer-01"}
 ```
 
-提交立即返回 `action_id`。用 `{"action":"status","action_id":"…","include_history":true}` 获取执行阶段、模型动作、实测回执和终态原因。用 `{"action":"cancel","action_id":"…"}` 取消后续决策。已发布目标的执行由下游控制。卡片一次接受一个任务，保留最近 32 个任务。重复提交相同 `request_id`、指令与模式时返回已有任务。启用归档后，重启可按原 `action_id` 查询已保存的终态和历史。上层也可以按 ActuCore 的 ACP 契约接收完成事件。
+提交立即返回 `action_id`。用 `{"action":"status","action_id":"…","include_history":true}` 获取执行阶段、模型动作、实测回执和终态原因。用 `{"action":"cancel","action_id":"…"}` 取消后续决策。卡片将受控组切换到最新实测位置保持。缺少新鲜反馈时，恢复后的首帧确定保持位置。卡片一次接受一个任务，保留最近 32 个任务。使用同一 `request_id` 和指令重试时，返回原任务及其当时的手臂模式。启用归档后，重启可按原 `action_id` 查询已保存的终态和历史。上层也可以按 ActuCore 的 ACP 契约接收完成事件。
+
+## 采集多模态训练数据
+
+每次接受新的 `submit` 时，卡片立即创建一个独立的会话目录，`submit` 和 `status` 的 `model_log_path` 返回容器内的目录路径。一次实际模型调用对应一个序号，从 `0001` 递增。复核、重新观察后的推理和重试各自占一轮。新任务从 `0001` 重新编号；复用已接受的 `request_id` 重试提交会返回已有任务。
+
+| 文件 | 内容 |
+|---|---|
+| `0000-session.json` | 格式版本 3、任务 ID、提交编号、原始指令、操作模式和开始时间。 |
+| `0001-request.json` | 发出第一轮请求前，写入实际 HTTP 请求正文。根对象就是模型 API 的请求，包含提示词、工具定义、输入文本和 Base64 图像。 |
+| `0001-response.json` | 收到并解析出完整 JSON 后，保存实际响应正文，包含模型输出及服务返回的其他字段。若服务以 HTTP 错误状态返回合法 JSON，也会保留响应。 |
+| `0001-tool-result.json` | 仅当本轮实际执行了工具时写入。通过 `call_id` 关联模型输出中的函数调用；`payload` 是工具原始返回值，抛出异常时记录 `error`。 |
+| `0001-error.json` | 本轮 HTTP 或响应解析失败时的本地诊断。没有收到完整合法的 JSON 时，只记录错误。 |
+| `0000-end.json` | 会话终态、结束原因和时间。 |
+
+每个文件都在写完整后一次性发布。请求与响应单独保存，按同一序号配对；推理进行中可以先读到请求。会话文件不包含 HTTP 鉴权头。服务错误正文意外回显已配置的 API 密钥时会作脱敏处理。工具在本地执行后的回执与模型看到的反馈可分别核对：当前卡片将后者放在下一次真实请求的 `input_text.text` 所含 JSON 的 `actual_action_history[*].feedback` 中。
+
+日志仅通过 SSH 从 Jetson 复制。默认容器目录为 `/models/autonomous_task/model_logs/<action_id>/`，标准部署下对应宿主机的 `/opt/embodied/models/autonomous_task/model_logs/<action_id>/`。部署 YAML 中的 `model_log_dir` 可指定其他持久卷，`record_dir` 单独控制动作归档。任务结束后，在本机将 `nvidia@jetson` 换为实际 SSH 地址，用提交时返回的 `action_id` 复制完整会话。
+
+```sh
+action_id='<submit 返回的 action_id>'
+ssh nvidia@jetson "docker exec embodied-actucore tar -C /models/autonomous_task/model_logs -czf - '$action_id'" > "$action_id.tar.gz"
+```
 
 ## 末端工具与实测反馈
 
-每只启用的手向模型提供以下工具，工具名带 `left_` 或 `right_` 前缀。双臂模式每轮仍只选一个工具。
+每只启用的手向模型提供两个工具，工具名带 `left_` 或 `right_` 前缀。双臂模式可用四个工具，每轮只选一个。
 
 | 工具 | 参数 | 目标 |
 |---|---|---|
-| `move_to` | `position_m`、`quaternion_xyzw` | TCP 在声明的参考系中的绝对位置（米）和姿态（xyzw 单位四元数） |
 | `move_by` | `translation_m`、`rotation_vector_rad` | 从本轮实测 TCP 出发，沿参考系轴平移，以 TCP 自身为中心按参考系旋转向量转动 |
 | `set_gripper` | `opening_mm` | 夹爪的名义开口（毫米），工具可用范围由下游声明 |
 
-相对目标按 `p' = p + Δp`、`R' = Exp(Δr) · R` 合成。模型推理期间手的位置发生明显变化时，卡片重新观测。卡片将一次相对决策限制在 10 厘米和 30 度内，实际限速、逆解和硬件下发由执行卡处理。工具使用观测中的 `eef_frame` 和 `reference_label`。`axes_in_reference` 给出 TCP 局部三根轴在参考系中的方向，可与实例声明的夹爪安装约定结合。例如 TRON2 的左右 TCP 分别是 `L_ee_link` 和 `R_ee_link`，两者都在 `base_Link` 中表达。当前反馈可以直接作为绝对目标。迁移旧版 TRON2 记录的 grasper 绝对位姿时，需要做一次参考点换算，`p_tcp = p_grasper + R_grasper × [-0.0021, 0, -0.1313] m`，四元数相同。
+相对目标按 `p' = p + Δp`、`R' = Exp(Δr) · R` 合成。模型推理期间手的位置发生明显变化时，卡片重新观测。卡片将一次相对决策限制在 10 厘米和 30 度内，实际限速、逆解和硬件下发由执行卡处理。工具使用观测中的 `eef_frame` 和 `reference_label`。`axes_in_reference` 给出 TCP 局部三根轴在参考系中的方向，可与实例声明的夹爪安装约定结合。TRON2 驱动报告的 TCP 名称为 `MoveP_left_TCP` 和 `MoveP_right_TCP`，参考系为 `base_Link`。其他设备使用各自描述符中的名称和参考系。
 
-对于 TRON2，`state/eef` 和 `control/eef` 两端都是 ROS 2 的 `std_msgs/String`，内容为带 `schema`、`frame`、`stamp_ms`、`values` 的 JSON。`tron2.eef/1` 的 16 项依次为左 TCP 的 xyz 和 xyzw、左开口、右 TCP 的 xyz 和 xyzw、右开口。线上位置和开口都使用米。每条指令生成递增的 Unix 毫秒时间戳。单臂操作也发送完整目标，保持静止的分组取自最新实测值。
+`autonomous_task` 与 `eef` 共用末端控制流实现。两张卡片分别作为 `servo_eef` 的控制源使用，同一条执行链应只连接其中一张。相机和模型推理频率独立于反馈流；等待模型时，控制流仍按驱动反馈刷新。
+
+| ROS 2 消息 | 内容 |
+|---|---|
+| `state/eef` | `std_msgs/String` 中的 `motus.eef/1` JSON。按描述符解读 `eef` 数组中的 TCP 位姿和开口，`stamp_ms` 为实测采样时间。 |
+| `control/eef` | `std_msgs/String` 中的 `motus.control/1` JSON。每次发布携带完整绝对目标 `values`、参考系、模式、维度、发布源、递增序号、发布时间、对应的实测采样时间和有效期。 |
+
+每次模型动作只设置一个目标。首次对一侧下令时，卡片从最新实测帧读入另一侧的 TCP 位姿和夹爪开口，并在同侧后续动作及视觉推理期间持续保持这组值。双臂任务切换操作侧时，按当时实测值保持刚退出操作的那只手。每帧命令携带最新观测的采样时间。选中侧未指定的分组仍取该帧实测值。
+
+启动后尚无目标时，卡片回显整帧实测值。任务结束或被取消时，原受控组切换到最新实测位置保持。若未选臂的 TCP 在连续推进的两帧实测中偏离保持位姿超过 10 毫米或 5 度，卡片停止发布整个控制流、返回具体原因。重新启动卡片可从新的实测位置建立控制流。硬件限速、运动分段和夹爪下发由驱动处理。
 
 卡片发令后等待时间戳推进的连续状态帧。回执的 `target_reached` 表示实测 TCP 与目标的位置、姿态误差均落入下游 `control_interface.pose_tolerance` 声明的范围。`position_m` 是位置误差的欧氏距离上限，`orientation_rad` 是相对旋转角的上限。旧版描述符省略该字段时，分别使用 1 毫米和 0.01 弧度。夹爪动作独立按开口误差 1 毫米判断到位。若夹爪接触物体后在目标开口之外稳定，模型会结合实际开口和下一轮视觉决定是否试提。
 
-指令已发布、持续有反馈而手没有移动时，回执会记录 `no_motion_observed`。缺测超时会返回具体原因。模型请求临时超时会重新观察再推理，连续三次推理无响应则结束任务。模型仅返回无法解析的文字时，卡片保留可见回复、重新取图，并在三次无有效决策后结束任务。
+卡片按最近一秒连续实测的运动范围和漂移判断停稳。动作停稳即可把实际结果交给模型，目标误差单独记录。若持续收到反馈但动作在 12 秒内仍未停稳，卡片将受控组切换到实测保持位置，再用新反馈确认停稳；保持后仍持续运动或失去反馈时返回具体失败原因。
+
+指令已发布、持续有反馈而手没有移动时，回执会记录 `no_motion_observed`。缺测超时会返回具体原因。模型请求临时超时会重新观察再推理，连续三次推理无响应则结束任务。模型回复因输出长度被截断时，卡片丢弃该轮动作并重新取图。仅返回无法解析的文字时保留可见回复。连续三次未得到有效决策时，卡片结束任务并记录原因。
 
 模型提出完成后，卡片等待 3 秒再取图，同一模型在无动作工具的情况下复核。复核可查看初始和最新图像，以及夹爪收紧后首次平移、搬运最远处和张开时的历史帧。对于搬运任务，模型须从图像确认物体曾随夹爪离开支撑面，并在目标位置独立放稳。证据不足时，模型可以继续观察、纠正或给出具体失败原因。
