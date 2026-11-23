@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PLATFORMS, getReadiness, getGuide, getGuideHelp, makeStreamUrl, makeXiaohongshuStreamUrl } from './platforms.js';
+import { PLATFORMS, getReadiness, getGuide, getGuideHelp, makeStreamUrl, makeXiaohongshuStreamUrl, makeOtherStreamUrl } from './platforms.js';
 import { callLiveStream, saveLiveStreamConfig, authorizeStoredLiveStream, startApprovedLiveStream } from './api.js';
 import { mountLiveStreamCard } from './card-ui.js';
 
@@ -19,13 +19,14 @@ test('card UI loads together with its API export contract', () => {
 });
 
 test('only supported platforms are selectable', () => {
-  assert.deepEqual(Object.keys(PLATFORMS), ['xiaohongshu', 'huya']);
+  assert.deepEqual(Object.keys(PLATFORMS), ['xiaohongshu', 'huya', 'other']);
 });
 test('all readiness branches are represented', () => {
   for (const platform of Object.keys(PLATFORMS)) {
-    assert.ok(getGuide(platform, 'new').length >= 5);
-    assert.ok(getGuide(platform, 'permission').length >= 4);
-    assert.ok(getGuide(platform, 'find').length >= 3);
+    const minimum = platform === 'other' ? { new: 5, permission: 3, find: 2 } : { new: 5, permission: 4, find: 3 };
+    assert.ok(getGuide(platform, 'new').length >= minimum.new);
+    assert.ok(getGuide(platform, 'permission').length >= minimum.permission);
+    assert.ok(getGuide(platform, 'find').length >= minimum.find);
     assert.deepEqual(getGuide(platform, 'ready'), []);
     for (const step of getGuide(platform, 'new')) {
       assert.ok(getGuideHelp(platform, step.title).length > 12);
@@ -147,6 +148,27 @@ test('rejects wrong hosts, incomplete parameters, cross-platform info, and inval
   assert.throws(() => makeStreamUrl('huya', 'https://tx.direct.huya.com/huyalive/123'));
   assert.throws(() => makeStreamUrl('huya', 'rtmp://tx.direct.huya.com/huyalive/'));
 });
+test('other platforms require a server address and a distinct stream key', () => {
+  const expected = 'rtmps://rtmp.youtube.com/live2/FAKE_STREAM_KEY';
+  assert.equal(makeOtherStreamUrl('rtmps://rtmp.youtube.com/live2', 'FAKE_STREAM_KEY'), expected);
+  assert.equal(makeStreamUrl('other', expected), expected);
+  assert.throws(() => makeOtherStreamUrl('', 'key'), /服务器地址/);
+  assert.throws(() => makeOtherStreamUrl('rtmp://rtmp.youtube.com/live2', ''), /推流码/);
+  assert.throws(() => makeOtherStreamUrl('rtmp://rtmp.youtube.com/live2', expected), /只填写密钥/);
+  assert.match(getGuide('other', 'find').at(-1).detail, /推流码/);
+});
+test('other platforms cannot target local networks or bypass dedicated platform rules', () => {
+  for (const host of ['localhost', 'localhost.local', '10.0.0.1', '127.0.0.1',
+    '169.254.169.254', '192.168.3.22', '[::1]', 'robot.internal',
+    'test.local', 'push.test', 'fake-live-push.xhscdn.com',
+    'live-push.xhscdn.com.evil.com', 'tx.direct.huya.com']) {
+    assert.throws(() => makeStreamUrl('other', `rtmp://${host}/live/key`), host);
+  }
+  assert.throws(() => makeStreamUrl('other', 'http://rtmp.youtube.com/live2/key'));
+  assert.throws(() => makeStreamUrl('other', 'rtmp://rtmp.youtube.com/live2/'));
+  assert.throws(() => makeStreamUrl('other', 'rtmp://rtmp.youtube.com/live2/key#fragment'));
+});
+
 test('config must be confirmed by Driver, not just HTTP 200', async () => {
   await stubFetch(async () => ({
     ok: true, json: async () => ({ code: 200, applied: false, ready_to_go_live: true }),
