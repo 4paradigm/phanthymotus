@@ -463,7 +463,7 @@ def ground_mask(depth_m: np.ndarray, horizontal, vertical) -> np.ndarray | None:
 
 def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
              reference_m: float, lateral_offset_m: float = 0.0,
-             intrinsics=None, ground=None):
+             intrinsics=None, ground=None, ignored_low_pixels=None):
     """Nearest obstacle inside a metric corridor, and how much of it was measured.
 
     Returns `(clearance_m | None, coverage)`. With floor returns only, clearance
@@ -524,6 +524,8 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
     # Ground returns still contribute to depth coverage. Holes remain unknown.
     if ground is not None:
         valid &= ~ground[top:bottom]
+    if ignored_low_pixels is not None:
+        valid &= ~ignored_low_pixels[top:bottom]
     samples = rows[valid]
     clearance = (round(float(np.percentile(samples, OBSTACLE_PERCENTILE)), 3)
                  if samples.size else None)

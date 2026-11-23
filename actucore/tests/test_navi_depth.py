@@ -695,3 +695,30 @@ def test_repeated_depth_revisions_preserve_pixel_order_and_mutable_edits():
     revision = array_revision(pixels)
     pixels[0, 0] += 1
     assert array_revision(pixels) != revision
+
+
+@pytest.mark.parametrize("wide", [False, True])
+def test_metric_clearance_uses_the_same_low_patch_as_the_planning_grid(wide):
+    from plugins.navi import local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    camera = HorizontalIntrinsics(640, 315, 337)
+    vertical = (480, 420, 243.2)
+    geometry = local_path.camera_square(camera, vertical, .275)
+    frame = _floor_scene()
+    columns = slice(180, 480) if wide else slice(318, 350)
+    frame[388:402, columns] = 1.02
+    ground = D.ground_mask(frame, camera, vertical)
+    assert ground is not None
+    config = policy.Config(local_geometry=geometry, depth_intrinsics=camera)
+    depth = {"map": frame, "ground": ground}
+    raw, coverage = _corridor(frame, ground=ground, intrinsics=camera,
+                              half_width_m=policy._keepout_m(config),
+                              reference_m=config.obstacle_stop_m)
+    assert raw == pytest.approx(1.02)
+    clearance, measured = policy._clearance(depth, config)
+    if wide:
+        assert clearance == raw
+    else:
+        assert clearance > 1.5
+    assert measured == coverage

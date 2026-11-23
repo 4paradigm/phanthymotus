@@ -2690,13 +2690,19 @@ def _clearance(depth, config: Config, lateral_offset_m: float = 0.0):
         band = ("center" if abs(lateral_offset_m) < 1e-6
                 else "right" if lateral_offset_m > 0 else "left")
         return bands.get(band), 1.0
+    geometry = config.scan_geometry or config.local_geometry
+    ignored = None
+    if geometry is not None and depth.get("ground") is not None:
+        grid = local_path.project_observation(depth, geometry, require_valid_depth=True)
+        ignored = getattr(grid, "ignored_low_pixels", None)
     return depth_mod.corridor(depth["map"],
                               half_width_m=_keepout_m(config),
                               half_fov_rad=config.half_fov_rad,
                               reference_m=config.obstacle_stop_m,
                               lateral_offset_m=lateral_offset_m,
                               intrinsics=config.depth_intrinsics,
-                              ground=depth.get("ground"))
+                              ground=depth.get("ground"),
+                              ignored_low_pixels=ignored)
 
 
 def forward_stop_line(config, speed):

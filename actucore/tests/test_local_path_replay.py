@@ -41,7 +41,8 @@ def test_near_ground_projection_distinguishes_floor_endpoints_from_missing_or_we
 
 
 @pytest.mark.parametrize("height,calibrated,blocked", [
-    (.022, False, False), (.043, False, False), (.08, False, True), (.043, True, True),
+    (.08, False, False), (.08, True, False), (.099, False, False), (.099, True, False),
+    (.101, False, True), (.101, True, True),
 ])
 def test_camera_grid_distinguishes_near_floor_depth_noise_from_a_low_obstacle(height, calibrated, blocked):
     horizontal = HorizontalIntrinsics(640, 315, 337)
@@ -62,7 +63,8 @@ def test_camera_grid_distinguishes_near_floor_depth_noise_from_a_low_obstacle(he
     center = (abs(replay.RIGHT) <= .05) & (replay.FORWARD > .75) & (replay.FORWARD < 1.12)
     assert bool((occupied & center).any()) is blocked
     if not blocked:
-        patch_cell = replay.START[0] + 20, replay.START[1]
+        sample = frame[417, 332]
+        patch_cell = replay.START[0] + round(sample / replay.RESOLUTION), replay.START[1]
         assert free[patch_cell] and not replay.confirmed_free(grid)[patch_cell]
 
 
@@ -493,7 +495,7 @@ def test_pose_aligned_scan_uses_only_obstacles_at_the_current_pose(monkeypatch):
     ("weak_speckle", 0),
     ("low_single", 0),
     ("low_pair", 0),
-    ("low_strip", 5),
+    ("low_strip", 0),
     ("thin_leg", 1),
     ("near_obstacle", 1),
 ])
@@ -600,10 +602,10 @@ def test_camera_projection_drops_small_low_patches_but_keeps_the_taller_rod(case
 
 
 @pytest.mark.parametrize("heights,remaining", [
-    ((.09,), 0), ((.09, .09, .09), 0), ((.09,) * 4, 4),
-    ((.09, .10, .09), 3), (None, 3),
+    ((.09,), 0), ((.09, .09, .09), 0), ((.09,) * 4, 0),
+    ((.09, .10, .09), 3), ((np.nextafter(.10, 0.),), 0), ((.10,), 1), (None, 3),
 ])
-def test_low_components_use_diagonal_connectivity_and_strict_height_limit(heights, remaining):
+def test_small_low_components_with_or_without_tall_support(heights, remaining):
     n = len(heights) if heights is not None else 3
     horizontal = HorizontalIntrinsics(640, 480, 320)
     geometry = replay.camera_square(horizontal, (480, 480, 240), .275, at_front=True)
@@ -651,3 +653,80 @@ def test_clear_straight_goal_uses_its_grid_path_without_expanding_neighbors(monk
     path = replay.shortest_path(allowed, (2, 4), (14, 4), target_cells=goals, target_cost=ranks,
                                 cell_cost=np.zeros_like(allowed, dtype=float))
     assert path == [(r, 4) for r in range(2, 15)]
+
+
+@pytest.mark.parametrize("surface,remaining", [
+    ("small", 0), ("broad", 20), ("long", 10), ("boundary", 4), ("raised_leg", 5), ("overhead", 1),
+])
+def test_low_occupancy_uses_entire_metric_component(surface, remaining):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 480, 320), (480, 480, 240), .275)
+    shape = {"small": (4, 4), "broad": (4, 5), "long": (1, 10)}.get(surface, (2, 2))
+    rc = [(30+i, 20+j) for i in range(shape[0]) for j in range(shape[1])]
+    if surface == "boundary":
+        rc = [(i-30, j) for i, j in rc]
+    heights = [.09] * len(rc)
+    if surface in ("raised_leg", "overhead"):
+        rc.append((32, 22))
+        heights.append(.12 if surface == "raised_leg" else 1.50)
+    rows, cols = np.asarray(rc).T
+    f = np.repeat(replay.FORWARD[rows, cols], 8)
+    r = np.repeat(replay.RIGHT[rows, cols], 8)
+    grid = replay._project_observed(geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION,
+        r, np.zeros_like(f), f, np.ones(len(f), bool), check_free_space=True,
+        heights=np.repeat(heights, 8), pixel_samples=np.ones((len(rc), 8), bool))
+    assert int(grid[1].sum()) == remaining
+    mask = getattr(replay.frozen_grid(grid), "ignored_low_pixels", None)
+    if remaining < len(rc):
+        assert mask is not None and not mask.flags.writeable
+        assert mask[:len(rc)-remaining].all() and not mask[len(rc)-remaining:].any()
+    else:
+        assert mask is None
+
+
+def test_depth_cutoff_preserves_the_visible_edge_of_a_large_low_platform():
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 480, 320), (480, 480, 240), .275)
+    rows, cols = np.indices((5, 5))
+    f = np.repeat(1. + rows.ravel() * .05, 8)
+    r = np.repeat(cols.ravel() * .05, 8)
+    grid = replay._project_observed(geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION,
+        r, np.zeros_like(f), f, np.ones(len(f), bool), check_free_space=False,
+        heights=np.full(len(f), .09), max_hit_depth=1.01)
+    assert grid[1].sum() == 5
+
+
+@pytest.mark.parametrize("wide", [False, True])
+def test_pixel_corridor_classifies_below_camera_grid_height_by_physical_extent(wide):
+    from plugins.navi.depth import corridor
+
+    intrinsics = HorizontalIntrinsics(640, 315, 337)
+    vertical = (480, 420, 243.2)
+    geometry = replay.camera_square(intrinsics, vertical, .275)
+    tangent = (np.arange(480) - 243.2) / 420
+    floor = .42 / np.maximum(tangent - .02, .001)
+    frame = np.broadcast_to(np.minimum(floor, 4.)[:, None], (480, 640)).copy()
+    columns = slice(180, 480) if wide else slice(318, 350)
+    frame[:300] = np.nan
+    frame[400:407, columns] = 1.065  # 3–4.5 cm above floor.
+    ground = ground_mask(frame, intrinsics, vertical)
+    grid = replay.observe(frame, geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION, ground)
+    kwargs = dict(ground=ground, intrinsics=intrinsics, half_fov_rad=.55,
+                  half_width_m=.30, reference_m=.70)
+    raw, coverage = corridor(frame, **kwargs)
+    cleared, measured = corridor(frame, ignored_low_pixels=grid.ignored_low_pixels, **kwargs)
+    assert raw == pytest.approx(1.065) and measured == coverage
+    assert cleared == raw if wide else cleared > 1.5
+
+
+@pytest.mark.parametrize("cells,ignored", [(4, True), (12, False)])
+def test_pixel_corridor_keeps_extent_when_each_cell_has_only_two_returns(cells, ignored):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 480, 320), (480, 480, 240), .275)
+    r = np.repeat(np.arange(cells) * replay.RESOLUTION, 2)
+    f = np.ones_like(r)
+    grid = replay._project_observed(geometry, replay.RIGHT, replay.FORWARD, replay.RESOLUTION,
+        r, np.zeros_like(f), f, np.ones(len(f), bool), check_free_space=True,
+        heights=np.full(len(f), .08), pixel_samples=np.ones((cells, 2), bool))
+    assert not grid[1].any()
+    if ignored:
+        assert grid.ignored_low_pixels.all()
+    else:
+        assert grid.ignored_low_pixels is None

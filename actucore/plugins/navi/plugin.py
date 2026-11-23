@@ -237,6 +237,7 @@ class _ForwardCheck:
     planning_guard: policy_mod.DwaMotionGuard | None = None
     target_capture_ms: int | None = None
     original_detection: tuple | None = None
+    direct_association: tuple | None = None
 
     def matches_target_receipt(self, receipt_ms):
         return (self.planning_guard.association is None or self.target_source is not None
@@ -2136,6 +2137,30 @@ class NaviPlugin:
             depth_ms = min(depth_ms, scan.current_frame)
         track = state.tracker.track
         fix = track.measured_point if track is not None else None
+        # The first detour creates its anchor just after selecting the route.
+        # Bind it only when it describes the very same measured planning goal.
+        anchor = state.goal_anchor
+        if (motion_guard is not None and motion_guard.target_revision[0] is None
+                and motion_guard.association is None and motion_guard.measured_target is not None
+                and anchor is not None and anchor.frame is not None and not anchor.target_missing
+                and anchor.reference_ms == motion_guard.checked_ms and track is not None
+                and track.state == CONFIRMED and track.observed and track.front_fix is not None
+                and fix is not None and fix.capture_ms is not None and target_source is not None
+                and track.source == target_source and anchor.generation == track.generation == motion_guard.generation
+                and anchor.frame == track.frame and tuple(track.front_fix) == (anchor.x, anchor.y)
+                and math.dist(anchor.frame.grid_point((anchor.x, anchor.y), geometry), motion_guard.goal) < 1e-9):
+            revision = policy_mod.dwa_target_revision(state)
+            if revision[1] == motion_guard.target_revision[1]:
+                motion_guard = replace(motion_guard, target_revision=revision, deadline_ms=min(
+                    motion_guard.deadline_ms, fix.capture_ms + config.depth_age_limit_ms))
+        direct_association = None
+        if (motion_guard is None and config.local_controller == "dwa" and target_source is not None
+                and anchor is None and track is not None and track.observed and track.navigation_range_known
+                and track.source == target_source):
+            stamp = depth.get("control_ms") or depth["frame_id"]
+            pose = policy_mod.target_body_pose(stamp, odom, odom_mod.planar_feedback(odom),
+                                               depth.get("obstacle_capture_pose"))
+            direct_association = track.snapshot(stamp), pose
         return _ForwardCheck(geometry, depth["frame_id"], depth.get("source_frame_id"),
                              objects_ms, decision.distance_m, previous_twist, mount_frame,
                              (odom or {}).get("source_sample_id"), (odom or {}).get("received_ms"),
@@ -2147,7 +2172,8 @@ class NaviPlugin:
                              input_revision, motion_guard.memory_revision if motion_guard else None,
                              motion_guard.target_revision if motion_guard else None,
                              depth_ms, motion_guard, fix.capture_ms if fix else None,
-                             (objects_ms, input_revision[2]) if fix is not None and input_revision else None)
+                             (objects_ms, input_revision[2]) if fix is not None and input_revision else None,
+                             direct_association)
 
     def _registered_dwa_scene(self, check, depth, odom, now_ms, depth_ms, geometry, twists, *, scan, sources,
                               anchor_changed):
@@ -2560,7 +2586,8 @@ class NaviPlugin:
                        target_ms=objects_ms, renewable=True)
 
     def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False,
-                         snapshot=None, diagnostics=None, renew=True, handoff_deadline_ms=None):
+                         snapshot=None, diagnostics=None, renew=True, handoff_deadline_ms=None,
+                         refresh_direct=False, recheck_feedback=False):
         """Try the short motion against current depth and feedback without retiming either."""
         config = self._config
         if check.motion_guard is not None:
@@ -2570,11 +2597,11 @@ class NaviPlugin:
                                             renew=renew, diagnostics=diagnostics if diagnostics is not None else {},
                                             handoff_deadline_ms=handoff_deadline_ms)
         distance_ms = check.target_ms or check.checked_ms
-        target_deadline = distance_ms + min(max_age, config.max_obs_age_ms)
-        if not distance_ms <= now_ms < target_deadline:
+        target_age = min(max_age, config.max_obs_age_ms)
+        if not refresh_direct and not distance_ms <= now_ms < distance_ms + target_age:
             return None
-        objects, depth, odom, _ = (self._observation_snapshot(with_capture_timing=True)
-                                  if snapshot is None else snapshot)
+        objects, depth, odom, receipt = (self._observation_snapshot(with_capture_timing=True)
+                                        if snapshot is None else snapshot)
         if depth is None or depth.get("capture_invalid") or depth.get("map") is None:
             return None
         source = depth.get("source_frame_id")
@@ -2582,7 +2609,8 @@ class NaviPlugin:
         same_depth = (allow_same_depth and depth["frame_id"] == check.frame_id
                       and source is not None and source == check.source_id
                       and feedback is not None and check.feedback_source is not None
-                      and feedback > check.feedback_source)
+                      and (feedback > check.feedback_source or (
+                          recheck_feedback and feedback == check.feedback_source)))
         if (not same_depth and (depth["frame_id"] <= check.frame_id
                                 or (check.source_id is not None and (source or 0) <= check.source_id))):
             return None
@@ -2609,11 +2637,36 @@ class NaviPlugin:
                 return None
             if feedback_source == check.feedback_source and check.feedback_ms is not None:
                 odom_ms = min(odom_ms, check.feedback_ms)
+        if refresh_direct and check.direct_association is not None:
+            association, pose = check.direct_association
+            source = observation_source(objects)
+            track = self._state.tracker.track
+            if (source is not None and source > check.target_source and distance_ms < receipt <= now_ms
+                    and now_ms - receipt < target_age
+                    and track is not None and track.observed and track.generation == association.generation
+                    and (track.latest_source is None or source >= track.latest_source)
+                    and self._state.reacquire_generation is None and not _feedback_pose_jump(
+                        check.input_revision, _motion_inputs(objects, depth, odom), config.max_feedback_gap_ms, config)):
+                current = policy_mod.target_body_pose(receipt, odom, measured, depth.get("obstacle_capture_pose"))
+                if pose is not None and current is not None and pose.frame != current.frame:
+                    return None
+                elapsed = max(0., (receipt - association.reference_ms) / 1000)
+                delta = policy_mod.target_body_delta(pose, association.reference_ms, receipt, odom, measured, current)
+                match = match_observation(association, objects, depth, ego_motion=delta, elapsed_s=elapsed,
+                                          target=check.target, config=replace(config, scan_geometry=geometry))
+                if match is not None:
+                    bearing = math.atan2(-match.point[1], match.point[0]) / config.half_fov_rad
+                    if values[0] > config.vx_max * policy_mod._alignment_scale(bearing, config) + 1e-9:
+                        return None
+                    distance_ms = receipt
+                    check = replace(check, target_ms=receipt, target_source=source,
+                                    distance_m=min(check.distance_m, match.range_m))
+        target_deadline = distance_ms + target_age
         obs_ms = min(distance_ms, depth_ms, odom_ms)
         deadline = int(min(target_deadline, depth_ms + config.depth_age_limit_ms,
                            odom_ms + min(self._odom_max_age_ms, config.max_feedback_gap_ms),
                            obs_ms + max_age))
-        if not max(depth_ms, odom_ms) <= now_ms < deadline:
+        if not max(distance_ms, depth_ms, odom_ms) <= now_ms < deadline:
             return None
         horizon = max(check.guard_horizon_s,
                       (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000)
@@ -3264,7 +3317,10 @@ class NaviPlugin:
             slow_first_send = (now_ms - origin.acceptance.motion_guard.checked_ms >= period
                                and origin.forward_check.motion_guard.deadline_ms - now_ms <= 2 * period)
             renew = slow_first_send and self._fresh_first_send(origin, snapshot, now_ms)
-            if not renew and check.motion_guard.deadline_ms > origin.forward_check.motion_guard.deadline_ms:
+            # A fixed-window check can match a new detector frame without
+            # taking its timestamp. Renew from the original association so
+            # the newer frame has to earn its own deadline on a fresh sweep.
+            if renew or check.motion_guard.deadline_ms > origin.forward_check.motion_guard.deadline_ms:
                 check = origin.forward_check
             checked = self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
                                                renew=renew, diagnostics=diagnostics,
@@ -3730,12 +3786,43 @@ class NaviPlugin:
                          and remaining_ms <= math.ceil(2000 / self._rate_hz))
             if stop is None and may_renew:
                 max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+                refresh_direct = (work.sent and work.dwa_origin is None and work.turn is None and work.leg is None
+                                  and work.forward_check.direct_association is not None
+                                  and not self._state.failed_reason
+                                  and remaining_ms <= math.ceil(1000 / self._rate_hz))
+                snapshot = self._observation_snapshot(with_capture_timing=True) if refresh_direct else None
                 checked = self._recheck_forward(work.forward_check, work.message["values"],
                                                 max_age, now_ms, allow_same_depth=True,
-                                                diagnostics=recheck_diagnostics)
+                                                diagnostics=recheck_diagnostics, snapshot=snapshot,
+                                                refresh_direct=refresh_direct)
                 now_ms = int(time.time() * 1000)
                 remaining_ms = min(work.expires_ms - now_ms,
                                    round((work.expires_at - time.monotonic()) * 1000))
+                if (refresh_direct and checked is not None and checked[2]
+                        and checked[3].target_ms != work.forward_check.target_ms):
+                    # Only a completed check can replace the running window.
+                    latest = self._observation_snapshot(with_capture_timing=True)
+                    revision = _motion_inputs(*snapshot[:3])
+                    current = _motion_inputs(*latest[:3])
+                    gap = min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)
+                    if (remaining_ms > 0 and latest[3] == snapshot[3] and current != revision
+                            and _continuous_feedback_update(revision, current, gap, stationary=False)):
+                        # Keep the matched range and check the sweep with the
+                        # newer measured twist before the outgoing window closes.
+                        checked = self._recheck_forward(checked[3], work.message["values"], max_age, now_ms,
+                                                        allow_same_depth=True, snapshot=latest, recheck_feedback=True)
+                        now_ms = int(time.time() * 1000)
+                        remaining_ms = min(work.expires_ms - now_ms,
+                                           round((work.expires_at - time.monotonic()) * 1000))
+                        revision = current
+                        latest = self._observation_snapshot(with_capture_timing=True)
+                        current = _motion_inputs(*latest[:3])
+                    track = self._state.tracker.track
+                    association, _ = work.forward_check.direct_association
+                    if (remaining_ms <= 0 or self._state.failed_reason or self._state.reacquire_generation is not None
+                            or track is None or not track.observed or track.generation != association.generation
+                            or latest[3] != snapshot[3] or current != revision):
+                        checked = None
                 if checked is None and recheck_diagnostics.get("reason"):
                     stop = ("局部规划：续发所用目标或运动约束已失效", True)
                 # The old window can elapse while a new observation is

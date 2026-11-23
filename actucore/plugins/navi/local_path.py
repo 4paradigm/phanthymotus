@@ -17,6 +17,9 @@ CARDINAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
 STEPS = CARDINAL_STEPS + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 RESOLUTION = .05
 MIN_OBSTACLE_HEIGHT_M = .02
+LOW_OBSTACLE_HEIGHT_M = .10
+LOW_COMPONENT_AREA_M2 = .05
+LOW_COMPONENT_SPAN_M = .50
 APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M = .05
 # Preserve the forward range while covering the body behind a front camera.
 START = (20, 28)
@@ -202,28 +205,38 @@ def _neighbor_count(mask):
                for r in range(3) for c in range(3) if (r, c) != (1, 1))
 
 
-def _drop_small_low_components(occupied, tall):
-    """Ignore low patches of up to three cells using eight-way connectivity."""
+def _isolated_low_cells(occupied, highest, lowest, resolution):
+    """Find small, wholly visible patches without a physical connection to a taller return."""
+    tall = occupied & (highest >= LOW_OBSTACLE_HEIGHT_M)
+    low = occupied & ~tall
+    # Entire contiguous runs already meeting the span limit need no component walk.
+    columns = np.arange(low.shape[1])
+    left = np.maximum.accumulate(np.where(low, -1, columns), axis=1)
+    right = np.minimum.accumulate(np.where(low, low.shape[1], columns)[:, ::-1], axis=1)[:, ::-1]
+    long_runs = low & ((right - left - 1) * resolution >= LOW_COMPONENT_SPAN_M)
+    pending = set(map(tuple, np.argwhere(low & ~long_runs).tolist()))
+    removed = np.zeros_like(occupied)
     rows, cols = occupied.shape
-    offsets = tuple((dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1) if dr or dc)
-    # A cell with at least three neighbours already belongs to a large patch.
-    seeds = np.argwhere(occupied & ~tall & (_neighbor_count(occupied) < 3))
-    for r, c in seeds:
-        if not occupied[r, c]:
+    while pending:
+        patch = [pending.pop()]
+        supported = False
+        for r, c in patch:
+            if r == 0 or c == 0 or r == rows - 1 or c == cols - 1:
+                supported = True  # The rest of this patch may lie outside the grid.
+            for nr in range(max(0, r-1), min(rows, r+2)):
+                for nc in range(max(0, c-1), min(cols, c+2)):
+                    if (nr, nc) in pending:
+                        pending.remove((nr, nc))
+                        patch.append((nr, nc))
+                    elif long_runs[nr, nc] or (tall[nr, nc] and lowest[nr, nc] <= highest[r, c] + resolution):
+                        supported = True
+        if supported or len(patch) * resolution**2 >= LOW_COMPONENT_AREA_M2:
             continue
-        patch = {(r, c)}
-        pending = [(r, c)]
-        while pending and len(patch) < 4:
-            row, col = pending.pop()
-            for dr, dc in offsets:
-                nr, nc = row + dr, col + dc
-                if (0 <= nr < rows and 0 <= nc < cols and occupied[nr, nc]
-                        and (nr, nc) not in patch):
-                    patch.add((nr, nc))
-                    pending.append((nr, nc))
-        if len(patch) < 4 and not any(tall[row, col] for row, col in patch):
-            for row, col in patch:
-                occupied[row, col] = False
+        rr, cc = zip(*patch)
+        span = (math.hypot(max(rr)-min(rr), max(cc)-min(cc)) + 1) * resolution
+        if span < LOW_COMPONENT_SPAN_M:
+            removed[rr, cc] = True
+    return removed
 
 
 def _floorless_hits(frame):
@@ -272,9 +285,10 @@ def _floor_patch_evidence(frame, heights, pixels, intrinsics, optical_normal):
 class DepthGrid(tuple):
     """Planning visibility and occupancy, with stronger evidence for clearing memory."""
 
-    def __new__(cls, free, occupied, confirmed_free):
+    def __new__(cls, free, occupied, confirmed_free, ignored_low_pixels=None):
         grid = super().__new__(cls, (free, occupied))
         grid.confirmed_free = confirmed_free
+        grid.ignored_low_pixels = ignored_low_pixels
         return grid
 
 
@@ -295,7 +309,9 @@ def frozen_grid(grid):
     free, occupied = grid
     clear = confirmed_free(grid)
     frozen_free = frozen_mask(free)
-    return DepthGrid(frozen_free, frozen_mask(occupied), frozen_free if clear is free else frozen_mask(clear))
+    ignored = getattr(grid, "ignored_low_pixels", None)
+    return DepthGrid(frozen_free, frozen_mask(occupied), frozen_free if clear is free else frozen_mask(clear),
+                     frozen_mask(ignored) if ignored is not None else None)
 
 
 def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
@@ -326,7 +342,7 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
         hits = valid & ~ground & (above_floor >= MIN_OBSTACLE_HEIGHT_M)
         if geometry.height is not None:
             hits &= above_floor <= geometry.height + .05
-    if max_hit_depth is not None:
+    if max_hit_depth is not None and above_floor is None:
         valid &= frame <= max_hit_depth
         hits &= valid
     samples = valid if check_free_space else hits
@@ -347,11 +363,15 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     return _project_observed(geometry, right, forward, resolution, x, y, z,
                              hits[samples], check_free_space=check_free_space,
                              heights=above_floor[samples] if above_floor is not None else None,
-                             floor_context=floor_context, floor_samples=floor_samples)
+                             floor_context=floor_context, floor_samples=floor_samples,
+                             pixel_samples=samples if check_free_space and above_floor is not None else None,
+                             max_hit_depth=max_hit_depth if above_floor is not None else None)
 
 
 def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
-                      check_free_space, heights, floor_context=None, floor_samples=None):
+                      check_free_space, heights, floor_context=None, floor_samples=None, pixel_samples=None,
+                      max_hit_depth=None):
+    within_depth = z <= max_hit_depth if max_hit_depth is not None else None
     transform = geometry.base_from_optical
     body_f = x * transform[0, 0] + y * transform[0, 1] + z * transform[0, 2] + transform[0, 3]
     hit_row = np.rint((body_f - forward[0, 0]) / resolution).astype(int)
@@ -377,10 +397,41 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     cell_ids = cells[0] * right.shape[1] + cells[1]
     counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
     occupied = counts >= 3
-    if heights is not None:
-        tall_ids = cell_ids[raised & (heights >= .10)]
-        tall = np.bincount(tall_ids, minlength=right.size).reshape(right.shape) > 0
-        _drop_small_low_components(occupied, tall)
+    ignored_low_pixels = None
+    removed = None
+    raw_removed = None
+    if heights is not None and possible_hits.any():
+        top = np.zeros(right.shape)
+        bottom = np.full(right.shape, np.inf)
+        np.maximum.at(top.ravel(), cell_ids[raised], heights[raised])
+        np.minimum.at(bottom.ravel(), cell_ids[raised], heights[raised])
+        removed = _isolated_low_cells(occupied, top, bottom, resolution)
+        raw_removed = removed
+        if pixel_samples is not None:
+            # The pixel corridor can also see returns below the raster vote
+            # threshold. Classify these without joining separate occupied patches.
+            weak = possible_hits & ~raised
+            np.maximum.at(top.ravel(), cell_ids[weak], heights[weak])
+            np.minimum.at(bottom.ravel(), cell_ids[weak], heights[weak])
+            present = top > 0.
+            if (present & ~occupied).any():
+                raw_removed = removed | _isolated_low_cells(present, top, bottom, resolution)
+    if within_depth is not None:
+        # The range cap belongs to this query. A large platform straddling it
+        # must be classified using its complete visible footprint first.
+        keep = within_depth[in_grid]
+        in_grid[in_grid] = keep
+        cells = cells[0][keep], cells[1][keep]
+        cell_ids, possible_hits, raised = cell_ids[keep], possible_hits[keep], raised[keep]
+        if heights is not None:
+            heights = heights[keep]
+        counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
+        occupied = counts >= 3
+    if pixel_samples is not None and raw_removed is not None and raw_removed.any():
+        votes = possible_hits & (heights < LOW_OBSTACLE_HEIGHT_M) & raw_removed[cells]
+        if votes.any():
+            ignored_low_pixels = np.zeros(pixel_samples.shape, dtype=bool)
+            ignored_low_pixels.flat[np.flatnonzero(pixel_samples)[in_grid][votes]] = True
     neighbors = _neighbor_count(occupied)
     ends = occupied & (neighbors == 1)
     small = occupied & ((neighbors == 0) | (ends & (_neighbor_count(ends) == 1)))
@@ -414,6 +465,8 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
                     floor_votes = np.bincount(ids[floor], minlength=right.size).reshape(right.shape)
                     face_votes = np.bincount(ids[face], minlength=right.size).reshape(right.shape)
                     occupied &= ~((weak | (low & (floor_votes >= .8 * counts))) & (face_votes < 2))
+    if removed is not None:
+        occupied &= ~removed
     # Only metric returns establish visibility. Unseen gaps, blind regions,
     # and cells behind the last measured surface retain the unknown state.
     free = np.zeros(right.shape, dtype=bool)
@@ -431,7 +484,7 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     clear_votes = np.bincount(cell_ids[clear_samples], minlength=right.size).reshape(right.shape)
     clear = clear_votes >= minimum_clear_samples
     clear[cells[0][possible_hits], cells[1][possible_hits]] = False
-    return DepthGrid(free, occupied, clear)
+    return DepthGrid(free, occupied, clear, ignored_low_pixels)
 
 
 @dataclass(frozen=True)

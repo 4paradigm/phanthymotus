@@ -1856,3 +1856,131 @@ def test_same_detector_exposure_keeps_original_range_when_depth_advances(monkeyp
     else:
         assert not any(packets[-1]["values"])
         assert card._dwa_publication["reason"] in {"target_missing", "target_standoff", "footprint_collision", "publish_expired"}
+
+
+@pytest.mark.parametrize("change", ["clear", "different_goal", "near_person"])
+def test_first_detour_freezes_its_measured_goal_before_publish(monkeypatch, change):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=True)
+    state, config = card._state, card._config
+    state.goal_anchor = None
+    config.depth_intrinsics = config.local_geometry.horizontal
+    _, depth, odom, _ = snapshot[0]
+    person = {"name": "person", "position": [0., -.6], "confidence": .95,
+              "bbox_norm": [.45, .10, .55, .30]}
+    for stamp in (700, 800, 900):
+        objects = {"timestamp": stamp / 1000, "objects": [person]}
+        state.tracker.step(detections=objects, depth=dict(depth, frame_id=stamp, source_frame_id=stamp,
+                           capture_ms=stamp), target="person", config=config, ego=(0., 0., 0.),
+                           ego_measured=True, dt=.1)
+    snapshot[0] = objects, depth, odom, 900
+    if change == "different_goal":
+        remember = policy._remember_detour_goal
+        def move_goal(*args):
+            remember(*args)
+            if state.goal_anchor is not None:
+                state.goal_anchor.x += .2
+        monkeypatch.setattr(policy, "_remember_detour_goal", move_goal)
+    message = card.next_command()
+    check = card._staged_dwa_command[1].forward_check
+    assert check.planning_guard.association is None and not check.renewable
+    assert check.planning_guard.measured_target is not None and state.goal_anchor is not None
+    clock[0] = 1010
+    if change == "near_person":
+        depth = dict(depth, map=depth["map"].copy())
+        depth["map"][:150] = config.stop_distance_m
+    snapshot[0] = dict(objects, timestamp=1.01), depth, odom, 1010
+    card._publish_command(message)
+    if change == "clear":
+        assert packets[-1]["values"] == message["values"] and message["values"][0] > 0
+        assert packets[-1]["stamp_ms"] + packets[-1]["ttl_ms"] <= check.motion_guard.deadline_ms
+    else:
+        assert packets[-1]["values"] == [0.] * 6
+
+
+@pytest.mark.parametrize("update", [
+    "fresh", "feedback_during_check", "repeat_feedback_during_check", "obstacle_during_check",
+    "duplicate", "obstacle", "no_feedback", "different_target",
+])
+def test_direct_controller_checks_new_target_before_the_old_packet_expires(monkeypatch, update):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=True)
+    snapshot = [card._observation_snapshot(with_capture_timing=True)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._command_timer = object()
+    message = card.next_command()
+    assert card._stage_command(message, card._output_epoch)
+    first, = packets
+    assert first["values"][0] > 0 and card._wire_dwa_origin is None
+    deadline = first["stamp_ms"] + first["ttl_ms"]
+
+    # New range, depth and feedback must all be available before cutoff.
+    stamp = deadline - 10
+    card._config.max_obs_age_ms = stamp - snapshot[0][3] - 1
+    advance_snapshot(snapshot, clock, stamp, obstacle=update == "obstacle")
+    objects, depth, odom, target_ms = snapshot[0]
+    if update != "duplicate":
+        objects = dict(objects, timestamp=stamp / 1000)
+    target_ms = stamp
+    if update == "different_target":
+        objects["objects"] = [dict(objects["objects"][0], name="chair")]
+    pose = policy.PlanarPose(stamp, ("body",), 0., 0., 0.)
+    first_feedback = (stamp, stamp, (.1, 0., 0.))
+    odom = dict(odom, motion_pose=pose, velocity_history=(first_feedback,))
+    snapshot[0] = objects, depth, odom if update != "no_feedback" else None, target_ms
+    feedback_updates = "feedback_during_check", "repeat_feedback_during_check"
+    if update in (*feedback_updates, "obstacle_during_check"):
+        recheck = card._recheck_forward
+
+        def late_input(*args, **kwargs):
+            result = recheck(*args, **kwargs)
+            if kwargs.get("refresh_direct"):
+                assert result and result[2]
+                clock[0] = stamp + 1
+                if update == "obstacle_during_check":
+                    advance_snapshot(snapshot, clock, stamp + 1, obstacle=True)
+                else:
+                    source = stamp if update == "repeat_feedback_during_check" else stamp + 1
+                    feedback = (stamp + 1, source, (.1, 0., 0.))
+                    latest = dict(odom, received_ms=stamp + 1, source_sample_id=source,
+                                  motion_pose=replace(pose, stamp_ms=stamp + 1),
+                                  velocity_history=(first_feedback, feedback))
+                    snapshot[0] = objects, depth, latest, target_ms
+            return result
+
+        monkeypatch.setattr(card, "_recheck_forward", late_input)
+    card._dispatch_command()
+    if update in ("fresh", *feedback_updates):
+        assert len(packets) == 2 and packets[-1]["values"][0] > 0
+        assert packets[-1]["stamp_ms"] == clock[0]
+        assert deadline < clock[0] + packets[-1]["ttl_ms"] <= stamp + card._config.max_obs_age_ms
+    else:
+        clock[0] = deadline
+        card._dispatch_command()
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+
+
+def test_first_send_retry_uses_original_association_to_refresh_the_target_clock(monkeypatch):
+    card, _, clock, snapshot, message = selected_card(monkeypatch, live_target=True)
+    origin = card._staged_dwa_command[1]
+    proof = origin.forward_check
+    deadline = min(proof.motion_guard.deadline_ms, proof.target_ms + card._config.max_obs_age_ms)
+    start = proof.motion_guard.checked_ms + 50
+    advance_snapshot(snapshot, clock, start)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=start / 1000), depth, odom, start
+    recheck = card._recheck_dwa_motion
+    results = []
+
+    def new_depth_during_check(*args, **kwargs):
+        result = recheck(*args, **kwargs)
+        results.append(result)
+        if len(results) == 1:
+            assert result and result[2] and not kwargs["renew"]
+            assert result[3].target_source != proof.target_source and result[3].target_ms == proof.target_ms
+            advance_snapshot(snapshot, clock, deadline - 1)
+        return result
+
+    monkeypatch.setattr(card, "_recheck_dwa_motion", new_depth_during_check)
+    reason, checked = card._recheck_dwa_inputs(origin, message["values"], start)
+    assert reason is None and checked[2]
+    assert checked[3].target_ms == start
+    assert checked[1] > deadline
