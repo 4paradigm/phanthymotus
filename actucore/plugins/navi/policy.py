@@ -1968,12 +1968,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
             else:
                 if scan.active or scan.result_frame or state.detour_leg is not None:
                     _reset_detour_route(state)
-                if fresh and state.missing_frames < config.lost_frames:
-                    state.missing_frames += 1
-                if depth is None or state.missing_frames < min(2, config.lost_frames):
-                    return Decision(_twist(0., 0., 0.), SEARCHING, "等待新的原目标观测")
-                # Publication already rejected the approach. Two independent misses
-                # confirm the loss without restarting the normal occlusion grace.
+                if depth is None:
+                    return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
                 state.missing_frames = max(state.missing_frames, config.lost_frames)
                 return _search_for_target(depth, config, state, dt, odom)
         reviewing_observation = (target_fix is not None and feedback is not None

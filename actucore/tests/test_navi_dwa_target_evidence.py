@@ -905,16 +905,9 @@ def test_missing_target_veto_hands_off_to_search(monkeypatch, recover):
     observe(1010, absent_target_payload("empty"))
     card._publish_command(motion)
     assert card._dwa_publication["reason"] == "target_missing"
-    observe(1020, absent_target_payload("empty"))
-    for _ in range(3):
-        message = card.next_command()
-        assert message is None or not any(message["values"])
-    # A retransmitted detector payload can have a later local receipt.
-    advance_snapshot(snapshot, clock, 1030, vx=0.)
-    duplicate, depth, odom, _ = snapshot[0]
-    snapshot[0] = duplicate, depth, odom, 1030
+    # Search can start on the very snapshot that caused the veto.
     message = card.next_command()
-    assert message is None or not any(message["values"])
+    assert message["values"][:5] == [0.] * 5 and message["values"][5] != 0
     for stamp in ((1050, 1100, 1150) if recover else (1050,)):
         observe(stamp, original if recover else absent_target_payload("empty"))
         message = card.next_command()
@@ -926,3 +919,29 @@ def test_missing_target_veto_hands_off_to_search(monkeypatch, recover):
         assert twist[0] > 0
     else:
         assert twist[:5] == [0.] * 5 and twist[5] != 0
+
+
+@pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
+@pytest.mark.parametrize("vx", [0., .25], ids=["stationary", "still-translating"])
+def test_tick_checks_search_when_target_lost_before_first_send(monkeypatch, body, vx):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=body, live_target=True)
+    plan = card.next_command
+
+    def lose_target_after_plan():
+        message = plan()
+        if card._last_decision.dwa_acceptance is not None:
+            advance_snapshot(snapshot, clock, 1010, vx=vx)
+            _, depth, odom, _ = snapshot[0]
+            snapshot[0] = absent_target_payload("empty", 1010), depth, odom, 1010
+        return message
+
+    monkeypatch.setattr(card, "next_command", lose_target_after_plan)
+    card._tick()
+    assert not card._last_error
+    packet, = packets
+    assert packet["values"][:5] == [0.] * 5
+    if vx:
+        assert packet["values"][5] == 0.
+        assert "停稳" in card._last_decision.reason
+    else:
+        assert packet["values"][5] != 0

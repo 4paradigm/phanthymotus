@@ -280,6 +280,7 @@ class NaviPlugin:
         self._output_blocked = False
         self._output_stop = None
         self._wire_seq = 0
+        self._can_replan_search = False
         self._wire_moving = False
         self._wire_twist = None
 
@@ -2745,19 +2746,30 @@ class NaviPlugin:
                         scan.turn_stop_ms = None if reason == _UNSENT_TURN else stamp
                 started = time.monotonic()
                 previous = self._last_tick
-                message = self.next_command()
-                decided = time.monotonic()
-                if self._command_timer is not None:
-                    if not self._stage_command(message, epoch):
-                        return
-                elif message is not None:
+                # If publication discovers the lost target, take one new snapshot
+                # and plan its checked search in this tick, outside the output lock.
+                for attempt in range(2):
+                    searching = self._state.reacquire_generation is not None
+                    message = self.next_command()
+                    decided = time.monotonic()
                     with self._output_lock:
                         if self._config.local_controller == "dwa" and epoch != self._output_epoch:
                             self._supersede_message(message)
                             return
-                        publishing = True
-                        self._publish_command(message)
-                        publishing = False
+                        self._can_replan_search = not attempt and not searching
+                        try:
+                            if self._command_timer is not None:
+                                if not self._stage_command(message, epoch):
+                                    return
+                            elif message is not None:
+                                publishing = True
+                                self._publish_command(message)
+                                publishing = False
+                        finally:
+                            self._can_replan_search = False
+                        if (attempt or searching or self._state.reacquire_generation is None
+                                or epoch != self._output_epoch):
+                            break
                 finished = time.monotonic()
                 period = 1.0 / self._rate_hz
                 interval = self._last_tick - previous if previous else 0.
@@ -3349,6 +3361,19 @@ class NaviPlugin:
                 stop_reason = rejection
                 message = dict(message, values=[0.] * ACTION_DIM, stamp_ms=now_ms,
                                obs_stamp_ms=now_ms, ttl_ms=self._ttl_ms)
+        # With no outstanding motion there is nothing to brake. Drop only
+        # this rejected plan so the checked search can take the wire slot.
+        if (self._can_replan_search and not self._wire_moving and not any(message["values"])
+                and self._state.reacquire_generation is not None
+                and (stop_reason or (diagnostic and diagnostic.veto_reason)) == "target_missing"
+                and diagnostic is not None and diagnostic.state_id == id(self._state)
+                and diagnostic.decision_id == self._state.decision_id):
+            work = self._scheduled_command
+            if (work is not None and work.stop_reason is None and work.dwa_origin is not None
+                    and origin is not None and work.dwa_origin.identity == origin.identity):
+                self._scheduled_command = None
+            if work is None or work.stop_reason is None:
+                return False
         if self._command_timer is None:
             # Direct plans and their timer-dispatched stop retries share this
             # sequence. Resolve plan-sequence-specific proof before renumbering.
