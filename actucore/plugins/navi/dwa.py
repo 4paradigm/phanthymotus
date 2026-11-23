@@ -380,6 +380,31 @@ def _preferred_command(points, nominal, horizon, yaw_limit, *, differential=Fals
     return max(0., nominal * math.cos(angle)), -nominal * math.sin(angle), -math.copysign(turn, angle)
 
 
+def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral):
+    """Track the finite visible polyline in the current forward/right grid."""
+    segments = _route_segments(points)
+    if not segments:
+        return None
+    progress, _, _ = _project_to_route((0., 0.), points, segments)
+    end = segments[-1].walked + segments[-1].length
+    remaining = end - max(0., progress)
+    if remaining <= 1e-8:
+        return None
+    lookahead = min(end, max(0., progress) + max(.45, nominal * horizon))
+    segment = next((s for s in segments if s.walked + s.length >= lookahead), segments[-1])
+    f, r = (start + (lookahead - segment.walked) * axis - pivot
+            for start, axis, pivot in zip(segment.start, segment.tangent, body_origin))
+    if f <= 0. and (not lateral or abs(r) <= abs(f)):
+        return None
+    speed = min(nominal, remaining / horizon)
+    if not lateral and r:
+        # Preserve the requested curvature at a tight bend when yaw saturates.
+        yaw_cap = -yaw_limit[0] if r > 0. else yaw_limit[1]
+        speed = min(speed, yaw_cap * (f * f + r * r) / (2. * abs(r)))
+    command = _preferred_command(((0., 0.), (f, r)), speed, horizon, yaw_limit, differential=not lateral)
+    return command, remaining
+
+
 def _obstacle_score(check):
     return 1.5 * max(0., .25 - check.min_clearance_m) / .25
 

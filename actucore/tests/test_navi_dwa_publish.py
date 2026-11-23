@@ -1675,3 +1675,184 @@ def test_repeated_speed_sample_with_independently_updated_pose(change, compact, 
     new = plugin._motion_inputs(None, None, after)
     assert plugin._continuous_feedback_update(old, new, 350, stationary=False) == compact
     assert plugin._continuous_feedback_update(old, new, 350, stationary=True) == stationary
+
+
+@pytest.mark.parametrize("change", [
+    "clear", "obstacle", "obstacle_new_odom", "missing_target", "same_speed", "partial_speed",
+    "lost_speed", "cancel", "late", "obstacle_failed_stop", "obstacle_duplicate_speed",
+])
+def test_bounded_watchdog_repeat_requires_new_clear_sweep(monkeypatch, change):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    message = card.next_command()
+    assert card._stage_command(message, card._output_epoch)
+    assert len(packets) == 1 and packets[0]["values"][0] > 0
+    advance_snapshot(snapshot, clock, 1100, obstacle=change.startswith("obstacle"))
+    snapshot[0][2].update(received_speed_ms=1100, component_speed_ms=1000 if change in ("same_speed", "obstacle_duplicate_speed") else 1100)
+    if change == "partial_speed":
+        snapshot[0][2]["received_speed_ms"] = None
+    if change == "missing_target":
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = {"objects": [], "timestamp": 1.1}, depth, odom, 1100
+    recheck = card._recheck_dwa_motion
+
+    def during_repeat(*args, **kwargs):
+        result = recheck(*args, **kwargs)
+        if change == "lost_speed":
+            objects, depth, odom, receipt = snapshot[0]
+            snapshot[0] = objects, depth, dict(odom, received_speed_ms=None, component_speed_ms=None), receipt
+        if change == "obstacle_new_odom":
+            snapshot[0][2]["source_sample_id"] += 1
+        if change == "cancel":
+            card._cancel_scheduled_motion(block=True)
+        if change == "late":
+            clock[0] = 1500
+        return result
+
+    monkeypatch.setattr(card, "_recheck_dwa_motion", during_repeat)
+    if change == "obstacle_failed_stop":
+        attempts = []
+        publish = card._publisher.publish
+
+        def fail_once(packet):
+            attempts.append(packet)
+            if len(attempts) == 1:
+                raise RuntimeError("transport unavailable")
+            publish(packet)
+
+        monkeypatch.setattr(card._publisher, "publish", fail_once)
+        card._dispatch_command()
+        assert len(attempts) == len(packets) == 1 and card._wire_moving
+        card._dispatch_command()
+        assert len(attempts) == len(packets) == 2 and not any(packets[-1]["values"])
+        return
+    card._dispatch_command()
+    if change in ("same_speed", "partial_speed", "lost_speed"):
+        assert len(packets) == 1 and card._wire_moving
+        clock[0] = 1500
+        card._dispatch_command()
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+    elif change == "clear":
+        assert len(packets) == 2 and packets[-1]["values"] == message["values"]
+        card._dispatch_command()
+        assert len(packets) == 2
+        clock[0] = 1600
+        card._dispatch_command()
+        assert len(packets) == 3 and not any(packets[-1]["values"])
+    else:
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+        card._dispatch_command()
+        assert len(packets) == 2
+
+
+@pytest.mark.parametrize("body", [False, True], ids=["camera", "body"])
+@pytest.mark.parametrize("yaw", [-.06, .06])
+def test_route_controller_changes_wire_curvature_on_feedback_between_depth_frames(monkeypatch, body, yaw):
+    from plugins.navi.odom import PlanarPose
+
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=body, live_target=True)
+    card._command_timer = object()
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    objects, depth, odom, received = snapshot[0]
+    pose = PlanarPose(1000, ("odom",), 0., 0., 0.)
+    odom.update(motion_pose=pose, obstacle_pose=pose)
+    depth["obstacle_capture_pose"] = pose
+    message = card.next_command()
+    assert card._stage_command(message, card._output_epoch)
+    assert packets[-1]["values"][0] > 0 and not packets[-1]["values"][5]
+    clock[0] = 1100
+    current = PlanarPose(1100, pose.frame, .01, 0., yaw)
+    snapshot[0] = objects, depth, dict(odom, motion_pose=current, obstacle_pose=current,
+        source_sample_id=1100, received_ms=1100,
+        velocity_history=(*odom["velocity_history"], (1100, 1100, (.1, 0., 0.)))), received
+    card._dispatch_command()
+    assert len(packets) == 2 and packets[1]["values"][0] > 0
+    assert packets[1]["values"][5] * yaw < 0
+    assert card._wire_dwa_origin.acceptance.command == tuple(message["values"][i] for i in (0, 1, 5))
+    for stamp, remaining_yaw in ((1200, yaw / 2), (1300, 0.)):
+        clock[0] = stamp
+        current = PlanarPose(stamp, pose.frame, (stamp - 1000) / 10000, 0., remaining_yaw)
+        previous = snapshot[0][2]
+        snapshot[0] = objects, depth, dict(previous, motion_pose=current, obstacle_pose=current,
+            source_sample_id=stamp, received_ms=stamp,
+            velocity_history=(*previous["velocity_history"], (stamp, stamp, (.1, 0., 0.)))), received
+        card._dispatch_command()
+    assert [packet["stamp_ms"] for packet in packets] == [1000, 1100, 1200, 1300]
+    assert all(packet["values"][0] > 0. for packet in packets)
+    assert abs(packets[1]["values"][5]) > abs(packets[2]["values"][5]) > abs(packets[3]["values"][5])
+
+def test_tracker_checks_driver_stop_and_longer_obstacle_lookahead(monkeypatch):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    message = card.next_command()
+    assert card._stage_command(message, card._output_epoch)
+    advance_snapshot(snapshot, clock, 1100)
+    predict = motion.predict_motion
+    evaluate = motion.evaluate_motion
+    holds, budgets = [], []
+
+    def track_holds(*args, **kwargs):
+        holds.append((kwargs["hold_s"], kwargs["latency_s"]))
+        return predict(*args, **kwargs)
+
+    def track_checks(trace, **kwargs):
+        assert trace.stopped
+        budgets.append(kwargs.get("terminal_boundary"))
+        return evaluate(trace, **kwargs)
+
+    monkeypatch.setattr(motion, "predict_motion", track_holds)
+    monkeypatch.setattr(motion, "evaluate_motion", track_checks)
+    card._dispatch_command()
+    assert len(packets) == 2 and packets[1]["values"][0] > 0
+    assert any(hold == pytest.approx(admission + .55) for hold, admission in holds)
+    assert max(hold for hold, _ in holds) > min(hold for hold, _ in holds)
+    assert any(isinstance(room, motion.TravelBudget) for room in budgets) and None in budgets
+
+
+def test_route_controller_slows_for_curvature_at_directional_yaw_limit():
+    command, _ = dwa.track_route(((0., 0.), (.3, .4), (1., .4)), .4, 1., (-.1, .3),
+                                 body_origin=(0., 0.), lateral=False)
+    vx, vy, wz = command
+    # 0.45 m along the first segment is (0.27, 0.36) in the body grid.
+    assert 0. < vx < .4 and vy == 0. and wz == pytest.approx(-.1)
+    assert wz / vx == pytest.approx(-2 * .36 / (.27 ** 2 + .36 ** 2))
+
+
+@pytest.mark.parametrize("change", ["background", "new_detection", "changed_payload", "close_person", "expired_range", "expired_matching_range", "driver_expired"])
+def test_same_detector_exposure_keeps_original_range_when_depth_advances(monkeypatch, change):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    if change.startswith("expired"):
+        card._config.max_depth_age_ms = 80
+    if change in ("background", "driver_expired"):
+        snapshot[0][1]["capture_ms"] = 950
+    if change == "driver_expired":
+        card._descriptor["rate"]["max_obs_age_ms"] = 130
+    message = card.next_command()
+    assert card._stage_command(message, card._output_epoch)
+    original = card._wire_dwa_origin.forward_check
+    advance_snapshot(snapshot, clock, 1100)
+    objects, depth, odom, receipt = snapshot[0]
+    # The detector centre was on the 5 m surface; a later depth exposure at
+    # the same pixels has an unrelated range, outside the association gate.
+    if change != "expired_matching_range":
+        depth["map"][:185, :] = .30 if change == "close_person" else 12.
+    if change == "new_detection":
+        objects = dict(objects, timestamp=1.1)
+        receipt = 1100
+    elif change == "changed_payload":
+        objects = dict(objects, objects=[dict(objects["objects"][0], confidence=.92)])
+    snapshot[0] = objects, depth, odom, receipt
+    card._dispatch_command()
+    assert len(packets) == 2
+    if change == "background":
+        assert packets[-1]["values"][0] > 0.
+        result = card._wire_dwa_origin.forward_check
+        assert result.target_ms == original.target_ms and result.target_capture_ms == original.target_capture_ms
+        assert packets[-1]["obs_stamp_ms"] == original.target_capture_ms == 950
+        assert packets[-1]["stamp_ms"] + packets[-1]["ttl_ms"] <= min(
+            original.target_ms + card._config.max_obs_age_ms,
+            original.target_capture_ms + card._config.depth_age_limit_ms)
+    else:
+        assert not any(packets[-1]["values"])
+        assert card._dwa_publication["reason"] in {"target_missing", "target_standoff", "footprint_collision", "publish_expired"}

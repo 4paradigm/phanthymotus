@@ -874,6 +874,7 @@ class DwaAcceptance:
     guard_horizon_s: float = 0.
     motion_guard: DwaMotionGuard | None = None
     angle_controlled: bool = False
+    route_points: tuple = ()
 
     @property
     def target_observed(self):
@@ -1484,7 +1485,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
         if state.dwa_selected and proposal is not None and final == proposal.command and any(final):
             decision.dwa_acceptance = DwaAcceptance(
                 state.decision_id, proposal.command, trace["guard_horizon_s"],
-                state.dwa_motion_guard, isinstance(proposal, DwaTurn))
+                state.dwa_motion_guard, isinstance(proposal, DwaTurn),
+                proposal.reference.points if isinstance(proposal, DwaProposal) and proposal.branch != "visual_probe" else ())
             trace.update(controller_used="dwa", accepted_twist=proposal.command, fallback_reason=None)
         else:
             if state.dwa_selected:

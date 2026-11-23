@@ -951,7 +951,8 @@ def test_depth_processing_leaves_odometry_and_object_callbacks_runnable():
     assert groups["/cam/depth"] is not groups["/cam/objects"]
 
 
-def test_camera_only_geometry_starts_separate_planning_and_velocity_timers(monkeypatch):
+@pytest.mark.parametrize("body_geometry, max_hz", [(False, 20), (True, 20), (True, 5)])
+def test_local_geometry_starts_separate_planning_and_velocity_timers(monkeypatch, body_geometry, max_hz):
     from types import SimpleNamespace
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -968,7 +969,7 @@ def test_camera_only_geometry_starts_separate_planning_and_velocity_timers(monke
     monkeypatch.setitem(sys.modules, "rclpy.callback_groups",
                         SimpleNamespace(MutuallyExclusiveCallbackGroup=object))
     executor = SimpleNamespace(add_node=lambda node: None, remove_node=lambda node: None)
-    card = NaviPlugin({"view_hz": 0.}, executor=executor)
+    card = NaviPlugin({"view_hz": 0., "rate_hz": min(10, max_hz)}, executor=executor)
     monkeypatch.setattr(card, "_bind_inputs", lambda *args: ({"depth_map": "/depth", "odom": "/odom"}, ""))
 
     def camera(*args):
@@ -977,10 +978,16 @@ def test_camera_only_geometry_starts_separate_planning_and_velocity_timers(monke
         return ""
 
     monkeypatch.setattr(card, "_adopt_camera", camera)
-    args = {"control_interface": _descriptor(footprint={"half_width": .20})}
+    descriptor = _descriptor(footprint={"half_width": .20})
+    descriptor["rate"].update(max_hz=max_hz, expected_hz=min(10, max_hz))
+    args = {"control_interface": descriptor}
+    if body_geometry:
+        args["camera_info"] = {"/depth": {"vendor": {"body_from_optical": [
+            [0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]]}}}
     try:
         assert card._start(args)["state"] == "running"
-        assert [timer[0] for timer in node.timers] == [.1, .1]
+        assert (card._config.scan_geometry is not None) == body_geometry
+        assert [timer[0] for timer in node.timers] == [1 / min(10, max_hz)] * 2
         assert [timer[1] for timer in node.timers] == [card._tick, card._dispatch_command]
         assert node.timers[0][2] is not node.timers[1][2]
     finally:
