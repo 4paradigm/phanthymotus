@@ -10,6 +10,8 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
+from utils.model_progress import fetch_status
+
 from .runtime.synthesis import acquire_gpu_backend, validate_options
 
 log = logging.getLogger(__name__)
@@ -351,7 +353,7 @@ def _node(input_topic, backend, suffix, cfg):
 class TTSPlugin:
     PREFIX = 'tts'
 
-    def __init__(self, plugin_cfg, executor):
+    def __init__(self, plugin_cfg, executor, *, on_status=None):
         self._cfg = dict(plugin_cfg)
         if self._cfg.get('engine', ENGINE) != ENGINE:
             raise ValueError('V6 plugin cannot use a different engine')
@@ -367,9 +369,11 @@ class TTSPlugin:
                                 'ready_after_enabled_warmup': False}
         if self._cfg.get('backend', 'tensorrt_fp32') != 'tensorrt_fp32':
             raise ValueError('Xiaoyou requires the TensorRT FP32 backend')
+        progress_cb, stage_cb = fetch_status(on_status, MODEL_ID)
         self._backend = acquire_gpu_backend(self._cfg.get('model_dir'),
             cpu_threads=self._cfg.get('cpu_threads', 2),
-            expected_manifest_sha256=self._cfg.get('runtime_manifest_sha256'))
+            expected_manifest_sha256=self._cfg.get('runtime_manifest_sha256'),
+            progress_cb=progress_cb, stage_cb=stage_cb)
         try:
             loaded = time.perf_counter()
             self._startup_timing['asset_prepare_seconds'] = self._backend.asset_prepare_seconds

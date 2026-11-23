@@ -4,7 +4,7 @@ Production downloads use a fixed ModelScope repository and immutable revision.
 An internal HTTP mirror is available only through the explicitly named test opt-in.
 Existing bundles are rehashed before use; unknown/corrupt destinations are preserved.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import fcntl
 import hashlib
 from io import BytesIO
@@ -23,7 +23,7 @@ from zipfile import ZipFile
 SOURCE_SHA = 'a46bd6826d1074b93bc7a17379966d88005cd248136acd24aab4b6883e689bb0'
 
 FRONTEND_FILE = 'frontend/phonemizer.py'
-FRONTEND_SHA = '9fe8b062c3511c49e89eec54aca5c757d952fdbfa9ecbcd9d5271edd373e288a'
+FRONTEND_SHA = '8b0aac03f49255672072e8bbb2b4a9dc27037c281d1de479ed1edd55a77f5dd5'
 _RELEASE_FRONTEND_SHA = '650f908b1f9ef473656e537630b8c2823b7a3633ff8a562745cc5d7ce1db0dc5'
 
 NORMALIZATION_REVISION = '01yuewen-contextual-polyphones-compact-20261118'
@@ -57,7 +57,7 @@ NATIVE_WEIGHTS_SHA = 'f33dcf83714f3c42cbdad5c85a6ec09d1e69bec29e6c173992bff429f7
 
 # The published archive records the pre-merge excitation source.
 PHASE_DSP_SHA = '82e542dc0d002ff5214779ae568b66407cd0f2770495bb7614fc58bc3804a4b4'
-SYNTHESIS_SOURCE_SHA = '080c4157c705f9f8be4a74dcb1f91cae538d0f2fa41145e8aed235bb5e7104a3'
+SYNTHESIS_SOURCE_SHA = '435c10ace9cc5d27e6a14d65fae19791cda7ebb6f400f7d66e53770eb1d253fd'
 
 STYLE_FILE_SHA = '1c0c128370aa247bbf3eb77bf798c0f7d4d4583074f9d582e314c4a0570ca13c'
 
@@ -358,12 +358,17 @@ def _release_from_environment(jetpack_major=None):
     return url, size, expected
 
 
-def _download(url, path, expected_size, expected_sha256):
+def _download(url, path, expected_size, expected_sha256, *, progress_cb=None):
     request = Request(url, headers={'User-Agent': 'xiaoyou-v6-pinned-assets/1'})
     last_error = None
+    mb_total = expected_size / (1024 * 1024)
+    if progress_cb is not None:
+        with suppress(Exception):
+            progress_cb(0, 0, mb_total)
     for attempt in range(3):
         digest = hashlib.sha256()
         count = 0
+        last_pct = 0
         try:
             with urlopen(request, timeout=30) as response, path.open('xb') as stream:
                 for chunk in iter(lambda: response.read(1024 * 1024), b''):
@@ -372,10 +377,19 @@ def _download(url, path, expected_size, expected_sha256):
                         raise ValueError('Archive exceeds its pinned byte count')
                     stream.write(chunk)
                     digest.update(chunk)
+                    if progress_cb is not None:
+                        pct = count * 100 // expected_size
+                        if last_pct + 10 <= pct < 100:
+                            last_pct = pct
+                            with suppress(Exception):
+                                progress_cb(pct, count / (1024 * 1024), mb_total)
                 stream.flush()
                 os.fsync(stream.fileno())
             if count != expected_size or digest.hexdigest() != expected_sha256:
                 raise ValueError('Downloaded V6 archive size/SHA mismatch')
+            if progress_cb is not None:
+                with suppress(Exception):
+                    progress_cb(100, mb_total, mb_total)
             return
         except Exception as exc:
             last_error = type(exc).__name__
@@ -384,7 +398,7 @@ def _download(url, path, expected_size, expected_sha256):
             if attempt < 2:
                 time.sleep(attempt + 1)
     # Never expose signed URLs, credentials, or HTTP request details in exceptions.
-    raise RuntimeError('V6 archive download failed after3 attempts: ' + str(last_error))
+    raise RuntimeError('V6 archive download failed after 3 attempts: ' + str(last_error))
 
 
 def _extract(archive_path, destination, verified_sha=None):
@@ -434,7 +448,8 @@ def _extract(archive_path, destination, verified_sha=None):
                 os.fsync(stream.fileno())
 
 
-def ensure_runtime_bundle(model_dir=None, expected_manifest_sha256=None, *, jetpack_major=None):
+def ensure_runtime_bundle(model_dir=None, expected_manifest_sha256=None, *, jetpack_major=None,
+                          progress_cb=None, stage_cb=None):
     """Return a fully rehashed local bundle; fail closed on any missing pin or mismatch.
 
     ModelScope repo/revision/archive size/SHA are required only for a cold download.
@@ -460,7 +475,10 @@ def ensure_runtime_bundle(model_dir=None, expected_manifest_sha256=None, *, jetp
             archive = temp / 'model.tar'
             staging = temp / 'bundle'
             staging.mkdir()
-            _download(url, archive, size, archive_sha)
+            _download(url, archive, size, archive_sha, progress_cb=progress_cb)
+            if stage_cb is not None:
+                with suppress(Exception):
+                    stage_cb('extract')
             _extract(archive, staging, archive_sha)
             _verified_bundle(staging, expected)
             os.replace(staging, root)  # Complete verified tree, same filesystem.

@@ -224,6 +224,157 @@ def test_info_reports_loading_while_the_new_engine_builds(monkeypatch, _fake_eng
     assert plugin.dispatch("tts", {"action": "speak", "text": "hi"})["state"] == "loading"
 
 
+@pytest.fixture
+def _xiaoyou_module(monkeypatch):
+    from plugins.xiaoyou_tts import plugin
+    from plugins.xiaoyou_tts.frontend import phonemizer
+
+    monkeypatch.setattr(phonemizer, "require_runtime", lambda: None)
+    return plugin
+
+
+@pytest.mark.parametrize("stop_during_replay", [False, True])
+def test_xiaoyou_shows_download_and_unpacking_before_start_replays(
+        monkeypatch, _fake_engines, _xiaoyou_module, stop_during_replay):
+    from utils.model_progress import fetch_status
+
+    downloading = threading.Event()
+    extracting = threading.Event()
+    replaying = threading.Event()
+    allow_extract = threading.Event()
+    allow_finish = threading.Event()
+    allow_start = threading.Event()
+    engine = tts.XIAOYOU_TTS_ENGINE
+    start = {"action": "start", "instance_id": "card-1", "input_topic": "/say"}
+
+    class _XiaoyouEngine(_FakeEngine):
+        def dispatch(self, name, args):
+            if args == start:
+                replaying.set()
+                assert allow_start.wait(5)
+            result = super().dispatch(name, args)
+            if args.get("action") == "info" and start in self.calls and not self.stopped:
+                result["state"] = "running"
+                result["topic_out"] = [{"topic": "/say/tts", "format": "audio/pcm-16k"}]
+            return result
+
+    def build(cfg, executor, *, on_status=None):
+        progress, stage = fetch_status(on_status, "xiaoyou01")
+        progress(40, 120, 300)
+        downloading.set()
+        assert allow_extract.wait(5)
+        stage("extract")
+        extracting.set()
+        assert allow_finish.wait(5)
+        return _XiaoyouEngine(engine, cfg, executor, _fake_engines.add)
+
+    monkeypatch.setattr(_xiaoyou_module, "TTSPlugin", build)
+    plugin = _plugin()
+    configure = {"action": "config", "tts_engine": engine, "xiaoyou_language": "zh"}
+    query = {"action": "info", "instance_id": "card-1"}
+    stop = {"action": "stop", "instance_id": "card-1"}
+    stopping = None
+    stopped = []
+    try:
+        assert plugin.dispatch("tts", configure)["state"] == "loading"
+        assert downloading.wait(5)
+        info = plugin.dispatch("tts", {"action": "info"})
+        assert info["state"] == "loading" and info["engine"] == engine
+        assert "40% (120/300 MB)" in info["desc"]
+        assert plugin.dispatch("tts", configure)["message"] == info["desc"]
+        assert plugin.dispatch("tts", start) == {"state": "loading", "message": info["desc"]}
+
+        allow_extract.set()
+        assert extracting.wait(5)
+        info = plugin.dispatch("tts", {"action": "info"})
+        assert info["state"] == "loading" and "正在解压模型" in info["desc"]
+        allow_finish.set()
+        assert replaying.wait(5)
+        assert plugin.dispatch("tts", query)["state"] == "loading"
+        incoming = _fake_engines[engine]
+        if stop_during_replay:
+            stopping = threading.Thread(target=lambda: stopped.append(plugin.dispatch("tts", stop)))
+            stopping.start()
+            assert _wait_until(lambda: "card-1" not in plugin._pending_starts)
+        allow_start.set()
+        if stopping:
+            stopping.join(5)
+            assert stopped == [{"state": "idle"}]
+            assert [c for c in incoming.calls if c.get("action") in {"start", "stop"}] == [start, stop]
+            assert plugin.dispatch("tts", query)["state"] == "idle"
+        else:
+            assert _wait_until(lambda: plugin.dispatch("tts", query)["state"] == "running")
+            assert plugin.dispatch("tts", query)["topic_out"][0]["topic"] == "/say/tts"
+        assert _fake_engines.order == ["vits2-zh-en", engine]
+        assert incoming.cfg["language"] == "zh"
+        assert incoming.calls.count(start) == 1
+    finally:
+        allow_extract.set()
+        allow_finish.set()
+        allow_start.set()
+        if stopping:
+            stopping.join(5)
+        plugin.shutdown()
+
+
+def test_xiaoyou_switch_ignores_progress_from_an_old_build(
+        monkeypatch, _fake_engines, _xiaoyou_module):
+    first_build = threading.Event()
+    allow_first_finish = threading.Event()
+    old_status = []
+    engine = tts.XIAOYOU_TTS_ENGINE
+
+    def build(cfg, executor, *, on_status=None):
+        if old_status:
+            raise RuntimeError("Xiaoyou archive check failed")
+        old_status.append(on_status)
+        on_status("old Xiaoyou download")
+        first_build.set()
+        assert allow_first_finish.wait(5)
+        return _FakeEngine(engine, cfg, executor, _fake_engines.add)
+
+    monkeypatch.setattr(_xiaoyou_module, "TTSPlugin", build)
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.0)
+    plugin = _plugin()
+    configure = {"action": "config", "tts_engine": engine}
+    try:
+        assert plugin.dispatch("tts", configure)["state"] == "loading"
+        assert first_build.wait(5)
+        assert plugin.dispatch("tts", {"action": "info"})["desc"] == "old Xiaoyou download"
+
+        plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
+        assert plugin.dispatch("tts", configure)["state"] == "loading"
+        old_status[0]("stale Xiaoyou progress")
+        info = plugin.dispatch("tts", {"action": "info"})
+        assert info["state"] == "loading" and "stale" not in info["desc"]
+
+        allow_first_finish.set()
+        assert _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "error")
+        info = plugin.dispatch("tts", {"action": "info"})
+        assert info["error"] == "Xiaoyou archive check failed"
+        assert "stale" not in info["desc"]
+        assert _fake_engines[engine].stopped is True
+    finally:
+        allow_first_finish.set()
+        plugin.shutdown()
+
+
+def test_explicit_xiaoyou_benchmark_build_is_synchronous(
+        monkeypatch, _fake_engines, _xiaoyou_module):
+    engine = tts.XIAOYOU_TTS_ENGINE
+
+    def build(cfg, executor, *, on_status=None):
+        assert on_status is None
+        assert cfg["pace_audio"] is False
+        return _FakeEngine(engine, cfg, executor, _fake_engines.add)
+
+    monkeypatch.setattr(_xiaoyou_module, "TTSPlugin", build)
+    monkeypatch.setenv("XIAOYOU01_TTS_BENCHMARK", "1")
+    plugin = _plugin(engine=engine)
+    assert _fake_engines.order == [engine]
+    assert plugin.dispatch("tts", {"action": "info"})["state"] == "idle"
+
+
 def test_switching_back_and_forth_keeps_one_engine_live(_fake_engines):
     plugin = _plugin()
     plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})

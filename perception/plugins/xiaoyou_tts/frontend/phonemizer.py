@@ -1741,8 +1741,9 @@ def run(connection, model_dir):
     try:
         import jieba
 
-        if version('en-core-web-sm') != '3.8.0':
-            raise RuntimeError('Xiaoyou requires the pinned spaCy English model 3.8.0')
+        english_model_version = '3.7.1' if detect_jetpack_major() == 5 else '3.8.0'
+        if version('en-core-web-sm') != english_model_version:
+            raise RuntimeError(f'Xiaoyou requires the pinned spaCy English model {english_model_version}')
         started = time.perf_counter()
         jieba.initialize()
         if not jieba.dt.initialized:

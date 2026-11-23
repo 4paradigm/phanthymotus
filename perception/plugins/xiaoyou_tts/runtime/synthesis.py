@@ -305,7 +305,8 @@ class ExcitationCache:
 class TRTBackend:
     dry_run_text = 'Hi.'
 
-    def __init__(self, model_dir=None, *, cpu_threads=2, backend='tensorrt_fp32', expected_manifest_sha256=None):
+    def __init__(self, model_dir=None, *, cpu_threads=2, backend='tensorrt_fp32', expected_manifest_sha256=None,
+                 progress_cb=None, stage_cb=None):
         major = require_runtime()
         self.first_output_policy = os.environ.get('XIAOYOU01_FIRST_OUTPUT_POLICY', STREAM_POLICY['default_first_output_policy'])
         if self.first_output_policy not in STREAM_POLICY['allowed_first_output_policies']:
@@ -326,7 +327,8 @@ class TRTBackend:
             raise ValueError('Xiaoyou synthesis source differs from the verified runtime')
         pin = resolve_runtime_manifest_pin(expected_manifest_sha256, jetpack_major=major)
         asset_started = time.perf_counter()
-        self.root = ensure_runtime_bundle(model_dir, pin, jetpack_major=major)
+        self.root = ensure_runtime_bundle(model_dir, pin, jetpack_major=major,
+                                          progress_cb=progress_cb, stage_cb=stage_cb)
         backend_started = time.perf_counter()
         self.asset_prepare_seconds = backend_started - asset_started
         print('XIAOYOU_STARTUP ' + json.dumps({
@@ -739,14 +741,18 @@ class _Lease:
             self._released = True
 
 
-def acquire_gpu_backend(model_dir=None, *, cpu_threads=2, expected_manifest_sha256=None):
+def acquire_gpu_backend(model_dir=None, *, cpu_threads=2, expected_manifest_sha256=None,
+                        progress_cb=None, stage_cb=None):
     root = str(Path(model_dir or os.environ.get('XIAOYOU_V6_MODEL_DIR') or '/models/01yuewen').expanduser().resolve())
     pin = resolve_runtime_manifest_pin(expected_manifest_sha256)
     key = (root, pin, int(cpu_threads))
     with _SHARED_LOCK:
         entry = _SHARED.get(key)
         if entry is None:
-            entry = {'backend': TRTBackend(model_dir, cpu_threads=cpu_threads, expected_manifest_sha256=expected_manifest_sha256), 'references': 0}
+            backend = TRTBackend(model_dir, cpu_threads=cpu_threads,
+                                 expected_manifest_sha256=expected_manifest_sha256,
+                                 progress_cb=progress_cb, stage_cb=stage_cb)
+            entry = {'backend': backend, 'references': 0}
             _SHARED[key] = entry
         entry['references'] += 1
         return _Lease(key, entry['backend'])

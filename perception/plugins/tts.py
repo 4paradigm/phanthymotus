@@ -18,6 +18,7 @@ import queue
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Optional
 
 import numpy as np
@@ -2261,14 +2262,9 @@ class TTSPlugin:
     the new one on a background thread, because sherpa-onnx downloads its Matcha
     model in its constructor and that is open-ended.
 
-    `action=config` then waits up to ENGINE_SWITCH_WAIT_S for that build and only
-    answers `loading` if it is still going, so the bounded part — constructing the
-    session, ~2 s on cpu and ~5 s on gpu — is not something callers have to poll
-    for. It can afford to wait: the dashboard's start-project path
-    (agent-core/src/api/mcp_manage.py mcp_call_tool) sets no client timeout at all,
-    and its loading watcher polls for up to 900 s. The 60 s figure that used to be
-    cited here belongs to the *LLM* tool path (agent-core/src/mcp_client.py), which
-    does not send config.
+    Xiaoyou returns `loading` while it builds so the dashboard can start polling
+    and show model download progress. Other engines wait up to ENGINE_SWITCH_WAIT_S
+    for the bounded session construction, then let the dashboard poll if needed.
     """
 
     PREFIX = "tts"
@@ -2278,6 +2274,7 @@ class TTSPlugin:
         self._executor = executor
         self._lock = threading.Lock()
         self._build_lock = threading.Lock()
+        self._xiaoyou_replay_lock = threading.Lock()
         self._build_revision = 0
         self._retiring_impl = None
         self._closed = False
@@ -2285,6 +2282,7 @@ class TTSPlugin:
         self._impl_engine = ""
         self._building = ""          # engine name while a build is in flight
         self._build_error = None
+        self._xiaoyou_build_status = None
         # `start` calls that arrived while a build was in flight, keyed by
         # instance_id, replayed against the new engine once it is resident. Agent
         # Core's contract for a start that answers `state: loading` is that the
@@ -2340,11 +2338,11 @@ class TTSPlugin:
             return self._configured_model_dir
         return ENGINE_MODEL_DIRS[engine]
 
-    def _build(self, engine: str):
+    def _build(self, engine: str, *, revision: int | None = None):
         with self._lock:
             cfg = dict(self._cfg)
         if engine == XIAOYOU_TTS_ENGINE:
-            impl = self._build_xiaoyou(cfg)
+            impl = self._build_xiaoyou(cfg, revision=revision)
         else:
             for key in _XIAOYOU_CONFIG_KEYS:
                 cfg.pop(key, None)
@@ -2369,7 +2367,7 @@ class TTSPlugin:
 
         return Vits2TTSPlugin(cfg, self._executor)
 
-    def _build_xiaoyou(self, cfg: dict):
+    def _build_xiaoyou(self, cfg: dict, *, revision: int | None):
         from plugins.xiaoyou_tts.plugin import TTSPlugin as XiaoYouTTSPlugin
         from plugins.xiaoyou_tts.runtime.model_bundle import resolve_runtime_manifest_pin
 
@@ -2377,6 +2375,12 @@ class TTSPlugin:
         pin = resolve_runtime_manifest_pin(cfg.get("runtime_manifest_sha256") if configured else None)
         model_dir = (os.environ.get("XIAOYOU_V6_MODEL_DIR")
                      or f"{ENGINE_MODEL_DIRS[XIAOYOU_TTS_ENGINE]}/{pin[:12]}")
+
+        def on_status(message):
+            with self._lock:
+                if self._building == XIAOYOU_TTS_ENGINE and revision == self._build_revision:
+                    self._xiaoyou_build_status = message
+
         return XiaoYouTTSPlugin({
             "engine": XIAOYOU_TTS_ENGINE,
             "model_dir": model_dir,
@@ -2384,7 +2388,7 @@ class TTSPlugin:
             "language": cfg.get("xiaoyou_language", "auto"),
             "warmup": cfg.get("warmup", True) if configured else True,
             "pace_audio": os.environ.get("XIAOYOU01_TTS_BENCHMARK") != "1",
-        }, self._executor)
+        }, self._executor, on_status=on_status if revision is not None else None)
 
     def _wait_for_vits_load(self, impl) -> None:
         # VITS2 stop clears pending nodes, but the initial adapter may still
@@ -2425,27 +2429,34 @@ class TTSPlugin:
             with self._lock:
                 if revision != self._build_revision:
                     return
-            impl = self._build(engine)
+            impl = self._build(engine, revision=revision)
         except Exception as error:  # noqa: BLE001
             log.error("[tts] failed to build engine %r: %s", engine, error, exc_info=True)
             with self._lock:
                 if revision == self._build_revision:
                     self._building = ""
                     self._build_error = str(error)
+                    self._xiaoyou_build_status = None
             return
 
+        with self._xiaoyou_replay_lock if engine == XIAOYOU_TTS_ENGINE else nullcontext():
+            self._install_and_replay(engine, impl, revision)
+
+    def _install_and_replay(self, engine: str, impl, revision: int) -> None:
+        xiaoyou = engine == XIAOYOU_TTS_ENGINE
         with self._lock:
             stale = revision != self._build_revision
             if stale:
                 self._retiring_impl = (engine, impl)
             else:
-                if engine == XIAOYOU_TTS_ENGINE:
+                if xiaoyou:
                     impl.dispatch("tts", {"action": "config",
                                          "language": self._cfg.get("xiaoyou_language", "auto")})
                 self._impl = impl
                 self._impl_engine = engine
                 self._building = ""
                 self._build_error = None
+                self._xiaoyou_build_status = None
                 replay = list(self._pending_starts)
         if stale:
             try:
@@ -2458,7 +2469,10 @@ class TTSPlugin:
             with self._lock:
                 if revision != self._build_revision:
                     break
-                start_args = self._pending_starts.pop(key, None)
+                # Keep Xiaoyou's start visible to info until its synchronous
+                # ROS publisher and speech session have actually started.
+                start_args = (self._pending_starts.get(key) if xiaoyou
+                              else self._pending_starts.pop(key, None))
             if start_args is None:
                 continue
             try:
@@ -2467,6 +2481,12 @@ class TTSPlugin:
                 log.error("[tts] deferred start for %s failed after the %s build", key or "?",
                           engine, exc_info=True)
                 continue
+            finally:
+                if xiaoyou:
+                    with self._lock:
+                        if (revision == self._build_revision
+                                and self._pending_starts.get(key) is start_args):
+                            self._pending_starts.pop(key)
             if result.get("state") == "error":
                 log.error("[tts] deferred start for %s failed after the %s build: %s", key or "?", engine,
                           result.get("message") or result.get("desc") or result)
@@ -2489,14 +2509,27 @@ class TTSPlugin:
             impl = self._impl
             building = self._building
             error = self._build_error
+            load_status = self._xiaoyou_build_status
             engine = self._engine
+            key = args.get("instance_id") or args.get("input_topic") or ""
             if action == "stop":
-                key = args.get("instance_id") or args.get("input_topic") or ""
                 if key:
                     self._pending_starts.pop(key, None)
                 else:
                     self._pending_starts.clear()
+            if (action == "info" and impl is not None and engine == XIAOYOU_TTS_ENGINE
+                    and key in self._pending_starts):
+                return {"engine": engine, "state": "loading", "desc": "正在启动小优音频输出"}
         if impl is not None:
+            if engine == XIAOYOU_TTS_ENGINE and action in ("start", "stop"):
+                # A stop can cancel an unclaimed start immediately. If replay
+                # has already claimed it, stop the session after it starts.
+                with self._xiaoyou_replay_lock:
+                    with self._lock:
+                        current = self._impl is impl
+                    if current:
+                        return impl.dispatch(name, args)
+                return self.dispatch(name, args)
             result = impl.dispatch(name, args)
             if isinstance(result, dict) and action == "info":
                 # Assignment, not setdefault: the facade is the only thing that
@@ -2517,7 +2550,7 @@ class TTSPlugin:
             result = {
                 "name": "TTS", "manufacture": "Embodied", "model": engine,
                 "engine": engine, "state": state,
-                "desc": (f"Switching to the {building} engine..." if building
+                "desc": (load_status or f"Switching to the {building} engine..." if building
                          else f"Engine {engine} failed to load: {error}"),
             }
             if state == "error" and error:
@@ -2530,6 +2563,8 @@ class TTSPlugin:
                 # not a rare race — and _build_async replays it.
                 with self._lock:
                     if self._building:
+                        building = self._building
+                        load_status = self._xiaoyou_build_status
                         key = args.get("instance_id") or args.get("input_topic") or ""
                         self._pending_starts[key] = dict(args)
                         deferred = True
@@ -2542,7 +2577,7 @@ class TTSPlugin:
                 # after the operator asked for it to stop.
                 return {"state": "idle"}
             return {"state": "loading",
-                    "message": f"TTS engine {building} is initializing, retry shortly"}
+                    "message": load_status or f"TTS engine {building} is initializing, retry shortly"}
         return {"state": "error", "message": f"TTS engine {engine} failed: {error}"}
 
     def _await_build(self, engine: str, revision: int, timeout_s: float) -> tuple[bool, str | None]:
@@ -2615,6 +2650,7 @@ class TTSPlugin:
                 self._cfg["engine"] = engine
                 self._building = engine
                 self._build_error = None
+                self._xiaoyou_build_status = None
                 self._build_revision += 1
             revision = self._build_revision
 
@@ -2632,33 +2668,34 @@ class TTSPlugin:
                     # cold CUDA build the card never settles and just reloads
                     # the model over and over. Ride the in-flight build instead.
                     log.info("[tts] config for %s while already building; "
-                              "waiting on the in-flight build instead of "
+                              "using the in-flight build instead of "
                               "starting another", engine)
-                # Wait for it, up to a bound. Only part of a build is open-ended
-                # (downloading a model); constructing the session afterwards took
-                # ~2 s on cpu and ~5 s on gpu, and answering `loading` for that is
-                # what made the dashboard send a start the engine could not honour.
-                # A time bound rather than "does it need to download" because the
-                # download is not the only slow phase — the gpu paraformer encoder
-                # is 636 MB and reading it cold takes seconds on its own.
-                ready, error = self._await_build(engine, revision, ENGINE_SWITCH_WAIT_S)
+                # Core sends start only after config returns. Let it queue start
+                # and poll Xiaoyou's progress while the model is still downloading.
+                timeout_s = 0.0 if engine == XIAOYOU_TTS_ENGINE else ENGINE_SWITCH_WAIT_S
+                ready, error = self._await_build(engine, revision, timeout_s)
                 if error:
                     return {"status": "error", "engine": engine,
                             "state": "error", "message": error}
                 if ready:
                     log.info("[tts] engine %s ready", engine)
                     return {"status": "configured", "engine": engine}
-                if not ready:
-                    return {"status": "configured", "state": "loading",
-                            "engine": engine,
-                            "message": f"loading the {engine} engine"}
+                with self._lock:
+                    load_status = (self._xiaoyou_build_status
+                                   if revision == self._build_revision else None)
+                return {"status": "configured", "state": "loading",
+                        "engine": engine, "message": load_status or f"loading the {engine} engine"}
 
         with self._lock:
             impl = self._impl
             current = self._engine
             already_changed = revision != self._build_revision
+            load_status = None if already_changed else self._xiaoyou_build_status
         if impl is None or already_changed or current != engine:
-            return {"status": "configured", "state": "loading", "engine": engine}
+            result = {"status": "configured", "state": "loading", "engine": engine}
+            if load_status:
+                result["message"] = load_status
+            return result
         result = impl.dispatch(name, {**forwarded, "action": "config"})
         if isinstance(result, dict):
             result.setdefault("engine", engine)
@@ -2679,6 +2716,7 @@ class TTSPlugin:
             self._closed = True
             self._build_revision += 1
             self._building = ""
+            self._xiaoyou_build_status = None
             self._pending_starts.clear()
             if self._impl is not None:
                 self._retiring_impl = (self._impl_engine, self._impl)
