@@ -513,6 +513,25 @@ class DepthProjection:
         self.frame, self.ground = frame, ground
         self._lock = Lock()
         self._grids = {}
+        self._received = False
+
+    @classmethod
+    def received(cls, frame, ground):
+        # Only the decoder's bytes-backed frames are safe to share across timers.
+        immutable = isinstance(getattr(frame.base, "base", None), bytes) and not frame.flags.writeable
+        if immutable and ground is not None:
+            ground = np.frombuffer(ground.tobytes(), dtype=ground.dtype).reshape(ground.shape)
+        projection = cls(frame, ground)
+        projection._received = immutable
+        return projection
+
+    @staticmethod
+    def for_observation(depth):
+        projection = depth.get("grid_projection")
+        if (isinstance(projection, DepthProjection) and projection._received
+                and projection.frame is depth["map"] and projection.ground is depth.get("ground")):
+            return projection
+        return DepthProjection(depth["map"], depth.get("ground"))
 
     def grid_for(self, geometry, *, require_valid_depth, check_free_space):
         geometry_key = (geometry.horizontal, geometry.vertical, geometry.front, geometry.height,

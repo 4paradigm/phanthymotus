@@ -1452,3 +1452,141 @@ def test_admitted_drive_outlives_its_packet_ttl_until_the_declared_watchdog(monk
     clock[0] = 1500
     card._dispatch_command()
     assert len(packets) == 2 and not any(packets[-1]["values"])
+
+
+@pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
+@pytest.mark.parametrize("update", ["fresh", "same_target", "obstacle", "missing_target", "no_new_input"])
+def test_first_send_rechecks_new_evidence_when_publication_outlasts_proof(monkeypatch, update, body):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=body, live_target=True)
+    original_deadline = message["stamp_ms"] + message["ttl_ms"]
+    finish = original_deadline + 10
+    recheck = card._recheck_dwa_motion
+    calls = []
+
+    def during_publication(*args, **kwargs):
+        checked = recheck(*args, **kwargs)
+        if not calls:
+            if update == "no_new_input":
+                clock[0] = finish
+            else:
+                advance_snapshot(snapshot, clock, finish, obstacle=(update == "obstacle"))
+                objects, depth, odom, target_ms = snapshot[0]
+                if update != "same_target":
+                    objects = dict(objects, timestamp=finish / 1000)
+                    target_ms = finish
+                if update == "missing_target":
+                    objects["objects"] = []
+                snapshot[0] = objects, depth, odom, target_ms
+        calls.append(checked)
+        return checked
+
+    monkeypatch.setattr(card, "_recheck_dwa_motion", during_publication)
+    if body:
+        card._publish_command(message)
+    else:
+        card._stage_command(message, card._output_epoch)
+    packet, = packets
+    if update in ("fresh", "same_target"):
+        assert packet["values"] == message["values"]
+        assert packet["stamp_ms"] == finish
+        assert packet["obs_stamp_ms"] == (finish if update == "fresh" else message["obs_stamp_ms"])
+        assert 0 < packet["ttl_ms"] <= card._config.max_feedback_gap_ms
+        assert card._wire_dwa_origin.forward_check.motion_guard.deadline_ms == finish + packet["ttl_ms"]
+        if not body:
+            assert card._scheduled_command.expires_ms == finish + packet["ttl_ms"]
+            clock[0] += 1
+            card._dispatch_command()
+            assert len(packets) == 1
+    else:
+        assert packet["values"] == [0.] * 6
+
+
+@pytest.mark.parametrize("change", ["payload", "receipt_only", "new_decision", "previously_sent"])
+def test_first_send_cannot_renew_superseded_evidence(monkeypatch, change):
+    card, _, clock, snapshot, message = selected_card(monkeypatch, live_target=True)
+    origin = card._staged_dwa_command[1]
+    finish = message["stamp_ms"] + message["ttl_ms"] + 10
+    advance_snapshot(snapshot, clock, finish)
+    check_motion = card._recheck_dwa_motion
+
+    def change_during_check(*args, **kwargs):
+        result = check_motion(*args, **kwargs)
+        if change != "receipt_only":
+            advance_snapshot(snapshot, clock, finish + 1)
+        objects, depth, odom, receipt = snapshot[0]
+        if change == "payload":
+            objects = dict(objects, objects=[dict(objects["objects"][0], confidence=.94)])
+            receipt = finish + 1
+        elif change == "receipt_only":
+            receipt = finish
+        elif change == "new_decision":
+            card._state.decision_id += 1
+        else:
+            card._dwa_last_published = origin.identity
+        snapshot[0] = objects, depth, odom, receipt
+        return result
+
+    monkeypatch.setattr(card, "_recheck_dwa_motion", change_during_check)
+    reason, checked = card._recheck_dwa_inputs(origin, message["values"], finish)
+    assert reason and checked is None
+
+
+def test_slow_first_send_uses_one_check_for_the_new_window(monkeypatch):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, live_target=True)
+    old_end = message["stamp_ms"] + message["ttl_ms"]
+    advance_snapshot(snapshot, clock, old_end - 50)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=clock[0] / 1000), depth, odom, clock[0]
+    step = card._recheck_dwa_inputs
+    checks = []
+
+    def slow_publish(*args, **kwargs):
+        checked = step(*args, **kwargs)
+        checks.append(checked)
+        clock[0] += 100
+        return checked
+
+    monkeypatch.setattr(card, "_recheck_dwa_inputs", slow_publish)
+    card._publish_command(message)
+    assert len(checks) == 1
+    assert packets[0]["values"] == message["values"]
+    assert old_end < packets[0]["stamp_ms"] < packets[0]["stamp_ms"] + packets[0]["ttl_ms"]
+
+
+@pytest.mark.parametrize("change", [
+    "stationary", "depth", "target", "nonzero_sample", "pose", "frame", "gap",
+    "disjoint_history", "source_regression", "pose_regression", "missing_pose",
+])
+def test_only_contiguous_exactly_stationary_feedback_preserves_a_check(change):
+    stopped = (0., 0., 0.)
+    pose = plugin.odom_mod.PlanarPose(1000, ("odom",), 1., 2., .5)
+    prior = dict(vx=0., vy=0., wz=0., source_sample_id=1000, stamp_ms=1000,
+                 motion_pose=pose, obstacle_pose=pose, velocity_history=((1000, 1000, stopped),))
+    current_pose = replace(pose, stamp_ms=1100)
+    history = prior["velocity_history"] + ((1050, 1050, stopped), (1100, 1100, stopped))
+    current = dict(prior, source_sample_id=1100, stamp_ms=1100, motion_pose=current_pose,
+                   obstacle_pose=current_pose, velocity_history=history)
+    target = depth = None
+    if change == "depth":
+        depth = {"map": np.ones((1, 1))}
+    elif change == "target":
+        target = {"objects": []}
+    elif change == "nonzero_sample":
+        current["velocity_history"] = history[:1] + ((1050, 1050, (.000001, 0., 0.)), history[-1])
+    elif change == "pose":
+        current["obstacle_pose"] = replace(current_pose, x=1.0000001)
+    elif change == "frame":
+        current["motion_pose"] = replace(current_pose, frame=("other",))
+    elif change == "gap":
+        current["velocity_history"] = history[:-1] + ((1450, 1100, stopped),)
+    elif change == "disjoint_history":
+        current["velocity_history"] = history[1:]
+    elif change == "source_regression":
+        current["velocity_history"] = history[:1] + ((1050, 900, stopped), history[-1])
+    elif change == "pose_regression":
+        current["motion_pose"] = replace(current_pose, stamp_ms=999)
+    elif change == "missing_pose":
+        current["motion_pose"] = None
+    old_revision = plugin._motion_inputs(None, None, prior)
+    new_revision = plugin._motion_inputs(target, depth, current)
+    assert plugin._stationary_feedback_update(old_revision, new_revision, 350) == (change == "stationary")

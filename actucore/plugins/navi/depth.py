@@ -85,7 +85,7 @@ def decode(payload: bytes) -> np.ndarray:
     millimetres = np.frombuffer(raw, dtype="<u2").reshape(HEIGHT, WIDTH)
     metres = millimetres.astype(np.float32) / 1000.0
     metres[millimetres == 0] = np.nan
-    return metres
+    return np.frombuffer(metres.tobytes(), dtype=metres.dtype).reshape(metres.shape)
 
 
 
@@ -105,6 +105,18 @@ def _box_slices(shape, bbox_norm):
     top = max(0, min(height - 1, int(y1 * height)))
     bottom = max(top + 1, min(height, int(y2 * height)))
     return slice(top, bottom), slice(left, right)
+
+
+def approach_clearance(frame, box):
+    """Nearest return in the box, with continuous depth coverage across its centre."""
+    patch = frame[_box_slices(frame.shape, box)]
+    h, w = patch.shape
+    if min(h, w) < 3:
+        return None
+    core = patch[h//3:h-h//3, w//3:w-w//3]
+    if not np.all(np.isfinite(core) & (core > 0.)):
+        return None
+    return float(_valid(patch).min())
 
 
 def sample_box(depth_m: np.ndarray, bbox_norm) -> float | None:

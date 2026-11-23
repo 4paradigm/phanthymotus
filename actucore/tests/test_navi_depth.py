@@ -665,3 +665,21 @@ def test_floor_only_corridor_reports_its_observed_free_extent():
     clearance, coverage = _corridor(frame, intrinsics=camera, ground=ground)
     assert clearance is not None and clearance > 0.95
     assert coverage > 0.9
+
+
+def test_only_received_immutable_pixels_can_share_a_projection():
+    from plugins.navi.local_path import DepthProjection
+
+    frame = D.decode(_encode(_solid(3.)))
+    ground = np.zeros(frame.shape, dtype=bool)
+    projection = DepthProjection.received(frame, ground)
+    snapshot = dict(map=frame, ground=projection.ground, grid_projection=projection)
+    assert DepthProjection.for_observation(snapshot) is projection
+    with pytest.raises(ValueError):
+        frame.setflags(write=True)
+    ground[:] = True
+    assert not projection.ground.any()
+    mutable = frame.copy()
+    mutable_projection = DepthProjection.received(mutable, ground)
+    assert DepthProjection.for_observation(dict(map=mutable, ground=ground,
+                                                grid_projection=mutable_projection)) is not mutable_projection

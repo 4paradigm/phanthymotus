@@ -892,7 +892,7 @@ def test_duplicate_unstamped_receipt_preserves_its_fixed_window_and_order(monkey
     assert [p["values"] for p in packets] == [message["values"]]
 
 
-@pytest.mark.parametrize("recover", [True, False])
+@pytest.mark.parametrize("recover", [True, False, "replacement"])
 def test_missing_target_veto_hands_off_to_search(monkeypatch, recover):
     card, packets, clock, snapshot, motion = selected_card(monkeypatch, live_target=True)
     original = snapshot[0][0]
@@ -908,12 +908,18 @@ def test_missing_target_veto_hands_off_to_search(monkeypatch, recover):
     # Search can start on the very snapshot that caused the veto.
     message = card.next_command()
     assert message["values"][:5] == [0.] * 5 and message["values"][5] != 0
+    if recover == "replacement":
+        # A confirmed track can expire while the card is searching.
+        old_generation = card._state.reacquire_generation
+        card._state.tracker.track = None
     for stamp in ((1050, 1100, 1150) if recover else (1050,)):
         observe(stamp, original if recover else absent_target_payload("empty"))
         message = card.next_command()
         if message:
             card._publish_command(message)
     twist = packets[-1]["values"]
+    if recover == "replacement":
+        assert card._state.tracker.track.generation > old_generation
     if recover:
         assert card._state.reacquire_generation is None
         assert twist[0] > 0
@@ -972,3 +978,48 @@ def test_slow_plan_refreshes_only_with_new_original_target_and_clear_sweep(monke
         assert result[3].target_ms == 1270
     else:
         assert result is None or not result[2]
+
+
+@pytest.mark.parametrize("box_depth,can_advance,vx_max,update", [
+    (5., True, .30, None), (5., True, .12, None), (.4, False, .30, None), (0., False, .30, None),
+    (5., True, .30, "same_person"), (5., False, .30, "closer_surface"),
+    (5., False, .30, "missing_person"),
+])
+def test_visible_person_without_front_fix(monkeypatch, box_depth, can_advance, vx_max, update):
+    from plugins.navi import track as tracking
+
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=True)
+    state, config = card._state, card._config
+    calls = observe_selector(monkeypatch)
+    config.vx_max = vx_max
+    _, depth, odom, _ = snapshot[0]
+    depth["map"][48:145, 287:354] = box_depth
+    state.goal_anchor = None
+    config.depth_intrinsics = config.local_geometry.horizontal
+    person = {"name": "person", "position": [0., -.6], "confidence": .95,
+              "bbox_norm": [.45, .10, .55, .30]}
+    monkeypatch.setattr(tracking, "_front_point", lambda *args: None)
+    for stamp in (700, 800, 900):
+        state.tracker.step(detections={"timestamp": stamp / 1000, "objects": [person]},
+                           depth=dict(depth, frame_id=stamp, source_frame_id=stamp),
+                           target=state.target, config=config, ego=(0., 0., 0.), ego_measured=True, dt=.1)
+    snapshot[0] = {"timestamp": 1., "objects": [person]}, depth, odom, 1000
+    message = card.next_command()
+    assert state.tracker.track.front_fix is None and state.goal_anchor is None
+    assert card._last_decision.distance_m is None
+    if update:
+        assert message["values"][0] > 0.
+        advance_snapshot(snapshot, clock, 1010)
+        objects, depth, odom, _ = snapshot[0]
+        if update == "closer_surface":
+            depth["map"][48:145, 287:354] = .4
+        snapshot[0] = (dict(objects, timestamp=1.01, objects=[] if update == "missing_person" else [person]),
+                       depth, odom, 1010)
+    card._publish_command(message)
+    if can_advance:
+        assert calls[-1][0]["x_limit"][1] == pytest.approx(.6 * vx_max)
+        assert (.04, 0., 0.) in calls[-1][0]["candidate_commands"]
+        assert 0. < packets[-1]["values"][0] <= .6 * vx_max
+        assert packets[-1]["values"][1:] == [0.] * 5
+    else:
+        assert packets[-1]["values"] == [0.] * 6

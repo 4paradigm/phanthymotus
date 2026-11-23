@@ -70,8 +70,8 @@ from .camera import half_fov as _resolve_half_fov
 from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, CAMERA_OCCUPANCY_MEMORY_RANGE_M, MAP_AGE_MS, ODOM_GAP_MS,
                           NearProjection, SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW,
                           TURN_SPEED_REDUCTION, confirmed_square_coverage, relative_pose_at)
-from .depth import has_valid_returns
-from .track import AssociationSnapshot, ObservationFrame, Track, Tracker, observation_source, observation_transform
+from .depth import approach_clearance, has_valid_returns
+from .track import AssociationSnapshot, ObservationFrame, Track, Tracker, observation_source, observation_transform, target_objects
 from . import local_path
 from . import dwa
 from . import motion as motion_model
@@ -843,6 +843,7 @@ class DwaMotionGuard(DwaMotionInputs):
     trace: motion_model.MotionTrace
     check: motion_model.MotionCheck
     visibility_required: bool = False
+    probe_region: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -1316,7 +1317,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
     state.dwa_odom = odom if config.local_controller == "dwa" else None
     if config.local_controller == "dwa":
         _latch_progress_feedback(state, config, odom)
-    state.dwa_projection = (local_path.DepthProjection(depth["map"], depth.get("ground"))
+    state.dwa_projection = (local_path.DepthProjection.for_observation(depth)
                             if config.local_controller == "dwa" and (depth or {}).get("map") is not None else None)
     if state.dwa_projection is not None:
         depth = dict(depth, grid_projection=state.dwa_projection)
@@ -1783,21 +1784,35 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt)
     anchor = state.goal_anchor
-    if track is not None and getattr(track, "front_required", False) and track.front_fix is None:
-        if anchor is None and track.observed:
-            scan = state.active_scan
-            scan.interrupt()
-            history = (odom or {}).get("velocity_history")
-            if scan.receipt_only and scan.near_obstacles.has_cells and scan.poses and history:
-                scan.sync_buffered_motion(history, odom.get("received_ms", history[-1][0]))
-            # A pending target can cancel a manoeuvre before it starts.
-            # Preserve the observed headings, but release that cancelled slot.
-            if not (scan.active or scan.exhausted or scan.has_result):
-                scan.attempted = False
-            state.commanded_vx = 0.
+    visual_only = bool(track is not None and track.observed and getattr(track, "front_required", False)
+                       and track.front_fix is None)
+    recovering = state.reacquire_generation is not None
+    detection_source = observation_source(detections) if recovering else None
+    fresh_recovery = (recovering and detections is not None and objects_ms > state.reacquire_receipt_ms
+                      and (state.reacquire_source is None or (detection_source is not None and detection_source > state.reacquire_source)))
+    if fresh_recovery and track is not None and track.observed and track.accepted_detection:
+        # A confirmed replacement owns a new goal; it cannot inherit the old detour.
+        if anchor is not None and (track.generation != anchor.generation or visual_only):
+            _reset_detour_route(state)
+            state.goal_anchor = anchor = None
+        if track.measured_range_m is not None or visual_only:
+            state.reacquire_generation = None
+            state.missing_frames = 0
+            state.searching_for_s = state.searched_rad = 0.
+    needs_probe = visual_only and anchor is None
+    if needs_probe:
+        scan = state.active_scan
+        scan.interrupt()
+        history = (odom or {}).get("velocity_history")
+        if scan.receipt_only and scan.near_obstacles.has_cells and scan.poses and history:
+            scan.sync_buffered_motion(history, odom.get("received_ms", history[-1][0]))
+        if not (scan.active or scan.exhausted or scan.has_result):
+            scan.attempted = False
+        state.commanded_vx = 0.
+        if config.local_controller != "dwa" or not config.local_planning or config.local_geometry is None:
             return Decision(_twist(0., 0., 0.), BLIND, "等待目标最前端的有效深度")
-        if anchor is None:
-            track = None
+    elif track is not None and getattr(track, "front_required", False) and track.front_fix is None and anchor is None:
+        track = None
     target_fix = None
     refresh_target = reobserved_target = False
     freeze_goal = config.local_controller == "dwa"
@@ -1954,24 +1969,19 @@ def _decide(detections, depth, odom, config: Config, state: State,
             scan.update_near_obstacles(scan_depth, geometry, obstacle_pose, _keepout_m(config), reach,
                                        approaching=approaching)
         if state.reacquire_generation is not None:
-            source = observation_source(detections)
-            fresh = (detections is not None and objects_ms > state.reacquire_receipt_ms
-                     and (state.reacquire_source is None or
-                          (source is not None and source > state.reacquire_source)))
-            if fresh:
-                state.reacquire_receipt_ms, state.reacquire_source = objects_ms, source
-            if (fresh and track is not None and track.generation == state.reacquire_generation
-                    and current_target_observed(state)):
-                state.reacquire_generation = None
-                state.missing_frames = 0
-                state.searching_for_s = state.searched_rad = 0.
-            else:
-                if scan.active or scan.result_frame or state.detour_leg is not None:
-                    _reset_detour_route(state)
-                if depth is None:
-                    return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
-                state.missing_frames = max(state.missing_frames, config.lost_frames)
-                return _search_for_target(depth, config, state, dt, odom)
+            if fresh_recovery:
+                state.reacquire_receipt_ms, state.reacquire_source = objects_ms, detection_source
+            if scan.active or scan.result_frame or state.detour_leg is not None:
+                _reset_detour_route(state)
+            if depth is None:
+                return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
+            if (detections is not None and state.tracker.track is not None
+                    and any(target_objects(detections, state.target, config))):
+                return Decision(_twist(0., 0., 0.), ALIGNING, "已看到目标，等待新观测确认")
+            state.missing_frames = max(state.missing_frames, config.lost_frames)
+            return _search_for_target(depth, config, state, dt, odom)
+        if needs_probe:
+            return _visual_approach(depth, config, state, geometry, track, feedback, objects_ms, detections)
         reviewing_observation = (target_fix is not None and feedback is not None
                                  and geometry is not None and geometry.horizontal is not None
                                  and ((freeze_goal and not (scan.active and scan.route_segment)) or reobserved_target or (
@@ -2068,6 +2078,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
         anchor = state.goal_anchor = None
 
     if track is None and anchor is None:
+        if (state.searched_rad > 0. and state.tracker.track is not None
+                and any(target_objects(detections, state.target, config))):
+            return Decision(_twist(0., 0., 0.), ALIGNING, "已看到目标，等待新观测确认")
         return _search_for_target(depth, config, state, dt, odom)
 
     state.missing_frames = 0
@@ -3319,7 +3332,8 @@ def _check_dwa_turn(depth, config, state, geometry, target, branch, command):
     if not check.accepted:
         state.dwa_trace["fallback_reason"] = check.reason
         return False
-    guard = DwaMotionGuard(**vars(inputs), trace=prediction, check=check)
+    guard = DwaMotionGuard(**vars(inputs), trace=prediction, check=check,
+                           probe_region=state.tracker.track.image_region if branch == "visual_probe" else None)
     state.dwa_proposal = DwaTurn(command, guard)
     state.dwa_motion_guard = guard
     state.dwa_selected = state.checked_prefix = state.avoidance_yaw_override = True
@@ -3358,6 +3372,44 @@ def _blocking_memory_view(scan, context, budget):
             # Bound the extra recovery work to one checked trajectory per reference group.
             break
     return None
+
+
+def _visual_approach(depth, config, state, geometry, track, feedback, objects_ms, detections):
+    hold = Decision(_twist(0., 0., 0.), ALIGNING, "已看到人，等待可验证的接近空间")
+    if (not depth or depth.get("map") is None or not track.front_box or geometry is None
+            or feedback is None or not objects_ms):
+        return hold
+    if not track.accepted_detection and not (
+            track.source is not None and track.source == observation_source(detections)
+            and track.since_obs_s * 1000 < config.max_obs_age_ms
+            and any((tuple(obj.get("position") or ()), tuple(obj.get("bbox_norm") or ())) == track.image_region
+                    for obj in target_objects(detections, state.target, config))):
+        return hold
+    near = approach_clearance(depth["map"], track.front_box)
+    if near is None or near <= config.stop_distance_m + local_path.RESOLUTION:
+        return hold
+    # A short local waypoint limits this approach; it is never a target range or an arrival fix.
+    distance = min(near, config.stop_distance_m + 2 * local_path.RESOLUTION)
+    bearing = track.bearing_rad / config.half_fov_rad
+    if abs(bearing) > config.align_tol:
+        limit = _scan_yaw_rate(config, math.copysign(1., bearing))
+        yaw = _lift(-config.k_yaw * bearing, config.floor_wz, limit) if limit >= config.floor_wz else 0.
+        point = local_path.target_in_grid(geometry, distance * math.cos(track.bearing_rad),
+                                         distance * math.sin(track.bearing_rad))
+        if yaw and _check_dwa_turn(depth, config, state, geometry, point, "visual_probe", (0., 0., yaw)):
+            return Decision(_twist(0., 0., yaw), ALIGNING, "已看到人，转向对准人体")
+        return hold
+    point = local_path.target_in_grid(geometry, distance, 0.)
+    # Keep a short-step candidate when the speed ceiling spreads the DWA samples apart.
+    speed_limit = .6 * config.vx_max
+    short_step = min(.04, speed_limit)
+    proposal = _dwa_detour(depth, config, state, Detour(None, ((0., 0.), point), geometry),
+                           distance, 0., branch="visual_probe", motion=feedback,
+                           speed_limit=speed_limit, candidate_commands=((short_step, 0., 0.),))
+    if proposal is None:
+        return hold
+    vx, vy, yaw, _, _ = _use_dwa(state, proposal, 0.)
+    return Decision(_twist(vx, vy, yaw), APPROACHING, "已看到人，沿已检查的短直线低速接近，等待人体测距")
 
 
 def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
@@ -3427,11 +3479,11 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         occupied=inputs.observed, remembered=inputs.remembered, supported_region=local_path.SUPPORTED_REGION,
         latency_s=(inputs.deadline_ms - inputs.checked_ms) / 1000,
         measured=inputs.measured, previous=inputs.previous, x_limit=(0., max(0., limit_x)),
-        y_limit=(-right_vy, left_vy),
+        y_limit=(0., 0.) if branch == "visual_probe" else (-right_vy, left_vy),
         yaw_limit=(-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.)),
         floors=(floor_x, floor_y, config.floor_wz, config.floor_wz_moving),
         target=target, stop_distance=config.stop_distance_m,
-        horizon=inputs.prediction_horizon_s, max_candidates=limit, allow_yaw=True,
+        horizon=inputs.prediction_horizon_s, max_candidates=limit, allow_yaw=branch != "visual_probe",
         candidate_commands=candidate_commands, validate_candidate=visible if shadow is not None else None,
         diagnostics=diagnostics, alternate_routes=tuple(ref.points for ref in alternates),
         candidate_budget=state.dwa_budget, motion_frame=(scan.motion_frame, inputs.pose), guidance=guidance,
@@ -3451,7 +3503,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
                 trace["memory_recheck"] = view
         return unavailable(diagnostics["reason"])
     guard = DwaMotionGuard(**vars(inputs), trace=proposed.trace, check=proposed.check,
-                           visibility_required=shadow is not None)
+                           visibility_required=shadow is not None,
+                           probe_region=state.tracker.track.image_region if branch == "visual_probe" else None)
     return DwaProposal(proposed, routes[proposed.reference_index], branch, guard)
 
 
@@ -4795,21 +4848,10 @@ def _search(config: Config, state: State, dt: float, odom=None, *, requested_yaw
     # eventually noticed. "I turned all the way round and it is not here" is a
     # result, and the caller is owed it.
     if state.searched_rad >= config.search_sweep_rad:
-        # The suggestion is part of the answer, not politeness. A detector's
-        # class for one object is not stable — the same fire extinguisher on
-        # r1_sz was reported 373 times as `fire extinguisher` in one recording
-        # and as `bottle` twenty minutes later — so "not found" far more often
-        # means the name does not match than that the thing is absent. A caller
-        # told only "lost" retries the same wrong name or gives up.
-        # Say which of the two measures ended it. "Swept a full circle" and
-        # "was told to sweep a full circle" are different claims, and only one
-        # of them is evidence the target is not there.
         state.failed_reason = (
             f"swept {state.searched_rad:.1f} rad "
             f"({'measured' if sweep_measured else 'commanded, no odometry'}) "
-            f"without seeing {state.target!r}: target lost. "
-            f"检测模型对同一物体的类别并不稳定，「没找到」多半是名字对不上 —— "
-            f"用 list_visible_objects 看一眼现在认出了什么，再和用户确认")
+            f"without a confirmed navigation fix for {state.target!r}: target lost")
         return Decision(None, FAILED, state.failed_reason)
     if state.searching_for_s >= config.search_timeout_s:
         state.failed_reason = (
