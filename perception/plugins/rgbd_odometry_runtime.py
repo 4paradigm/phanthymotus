@@ -786,7 +786,7 @@ class CaptureObservations:
             if visual is not None:
                 quality = entry['image_quality']
                 if quality is None:
-                    quality = observation_quality(entry['color'], entry['depth'])
+                    quality = entry['image_quality'] = observation_quality(entry['color'], entry['depth'])
                 candidate = (stamp, *pose_values(visual))
                 if not quality['visual_usable']:
                     reason = 'image_' + quality['reason']
@@ -887,7 +887,7 @@ class CaptureObservations:
                 continue
             self.counts['completed'] += 1
             sample = self.fusion.observe_frame(stamp, entry['color'], entry['depth'], visual, now,
-                                               reason=reason, arrival_ns=entry['added'])
+                                               reason=reason, arrival_ns=entry['added'], image_quality=entry['image_quality'])
             probe = self.startup_gate
             if probe is not None:
                 if self.fusion.filter is not None:

@@ -496,7 +496,8 @@ class ShortTermFusion:
         self.zero_velocity_updates += 1
         return True
 
-    def observe_frame(self, stamp, color, depth, visual_pose, now_ns, reason=None, *, arrival_ns=None):
+    def observe_frame(self, stamp, color, depth, visual_pose, now_ns, reason=None, *, arrival_ns=None,
+                      image_quality=None):
         from .rgbd_geometry import observation_quality
         # CaptureObservations waits for the previous geometry decision first.
         # Direct callers cannot apply an older result after advancing state.
@@ -515,7 +516,7 @@ class ShortTermFusion:
                 self.fault('fusion frame time is stale, repeated or reset', 'clock')
                 return self._finish(stamp, diagnostic)
             self.last_frame, self.last_processed_ns = stamp, now_ns
-            self.quality = observation_quality(color, depth)
+            self.quality = observation_quality(color, depth) if image_quality is None else dict(image_quality)
             covariance = None
             if visual_pose is not None:
                 if visual_pose.get('frame_id') != self.segment+'_odom' or visual_pose.get('child_frame_id') != self.frame:

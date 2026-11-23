@@ -18,7 +18,8 @@ class Fusion:
         self.filter = None
     def fault(self, reason, kind='fusion'):
         self.reason = reason
-    def observe_frame(self, stamp, color, depth, visual, now, reason=None, arrival_ns=None):
+    def observe_frame(self, stamp, color, depth, visual, now, reason=None, arrival_ns=None, image_quality=None):
+        self.qualities = getattr(self, 'qualities', []) + [image_quality]
         self.frames.append((stamp, visual, reason))
         self.arrivals = getattr(self, 'arrivals', []) + [arrival_ns]
         return {'stamp': stamp}
@@ -26,8 +27,9 @@ class Fusion:
 
 def test_capture_results_are_processed_in_order_at_original_time():
     fusion = Fusion(); frames = CaptureObservations(fusion)
-    frames.add_frame(1_000_000_000, 'rgb1', 'depth1', 1_010_000_000)
-    frames.add_frame(1_100_000_000, 'rgb2', 'depth2', 1_110_000_000)
+    q1, q2 = {'contrast': 9.}, {'contrast': 11.}
+    frames.add_frame(1_000_000_000, 'rgb1', 'depth1', 1_010_000_000, image_quality=q1)
+    frames.add_frame(1_100_000_000, 'rgb2', 'depth2', 1_110_000_000, image_quality=q2)
     m, i = messages(1_100_000_000)
     assert frames.result('pose', m, 1_120_000_000) == []
     assert frames.result('info', i, 1_120_000_000) == []
@@ -36,6 +38,7 @@ def test_capture_results_are_processed_in_order_at_original_time():
     out = frames.result('pose', m, 1_140_000_000)
     assert [s['stamp'] for s in out] == [1_000_000_000, 1_100_000_000]
     assert [f[0] for f in fusion.frames] == [1_000_000_000, 1_100_000_000]
+    assert fusion.qualities == [q1, q2]
     assert fusion.arrivals == [1_010_000_000, 1_110_000_000]  # enqueue time, for latency diagnostics
 
 

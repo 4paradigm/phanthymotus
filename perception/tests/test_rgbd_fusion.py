@@ -54,6 +54,22 @@ def images():
     return color, np.full((480, 640), 1500, np.uint16)
 
 
+def test_precomputed_quality_matches_direct_frame_and_remains_owned_by_caller(monkeypatch):
+    from plugins import rgbd_geometry
+    color, depth = images()
+    quality = rgbd_geometry.observation_quality(color, depth)
+    fusion = ShortTermFusion('run', 'optical', 'clock', K)
+    stamp = 1_000_000_000
+    fusion.observe_frame(stamp, color, depth, None, stamp)
+    expected = fusion.quality.copy()
+    monkeypatch.setattr(rgbd_geometry, 'observation_quality',
+                        lambda *_: pytest.fail('same capture was scored twice'))
+    stamp += 30_000_000
+    fusion.observe_frame(stamp, color, depth, None, stamp, image_quality=quality)
+    assert fusion.quality == expected == quality
+    assert fusion.quality is not quality
+
+
 def source(t, **changes):
     values = dict(camera_from_accel_translation=[.03, 0, 0],
                   camera_from_gyro_translation=[.03, 0, 0],
