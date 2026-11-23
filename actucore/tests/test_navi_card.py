@@ -471,7 +471,7 @@ def test_bumi_search_checks_depth_and_stops_immediately_when_it_expires(monkeypa
 
 
 @pytest.mark.parametrize("interrupt", [None, "depth", "detections"])
-def test_card_scans_the_clearer_side_then_replans_with_the_current_view(monkeypatch, interrupt):
+def test_legacy_card_scans_the_clearer_side_then_replans_with_the_current_view(monkeypatch, interrupt):
     from types import SimpleNamespace
 
     import numpy as np
@@ -480,6 +480,8 @@ def test_card_scans_the_clearer_side_then_replans_with_the_current_view(monkeypa
 
     card = _card(wz_max=.25)
     cfg = card._config
+    # Exercise the retained staged scan with its synthetic clearance grid.
+    cfg.local_controller = "legacy"
     cfg.local_planning = True
     cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
                                                   (480, 420, 243), .23)
@@ -619,7 +621,7 @@ def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
 
 
 @pytest.mark.parametrize("sweep_observed, pose_only", [(True, False), (False, False), (False, True)])
-def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
+def test_legacy_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
         monkeypatch, sweep_observed, pose_only):
     import math
     import numpy as np
@@ -629,6 +631,8 @@ def test_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
 
     card = _card(wz_max=.4)
     cfg = card._config
+    # This fixture asserts the historical scan phases and fixed leg commands.
+    cfg.local_controller = "legacy"
     cfg.local_planning = True
     cfg.odom_expected = True
     cfg.half_width_m = .23
@@ -1407,7 +1411,7 @@ def test_a_lost_target_tells_the_caller_to_look_before_retrying():
 def test_the_dialog_exposes_only_generic_card_configuration():
     keys = set(_tool()["configSchema"]["properties"])
     assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m",
-                    "local_controller", "dwa_horizon_s", "dwa_samples"}
+                    "dwa_horizon_s", "dwa_samples"}
 
 
 def test_only_default_stop_distance_is_available_to_the_config_action():
@@ -2317,8 +2321,8 @@ def test_projected_depth_grid_is_shared_by_scanning_planning_and_execution(monke
 @pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom,ttl_cap,expected_ttl,bumi_mount",
                          [(50, None, True, 600, 400, False), (700, 800, True, 250, 250, False),
                           (50, None, False, 600, 400, False), (50, None, True, 600, 400, True)])
-def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms,
-                                                          with_odom, ttl_cap, expected_ttl, bumi_mount):
+def test_legacy_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms,
+                                                                 with_odom, ttl_cap, expected_ttl, bumi_mount):
     import numpy as np
     from plugins.navi import active_scan, local_path, policy
 
@@ -2351,6 +2355,9 @@ def test_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_ag
     assert reply["state"] == "running"
     assert reply["ttl_ms"] == expected_ttl
     assert card._config.local_planning
+    # The mocked translation below intentionally supplies a fixed legacy leg;
+    # default DWA startup and native command publication have their own test.
+    card._config.local_controller = "legacy"
     assert card._config.half_width_m == .23
     assert card._config.local_geometry.front == 0.
     assert card._config.local_geometry.rear == .50
@@ -2676,7 +2683,7 @@ def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observati
         [.15, 0., 0., 0., 0., .10], policy.AVOIDING if checked_prefix else policy.APPROACHING,
         "checked motion", distance_m=3.))
     published = []
-    monkeypatch.setattr(card, "_publish_command", published.append)
+    monkeypatch.setattr(card, "_publish_command", lambda message, **_: published.append(message))
     assert card._stage_command(card.next_command(), card._output_epoch)
     initial_ttl = 90 if checked_prefix and next_frame == "duplicate_feedback" else 150
     assert published[-1]["ttl_ms"] == initial_ttl
@@ -2728,7 +2735,7 @@ def test_forward_timer_can_recheck_same_unexpired_depth_with_new_feedback(monkey
     monkeypatch.setattr(policy, "step", lambda **kwargs: policy.Decision(
         [.15, 0., 0., 0., 0., 0.], policy.APPROACHING, "target at 3 m", distance_m=3.))
     published = []
-    monkeypatch.setattr(card, "_publish_command", published.append)
+    monkeypatch.setattr(card, "_publish_command", lambda message, **_: published.append(message))
 
     assert card._stage_command(card.next_command(), card._output_epoch)
     assert published[-1]["ttl_ms"] == 250
@@ -2791,21 +2798,29 @@ def test_delayed_prefix_uses_new_feedback_before_publishing_short_window(
         assert command["values"] == [0.] * 6
         assert "运动反馈已到期" in card._last_decision.reason
 
-def test_dwa_controller_is_available_as_instance_config():
-    schema = _tool()["configSchema"]["properties"]
-    assert schema["local_controller"]["default"] == "legacy"
-    assert schema["local_controller"]["enum"] == ["legacy", "dwa"]
-    assert schema["local_controller"]["scope"] == "instance"
+@pytest.mark.parametrize("saved_controller", [None, "legacy", "dwa"])
+def test_all_cards_use_dwa_without_a_controller_selector(saved_controller):
+    saved = {"dwa_samples": 48}
+    if saved_controller is not None:
+        saved["local_controller"] = saved_controller
+    original = dict(saved)
+    selected = NaviPlugin(saved, executor=None)
+    schema = selected.get_tools()[0]["configSchema"]["properties"]
+    assert "local_controller" not in schema
     assert schema["dwa_horizon_s"]["scope"] == "instance"
     assert schema["dwa_samples"]["scope"] == "instance"
-    selected = _card(local_controller="dwa", dwa_samples=48)
     assert selected._config.local_controller == "dwa"
     assert selected._config.dwa_samples == 48
+    assert saved == original
 
 
-def test_dwa_instance_values_survive_card_restart(monkeypatch):
-    saved = json.loads(json.dumps({"local_controller": "dwa", "dwa_horizon_s": 1.2,
-                                  "dwa_samples": 64}))
+@pytest.mark.parametrize("saved_controller", [None, "legacy", "dwa"])
+def test_dwa_instance_values_survive_card_restart(monkeypatch, saved_controller):
+    saved = {"dwa_horizon_s": 1.2, "dwa_samples": 64}
+    if saved_controller is not None:
+        saved["local_controller"] = saved_controller
+    saved = json.loads(json.dumps(saved))
+    effective_values = {**saved, "local_controller": "dwa"}
     card = _card(**saved)
     monkeypatch.setattr(card, "_open_publisher", lambda: setattr(
         card, "_node", _FakeNode({"/camera/depth": ["sensor_msgs/msg/CompressedImage"]})))
@@ -2815,10 +2830,10 @@ def test_dwa_instance_values_survive_card_restart(monkeypatch):
                                           "input_topics": ["/camera/objects", "/camera/depth"]})[
                 "state"] == "running"
             effective = card._info()["config"]
-            assert {key: effective[key] for key in saved} == saved
+            assert {key: effective[key] for key in effective_values} == effective_values
             ignored = card._config_action({"local_controller": "legacy", "dwa_horizon_s": 2.,
                                            "dwa_samples": 32})
-            assert set(ignored["ignored_parameters"]) == set(saved)
+            assert set(ignored["ignored_parameters"]) == set(effective_values)
             assert card._config.local_controller == "dwa"
             card._stop()
     finally:

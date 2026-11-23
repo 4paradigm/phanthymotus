@@ -134,9 +134,10 @@ def test_normalizes_right_positive_path_against_ros_yaw():
     assert right.command[2] <= 0.
 
 
-def test_dwa_is_opt_in_and_has_bounded_configuration():
-    assert policy.Config().local_controller == "legacy"
+def test_dwa_is_default_and_has_bounded_configuration():
+    assert policy.Config().local_controller == "dwa"
     assert policy.Config(local_controller="dwa").local_controller == "dwa"
+    assert policy.Config(local_controller="legacy").local_controller == "legacy"
     with pytest.raises(ValueError, match="local_controller"):
         policy.Config(local_controller="unknown")
     with pytest.raises(ValueError, match="dwa_horizon"):

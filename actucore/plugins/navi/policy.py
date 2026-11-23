@@ -142,8 +142,8 @@ class Config:
     slow_distance_m: float = 1.0
     side_clearance_m: float = 1.0
     local_planning: bool = False
-    # Opt-in while replay and real-hardware results are being compared.
-    local_controller: str = "legacy"  # "legacy" or "dwa"
+    # Navi enables DWA by default; legacy remains an internal fallback/reference.
+    local_controller: str = "dwa"  # "legacy" or "dwa"
     dwa_horizon_s: float = 1.2
     dwa_samples: int = 64
     odom_expected: bool = False
@@ -677,6 +677,9 @@ class DirectApproachFix:
 @dataclass
 class DwaProgress:
     """Body-pivot measurements and finite view coverage for one navigate action."""
+    # Once feedback is expected or used, losing it cannot turn commands into
+    # evidence of progress. Only a new navigation action resets this latch.
+    requires_feedback: bool = False
     pose: PlanarPose | None = None
     source: int | None = None
     interrupted: bool = False
@@ -1298,6 +1301,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
          command_interrupted: bool = False, dwa_admission_ms: int = 0) -> Decision:
     state.dwa_admission_ms = dwa_admission_ms
     state.dwa_odom = odom if config.local_controller == "dwa" else None
+    if config.local_controller == "dwa":
+        _latch_progress_feedback(state, config, odom)
     state.dwa_projection = (local_path.DepthProjection(depth["map"], depth.get("ground"))
                             if config.local_controller == "dwa" and (depth or {}).get("map") is not None else None)
     if state.dwa_projection is not None:
@@ -1420,6 +1425,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
             decision = Decision(_twist(0., 0., 0.), FAILED, state.failed_reason,
                                 distance_m=anchor.verified_range_m, bearing=decision.bearing)
     if config.local_controller == "dwa":
+        _latch_progress_feedback(state, config, odom)
+    if config.local_controller == "dwa" and state.dwa_progress.requires_feedback:
         decision = _account_dwa_progress(decision, state, config, odom, depth, progress_route, dt)
     else:
         if (decision.values is None or decision.values[0] <= .05 or command_interrupted
@@ -2394,6 +2401,17 @@ def _direct_return_progress(progress, state, decision, pose, moved, obstacle_pos
         progress.credited_range = distance
     progress.approach_fix = DirectApproachFix(pose.frame, target, distance)
     return previous is not None
+
+
+def _latch_progress_feedback(state, config, odom):
+    """Keep depth-only fallback usable without weakening a measured action."""
+    scan, sample = state.active_scan, odom or {}
+    state.dwa_progress.requires_feedback |= bool(
+        config.odom_expected or state.dwa_selected
+        or state.motion_source in ("pose", "measured")
+        or (scan.poses and not scan.command_only)
+        or planar_feedback(odom) is not None
+        or sample.get("obstacle_pose") is not None or sample.get("motion_pose") is not None)
 
 
 def _account_dwa_progress(decision, state, config, odom, depth, route, dt):
@@ -3526,8 +3544,16 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
     route_candidates = candidates()
     if config.local_controller == "dwa":
         route_candidates = tuple(route_candidates)
+        dwa_candidates = route_candidates
+        detour_opening = (local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target, True)
+                          if not closest or dwa_only else None)
+        if detour_opening is not None and not any(
+                plan.points == detour_opening.points for plan, _, _ in route_candidates):
+            # Preserve existing reference seeds and the legacy fallback. An
+            # offset opening is an extra hypothesis for complete DWA checks.
+            dwa_candidates += ((detour_opening, True, "route"),)
         groups = {"route": [], "reachable_prefix": [], "prefix": []}
-        for plan, require_observed, branch in route_candidates:
+        for plan, require_observed, branch in dwa_candidates:
             visible, preview = visible_plan(plan)
             # Keep the observed-evidence rules on the bounded reference. The
             # scoring continuation cannot make an unobserved waypoint eligible.

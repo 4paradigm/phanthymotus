@@ -30,6 +30,16 @@ def _cfg(**over):
     return P.Config(**over)
 
 
+def _legacy_cfg(**over):
+    """Exercise historical segment ordering and timers as fallback contracts.
+
+    General policy tests use the production default through _cfg. Only tests
+    named test_legacy_* select the old controller explicitly; its turn/settle
+    phases, moving target anchors and blockage clock differ from DWA.
+    """
+    return P.Config(local_controller="legacy", **over)
+
+
 def _obj(name="chair", x=0.0, y=0.0, confidence=0.9, bbox=None):
     out = {"name": name, "position": [x, y], "confidence": confidence}
     if bbox:
@@ -99,6 +109,8 @@ class Sim:
                                 -range_m * np.sin(angle)])
         self.velocity = np.array(velocity, dtype=float)
         self.pose = np.array([0.0, 0.0, 0.0])      # x, y, theta
+        self.elapsed_s = 0.
+        self.last_motion = (0., 0., 0.)
         self.confidence = confidence
         self.name = name
         self.visible = True
@@ -125,6 +137,8 @@ class Sim:
     # ── what the robot does about it ─────────────────────────────────────────
 
     def apply(self, values, dt):
+        self.last_motion = (tuple(values[i] for i in (0, 1, 5))
+                            if values is not None else (0., 0., 0.))
         if values is not None:
             theta = self.pose[2]
             cos, sin = np.cos(theta), np.sin(theta)
@@ -133,6 +147,7 @@ class Sim:
             self.pose[1] += (sin * vx + cos * vy) * dt
             self.pose[2] += values[5] * dt
         self.target += self.velocity * dt
+        self.elapsed_s += dt
 
     def run(self, state, ticks, config=None, dt=0.1, odom=True):
         """Closed loop. Returns the last decision."""
@@ -141,11 +156,13 @@ class Sim:
         for _ in range(ticks):
             detections, depth = self.observe()
             measured = None
-            if odom and decision is not None and decision.values is not None:
-                measured = {"vx": decision.values[0], "vy": decision.values[1],
-                            "wz": decision.values[5]}
-            elif odom:
-                measured = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+            if odom:
+                # Preserve the actual preceding motion across run(ticks=1)
+                # calls. DWA progress requires an ordered producer sample,
+                # rather than an unclocked velocity or a new zero each call.
+                stamp = 1000 + round(self.elapsed_s * 1000)
+                measured = dict(zip(("vx", "vy", "wz"), self.last_motion),
+                                received_ms=stamp, source_sample_id=stamp)
             decision = P.step(detections=detections, depth=depth, odom=measured,
                               config=config, state=state, dt=dt)
             self.apply(decision.values, dt)
@@ -163,8 +180,14 @@ def seed(state, detections, depth=None, config=None, frames=None, dt=0.1):
     thing. Confirmation itself is tested in its own section below.
     """
     config = config or _cfg()
-    for _ in range(config.confirm_hits if frames is None else frames):
-        state.tracker.step(detections=_next_frame(detections), depth=depth,
+    count = config.confirm_hits if frames is None else frames
+    for index in range(count):
+        # Confirmation is history preceding the observation under test. DWA
+        # rejects out-of-order producer frames, so seeding with later stamps
+        # would make a fresh-looking single-tick test actually replay old data.
+        history = (dict(detections, timestamp=detections["timestamp"] - (count - index) * dt)
+                   if detections is not None and "timestamp" in detections else _next_frame(detections))
+        state.tracker.step(detections=history, depth=depth,
                            target=state.target, config=config,
                            ego=(0.0, 0.0, 0.0), dt=dt)
     return state
@@ -754,8 +777,8 @@ def test_seeing_the_target_again_resets_the_search():
 
 # ── stuck detection, and the null-versus-zero rule it rests on ───────────────
 
-def test_commanded_but_not_moving_is_stuck():
-    config = _cfg(stuck_window_s=0.3)
+def test_legacy_commanded_but_not_moving_is_stuck():
+    config = _legacy_cfg(stuck_window_s=0.3)
     state = _state()
     for _ in range(6):
         decision = _step(detections=_detections(_obj(x=0.0)), depth=_depth(),
@@ -766,8 +789,8 @@ def test_commanded_but_not_moving_is_stuck():
     assert decision.publishes is False
 
 
-def test_blind_stops_end_the_current_pose_only_stuck_interval():
-    config = _cfg(stuck_window_s=.3, confirm_hits=1)
+def test_legacy_blind_stops_end_the_current_pose_only_stuck_interval():
+    config = _legacy_cfg(stuck_window_s=.3, confirm_hits=1)
     state = _state()
     odom = {"pose_feedback": (0., 0., 0.)}
     for _ in range(6):
@@ -798,12 +821,12 @@ def test_anchor_predicts_motion_only_until_the_previous_command_expires():
 
 
 @pytest.mark.parametrize("association", ["same_track", "reacquired", "different_position"])
-def test_arrival_inside_an_active_drive_segment_requires_the_original_measurement(monkeypatch, association):
+def test_legacy_arrival_inside_an_active_drive_segment_requires_the_original_measurement(monkeypatch, association):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
-    config = _cfg(local_planning=True, local_geometry=geometry)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry)
     state = _state(motion_source="measured")
     target = SimpleNamespace(observed=True, range_known=True, range_m=.84, measured_range_m=.84,
                              bearing_rad=1. if association != "reacquired" else 0.)
@@ -1102,6 +1125,24 @@ def test_a_slow_but_moving_approach_never_times_out():
                          config=config, state=state, dt=0.1)
     assert decision.status == P.APPROACHING
     assert state.idle_for_s == 0.0
+
+
+@pytest.mark.parametrize("odom", [False, True], ids=["unwired", "measured"])
+def test_default_controller_finishes_a_long_approach_with_available_feedback(odom):
+    """Default DWA preserves direct motion with or without wired odometry."""
+    config = P.Config(vx_max=.15)
+    assert config.local_controller == "dwa"
+    sim = Sim(range_m=3., config=config)
+    state = seed(_state(), *sim.observe(), config)
+    for tick in range(250):
+        decision = sim.run(state, ticks=1, dt=.1, odom=odom)
+        assert decision.status != P.FAILED, decision.reason
+        assert not state.dwa_selected
+        if state.arrived:
+            break
+    assert state.arrived
+    assert (tick + 1) * .1 > config.idle_timeout_s
+    assert config.arrival_min_distance_m <= sim.relative()[0] <= config.arrival_distance_m
 
 
 def test_turning_counts_as_motion():
@@ -1721,12 +1762,12 @@ def test_search_holds_when_the_circular_sweep_is_blocked(monkeypatch):
         assert state.last_seen_side == direction
 
 
-def test_command_only_active_observation_uses_camera_geometry_without_extrinsics(monkeypatch):
+def test_legacy_command_only_active_observation_uses_camera_geometry_without_extrinsics(monkeypatch):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .21, .21, None)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.21,
+    cfg = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.21,
                max_depth_age_ms=800, floor_wz=.33, wz_max=.83)
     state = _state()
     target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True,
@@ -1853,12 +1894,12 @@ def test_a_coasted_position_cannot_be_called_an_arrival():
     assert decision.status == P.ARRIVED
 
 
-def test_a_corridor_that_stays_blocked_fails_saying_so():
+def test_legacy_a_corridor_that_stays_blocked_fails_saying_so():
     """Trying to get round it is the right first move, and `_avoid` makes it.
     But a robot that has been shuffling sideways for twelve seconds is not
     making progress, and the caller is owed the real reason — "blocked", not a
     generic idle timeout, and certainly not "arrived"."""
-    config = _cfg(blocked_timeout_s=1.0, stop_distance_m=0.3)
+    config = _legacy_cfg(blocked_timeout_s=1.0, stop_distance_m=0.3)
     depth = _depth(map_=_solid_depth(0.4))       # inside obstacle_stop_m
     state = seed(_state(), _detections(_obj(x=0.0)), depth, config)
 
@@ -1872,9 +1913,9 @@ def test_a_corridor_that_stays_blocked_fails_saying_so():
     assert decision.values is None, "a failure publishes nothing"
 
 
-def test_a_corridor_that_clears_resets_the_blocked_clock():
+def test_legacy_a_corridor_that_clears_resets_the_blocked_clock():
     """A person stepping across the path is not a blockage."""
-    config = _cfg(blocked_timeout_s=1.0, stop_distance_m=0.3)
+    config = _legacy_cfg(blocked_timeout_s=1.0, stop_distance_m=0.3)
     blocked = _depth(map_=_solid_depth(0.4))
     clear = _depth(map_=_solid_depth(5.0))
     state = seed(_state(), _detections(_obj(x=0.0)), blocked, config)
@@ -1887,10 +1928,10 @@ def test_a_corridor_that_clears_resets_the_blocked_clock():
 
 
 @pytest.mark.parametrize(("feedback", "fails"), [(-.12, False), (-.039, True), (.12, True)])
-def test_lateral_only_detour_uses_measured_progress_for_the_blockage_clock(monkeypatch, feedback, fails):
+def test_legacy_lateral_only_detour_uses_measured_progress_for_the_blockage_clock(monkeypatch, feedback, fails):
     from types import SimpleNamespace
 
-    cfg = _cfg(local_planning=True, blocked_timeout_s=.2)
+    cfg = _legacy_cfg(local_planning=True, blocked_timeout_s=.2)
     state = _state(commanded=(0., -.30, 0.))
     target = SimpleNamespace(bearing_rad=0., range_m=2.5, range_known=True,
                              observed=True, measured_range_m=2.5)
@@ -1905,13 +1946,13 @@ def test_lateral_only_detour_uses_measured_progress_for_the_blockage_clock(monke
 
 
 @pytest.mark.parametrize("moves_sideways", [False, True])
-def test_local_avoidance_executes_lateral_candidates_with_progress(monkeypatch, moves_sideways):
+def test_legacy_local_avoidance_executes_lateral_candidates_with_progress(monkeypatch, moves_sideways):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, stuck_window_s=.4)
+    cfg = _legacy_cfg(local_planning=True, local_geometry=geometry, stuck_window_s=.4)
     state = _state(motion_source="measured")
     state.active_scan.attempted = True
     target = SimpleNamespace(bearing_rad=0., range_m=2.4, range_known=True,
@@ -2670,12 +2711,12 @@ def test_local_no_route_approach_stops_at_the_stricter_boundary(
 
 
 @pytest.mark.parametrize("case", ["clear_prefix", "clear_prefix_inside_preview", "blocked_prefix", "detour_found"])
-def test_local_planning_uses_checked_forward_prefix_before_observing(monkeypatch, case):
+def test_legacy_local_planning_uses_checked_forward_prefix_before_observing(monkeypatch, case):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20, at_front=True)
-    config = _cfg(local_planning=True, local_geometry=geometry, stop_distance_m=.60,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, stop_distance_m=.60,
                   obstacle_stop_m=.60, max_depth_age_ms=800, watchdog_ms=600)
     state = _state(motion_source="measured")
     look = state.active_scan
@@ -2727,14 +2768,14 @@ def test_shared_search_prefers_the_observed_open_side_if_forward_is_blocked(monk
 
 @pytest.mark.parametrize("use_lateral", [True, False])
 @pytest.mark.parametrize("front", [.59, 1.30])
-def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch, use_lateral, front):
+def test_legacy_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch, use_lateral, front):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
 
     geometry = local_path.Geometry(None, None, np.array([
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=use_lateral,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=use_lateral,
                   vy_max=.4 if use_lateral else 0., half_width_m=.275, vx_max=.3, wz_max=1.)
     state = _state(motion_source="measured")
     target = SimpleNamespace(bearing_rad=0., range_m=4., range_known=True,
@@ -2778,7 +2819,7 @@ def test_shared_avoidance_turns_and_settles_before_driving_straight(monkeypatch,
     "none", "depth_gap", "odom_gap", "sweeps_blocked", "corridor_blocked",
     "recovery_left_clear", "recovery_sweeps_blocked", "recovery_corridors_blocked",
 ])
-def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(monkeypatch, fault):
+def test_legacy_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(monkeypatch, fault):
     """Tianyi 2.0, 2026-11-20 06:06:52 attempt, closed loop: a 0.59 m obstacle
     centre-left, the right side open, the person 3.4 m ahead. The chassis is a
     simulation that executes the command and reports it back. The recorded run
@@ -2790,7 +2831,7 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
     geometry = local_path.Geometry(None, None, np.array([
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.,
                   half_width_m=.275, vx_max=.3, wz_max=1., obstacle_stop_m=.6,
                   stop_distance_m=.6)
     state = _state(motion_source="measured")
@@ -2922,7 +2963,7 @@ def test_shared_avoidance_closed_loop_survives_gaps_and_reports_blocked_sweeps(m
 
 
 @pytest.mark.parametrize("blocked_sweep", [False, True])
-def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_segment(
+def test_legacy_small_heading_can_align_a_narrow_opening_before_the_shared_straight_segment(
         monkeypatch, blocked_sweep):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
@@ -2930,7 +2971,7 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
     geometry = local_path.Geometry(None, None, np.array([
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
                   half_width_m=.275)
     state = _state(motion_source="measured")
     target = SimpleNamespace(bearing_rad=0., range_m=3.5, range_known=True,
@@ -2977,7 +3018,7 @@ def test_small_heading_can_align_a_narrow_opening_before_the_shared_straight_seg
 
 @pytest.mark.parametrize("blocked_in_new_view", [False, True])
 @pytest.mark.parametrize("camera_fallback", [False, True])
-def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_motion(
+def test_legacy_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_motion(
         monkeypatch, blocked_in_new_view, camera_fallback):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
@@ -2985,7 +3026,7 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
     geometry = local_path.Geometry(None, None, np.array([
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
                   half_width_m=.275, vy_max=0.)
     state = _state(motion_source="measured")
     target = SimpleNamespace(bearing_rad=0., range_m=4., range_known=True,
@@ -3059,13 +3100,13 @@ def test_obstacle_route_supplies_a_turn_and_straight_waypoint_without_lateral_mo
     pytest.fail("The segment neither completed nor held for the newly observed obstruction")
 
 
-def test_local_obstacle_beyond_slowdown_starts_a_detour_with_width_based_margin(monkeypatch):
+def test_legacy_local_obstacle_beyond_slowdown_starts_a_detour_with_width_based_margin(monkeypatch):
     from plugins.navi import local_path
 
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336), (480, 420, 243), .20)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.20)
     assert P._keepout_m(config) == pytest.approx(.22)
     state = _state(motion_source="measured")
     view = dict(frame_id=1000, map=np.ones((4, 4)), ground=np.ones((4, 4), dtype=bool))
@@ -3085,14 +3126,14 @@ def test_local_obstacle_beyond_slowdown_starts_a_detour_with_width_based_margin(
 @pytest.mark.parametrize("reported_hit,projected_hit,distance,detour", [
     (1.10, 1.10, 1.31, False), (.72, .72, 1.31, True), (1.10, 2.80, 2.60, False),
 ])
-def test_local_avoidance_checks_the_path_to_the_target_stop_point(
+def test_legacy_local_avoidance_checks_the_path_to_the_target_stop_point(
         monkeypatch, reported_hit, projected_hit, distance, detour):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336),
                                         (480, 420, 243), .20, half_length=.23)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
                   stop_distance_m=.80, use_lateral=False, watchdog_ms=600)
     state = _state(motion_source="measured")
     depth = dict(frame_id=1000, map=np.ones((8, 8)), ground=np.ones((8, 8), dtype=bool))
@@ -3112,13 +3153,13 @@ def test_local_avoidance_checks_the_path_to_the_target_stop_point(
     assert scan.active is detour
 
 
-def test_goal_corridor_also_checks_the_current_turning_motion(monkeypatch):
+def test_legacy_goal_corridor_also_checks_the_current_turning_motion(monkeypatch):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336),
                                         (480, 420, 243), .20, half_length=.23)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
                   stop_distance_m=.80, use_lateral=False, watchdog_ms=600, max_depth_age_ms=800)
     state = _state(motion_source="measured", commanded=(.306, 0., -.15))
     depth = dict(frame_id=1000, map=np.ones((8, 8)), ground=np.ones((8, 8), dtype=bool))
@@ -3187,13 +3228,13 @@ def test_detour_first_leg_passes_the_obstacle_at_the_permitted_heading_error(sid
                                     heading - side * active_scan.ANGLE_TOLERANCE, scan.advance_m)
 
 
-def test_detour_first_turn_can_execute_with_the_braking_reserve():
+def test_legacy_detour_first_turn_can_execute_with_the_braking_reserve():
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 336), (480, 420, 243),
                                         .20, half_length=.23)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.20,
                   max_depth_age_ms=800, watchdog_ms=600)
     state = _state(motion_source="measured")
     scan = state.active_scan
@@ -3213,12 +3254,12 @@ def test_detour_first_turn_can_execute_with_the_braking_reserve():
     assert scan.command(geometry, config.half_width_m, 1., 600, 800).yaw < 0.
 
 
-def test_initial_route_points_at_measured_opening_between_offset_jambs():
+def test_legacy_initial_route_points_at_measured_opening_between_offset_jambs():
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(320, 247, 159.5), (240, 247, 115), .275)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.275)
     state = _state(motion_source="measured")
     scan = state.active_scan
     occupied = (np.isclose(local_path.FORWARD, 1.) &
@@ -3253,12 +3294,12 @@ def test_centering_requires_two_observed_jambs_and_returns_beyond_the_opening(sc
 
 
 @pytest.mark.parametrize("source_at_stop", [1000, 1100, None])
-def test_shortened_obstacle_braking_room_replans_from_the_current_depth(source_at_stop):
+def test_legacy_shortened_obstacle_braking_room_replans_from_the_current_depth(source_at_stop):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 493, 318), (480, 493, 229), .275)
-    config = _cfg(local_planning=True, local_geometry=geometry)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry)
     state = _state(motion_source="measured", commanded=(.15, 0., 0.))
     scan = state.active_scan
     scan.phase, scan.receipt_only, scan.route_segment = "evaluate", True, True
@@ -3284,13 +3325,13 @@ def test_shortened_obstacle_braking_room_replans_from_the_current_depth(source_a
 
 @pytest.mark.parametrize("post_side", [-1., 1.])
 @pytest.mark.parametrize("range_offset,expected", [(.004, -1.), (.35, 1.)])
-def test_similar_side_ranges_prefer_the_side_away_from_the_measured_post(monkeypatch, post_side, range_offset, expected):
+def test_legacy_similar_side_ranges_prefer_the_side_away_from_the_measured_post(monkeypatch, post_side, range_offset, expected):
     from plugins.navi import local_path
 
     geometry = local_path.Geometry(None, None, np.array([
         [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
     ]), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.275)
     state = _state()
     scan = state.active_scan
     scan.receipt_only, scan.current_frame = True, 1000
@@ -3320,12 +3361,12 @@ def test_synchronized_reroute_requires_the_evaluated_capture():
     ("fresh", False), ("fresh", True), ("missing", False), ("repeated", False),
     ("missing_midway", False), ("missing_initial", False), ("mismatched", False), ("gap_after_reroute", False),
 ])
-def test_blocked_route_replans_once_from_current_heading(monkeypatch, identity, second_corridor_clear):
+def test_legacy_blocked_route_replans_once_from_current_heading(monkeypatch, identity, second_corridor_clear):
     from plugins.navi import active_scan, local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 493, 318), (480, 493, 229), .275)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.275,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.275,
                   use_lateral=False)
     state = _state(motion_source="measured")
     scan = state.active_scan
@@ -3502,12 +3543,12 @@ def test_lost_target_does_not_start_a_turn_in_a_close_obstacle():
     (2.0, (-.40,), -.60),
     (2.0, (-.30,), 0.),
 ])
-def test_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obstacles, expected_yaw):
+def test_legacy_lost_target_checks_the_padded_turn_sweep(monkeypatch, ahead, side_obstacles, expected_yaw):
     from plugins.navi import active_scan as scan, local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 600, 320), (480, 600, 240), .21)
-    cfg = _cfg(lost_frames=1, local_planning=True, local_geometry=geometry,
+    cfg = _legacy_cfg(lost_frames=1, local_planning=True, local_geometry=geometry,
                half_width_m=.21, obstacle_stop_m=.60, search_rate=.60)
     depth = dict(_scene(3.0, [(0., ahead, .5)]), frame_id=1000)
     depth["ground"] = np.zeros_like(depth["map"], dtype=bool)
@@ -3540,8 +3581,8 @@ def test_an_unexecutable_side_manoeuvre_does_not_keep_going_straight():
     assert decision.values == [0.0] * 6
 
 
-def test_a_near_side_escape_has_a_blocked_deadline():
-    cfg = _cfg(stop_distance_m=0.6, blocked_timeout_s=0.4)
+def test_legacy_a_near_side_escape_has_a_blocked_deadline():
+    cfg = _legacy_cfg(stop_distance_m=0.6, blocked_timeout_s=0.4)
     near = _scene(4.0, [(0.25, 0.6, 0.3)])
     state = seed(_state(), _detections(_obj()), near, cfg)
     for frame_id in range(100, 700, 100):
@@ -3586,8 +3627,8 @@ def test_local_planning_reports_pose_only_odometry(monkeypatch):
     assert "缺少可用的速度或连续位姿" in decision[4]
 
 
-def test_local_detour_starts_at_the_slowdown_boundary(monkeypatch):
-    cfg, state = _cfg(local_planning=True, obstacle_stop_m=.60, slow_distance_m=1.50), _state()
+def test_legacy_local_detour_starts_at_the_slowdown_boundary(monkeypatch):
+    cfg, state = _legacy_cfg(local_planning=True, obstacle_stop_m=.60, slow_distance_m=1.50), _state()
     ahead = 1.50
     attempts = []
     monkeypatch.setattr(P, "_clearance", lambda depth, config, lateral_offset_m=0: (
@@ -3634,13 +3675,13 @@ def test_local_planner_admits_a_checked_sideways_route_near_an_obstacle(monkeypa
 
 
 @pytest.mark.parametrize("remember", [False, True])
-def test_remembered_wall_allows_the_same_checked_approach(monkeypatch, remember):
+def test_legacy_remembered_wall_allows_the_same_checked_approach(monkeypatch, remember):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
     from plugins.navi.odom import PlanarPose
 
     geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .2)
-    config = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
                   use_lateral=False, wz_max=0., half_width_m=.2)
     state = _state(motion_source="measured")
     wall = np.isclose(local_path.FORWARD, 1.25)
@@ -3669,12 +3710,12 @@ def test_remembered_wall_allows_the_same_checked_approach(monkeypatch, remember)
     assert command[:3] == (.15, 0., 0.)
 
 
-def test_exhausted_observation_can_hand_off_to_approach(monkeypatch):
+def test_legacy_exhausted_observation_can_hand_off_to_approach(monkeypatch):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .2)
-    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, wz_max=0., half_width_m=.2)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False, wz_max=0., half_width_m=.2)
     state = _state(motion_source="measured")
     wall = np.isclose(local_path.FORWARD, 1.25)
     monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~wall, wall))
@@ -3742,14 +3783,14 @@ def test_checked_route_speed_fits_its_remaining_waypoint_horizon():
 
 @pytest.mark.parametrize("motion_direction", [-1., 1.])
 @pytest.mark.parametrize("observation_exhausted", [False, True])
-def test_partial_outcome_requires_measured_progress_toward_the_original_target(
+def test_legacy_partial_outcome_requires_measured_progress_toward_the_original_target(
         monkeypatch, motion_direction, observation_exhausted):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .2)
-    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, wz_max=0.,
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False, wz_max=0.,
                   half_width_m=.2, stop_distance_m=.6, obstacle_stop_m=.60)
     state = _state(motion_source="measured")
     target = SimpleNamespace(observed=True, range_known=True, range_m=2.1,
@@ -4017,12 +4058,12 @@ def test_command_only_checks_the_ramp_even_for_a_repeated_diagonal(monkeypatch):
     assert P._local_translation(depth, cfg, state, None, .9, 1.) is P.LocalHold.TRANSITION
 
 
-def test_checked_straight_approach_keeps_tracking_a_moving_target(monkeypatch):
+def test_legacy_checked_straight_approach_keeps_tracking_a_moving_target(monkeypatch):
     from types import SimpleNamespace
     from plugins.navi import local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .30, .30, None)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.)
+    cfg = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False, vy_max=0.)
     state = _state()
     track = SimpleNamespace(bearing_rad=0., range_m=3., range_known=True, observed=True,
                             measured_range_m=3.)
@@ -4047,12 +4088,12 @@ def test_checked_straight_approach_keeps_tracking_a_moving_target(monkeypatch):
 
 
 @pytest.mark.parametrize("same_track, measured", [(True, True), (False, True), (True, False)])
-def test_scan_replan_updates_goal_only_with_a_fresh_range_from_the_original_track(monkeypatch, same_track, measured):
+def test_legacy_scan_replan_updates_goal_only_with_a_fresh_range_from_the_original_track(monkeypatch, same_track, measured):
     from types import SimpleNamespace
     from plugins.navi import local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
     state = _state(motion_source="measured")
     track = SimpleNamespace(bearing_rad=0., range_m=3.81, range_known=True,
                             observed=True, measured_range_m=3.81)
@@ -4090,13 +4131,13 @@ def test_scan_replan_updates_goal_only_with_a_fresh_range_from_the_original_trac
 
 @pytest.mark.parametrize("odom", [None, {"vx": 0., "vy": 0., "wz": 0.}])
 @pytest.mark.parametrize("already_occluded", [False, True])
-def test_local_detour_keeps_original_target_through_retarget_and_occlusion(monkeypatch, odom,
+def test_legacy_local_detour_keeps_original_target_through_retarget_and_occlusion(monkeypatch, odom,
                                                                          already_occluded):
     from types import SimpleNamespace
     from plugins.navi import local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
-    cfg = _cfg(local_planning=True, local_geometry=geometry)
+    cfg = _legacy_cfg(local_planning=True, local_geometry=geometry)
     state = _state()
     track = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True,
                              measured_range_m=2.)
@@ -4135,12 +4176,12 @@ def test_local_detour_keeps_original_target_through_retarget_and_occlusion(monke
 
 
 @pytest.mark.parametrize("blocked, predicted", [(False, 1.6), (True, 1.6), (False, 3.1)])
-def test_remembered_goal_motion_checks_sweep_and_prediction_budget(
+def test_legacy_remembered_goal_motion_checks_sweep_and_prediction_budget(
         monkeypatch, blocked, predicted):
     from plugins.navi import active_scan, local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .275, .275, None)
-    config = _cfg(local_planning=True, local_geometry=geometry)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry)
     state = _state(motion_source="command", goal_anchor=P.DetourGoal(2., 1., predicted_m=predicted))
     free = np.ones(local_path.SHAPE, dtype=bool)
     occupied = ~free
@@ -4159,11 +4200,11 @@ def test_remembered_goal_motion_checks_sweep_and_prediction_budget(
 
 
 @pytest.mark.parametrize("blocked", [False, True])
-def test_remembered_side_goal_aligns_without_search_and_waits_for_a_live_fix(monkeypatch, blocked):
+def test_legacy_remembered_side_goal_aligns_without_search_and_waits_for_a_live_fix(monkeypatch, blocked):
     from plugins.navi import active_scan, local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .22, .22, None)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
+    cfg = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False,
                stop_distance_m=.6, stop_tolerance_m=.05, arrive_align_tol=.05)
     state = _state(goal_anchor=P.DetourGoal(0., -.62), motion_source="measured")
     occupied = np.zeros(local_path.SHAPE, dtype=bool)
@@ -4222,11 +4263,11 @@ def test_command_only_scan_keeps_fresh_depth_when_detections_lapse(monkeypatch):
     assert decision.values[:5] == [0.] * 5
 
 
-def test_command_only_straight_segment_can_exceed_the_slowdown_distance(monkeypatch):
+def test_legacy_command_only_straight_segment_can_exceed_the_slowdown_distance(monkeypatch):
     from plugins.navi import active_scan, local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .2, .2, None)
-    config = _cfg(local_planning=True, local_geometry=geometry, slow_distance_m=1.5)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, slow_distance_m=1.5)
     anchor = P.DetourGoal(4., 0.)
     state = _state(motion_source="command", goal_anchor=anchor)
     free = np.ones(local_path.SHAPE, dtype=bool)
@@ -4316,13 +4357,13 @@ def test_losing_feedback_during_a_turn_waits_for_valid_feedback(monkeypatch):
     assert state.active_scan.phase == "brake_for_replan" and state.active_scan.attempted
 
 
-def test_interrupted_observation_replans_while_the_target_corridor_is_blocked(monkeypatch):
+def test_legacy_interrupted_observation_replans_while_the_target_corridor_is_blocked(monkeypatch):
     from types import SimpleNamespace
     from plugins.navi import active_scan, local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20)
-    cfg = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
+    cfg = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
     state = _state(motion_source="measured")
     track = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True,
                             observed=True, measured_range_m=2.)
@@ -4385,13 +4426,13 @@ def test_command_only_cannot_reuse_a_frozen_depth_frame(monkeypatch):
     assert tick(1803, 101).values[0] > 0.
 
 
-def test_visible_foreground_triggers_detour_before_slowdown_then_survives_blind_view(monkeypatch):
+def test_legacy_visible_foreground_triggers_detour_before_slowdown_then_survives_blind_view(monkeypatch):
     from plugins.navi.odom import PlanarPose
     from plugins.navi import active_scan, local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geom = local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
-    cfg = _cfg(scan_geometry=geom, local_geometry=geom, local_planning=True, use_lateral=False, slow_distance_m=1.5)
+    cfg = _legacy_cfg(scan_geometry=geom, local_geometry=geom, local_planning=True, use_lateral=False, slow_distance_m=1.5)
     state = _state()
     scan = state.active_scan
     visible = np.zeros(local_path.SHAPE, dtype=bool)
@@ -4524,12 +4565,12 @@ def test_foreground_in_bottom_of_depth_image_is_remembered_before_it_disappears(
 
 
 @pytest.mark.parametrize("change", ["none", "obstacle", "waypoint", "goal", "stall"])
-def test_measured_detour_keeps_its_first_leg_across_new_depth(monkeypatch, change):
+def test_legacy_measured_detour_keeps_its_first_leg_across_new_depth(monkeypatch, change):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
-    cfg = _cfg(local_planning=True, use_lateral=True, local_geometry=geometry, half_width_m=.20)
+    cfg = _legacy_cfg(local_planning=True, use_lateral=True, local_geometry=geometry, half_width_m=.20)
     state = _state(motion_source="measured")
     scan = state.active_scan
     scan.attempted = True
@@ -4569,11 +4610,11 @@ def test_measured_detour_keeps_its_first_leg_across_new_depth(monkeypatch, chang
     assert calls == [(1000, True)]
 
 
-def test_checked_local_translation_takes_priority_over_another_turn(monkeypatch):
+def test_legacy_checked_local_translation_takes_priority_over_another_turn(monkeypatch):
     from plugins.navi import local_path
 
     geometry = local_path.Geometry(None, None, np.eye(4), .20, .20, None)
-    cfg = _cfg(local_planning=True, use_lateral=True, local_geometry=geometry, half_width_m=.20)
+    cfg = _legacy_cfg(local_planning=True, use_lateral=True, local_geometry=geometry, half_width_m=.20)
     state = _state(motion_source="measured")
     scan = state.active_scan
     scan.receipt_only = True
@@ -4623,12 +4664,12 @@ def test_checked_approach_can_move_while_turning(monkeypatch, arc_blocked):
     assert decision[2] == (0. if arc_blocked else .20)
 
 
-def test_local_plan_rechecks_and_drives_without_a_ground_mask():
+def test_legacy_local_plan_rechecks_and_drives_without_a_ground_mask():
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = P.local_path.camera_square(HorizontalIntrinsics(640, 420, 320),
                                            (480, 420, 240), .20)
-    cfg = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
+    cfg = _legacy_cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
     state = _state(motion_source="measured")
     scan = state.active_scan
     frame = np.full((480, 640), np.nan)
@@ -4654,11 +4695,11 @@ def test_local_plan_rechecks_and_drives_without_a_ground_mask():
     assert decision[0] > 0. and decision[1:3] == (0., 0.)
 
 
-def test_local_plan_dispatches_a_checked_turn_on_the_first_tick_while_approaching():
+def test_legacy_local_plan_dispatches_a_checked_turn_on_the_first_tick_while_approaching():
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = P.local_path.camera_square(HorizontalIntrinsics(640, 420, 320), (480, 420, 240), .20)
-    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry,
+    config = _legacy_cfg(local_planning=True, use_lateral=False, local_geometry=geometry,
                   half_width_m=.20, watchdog_ms=500, wz_max=1.)
     state = _state(target="person", motion_source="measured", commanded=(.2, 0., 0.),
                    goal_anchor=P.DetourGoal(3., 0.))
@@ -4788,13 +4829,13 @@ def test_blind_spot_history_only_blocks_a_motion_that_sweeps_through_it(monkeypa
     assert (result[0] > 0.) is can_move
 
 
-def test_reobserved_original_target_rechecks_direct_corridor_after_exhaustion(monkeypatch):
+def test_legacy_reobserved_original_target_rechecks_direct_corridor_after_exhaustion(monkeypatch):
     from types import SimpleNamespace
     from plugins.navi import active_scan
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.25, use_lateral=False)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.25, use_lateral=False)
     track = SimpleNamespace(observed=True, range_known=True, range_m=2.5, measured_range_m=2.7,
                             bearing_rad=0., last_obs=(2.65, .52))
     state = _state(motion_source="measured", goal_anchor=P.DetourGoal(2.1, 0., track=track))
@@ -4815,13 +4856,13 @@ def test_reobserved_original_target_rechecks_direct_corridor_after_exhaustion(mo
 
 
 @pytest.mark.parametrize("direct_blocked", [False, True])
-def test_moved_original_target_updates_goal_during_active_detour(monkeypatch, direct_blocked):
+def test_legacy_moved_original_target_updates_goal_during_active_detour(monkeypatch, direct_blocked):
     from types import SimpleNamespace
     from plugins.navi import active_scan
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
-    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
     point = (2.6, -.8)
     angle = math.atan2(-point[1], point[0])
     distance = math.hypot(*point)
@@ -4854,12 +4895,12 @@ def test_moved_original_target_updates_goal_during_active_detour(monkeypatch, di
 
 
 @pytest.mark.parametrize("blocked", [False, True])
-def test_lost_detour_target_checks_motion_towards_remembered_goal(monkeypatch, blocked):
+def test_legacy_lost_detour_target_checks_motion_towards_remembered_goal(monkeypatch, blocked):
     from plugins.navi import active_scan
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.25)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.25)
     state = _state(motion_source="measured", goal_anchor=P.DetourGoal(2., .8), last_clearance=.8)
     occupancy = np.zeros(P.local_path.SHAPE, dtype=bool)
     occupancy[P.local_path.START] = blocked
@@ -4899,12 +4940,12 @@ def test_execution_leg_heading_and_yaw_thresholds(heading, yaw, allowed):
     assert (reason is None) == allowed
 
 
-def test_distant_blocked_corridor_releases_a_checked_arc_prefix(monkeypatch):
+def test_legacy_distant_blocked_corridor_releases_a_checked_arc_prefix(monkeypatch):
     from plugins.navi.camera import HorizontalIntrinsics
 
     grid = P.local_path
     geometry = grid.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
-    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
+    config = _legacy_cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
     state = _state(motion_source="measured")
     observed = dict(map=np.ones((4, 4)), ground=None, frame_id=1000, control_ms=1000)
     occupied = np.isclose(grid.FORWARD, 2.) & (abs(grid.RIGHT) <= .10)
@@ -4921,12 +4962,12 @@ def test_distant_blocked_corridor_releases_a_checked_arc_prefix(monkeypatch):
     assert state.view_detour is not None and len(state.view_detour.points) > 2
 
 
-def test_early_detour_follows_a_checked_passing_lane_instead_of_target_yaw(monkeypatch):
+def test_legacy_early_detour_follows_a_checked_passing_lane_instead_of_target_yaw(monkeypatch):
     from plugins.navi.camera import HorizontalIntrinsics
 
     grid = P.local_path
     geometry = grid.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
-    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
+    config = _legacy_cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.20)
     state = _state(motion_source="measured")
     scan = state.active_scan
     scan.receipt_only, scan.current_frame = True, 1000
@@ -4986,13 +5027,13 @@ def test_started_route_accepts_residual_turn_but_still_checks_new_obstacles():
 
 
 @pytest.mark.parametrize("blocked", [False, True])
-def test_new_view_rechecks_the_target_corridor_before_continuing_an_observation_turn(monkeypatch, blocked):
+def test_legacy_new_view_rechecks_the_target_corridor_before_continuing_an_observation_turn(monkeypatch, blocked):
     from types import SimpleNamespace
     from plugins.navi import active_scan
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.25, use_lateral=False)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.25, use_lateral=False)
     track = SimpleNamespace(observed=True, range_known=True, range_m=2.5, measured_range_m=2.5,
                             bearing_rad=0., last_obs=(2.5, 0.))
     state = _state(motion_source="measured", goal_anchor=P.DetourGoal(2.5, 0., track=track))
@@ -5065,12 +5106,12 @@ def test_off_axis_remembered_door_jamb_allows_a_checked_prefix(monkeypatch, late
     assert decision[:3] == (.2, 0., .3)
 
 
-def test_view_received_during_interrupted_observation_is_remembered_without_paired_pose(monkeypatch):
+def test_legacy_view_received_during_interrupted_observation_is_remembered_without_paired_pose(monkeypatch):
     from plugins.navi import active_scan
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .23)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.23)
+    config = _legacy_cfg(local_planning=True, local_geometry=geometry, half_width_m=.23)
     state = _state(motion_source="measured")
     scan = state.active_scan
     scan.receipt_only, scan.phase = True, "turn"
@@ -5089,12 +5130,12 @@ def test_view_received_during_interrupted_observation_is_remembered_without_pair
     assert not scan.begin((1.,), turn_angle=.18)
 
 
-def test_wheeled_detour_can_leave_box_corner_when_grid_search_has_no_complete_route(monkeypatch):
+def test_legacy_wheeled_detour_can_leave_box_corner_when_grid_search_has_no_complete_route(monkeypatch):
     from plugins.navi.camera import HorizontalIntrinsics
 
     g = P.local_path
     body = g.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .275)
-    config = _cfg(local_planning=True, use_lateral=False, local_geometry=body, half_width_m=.275,
+    config = _legacy_cfg(local_planning=True, use_lateral=False, local_geometry=body, half_width_m=.275,
                   max_depth_age_ms=1200, vx_max=.30)
     state = _state(motion_source="measured")
     scan = state.active_scan
@@ -5135,13 +5176,13 @@ def test_person_arrival_uses_single_valid_front_surface_at_configured_standoff()
     assert decision.distance_m == pytest.approx(.60, abs=.002)
 
 
-def test_wheeled_box_corner_prefers_longer_checked_escape_to_the_open_side(monkeypatch):
+def test_legacy_wheeled_box_corner_prefers_longer_checked_escape_to_the_open_side(monkeypatch):
     from plugins.navi.camera import HorizontalIntrinsics
 
     grid = P.local_path
     geometry = grid.camera_square(HorizontalIntrinsics(640, 492., 318.),
                                   (480, 492., 229.), .275, at_front=True)
-    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry,
+    config = _legacy_cfg(local_planning=True, use_lateral=False, local_geometry=geometry,
                   half_width_m=.275, max_depth_age_ms=1200, watchdog_ms=500, vx_max=.30)
     state = _state(motion_source="measured")
     scan = state.active_scan
@@ -5210,10 +5251,10 @@ def test_occluded_cells_stay_unknown_and_new_free_returns_take_precedence():
     assert grid.visible_prefix(((0., 0.), (.5, .30), (1.5, .30)), restored) == 3
 
 
-def test_local_detour_keeps_occluded_tail_as_preview_and_executes_visible_waypoint():
+def test_legacy_local_detour_keeps_occluded_tail_as_preview_and_executes_visible_waypoint():
     grid = P.local_path
     geometry = grid.camera_square(P.HorizontalIntrinsics(640, 420, 320), (480, 420, 240), .275, at_front=True)
-    config = _cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.275,
+    config = _legacy_cfg(local_planning=True, use_lateral=False, local_geometry=geometry, half_width_m=.275,
                   stop_distance_m=.60)
     state = _state(motion_source="measured")
     scan = state.active_scan

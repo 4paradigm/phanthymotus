@@ -40,6 +40,20 @@ def _tick(lookout, geometry, stamp, wz=0, capture=True):
     return lookout.command(geometry, .33, .25, 600)
 
 
+def _legacy_buffered_turn_card(config):
+    """Test the segmented fallback's hand-built burst state and deadlines.
+
+    These fixtures call ActiveScan.begin directly without a tracked DWA goal
+    or accepted motion proposal. Public card startup uses DWA; only the legacy
+    contract tests below select this internal fallback explicitly.
+    """
+    from plugins.navi import plugin
+
+    card = plugin.NaviPlugin(config, executor=None)
+    card._config.local_controller = "legacy"
+    return card
+
+
 @pytest.mark.parametrize("command_only", [False, True])
 def test_receipt_only_projects_only_the_latest_requested_frame(monkeypatch, command_only):
     geometry = camera_square(HorizontalIntrinsics(64, 50, 32), (48, 50, 24), .23)
@@ -278,11 +292,11 @@ def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(mon
 @pytest.mark.parametrize(("rate_hz", "expiry"), [
     (10., "tick"), (10., "publication"), (10., "observation"), (2., "tick"),
 ])
-def test_card_renews_a_short_turn_with_continuous_velocity_feedback(monkeypatch, rate_hz, expiry):
+def test_legacy_card_renews_a_short_turn_with_continuous_velocity_feedback(monkeypatch, rate_hz, expiry):
     from plugins.navi import plugin
 
     look, geometry, _, _ = _setup(monkeypatch)
-    card = plugin.NaviPlugin({"local_planning": True, "wz_max": 1.}, executor=None)
+    card = _legacy_buffered_turn_card({"local_planning": True, "wz_max": 1.})
     card._config.local_geometry = geometry
     card._descriptor = {"rate": {"max_obs_age_ms": 600}}
     card._rate_hz = rate_hz
@@ -362,7 +376,7 @@ def test_buffered_turn_reaches_evaluation_with_slew_limited_feedback(monkeypatch
 
 
 @pytest.mark.parametrize("recovery", ["clear", "obstacle", "feedback_gap"])
-def test_buffered_route_survives_a_depth_lapse_and_checks_the_new_view(monkeypatch, recovery):
+def test_legacy_buffered_route_survives_a_depth_lapse_and_checks_the_new_view(monkeypatch, recovery):
     from plugins.navi import policy
 
     look, geometry, _, blocked = _setup(monkeypatch)
@@ -407,7 +421,7 @@ def test_buffered_route_survives_a_depth_lapse_and_checks_the_new_view(monkeypat
     for stamp in range(2200, 2800, 100):
         assert tick(stamp, source=stamp - 50).yaw == 0.
     assert look.ready
-    config = policy.Config(local_planning=True, local_geometry=geometry)
+    config = policy.Config(local_controller="legacy", local_planning=True, local_geometry=geometry)
     state = policy.State(target="person", motion_source="measured", active_scan=look,
                          goal_anchor=policy.DetourGoal(2., 0.))
     odom = dict(_odom(2700), received_ms=2700, source_sample_id=2700,
@@ -478,11 +492,11 @@ def test_tianyi_buffered_turn_tolerates_a_short_feedback_gap():
 
 
 @pytest.mark.parametrize("planning_ms,expected_ttl", [(282, 242), (399, 125), (400, 0)])
-def test_slow_first_buffered_turn_uses_unspent_observation_budget(monkeypatch, planning_ms, expected_ttl):
+def test_legacy_slow_first_buffered_turn_uses_unspent_observation_budget(monkeypatch, planning_ms, expected_ttl):
     from plugins.navi import plugin
 
     look, geometry, _, _ = _setup(monkeypatch)
-    card = plugin.NaviPlugin({"local_planning": True, "wz_max": 1., "max_depth_age_ms": 800}, None)
+    card = _legacy_buffered_turn_card({"local_planning": True, "wz_max": 1., "max_depth_age_ms": 800})
     card._config.local_geometry = geometry
     card._descriptor = {"rate": {"max_obs_age_ms": 800}}
     card._ttl_ms = 400
@@ -520,11 +534,11 @@ def test_slow_first_buffered_turn_uses_unspent_observation_budget(monkeypatch, p
 
 
 @pytest.mark.parametrize("expiry", ["first_yaw", "renewal", "snapshot"])
-def test_card_finishing_a_turn_command_after_its_deadline_sends_stop(monkeypatch, expiry):
+def test_legacy_card_finishing_a_turn_command_after_its_deadline_sends_stop(monkeypatch, expiry):
     from plugins.navi import plugin
 
     look, geometry, _, _ = _setup(monkeypatch)
-    card = plugin.NaviPlugin({"local_planning": True, "wz_max": 1.}, executor=None)
+    card = _legacy_buffered_turn_card({"local_planning": True, "wz_max": 1.})
     card._config.local_geometry = geometry
     card._config.watchdog_ms = 500
     card._descriptor = {"rate": {"max_obs_age_ms": 600}}

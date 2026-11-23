@@ -380,7 +380,10 @@ def score_candidate(command, trace, check, reference, previous, *, half_width, l
     if progress < .025 and not turns_toward_route:
         return None, progress, "insufficient_progress"
     errors = [_project_to_route(p[:2], reference, segments)[1] for p in poses[:trace.moving_count:4]]
-    if error > max(.24, .75 * half_width) or max(errors, default=0.) > max(.30, half_width):
+    # A front camera traces an arc while the chassis turns toward the route.
+    # Keep that deviation as a score; the complete footprint still checks the turn.
+    if not turns_toward_route and (error > max(.24, .75 * half_width)
+                                  or max(errors, default=0.) > max(.30, half_width)):
         return None, progress, "off_route"
 
     path = 3.0 * (sum(errors) / len(errors)) / max(.15, half_width)

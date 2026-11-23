@@ -228,6 +228,9 @@ class NaviPlugin:
 
     def __init__(self, plugin_cfg: dict, executor, namespace: str = ""):
         self._cfg = dict(plugin_cfg or {})
+        # DWA is standard for every card. Normalize the retired selector from
+        # startup YAML and saved instances before starts rebuild the Config.
+        self._cfg["local_controller"] = "dwa"
         self._executor = executor
         self._namespace = (namespace or "").strip("/")
         self._topic = self._cfg.get("topic") or DEFAULT_TOPIC
@@ -457,13 +460,6 @@ class NaviPlugin:
                     "rate_hz": {"type": "number", "default": 10,
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
-                    "local_controller": {
-                        "type": "string", "enum": ["legacy", "dwa"],
-                        "default": self._cfg.get("local_controller", "legacy"),
-                        "description": "局部避障速度控制：legacy 为现有分段跟踪；"
-                                       "dwa 在有效运动反馈与局部路线可用时预测短时轨迹，"
-                                       "否则保留现有控制方式。更改后重启 Navi。",
-                        "scope": "instance"},
                     "dwa_horizon_s": {
                         "type": "number", "minimum": .2, "maximum": 3.,
                         "default": self._cfg.get("dwa_horizon_s", 1.2),
@@ -2543,7 +2539,8 @@ class NaviPlugin:
             values = [0.] * ACTION_DIM
             hold = policy_mod.Decision(values, status, reason,
                                        distance_m=decision.distance_m, bearing=decision.bearing)
-            if self._config.local_controller == "dwa":
+            if (self._config.local_controller == "dwa"
+                    and self._state.dwa_progress.requires_feedback):
                 self._last_decision = hold
             else:
                 self._state.idle_for_s = idle_for_s

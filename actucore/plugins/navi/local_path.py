@@ -1150,51 +1150,65 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     return Detour(None, ((0., 0.), *relative[look:]), geometry, topology=topology)
 
 
-def opening_route(frame, occupied, geometry, half_width, plane, target):
-    """Aim toward a measured opening straddling the forward axis."""
+def opening_route(frame, occupied, geometry, half_width, plane, target, allow_detour=False):
+    """Propose a measured opening; checked detours may leave the direct goal ray."""
     if (plane <= geometry.front or target is None or target[0] <= plane
             or geometry.horizontal is None or geometry.vertical is None or geometry.base_from_optical[0, 2] <= 0.):
         return None
     band = occupied & (abs(FORWARD - plane) <= .10)
     cols = np.flatnonzero(band.any(axis=0))
-    left, right = cols[cols < START[1]], cols[cols > START[1]]
-    if (band[:, START[1]].any() or left.size < 2 or right.size < 2
-            or left[-2] != left[-1] - 1 or right[1] != right[0] + 1):
-        return None
-    lo, hi = RIGHT[0, [left[-1], right[0]]]
-    if (hi - lo - RESOLUTION < 2 * half_width or min(-lo, hi) > half_width + RESOLUTION
-            or not lo < target[1] * plane / target[0] < hi):
-        return None
+    if allow_detour:
+        # Each edge is already a measured occupied cell. A checked moving
+        # detour can approach an offset gap or a single-cell jamb; requiring
+        # the body/goal ray inside it here discards that useful reference.
+        gaps = [(RIGHT[0, a], RIGHT[0, b]) for a, b in zip(cols[:-1], cols[1:])
+                if RIGHT[0, b] - RIGHT[0, a] - RESOLUTION >= 2 * half_width]
+        gaps.sort(key=lambda gap: math.hypot(plane, sum(gap) / 2)
+                  + math.hypot(target[0] - plane, target[1] - sum(gap) / 2))
+    else:
+        left, right = cols[cols < START[1]], cols[cols > START[1]]
+        if (band[:, START[1]].any() or left.size < 2 or right.size < 2
+                or left[-2] != left[-1] - 1 or right[1] != right[0] + 1):
+            return None
+        lo, hi = RIGHT[0, [left[-1], right[0]]]
+        if (hi - lo - RESOLUTION < 2 * half_width or min(-lo, hi) > half_width + RESOLUTION
+                or not lo < target[1] * plane / target[0] < hi):
+            return None
+        gaps = [(lo, hi)]
 
-    middle = (hi + lo) / 2
-    # Confirm optical returns beyond the jambs across the proposed width.
-    # These rays select a heading; they do not clear the driving envelope.
     height, width = frame.shape
     fx, cx, fy, cy = intrinsics_for(geometry, height, width)
     transform = geometry.base_from_optical
     origin = transform[:3, 3]
     samples = math.ceil(2 * half_width / RESOLUTION) + 1
-    r = np.append(np.linspace(middle - half_width, middle + half_width, samples),
-                  target[1] * plane / target[0])
-    f = np.full(r.size, plane)
     z = origin[2] + (plane - origin[0]) * transform[2, 2] / transform[0, 2]
-    optical = (np.column_stack((f, -r, np.full_like(f, z))) - origin) @ transform[:3, :3]
-    if np.any(optical[:, 2] <= 0):
-        return None
-    u = np.rint(cx + fx * optical[:, 0] / optical[:, 2]).astype(int)
-    v = np.rint(cy + fy * optical[:, 1] / optical[:, 2]).astype(int)
-    if np.any((u < 0) | (u >= width) | (v < 0) | (v >= height)):
-        return None
-    measured = frame[v, u]
-    valid = np.isfinite(measured) & (measured > 0.)
-    if (not valid[-1] or np.count_nonzero(valid[:-1]) < .75 * samples
-            or np.any(measured[valid] <= optical[valid, 2] + 2 * RESOLUTION)):
-        return None
-    # The caller takes the longest safe prefix and checks it again after turning.
-    end = min(plane + geometry.rear + .25, FORWARD[-1, 0] - geometry.front)
-    points = tuple((forward, forward * middle / plane)
-                   for forward in np.arange(0., end + 1e-9, RESOLUTION))
-    return Detour(None, points, geometry)
+    for lo, hi in gaps:
+        middle = (hi + lo) / 2
+        # Far returns only select a heading; they never clear the driving
+        # envelope. A detour need not also see the unrelated direct goal ray.
+        r = np.linspace(middle - half_width, middle + half_width, samples)
+        if not allow_detour:
+            r = np.append(r, target[1] * plane / target[0])
+        f = np.full(r.size, plane)
+        optical = (np.column_stack((f, -r, np.full_like(f, z))) - origin) @ transform[:3, :3]
+        if np.any(optical[:, 2] <= 0):
+            continue
+        u = np.rint(cx + fx * optical[:, 0] / optical[:, 2]).astype(int)
+        v = np.rint(cy + fy * optical[:, 1] / optical[:, 2]).astype(int)
+        if np.any((u < 0) | (u >= width) | (v < 0) | (v >= height)):
+            continue
+        measured = frame[v, u]
+        valid = np.isfinite(measured) & (measured > 0.)
+        opening_valid = valid if allow_detour else valid[:-1]
+        if ((not allow_detour and not valid[-1]) or np.count_nonzero(opening_valid) < .75 * samples
+                or np.any(measured[valid] <= optical[valid, 2] + 2 * RESOLUTION)):
+            continue
+        # The caller takes the longest safe prefix and checks it again after turning.
+        end = min(plane + geometry.rear + .25, FORWARD[-1, 0] - geometry.front)
+        points = tuple((forward, forward * middle / plane)
+                       for forward in np.arange(0., end + 1e-9, RESOLUTION))
+        return Detour(None, points, geometry)
+    return None
 
 
 def _turnable_endpoints(cells, occupied, geometry, half_width):
