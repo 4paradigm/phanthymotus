@@ -83,19 +83,28 @@ def relative_pose_at(poses, stamp):
 
 
 def confirmed_square_coverage(indices, yaw, clear, occupied):
-    """Require confirmed free evidence throughout the bounds of an original cell."""
-    half_extent = (abs(math.cos(yaw)) + abs(math.sin(yaw))) / 2
+    """Require confirmed free evidence throughout the area of an original cell."""
+    cosine, sine = math.cos(yaw), math.sin(yaw)
+    half_extent = (abs(cosine) + abs(sine)) / 2
     lo = np.floor(indices - half_extent + .5).astype(int)
     hi = np.ceil(indices + half_extent - .5).astype(int)
     rows, cols = clear.shape
     retire = (lo[:, 0] >= 0) & (hi[:, 0] < rows) & (lo[:, 1] >= 0) & (hi[:, 1] < cols)
+    limit = half_extent + .5 - 1e-10
     for dr in range(int((hi[:, 0] - lo[:, 0]).max(initial=0)) + 1):
         for dc in range(int((hi[:, 1] - lo[:, 1]).max(initial=0)) + 1):
             r, c = np.minimum(lo[:, 0] + dr, hi[:, 0]), np.minimum(lo[:, 1] + dc, hi[:, 1])
             pair = r.clip(0, rows - 1), c.clip(0, cols - 1)
-            retire &= clear[pair]
+            # A rotated square does not cover every corner of its bounds.
+            # Require positive area on both cells' axes; boundary-only
+            # contact must not introduce another evidence requirement.
+            dx, dy = r - indices[:, 0], c - indices[:, 1]
+            overlap = ((abs(dx) < limit) & (abs(dy) < limit)
+                       & (abs(cosine * dx + sine * dy) < limit)
+                       & (abs(sine * dx - cosine * dy) < limit))
+            retire &= ~overlap | clear[pair]
             if occupied is not None:
-                retire &= ~occupied[pair]
+                retire &= ~overlap | ~occupied[pair]
     return retire
 
 
@@ -282,7 +291,8 @@ class ObservedObstacles:
         if full_clear and observed_free is not None:
             cleared = confirmed_square_coverage(np.column_stack((row, col)), pose.yaw,
                                                 observed_free, observed_occupied)
-        cleared &= ~conflicting_hit
+        else:
+            cleared &= ~conflicting_hit
         if cleared.any():
             cleared_cells = cells[cleared]
             self.cells.difference_update(map(tuple, cleared_cells))

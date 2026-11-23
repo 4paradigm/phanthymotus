@@ -1937,10 +1937,25 @@ class NaviPlugin:
             mount_frame = capture_pose.frame
         elif depth.get("body_mount_required") and state.use_body_mount is not False:
             return None
+        acceptance = decision.dwa_acceptance
+        motion_guard = acceptance.motion_guard if acceptance is not None else None
         squares = scan.near_squares
         remembered = scan.historical_hits if squares is not None else scan.remembered_hits
         if remembered is None and squares is None and (scan.obstacles.has_occupied or scan.near_obstacles.has_occupied):
-            return None
+            if motion_guard is None or scan.obstacles.has_occupied:
+                return None
+            # Retained near cells can be outside the current finite grid.
+            # Distinguish a registered empty projection from missing pose
+            # registration; only the former preserves the selected proof.
+            pose, reference = motion_guard.pose, scan.pose_registration
+            if (reference is not None
+                    and reference[0].frame == scan.near_obstacles.frame == ("navi_relative", scan.motion_frame)):
+                # An absolute fix registers the selected pose while retained
+                # near cells keep their continuous relative frame.
+                pose = policy_mod._registered_dwa_pose(pose, (reference[1], reference[0]))
+            remembered = scan.near_obstacles.project(pose)
+            if remembered is None or remembered.any():
+                return None
         memory_ms = scan.control_ms or depth.get("control_ms") or depth["frame_id"]
         if scan.near_hits is not None and scan.near_revision:
             memory_ms = min(memory_ms, scan.near_revision)
@@ -1949,8 +1964,6 @@ class NaviPlugin:
                 geometry is config.local_geometry and scan.views[-1][0] == depth["frame_id"]
                 and scan.matches_route_view(depth)):
             occupied = scan.views[-1][3]
-        acceptance = decision.dwa_acceptance
-        motion_guard = acceptance.motion_guard if acceptance is not None else None
         if motion_guard is not None and target_source is None:
             renewable = False
         depth_ms = depth.get("capture_ms") or depth["frame_id"]

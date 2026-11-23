@@ -840,6 +840,117 @@ def test_unregistered_pose_frame_invalidates_dwa_origin(monkeypatch, body):
     assert card._info()["dwa"]["publication"]["reason"] == "geometry_mismatch"
 
 
+@pytest.mark.parametrize("scheduled", [False, True], ids=["direct", "scheduled"])
+@pytest.mark.parametrize("memory_frame", ["odom", "unregistered"])
+def test_empty_near_projection_preserves_dwa_only_in_its_registered_frame(monkeypatch, scheduled, memory_frame):
+    from plugins.navi.odom import PlanarPose
+
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False)
+    card._command_timer = object() if scheduled else None
+    advance_snapshot(snapshot, clock, 21000)
+    current = PlanarPose(21000, ("odom",), 0., 0., 0.)
+    snapshot[0][2].update(obstacle_pose=current, motion_pose=current,
+                          velocity_history=((21000, 21000, (.1, 0., 0.)),))
+    scan, geometry = card._state.active_scan, card._config.local_geometry
+    old = PlanarPose(1000, (memory_frame,), -2., 0., 0.)
+    cells = np.isclose(local_path.FORWARD, .10) & np.isclose(local_path.RIGHT, .10)
+    scan.near_obstacles.remember(scan._footprint_origin(old, geometry), cells)
+    retained = set(scan.near_obstacles.cells)
+
+    message = card.next_command()
+    accepted = card._last_decision.dwa_acceptance
+    assert accepted is not None and accepted.motion_guard.check.accepted
+    assert accepted.motion_guard.trace.stopped and message["values"][0] > 0.
+    assert scan.near_obstacles.has_occupied and scan.near_obstacles.cells == retained
+    assert scan.near_hits is None and scan.near_squares is None
+    if scheduled:
+        card._stage_command(message, card._output_epoch)
+    else:
+        card._publish_command(message)
+
+    packet, = packets
+    if memory_frame == "odom":
+        # The retained cell is 1.9 m behind this grid origin. A valid empty
+        # projection must not erase the real selector's complete-stop proof.
+        assert packet["values"] == message["values"]
+        assert card._state.dwa_totals["published_decisions"] == 1
+    else:
+        # An unavailable projection is different: the old obstacle has no
+        # registration to this robot pose and must still prevent publication.
+        assert packet["values"] == [0.] * 6
+        assert card._state.dwa_totals.get("published_decisions", 0) == 0
+    assert scan.near_obstacles.cells == retained
+
+
+@pytest.mark.parametrize("scheduled", [False, True], ids=["direct", "scheduled"])
+@pytest.mark.parametrize("event", ["continuous", "feedback_gap", "expired", "new_contact"])
+def test_first_absolute_pose_keeps_only_a_continuous_fresh_dwa_proof(monkeypatch, scheduled, event):
+    from plugins.navi.odom import PlanarPose
+
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False)
+    card._command_timer = object() if scheduled else None
+    advance_snapshot(snapshot, clock, 21000)
+    snapshot[0][2]["velocity_history"] = ((21000, 21000, (.1, 0., 0.)),)
+    card.next_command()
+    assert card._last_decision.dwa_acceptance is not None
+    scan, geometry = card._state.active_scan, card._config.local_geometry
+    relative = ("navi_relative", scan.motion_frame)
+    old = PlanarPose(1000, relative, -2., 0., 0.)
+    cells = np.isclose(local_path.FORWARD, .10) & np.isclose(local_path.RIGHT, .10)
+    scan.near_obstacles.remember(scan._footprint_origin(old, geometry), cells)
+    retained = set(scan.near_obstacles.cells)
+
+    stamp = 21400 if event == "feedback_gap" else 21100
+    advance_snapshot(snapshot, clock, stamp)
+    absolute = PlanarPose(stamp, ("odom",), 10., 20., .2)
+    snapshot[0][2].update(obstacle_pose=absolute, motion_pose=absolute, velocity_history=(
+        (21000, 21000, (.1, 0., 0.)), (stamp, stamp, (.1, 0., 0.))))
+    if event == "new_contact":
+        select = dwa.select
+
+        def record_contact_after_selection(**kwargs):
+            choice = select(**kwargs)
+            if choice is not None:
+                # A memory update can precede publication of its projection.
+                # The new cell lies inside the body at the selected pose.
+                pose = scan._relative_near_pose(stamp, scan.pose)
+                contact = np.isclose(local_path.FORWARD, -.05) & np.isclose(local_path.RIGHT, 0.)
+                scan.near_obstacles.remember(scan._footprint_origin(pose, geometry), contact)
+                retained.update(scan.near_obstacles.cells)
+            return choice
+
+        monkeypatch.setattr(dwa, "select", record_contact_after_selection)
+    message = card.next_command()
+    accepted = card._last_decision.dwa_acceptance
+    if event == "feedback_gap":
+        assert accepted is None and scan.pose_registration is None
+        assert scan.motion_frame is not relative[1]
+    else:
+        assert accepted is not None and accepted.motion_guard.check.accepted
+        assert accepted.motion_guard.pose.frame == absolute.frame
+        assert scan.pose_registration[0].frame == scan.near_obstacles.frame == relative
+        assert scan.near_hits is None and scan.near_squares is None
+        assert message["values"][0] > 0.
+    if event == "expired":
+        clock[0] = message["stamp_ms"] + message["ttl_ms"]
+    if scheduled:
+        card._stage_command(message, card._output_epoch)
+    else:
+        card._publish_command(message)
+
+    # The first absolute fix registers the existing relative memory; it
+    # cannot discard that memory, bridge a feedback gap or extend a deadline.
+    if event == "continuous":
+        packet, = packets
+        assert packet["values"] == message["values"]
+    else:
+        assert all(packet["values"] == [0.] * 6 for packet in packets)
+        if event == "expired":
+            assert card._dwa_publication["reason"] == "publish_expired"
+    assert bool(card._state.dwa_totals.get("published_decisions", 0)) is (event == "continuous")
+    assert scan.near_obstacles.cells == retained
+
+
 def _moving_memory_case(monkeypatch, layer, world_y, path):
     from plugins.navi.odom import PlanarPose
     card, packets, clock, snapshot = observation_card(monkeypatch, body=layer == "historical")

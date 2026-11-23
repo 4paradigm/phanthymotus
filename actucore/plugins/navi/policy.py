@@ -2339,9 +2339,8 @@ def _direct_return_progress(progress, state, decision, pose, moved, obstacle_pos
                    and proposal.guard.check.accepted and any(proposal.command[:2])
                    and decision.values is not None and not any(decision.values[2:5])
                    and tuple(decision.values[i] for i in (0, 1, 5)) == proposal.command)
-    if (not (direct or checked_dwa) or track is None or not track.observed
-            or track.generation != progress.goal_generation
-            or (anchor is not None and (anchor.target_missing or anchor.generation != track.generation))):
+    if (track is None or track.generation != progress.goal_generation
+            or (anchor is not None and anchor.generation != track.generation)):
         progress.approach_fix = None
         return False
 
@@ -2368,6 +2367,12 @@ def _direct_return_progress(progress, state, decision, pose, moved, obstacle_pos
             previous.travelled |= moved
             if not previous.travelled:
                 return False
+    # A short observation hold cannot earn credit, but it does not erase a
+    # same-target measured step. Keep that evidence until a qualified command
+    # and a fresh target measurement can verify both kinds of closure.
+    if (not (direct or checked_dwa) or not track.observed
+            or (anchor is not None and anchor.target_missing)):
+        return False
     if measured is None:
         return False
     point = measured.point
@@ -3063,10 +3068,10 @@ def _retire_confirmed(layer, origin, clear, occupied, reference=None):
         return layer
     forward, left, yaw = before.relative_to(origin)
     tf = local_path.GridTransform(forward, -left, -yaw)
-    # A newer exposure must cover the entire original square. Require all
-    # intersected grid cells in its axis-aligned bounds to confirm clearance.
+    # A newer exposure must cover every grid cell intersecting the original
+    # square in its registered orientation, including any source rotation.
     indices = np.round(tf.points(squares.centers) / local_path.RESOLUTION + local_path.START, 7)
-    retire = confirmed_square_coverage(indices, yaw, clear, occupied)
+    retire = confirmed_square_coverage(indices, squares.yaw + tf.yaw, clear, occupied)
     if not retire.any():
         return layer
     if retire.all():
