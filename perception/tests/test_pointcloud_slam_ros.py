@@ -1033,3 +1033,41 @@ def test_native_odom_tf_matches_admitted_pose_and_capture(node):
     assert vars(transform.transform.rotation) == vars(pose.pose.pose.orientation)
     static = published(node, '/tf_static')[0].raw_messages[-1].transforms
     assert all(t.header.frame_id != pose.header.frame_id for t in static)
+
+
+def test_place_uses_recent_native_pose_and_follows_optimized_anchor(node):
+    send(node)
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    segment = node._active
+    stamp = NS(frame_id='map', stamp=NS(sec=1, nanosec=0))
+    positions = [NS(position=NS(x=2., y=3., z=4.), orientation=NS(x=0., y=0., z=0., w=1.))]
+    graph = NS(header=stamp, poses_id=[7], poses=positions, links=[])
+    info = NS(header=stamp, ref_id=7, loop_closure_id=0, proximity_detection_id=0,
+              stats_keys=['Motus/RecoveryState/', 'Motus/Relocalizations/', 'Motus/VisualInliers/'],
+              stats_values=[0, 0, 0])
+    node._native_graph(graph, segment)
+    node._native_cloud(cloud(frame='map'), segment)
+    with pytest.raises(ValueError, match='current mapped pose'):
+        node.change_place('入口', remove=False)
+    node._native_info(info, segment)
+    place, = node.change_place('入口', remove=False)
+    assert (place['node_id'], place['x'], place['y'], place['z']) == (7, 2., 3., 4.)
+    packet = bytes(published(node, '/pointcloud_slam/map')[0].messages[-1])
+    _, _, _, flags, count = struct.unpack('<fffBI', packet[:17])
+    assert flags & 64 and json.loads(packet[17 + 12 * count:]) == [['入口', 2., 3., 4.]]
+    with pytest.raises(ValueError, match='already in use'):
+        node.change_place('入口', remove=False)
+    positions[0].position.x = 8.
+    node._native_graph(graph, segment)
+    assert segment['places'][0]['x'] == 8.
+    info.stats_values[0] = 1
+    node._native_info(info, segment)
+    with pytest.raises(ValueError, match='current mapped pose'):
+        node.change_place('失跟', remove=False)
+    info.stats_values[0] = 0
+    node._native_info(info, segment)
+    node._measurement_clock_ns = lambda: 10_000_000_000
+    with pytest.raises(ValueError, match='current mapped pose'):
+        node.change_place('过期', remove=False)
+    assert node.change_place('入口', remove=True) == []
+    assert not published(node, '/pointcloud_slam/map')[0].messages[-1][12] & 64

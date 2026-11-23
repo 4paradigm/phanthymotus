@@ -96,9 +96,20 @@ def test_failed_changes_preserve_committed_map(tmp_path, saved, legacy_annotatio
     with pytest.raises(OSError):
         library.rename_map(tmp_path, map_id, '新名字')
     with pytest.raises(OSError):
-        library.delete_map(tmp_path, map_id)
+        library.delete_map(tmp_path, '地图')
     assert library.map_entries(tmp_path)[0]['tags'] == legacy_annotations
     assert library.map_entries(tmp_path)[0]['revision'] == 1
+
+
+def test_delete_rejects_ambiguous_name_without_removing_either_map(tmp_path, saved):
+    first, save, _ = saved
+    second = save('另一张', request='another')
+    manifest = tmp_path / 'maps' / second / 'manifest.json'
+    entry = json.loads(manifest.read_text())
+    manifest.write_text(json.dumps(dict(entry, name='地图')))
+    with pytest.raises(ValueError, match='ambiguous map name'):
+        library.delete_map(tmp_path, '地图')
+    assert {entry['id'] for entry in library.map_entries(tmp_path)} == {first, second}
 
 
 def test_delete_and_rename_validate_manifest_identity(tmp_path, saved):
@@ -115,7 +126,7 @@ def test_delete_and_rename_validate_manifest_identity(tmp_path, saved):
             library.delete_map(tmp_path, target)
     stranger.rename(maps / 'unrelated')
     assert library.rename_map(tmp_path, map_id, ' 新名字 ')['name'] == '新名字'
-    library.delete_map(tmp_path, map_id)
+    library.delete_map(tmp_path, '新名字')
     with pytest.raises(ValueError, match='bound map no longer exists'):
         save(bound=map_id, request='late-save')
     assert not (maps / map_id).exists()

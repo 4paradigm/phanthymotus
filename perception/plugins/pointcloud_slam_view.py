@@ -11,7 +11,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import UInt8MultiArray
 
-from .pointcloud_slam_preview import PREVIEW_TOPIC, historical_mapping
+from .pointcloud_slam_preview import PREVIEW_TOPIC, historical_mapping, with_places
 
 _QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                   history=HistoryPolicy.KEEP_LAST, depth=1,
@@ -27,7 +27,7 @@ class SavedMapView(Node):
         self._interval = interval_s
         self._outputs = []
         self._publisher = None
-        self._packet = None
+        self._packet = self._base_packet = None
         self.segment_count = len(snapshots)
         self.selected_segment_id = None
         try:
@@ -48,7 +48,7 @@ class SavedMapView(Node):
                     'desc': 'Live or saved RTAB-Map preview',
                     'metadata': metadata,
                 }]
-                self._packet = historical_mapping(item['packet'])
+                self._packet = self._base_packet = historical_mapping(item['packet'])
                 self._publisher = self.create_publisher(UInt8MultiArray, PREVIEW_TOPIC, _QOS)
         except Exception:
             self.destroy_node()
@@ -62,6 +62,12 @@ class SavedMapView(Node):
         with self._lock:
             for output in self._outputs:
                 output['metadata']['map_view']['name'] = name
+
+    def set_places(self, places):
+        with self._lock:
+            self._packet = with_places(self._base_packet, places)
+        if self._timer is not None:
+            self._publish()
 
     def start(self):
         self._publish()

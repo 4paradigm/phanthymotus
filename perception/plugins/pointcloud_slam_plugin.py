@@ -36,11 +36,12 @@ _ACTIONS = {
     'start_mapping': ['map_name'],
     'resume_mapping': ['map_id'],
     'stop_mapping': [],
-    'abandon_pending': [],
     'list_maps': [],
-    'select_map': ['map_id'],
+    'select_map': ['map_name'],
     'rename_map': ['map_id', 'map_name'],
-    'delete_map': ['map_id'],
+    'delete_map': ['map_name'],
+    'tag_place': ['tag_name'],
+    'untag_place': ['tag_name'],
 }
 
 
@@ -62,7 +63,6 @@ class PointCloudSlamPlugin:
 
     def __init__(self, config, executor, *, input_registry=None):
         self._input_registry = input_registry
-        # 标点移至后续导航卡片；忽略旧画布中的标注平面，不阻止项目启动。
         # Retired/unknown deployment keys are ignored, never fatal: old config
         # rows and old canvas documents must not block a project start. The
         # filtered deployment config is kept separately so config-action
@@ -85,7 +85,6 @@ class PointCloudSlamPlugin:
         self._session_settings = {}
         self._last_stop = None
         self._bound_map_id = None
-        self._last_recovery = None
         self._save_status = {'state': 'idle'}
         self._capture_stop = threading.Event()
         self._project_stopping = False
@@ -103,23 +102,21 @@ class PointCloudSlamPlugin:
         for key, value in self._settings().items():
             if key in props and value is not None:
                 props[key]['default'] = json.dumps(value) if key == 'child_from_cloud' else value
-        verbs = ['start', 'stop', 'info', 'config', *_ACTIONS, 'operation_status']
+        verbs = ['start', 'stop', 'info', 'config', *_ACTIONS]
         actions = {key: {'requires_project': key in ('start_mapping', 'resume_mapping')} for key in _ACTIONS}
-        actions['operation_status'] = {'internal': True}
         actions['delete_map']['confirm'] = '删除地图及其全部版本？'
-        actions['abandon_pending']['confirm'] = '保存已经失败。解除阻塞并保留原始会话文件供人工恢复？该地图不会列入已保存地图。'
         for key in ('stop_mapping', 'select_map'):
-            actions[key].update(background=True, status_action='operation_status',
+            actions[key].update(background=True, status_action='info',
                 pending_states=['working'], error_states=['error'], poll_interval_ms=500)
         schema = {'type': 'object', 'properties': {
             'action': {'type': 'string', 'enum': verbs,
-                       'description': 'start_mapping 用 map_name 新建地图，resume_mapping 用 map_id 续建已有地图。',
+                       'description': 'start_mapping 用 map_name 新建地图，resume_mapping 用 map_id 续建已有地图。select_map 和 delete_map 用 map_name 选择或删除已保存地图。',
                        'oneOf': [{'const': k, 'title': k} for k in verbs]},
             'input_topics': {'type': 'array', 'items': {'type': 'string'}},
             'input_bindings': {'type': 'object'}, 'odom_interfaces': {'type': 'object'},
             'input_metadata': {'type': 'object'}, 'camera_infos': {'type': 'object'},
             'optional_input_diagnostics': {'type': 'array', 'items': {'type': 'object'}},
-            **{key: {'type': 'string'} for key in ('map_id', 'map_name', 'request_id')},
+            **{key: {'type': 'string'} for key in ('map_id', 'map_name', 'request_id', 'tag_name')},
             'background': {'type': 'boolean'}, 'revision': {'type': 'integer'}}, 'required': ['action'],
             'x-action-params': {k: {'params': params} for k, params in _ACTIONS.items()},
             'x-slam-input-contract': 'motus.slam_input/1',
@@ -128,6 +125,7 @@ class PointCloudSlamPlugin:
             'x-action-lifecycle': {'schema': 'motus.action-lifecycle/1', 'config_actions': ['start'], 'actions': actions}}
         schema['properties']['map_id']['x-resource-options'] = {
             'action': 'list_maps', 'items': 'maps', 'value': 'id', 'label': 'name'}
+        schema['properties']['tag_name']['description'] = '标点名称。tag_place 标记当前建图位置，untag_place 删除当前建图或所选地图上的同名标点。'
         return [{'name': self.PREFIX, 'type': 'processor', 'multiInstance': False,
                  'description': 'RTAB-Map point-cloud mapping with existing odometry',
                  'inputSchema': schema, 'configSchema': {'type': 'object', 'properties': props},
@@ -202,15 +200,17 @@ class PointCloudSlamPlugin:
             return {'state': 'error', 'message': str(error)}
 
     def _dispatch_action(self, action, args):
-        if action == 'operation_status':
+        if action in ('select_map', 'delete_map'):
+            from .pointcloud_slam_library import validate_map_name
+            if 'map_id' in args:
+                raise ValueError(f'{action} requires map_name instead of map_id')
+            args = dict(args, map_name=validate_map_name(args.get('map_name')))
+        if action == 'info' and args.get('request_id'):
             request = args.get('request_id')
             with self._operation_lock:
                 for operation in (self._operation, self._save_status):
                     if request and operation.get('request_id') == request:
                         return dict(operation, state='working' if operation['state'] == 'saving' else operation['state'])
-            if request and self._last_recovery and self._last_recovery.get('request_id') == request:
-                return {'state': 'error', 'request_id': request,
-                        'message': 'Map save failed; session retained at ' + self._last_recovery['path']}
             from .pointcloud_slam_library import map_entries
             for entry in map_entries(_ARCHIVE_DIR):
                 for saved in entry['saves']:
@@ -222,7 +222,7 @@ class PointCloudSlamPlugin:
             self._check_request(request)
             with self._operation_lock:
                 current = self._operation
-                identity = (action, args.get('map_id'))
+                identity = (action, args['map_name'], args.get('revision')) if action == 'select_map' else (action, None)
                 if current.get('request_id') == request:
                     if current['identity'] != identity:
                         raise ValueError('map request id reused')
@@ -268,8 +268,6 @@ class PointCloudSlamPlugin:
             return self._stop_project()
         if action == 'start':
             return self._prepare_after_prior_mapping(args)
-        if action == 'abandon_pending':
-            return self._abandon_pending()
         if action == 'stop_mapping':
             return self._stop_mapping(args.get('request_id'))
         if action == 'info':
@@ -279,7 +277,6 @@ class PointCloudSlamPlugin:
             if stopping:
                 return {'state': 'idle', 'capture_stopped': True, 'backend': 'rtabmap',
                         'save_state': save['state'], 'save_result': save,
-                        'last_recovery': deepcopy(self._last_recovery),
                         'topic_in': self._inputs(), 'topic_out': self._outputs(),
                         'rgb_input_status': self._rgb_input_status,
                         'input_diagnostics': deepcopy(self._input_diagnostics)}
@@ -290,7 +287,6 @@ class PointCloudSlamPlugin:
                         'capture_stopped': self._capture_stop.is_set(), 'map_name': self._map_name,
                         'selected_map_id': self._view_id, 'last_stop': deepcopy(self._last_stop),
                         'save_state': save['state'], 'save_result': save,
-                        'last_recovery': deepcopy(self._last_recovery),
                         'input_compatibility': {'mode': 'legacy_core' if self._legacy_core else 'explicit',
                             'role_source': 'not_resolved' if not self._topics else
                                 'native_ros_publishers' if self._legacy_core else 'input_bindings',
@@ -339,8 +335,7 @@ class PointCloudSlamPlugin:
                 self._stop_mapping()  # commits native DB; never discards it
             except Exception as error:
                 raise RuntimeError('previous map save failed: ' + str(error) +
-                                   '; retry stop_mapping or use abandon_pending '
-                                   'to preserve recovery files and release the card') from error
+                                   '; retry stop_mapping') from error
         with self._lock:
             return self._prepare(args)
 
@@ -612,39 +607,6 @@ class PointCloudSlamPlugin:
                 self._save_status = dict(result, state='saved' if result['state'] == 'saved' else 'idle')
             return result
 
-    def _abandon_pending(self):
-        """Release an unrecoverable failed save, preserving its raw session.
-
-        Explicit confirmation is required: this intentionally does not claim
-        the map is saved and never deletes a native database.
-        """
-        with self._save_lock:
-            with self._operation_lock:
-                if (self._save_status.get('state') != 'error' or
-                        self._project_stopping or self._blocking_stops or
-                        self._operation.get('state') == 'working'):
-                    raise ValueError('abandon_pending requires a failed, completed map save')
-            with self._lock:
-                pending = self._pending
-                if pending is None or self._node is not None:
-                    raise ValueError('no failed pending map to release')
-                for segment in getattr(pending, '_segments', []):
-                    process = segment.get('process')
-                    if process is not None and process.poll() is None:
-                        raise ValueError('native mapping process is still alive; retry stop_mapping first')
-                pending.freeze_capture()
-                recovery = {'path': str(self._session_dir), 'map_name': self._map_name,
-                            'request_id': self._save_request,
-                            'error': self._save_status.get('message')}
-                self._last_recovery = recovery
-                self._pending = self._session_dir = self._map_name = self._save_request = None
-            dispose_node(self._executor, pending, label=self.PREFIX)
-            with self._operation_lock:
-                self._save_status = {'state': 'idle'}
-        log.warning('[pointcloud_slam] failed map retained for recovery at %s', recovery['path'])
-        return {'state': 'recovery_required', 'recovery': recovery,
-                'message': 'Failed map save was released; raw files are preserved for recovery'}
-
     def _stop_ack(self):
         return {'state': 'idle', 'capture_stopped': True,
                 'save_state': self._save_status['state'], 'save_result': dict(self._save_status)}
@@ -724,6 +686,16 @@ class PointCloudSlamPlugin:
     def _map_action(self, action, args):
         from . import pointcloud_slam_library as library
         map_id, revision = args.get('map_id'), args.get('revision')
+        if action in ('tag_place', 'untag_place'):
+            name = library.validate_map_name(args.get('tag_name'))
+            if self._node:
+                places = self._node.change_place(name, remove=action == 'untag_place')
+            elif action == 'untag_place' and self._view:
+                places = library.remove_place(_ARCHIVE_DIR, *self._view_id, self._view.selected_segment_id, name)
+                self._view.set_places(places)
+            else:
+                raise ValueError('mark during mapping, or select a saved map to remove a place')
+            return {'state': 'ok', 'places': places}
         if action == 'list_maps':
             return {'state': 'ok', 'maps': [{k: e[k] for k in ('id', 'name', 'revision')}
                                            for e in library.map_entries(_ARCHIVE_DIR)]}
@@ -732,9 +704,8 @@ class PointCloudSlamPlugin:
                 raise ValueError('ROS executor unavailable')
             if self._node is not None or self._pending is not None:
                 raise ValueError('stop mapping and finish saving before viewing a saved map')
-            entry = next((e for e in library.map_entries(_ARCHIVE_DIR) if e['id'] == map_id), None)
-            if entry is None:
-                raise ValueError('unknown map')
+            entry = library.entry_by_name(library.map_entries(_ARCHIVE_DIR), args['map_name'])
+            map_id = entry['id']
             revision = revision or entry['revision']
             if self._view_id != (map_id, revision):
                 snapshots = library.load_map_snapshots(_ARCHIVE_DIR, map_id, revision,
@@ -747,6 +718,8 @@ class PointCloudSlamPlugin:
                 self._close_view()
                 try:
                     self._executor.add_node(view)
+                    view.set_places([p for p in entry.get('tags', {}).get(str(revision), [])
+                                     if p['segment_id'] == view.selected_segment_id])
                     view.start()
                 except Exception:
                     self._dispose(view)
@@ -766,9 +739,9 @@ class PointCloudSlamPlugin:
             return {'state': 'renamed', 'map_id': map_id, 'map_name': entry['name'],
                     'topic_out': self._outputs()}
         if action == 'delete_map':
+            map_id = library.delete_map(_ARCHIVE_DIR, args['map_name'])
             if self._view_id and self._view_id[0] == map_id:
                 self._close_view()
-            library.delete_map(_ARCHIVE_DIR, map_id)
             if self._last_stop and self._last_stop.get('map_id') == map_id:
                 self._last_stop = None
             return {'state': 'deleted', 'map_id': map_id}

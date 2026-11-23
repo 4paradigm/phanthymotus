@@ -186,32 +186,31 @@ def test_native_database_save_is_idempotent_and_old_geometry_config_is_not_expos
     assert set(props) == {'child_from_cloud'}
 
 
-def test_card_exposes_map_management_without_annotation_controls(card):
-    tool = card.get_tools()[0]
-    schema = tool['inputSchema']
-    removed = {'tag_place', 'list_tags', 'untag_place'}
-    assert not removed.intersection(schema['properties']['action']['enum'])
-    assert not removed.intersection(schema['x-action-params'])
-    assert not removed.intersection(schema['x-action-lifecycle']['actions'])
-    assert 'close_map_view' not in schema['properties']['action']['enum']
-    assert 'close_map_view' not in schema['x-map-manager']['actions']
-    assert not {'tag_id', 'tag_name', 'segment_id', 'x', 'y', 'yaw'}.intersection(schema['properties'])
-    assert 'map_plane' not in tool['configSchema']['properties']
-    capture(card)
-    saved = call(card, 'stop_mapping')
-    assert call(card, 'list_maps')['maps'] == [
-        {'id': saved['map_id'], 'name': 'Hall', 'revision': saved['revision']}]
+def test_places_use_current_session_and_persist_in_selected_map(card):
+    node = capture(card)
+    places = [dict(name='入口', segment_id='run', node_id=1, x=2., y=-1., z=.2)]
+    node.change_place = lambda name, remove: places if name == '入口' and not remove else []
+    original = node.artifacts
 
+    def marked_artifacts():
+        data = original()
+        data['segments'][0]['places'] = places
+        return data
 
-@pytest.mark.parametrize('action', ['tag_place', 'list_tags', 'untag_place'])
-def test_removed_annotation_actions_cannot_modify_saved_maps(card, action):
-    capture(card)
-    saved = call(card, 'stop_mapping')
-    manifest = Path(module._ARCHIVE_DIR) / 'maps' / saved['map_id'] / 'manifest.json'
-    before = manifest.read_bytes()
-    assert call(card, action, map_id=saved['map_id'], revision=saved['revision'],
-                segment_id='run', tag_name='Entrance', x=1, y=2, tag_id='old') is None
-    assert manifest.read_bytes() == before
+    node.artifacts = marked_artifacts
+    for action in ('tag_place', 'untag_place'):
+        assert card.get_tools()[0]['inputSchema']['x-action-params'][action]['params'] == ['tag_name']
+    assert call(card, 'tag_place', tag_name='入口')['places'] == places
+    assert call(card, 'stop_mapping')['state'] == 'saved'
+    assert call(card, 'select_map', map_name='Hall')['state'] == 'map_selected'
+    packets = card._view.publishers[0].messages
+    assert json.loads(packets[-1][29:]) == [['入口', 2., -1., .2]]
+    assert call(card, 'tag_place', tag_name='旧位置')['state'] == 'error'
+    assert call(card, 'untag_place', tag_name='入口')['places'] == []
+    assert len(packets[-1]) == 29
+    card._close_view()
+    assert call(card, 'select_map', map_name='Hall')['state'] == 'map_selected'
+    assert len(card._view.publishers[0].messages[-1]) == 29
 
 
 def test_old_annotation_setting_does_not_prevent_project_start(card):
@@ -281,24 +280,15 @@ def test_new_project_start_retries_prior_failed_save(card):
     assert call(card, 'list_maps')['maps'][0]['name'] == 'Hall'
 
 
-def test_abandon_failed_pending_retains_recovery_files_and_allows_restart(card):
-    session = capture(card)
-    assert call(card, 'abandon_pending')['state'] == 'error'  # cannot discard a live map
-    session.failure = 'native database cannot finalize'
-    assert call(card, 'stop_mapping', request_id='broken')['state'] == 'error'
-    directory = session.directory
-    assert directory.exists() and session.database.exists()
-    assert card.dispatch('pointcloud_slam', arguments())['state'] == 'error'
-    result = call(card, 'abandon_pending')
-    assert result['state'] == 'recovery_required'
-    assert result['recovery']['path'] == str(directory)
-    assert result['recovery']['map_name'] == 'Hall'
-    assert session.destroyed and card._pending is None
-    assert directory.exists() and session.database.exists()
-    info = call(card, 'info')
-    assert info['last_recovery']['path'] == str(directory)
-    assert call(card, 'operation_status', request_id='broken')['state'] == 'error'
-    assert card.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
+@pytest.mark.parametrize('removed', ['abandon_pending', 'operation_status'])
+def test_removed_actions_are_neither_advertised_nor_dispatched(card, removed):
+    schema = card.get_tools()[0]['inputSchema']
+    assert removed not in schema['properties']['action']['enum']
+    assert removed not in schema['x-action-params']
+    lifecycle = schema['x-action-lifecycle']['actions']
+    assert removed not in lifecycle
+    assert lifecycle['stop_mapping']['status_action'] == lifecycle['select_map']['status_action'] == 'info'
+    assert call(card, removed) is None
 
 
 def test_rejected_configuration_does_not_poison_the_previous_valid_extrinsic(card):
@@ -377,8 +367,8 @@ def test_stale_canvas_configuration_replay_is_noop_through_mapping_and_save(card
         if phase == 'pending' and card._pending is not None:
             call(card, 'stop_mapping', request_id='replay')
     if phase == 'saving':
-        assert _wait_until(lambda: call(card, 'operation_status', request_id='replay')['state'] == 'saved')
-        saved = call(card, 'operation_status', request_id='replay')
+        assert _wait_until(lambda: call(card, 'info', request_id='replay')['state'] == 'saved')
+        saved = call(card, 'info', request_id='replay')
     else:
         saved = call(card, 'stop_mapping', request_id='replay')
     assert saved['state'] == 'saved'
@@ -516,7 +506,7 @@ def test_stale_canvas_robot_cannot_change_the_其他_deployment(card):
     assert card.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
 
 
-@pytest.mark.parametrize('action', ['start', 'stop', 'info', 'config', 'operation_status'])
+@pytest.mark.parametrize('action', ['start', 'stop', 'info', 'config'])
 def test_core_json_schema_validation_accepts_lifecycle_actions(card, action):
     jsonschema = pytest.importorskip('jsonschema')
     jsonschema.validate({'action': action}, card.get_tools()[0]['inputSchema'])
@@ -543,13 +533,13 @@ def test_project_stop_preserves_acknowledged_save_request_id(card, monkeypatch, 
         release.set()
     card.stop()
     assert call(card, 'info')['save_result']['request_id'] == request
-    assert call(card, 'operation_status', request_id=request)['state'] == 'saved'
+    assert call(card, 'info', request_id=request)['state'] == 'saved'
 
 
 def test_later_mapping_does_not_reuse_completed_background_save_id(card):
     capture(card)
     assert call(card, 'stop_mapping', request_id='first', background=True)['state'] == 'working'
-    assert _wait_until(lambda: call(card, 'operation_status', request_id='first')['state'] == 'saved')
+    assert _wait_until(lambda: call(card, 'info', request_id='first')['state'] == 'saved')
     assert call(card, 'start_mapping', map_name='Other')['state'] == 'running'
     ack = call(card, 'stop')
     card.stop()
@@ -616,7 +606,7 @@ def test_saved_view_opened_after_project_stop_is_visible_and_closes_on_repeated_
     call(card, 'stop')
     card.stop()
     saved = call(card, 'list_maps')['maps'][0]
-    selected = call(card, 'select_map', map_id=saved['id'])
+    selected = call(card, 'select_map', map_name=saved['name'])
     assert selected['state'] == 'map_selected'
     assert selected['topic_out'] and selected['topic_out'][0]['format'] == 'sensor/mapping'
     assert call(card, 'info')['topic_out'] == selected['topic_out']
@@ -679,7 +669,7 @@ def test_fresh_card_can_view_native_map_without_requiring_backend_or_live_inputs
     monkeypatch.setattr(module, 'require_runtime', missing)
     fresh = module.PointCloudSlamPlugin({}, _FakeExecutor())
     try:
-        selected = call(fresh, 'select_map', map_id=saved['map_id'])
+        selected = call(fresh, 'select_map', map_name=saved['map_name'])
         assert selected['state'] == 'map_selected' and selected['tracking'] is False
         assert selected['snapshot_available'] is True
         assert call(fresh, 'info')['topic_out'] == selected['topic_out']
@@ -701,7 +691,7 @@ def test_stop_waits_for_view_already_admitted_before_selection_lock(card, monkey
             assert release.wait(5)
         return original(action, args)
     monkeypatch.setattr(card, '_dispatch', paused)
-    select = threading.Thread(target=lambda: call(card, 'select_map', map_id=saved['id']))
+    select = threading.Thread(target=lambda: call(card, 'select_map', map_name=saved['name']))
     select.start()
     assert entered.wait(1)
     finished = threading.Event()
@@ -713,7 +703,7 @@ def test_stop_waits_for_view_already_admitted_before_selection_lock(card, monkey
             assert finished.wait(.5)
         else:
             assert not finished.wait(.05)
-        assert call(card, 'select_map', map_id=saved['id'])['state'] == 'error'
+        assert call(card, 'select_map', map_name=saved['name'])['state'] == 'error'
     finally:
         release.set()
         select.join(2)
@@ -902,10 +892,10 @@ def test_stable_mapping_output_for_live_and_saved_views(card):
     assert card.dispatch('pointcloud_slam', arguments())['topic_out'] == expected
     running = call(card, 'start_mapping', map_name='Hall')
     assert running['topic_out'] == expected
-    assert call(card, 'select_map', map_id='0' * 32)['state'] == 'error'
+    assert call(card, 'select_map', map_name='Missing')['state'] == 'error'
     saved = call(card, 'stop_mapping')
     assert saved['state'] == 'saved'
-    selected = call(card, 'select_map', map_id=saved['map_id'])
+    selected = call(card, 'select_map', map_name=saved['map_name'])
     assert selected['topic_out'] == expected
     assert selected['preview_segment_count'] == 1
     assert card._view.publishers[0].topic == PREVIEW_TOPIC
@@ -922,9 +912,9 @@ def test_stable_mapping_output_for_live_and_saved_views(card):
 def test_reselect_saved_map_is_idempotent_and_renames_without_ports(card):
     capture(card)
     saved = call(card, 'stop_mapping')
-    selected = call(card, 'select_map', map_id=saved['map_id'])
+    selected = call(card, 'select_map', map_name=saved['map_name'])
     view = card._view
-    assert call(card, 'select_map', map_id=saved['map_id'])['topic_out'] == selected['topic_out']
+    assert call(card, 'select_map', map_name=saved['map_name'])['topic_out'] == selected['topic_out']
     assert card._view is view
     renamed = call(card, 'rename_map', map_id=saved['map_id'], map_name='Lobby')
     assert renamed['topic_out'] == selected['topic_out']
@@ -1068,7 +1058,7 @@ def test_optional_rgb_port_remains_visible_through_lifecycle_and_config_refresh(
     card.stop()
     assert_rgb_port(card)
     saved = call(card, 'list_maps')['maps'][0]
-    assert call(card, 'select_map', map_id=saved['id'])['state'] == 'map_selected'
+    assert call(card, 'select_map', map_name=saved['name'])['state'] == 'map_selected'
     assert_rgb_port(card)
 
 
@@ -1214,7 +1204,7 @@ def test_start_mapping_creates_a_new_map_with_a_stale_form_id(card, delete_old):
     capture(card)
     first = call(card, 'stop_mapping')
     if delete_old:
-        assert call(card, 'delete_map', map_id=first['map_id'])['state'] == 'deleted'
+        assert call(card, 'delete_map', map_name=first['map_name'])['state'] == 'deleted'
     assert call(card, 'start_mapping', map_name='Other room', map_id=first['map_id'])['state'] == 'running'
     saved = call(card, 'stop_mapping')
     assert saved['map_id'] != first['map_id']
@@ -1224,7 +1214,7 @@ def test_start_mapping_creates_a_new_map_with_a_stale_form_id(card, delete_old):
 def test_resume_mapping_requires_an_existing_id_even_with_a_stale_map_name(card):
     capture(card)
     first = call(card, 'stop_mapping')
-    assert call(card, 'delete_map', map_id=first['map_id'])['state'] == 'deleted'
+    assert call(card, 'delete_map', map_name=first['map_name'])['state'] == 'deleted'
     assert call(card, 'resume_mapping', map_name='Other room') == {
         'state': 'error', 'message': 'map_id is required for resume_mapping'}
     assert call(card, 'resume_mapping', map_id=first['map_id'], map_name='Other room') == {
@@ -1272,3 +1262,14 @@ def test_saved_fused_dynamic_mount_route_survives_resume(card, monkeypatch):
     assert call(card, 'resume_mapping', map_id=first['map_id'])['state'] == 'running'
     assert card._session_settings['extrinsic_mode'] == 'dynamic'
     assert card._session_settings['pose_capture_mount'] is True
+
+@pytest.mark.parametrize('action', ['select_map', 'delete_map'])
+def test_select_and_delete_require_name_and_reject_ids(card, action):
+    capture(card)
+    saved = call(card, 'stop_mapping')
+    params = card.get_tools()[0]['inputSchema']['x-action-params']
+    assert params[action]['params'] == ['map_name']
+    for args in ({'map_id': saved['map_id']}, {'map_name': 'Missing'},
+                 {'map_id': saved['map_id'], 'map_name': saved['map_name']}):
+        assert call(card, action, **args)['state'] == 'error'
+    assert call(card, 'list_maps')['maps'][0]['id'] == saved['map_id']

@@ -1,4 +1,5 @@
 """Bounded snapshots in Core's existing sensor/mapping wire format."""
+import json
 import math
 import struct
 
@@ -40,6 +41,15 @@ def encode_mapping(points, pose, *, max_points, pose_reference=None):
         ros_yaw = math.atan2(matrix[1, axis], matrix[0, axis])
     display_yaw = -ros_yaw if ros_yaw != 0.0 else 0.0  # avoid negative-zero bytes
     return struct.pack('<fffBI', matrix[0, 3], matrix[1, 3], display_yaw, flags, len(xyz)) + xyz.tobytes()
+
+
+def with_places(packet, places):
+    """Bit 6 adds UTF-8 JSON labels after the unchanged XYZ payload."""
+    if not places:
+        return packet
+    labels = [[p['name'], p['x'], p['y'], p.get('z', 0)] for p in places]
+    return (packet[:12] + bytes([packet[12] | 64]) + packet[13:] +
+            json.dumps(labels, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode())
 
 
 def historical_mapping(packet):

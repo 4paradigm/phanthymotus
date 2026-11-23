@@ -177,7 +177,7 @@ def _load(sources, stride):
     return clouds
 
 
-def rebuild(database_path, *, max_points, fallback=None):
+def rebuild(database_path, *, max_points, fallback=None, places=()):
     """Return a complete ``sensor/mapping`` packet, or ``fallback`` on any problem."""
     started = time.monotonic()
     try:
@@ -212,6 +212,11 @@ def rebuild(database_path, *, max_points, fallback=None):
         log.info('rebuilt saved map snapshot from database: graph_nodes=%d '
                  'points=%d bytes=%d time=%.2fs',
                  len(sources), len(points), len(packet), time.monotonic() - started)
+        if optimized is not None:
+            for place in places:
+                anchor = optimized.get(place.get('node_id'))
+                if anchor is not None:
+                    place['x'], place['y'], place['z'] = map(float, anchor[:3, 3])
         return packet
     except Exception as error:  # never break saving because diagnostics failed
         log.warning('keeping preview snapshot, database rebuild failed: %s', error)

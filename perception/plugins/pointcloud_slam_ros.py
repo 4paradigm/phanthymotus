@@ -26,7 +26,7 @@ from std_msgs.msg import String, UInt8MultiArray
 from .pointcloud_slam_rtabmap import RtabmapProcess, paired_sensor_odom
 from .pointcloud_slam_watchdog import BackendProgress
 from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
-from .pointcloud_slam_preview import PREVIEW_TOPIC
+from .pointcloud_slam_preview import PREVIEW_TOPIC, with_places
 from .pointcloud_slam_stream import SlamStream
 from .pointcloud_slam_transforms import rigid, pose_matrix
 from .pointcloud_slam_motion import ScanMotion, MotionPending
@@ -522,6 +522,7 @@ class RtabmapNode(Node):
             frame_id=restored['frame_id'] if restored else '', source_frame_id=pose.frame_id if pose else '',
             pose_reference=getattr(pose, 'pose_reference', None),
             process=process, snapshot=restored.get('snapshot') if restored else None,
+            places=deepcopy(restored.get('places', [])) if restored else [],
             graph=None, cloud=None, finalized=False, closing=False,
             native_loop_closures=0, native_proximity_detections=0, native_updates=0,
             native_recovery={'state': 'unavailable'},
@@ -1050,6 +1051,14 @@ class RtabmapNode(Node):
             links = [(link.from_id, link.to_id, link.type) for link in getattr(msg, 'links', ())]
             with self._result_lock:
                 segment['graph'] = (stamp, msg.header.frame_id, pose)
+                segment['graph_node'] = msg.poses_id[index]
+                if segment.get('places'):
+                    positions = dict(zip(msg.poses_id, msg.poses))
+                    for place in segment['places']:
+                        anchor = positions.get(place.get('node_id'))
+                        if anchor is not None:
+                            point = anchor.position
+                            place.update(x=point.x, y=point.y, z=point.z)
                 segment['progress'].graph(stamp, self._receipt_clock(), nodes, links)
             self._publish_snapshot(segment)
             self._native_accepted('graph')
@@ -1084,6 +1093,35 @@ class RtabmapNode(Node):
             segment['preview_pending'] = True
             self._flush_preview(segment)
 
+    def change_place(self, name, *, remove):
+        with self._result_lock:
+            segment = self._active
+            if not segment or self._stopped() or segment['closing']:
+                raise ValueError('no active map segment')
+            places = segment['places']
+            existing = next((p for p in places if p['name'] == name), None)
+            if remove:
+                if existing is None:
+                    raise ValueError('unknown place')
+                places.remove(existing)
+            else:
+                if existing is not None:
+                    raise ValueError('place name already in use')
+                graph = segment['graph']
+                now = self._measurement_clock_ns()
+                if (not graph or now is None or
+                        not -self._settings['max_future_skew_ms'] * 1e6 <= now - graph[0] <= self.stream.max_age_s * 1e9 or
+                        segment['native_recovery']['state'] in ('searching', 'unavailable') or
+                        segment.get('current_ref') != (segment['graph_node'], graph[0])):
+                    raise ValueError('current mapped pose unavailable')
+                x, y, z = map(float, graph[2][:3, 3])
+                places.append(dict(name=name, x=x, y=y, z=z, node_id=segment['graph_node'],
+                                   segment_id=segment['segment_id']))
+            segment['preview_pending'] = segment['snapshot'] is not None
+            segment['last_preview'] = 0.
+            self._flush_preview(segment)
+            return deepcopy(places)
+
     def _flush_preview(self, segment):
         with self._result_lock:
             if (self._active is not segment or self._closed or self._stopped() or
@@ -1094,7 +1132,7 @@ class RtabmapNode(Node):
                 return
             segment['last_preview'] = now
             segment['preview_pending'] = False
-            message = UInt8MultiArray(); message.data = array('B', segment['snapshot'])
+            message = UInt8MultiArray(); message.data = array('B', with_places(segment['snapshot'], segment.get('places')))
             self._map_pub.publish(message)
 
     def _native_info(self, msg, segment):
@@ -1133,6 +1171,7 @@ class RtabmapNode(Node):
                                 relocalization_anchor=int(match[1]), relocalization_inliers=int(match[2]))
             if valid_ref or has_recovery_state:
                 try:
+                    segment['current_ref'] = (msg.ref_id, self._stamp(msg))
                     segment['progress'].activity(self._stamp(msg),self._receipt_clock())
                 except AttributeError:
                     pass  # No stamped activity evidence in this native message.
@@ -1240,14 +1279,14 @@ class RtabmapNode(Node):
             raise RuntimeError('Close RTAB-Map before reading finalized map artifacts')
         with self._result_lock:
             pending = [(segment['segment_id'], segment['frame_id'],
-                        segment['process'].database_path, segment['snapshot'])
+                        segment['process'].database_path, segment['snapshot'], deepcopy(segment.get('places', [])))
                        for segment in self._segments if segment['forwarded'] and
                        getattr(segment['process'], 'mapped_nodes', None) != 0]
         segments = []
-        for segment_id, frame_id, database, snapshot in pending:
+        for segment_id, frame_id, database, snapshot, places in pending:
             if snapshot is not None:
                 snapshot = rebuild_snapshot(database, max_points=self._settings['preview_max_points'],
-                                            fallback=snapshot)
+                                            fallback=snapshot, places=places)
             segments.append({'segment_id': segment_id, 'frame_id': frame_id,
-                             'database': str(database), 'snapshot': snapshot})
+                             'database': str(database), 'snapshot': snapshot, 'places': places})
         return {'segments': segments, 'statistics': self.status()}

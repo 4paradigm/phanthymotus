@@ -80,13 +80,23 @@ def validate_map_name(name):
     return name
 
 
-def delete_map(root, map_id):
+def entry_by_name(entries, name):
+    name = validate_map_name(name)
+    matches = [entry for entry in entries if entry['name'] == name]
+    if not matches:
+        raise ValueError('unknown map name')
+    if len(matches) > 1:
+        raise ValueError('ambiguous map name')
+    return matches[0]
+
+
+def delete_map(root, name):
     with _maps_locked(root) as maps:
-        _manifest(maps, map_id)
+        map_id = entry_by_name(_entries(maps), name)['id']
         with tempfile.TemporaryDirectory(dir=maps, prefix='.deleting-') as stage:
             os.replace(maps / map_id, Path(stage) / 'map')
             _sync_dir(maps)
-
+        return map_id
 
 
 def rename_map(root, map_id, name):
@@ -116,6 +126,19 @@ def _revision(maps, map_id, revision):
     if type(revision) is not int or not any(s['revision'] == revision for s in entry['saves']):
         raise ValueError('unknown map revision')
     return entry
+
+
+def remove_place(root, map_id, revision, segment_id, name):
+    with _maps_locked(root) as maps:
+        entry = _revision(maps, map_id, revision)
+        tags = entry.get('tags', {}).get(str(revision), [])
+        match = next((p for p in tags if p['segment_id'] == segment_id and p['name'] == name), None)
+        if match is None:
+            raise ValueError('unknown place')
+        tags.remove(match)
+        with tempfile.TemporaryDirectory(dir=maps) as stage:
+            _write_json(Path(stage) / 'manifest.tmp', maps / map_id / 'manifest.json', entry, MAX_CHECKPOINT_BYTES)
+        return [p for p in tags if p['segment_id'] == segment_id]
 
 
 def _read_revision(path):
@@ -261,6 +284,9 @@ def save_rtabmap_revision(root, artifacts, settings, name, bound_id, request_id,
                         for key in ('resolved_inputs', 'extrinsic_mode', 'map_plane',
                             'cloud_frame', 'child_frame', 'clock_id',
                             'child_from_cloud', 'input_provenance', 'pose_capture_mount', 'color_from_depth')}}
+            places = [p for segment in segments for p in segment.get('places', [])]
+            if places:
+                entry.setdefault('tags', {})[str(revision)] = places
             entry['saves'].append({'request_id': request_id, 'revision': revision, 'source': source_id,
                                    'segments': len(saved_segments), 'backend': 'rtabmap'})
             entry.update(revision=revision, backend='rtabmap')
@@ -341,7 +367,9 @@ def copy_native_map(root, map_id, revision, destination, *,
         snapshot = (_artifact_path(directory, segment['snapshot']).read_bytes()
                     if segment['snapshot'] is not None else None)
         return dict(segment_id=segment['segment_id'], frame_id=segment['frame_id'],
-                    database=str(destination), snapshot=snapshot, resolved=deepcopy(data.get('resolved') or {}))
+                    database=str(destination), snapshot=snapshot,
+                    places=[p for p in entry.get('tags', {}).get(str(revision), [])
+                            if p['segment_id'] == segment['segment_id']], resolved=deepcopy(data.get('resolved') or {}))
 
 
 def load_map_snapshots(root, map_id, revision=None, *, max_points=40000):
