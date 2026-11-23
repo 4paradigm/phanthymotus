@@ -37,7 +37,7 @@ def paired_sensor_odom(settings):
     """The measured body pose and registered cloud share one private DDS delivery."""
     mount = settings.get('capture_mount') or {}
     has_sensor_data = settings.get('rgb_input') is not None or settings.get('scan_origin_recovery', False)
-    return has_sensor_data and mount.get('interpolate', False)
+    return has_sensor_data and mount.get('paired_sensor_odom', mount.get('interpolate', False))
 
 
 def mapping_parameters(database_path, namespace, settings):

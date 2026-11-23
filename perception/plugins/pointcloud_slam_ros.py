@@ -855,7 +855,7 @@ class RtabmapNode(Node):
             fallback = matrix
             if (saved_mount is None and rgb_stamp != stamp and self._rgb.mounts is None and
                     self.stream._external_body_frame is not None):
-                if self._capture_clouds is not None and self._capture_clouds.interpolate:
+                if self._capture_clouds is not None:
                     fallback = self._capture_clouds.matrix_at(rgb_stamp, self.stream.cloud_frame)
                 elif self.stream._pose_capture_mount:
                     capture = self.stream._mount_context(rgb_stamp, self.stream.cloud_frame)

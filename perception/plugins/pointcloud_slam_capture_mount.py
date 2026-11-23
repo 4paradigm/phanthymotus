@@ -20,7 +20,7 @@ def resolve_capture_mount(sample, camera, cloud_frame):
                     clock_id=pose.clock_id, child_from_cloud=None, extrinsic_mode='dynamic',
                     capture_mount=dict(declaration=mount, source_clock=clock,
                                        clock_reference=deepcopy(reference),
-                                       interpolate=pose.external_origin is not None,
+                                       paired_sensor_odom=pose.external_origin is not None,
                                        color_from_depth=deepcopy(baseline)))
     return settings, dict(resolution='declared_capture_mount',
         extrinsic_source=deepcopy(mount), clock_relation='producer_declared_common_reference',
@@ -37,7 +37,6 @@ class CaptureClouds:
     """Bounded raw-cloud waiting for the nearest supplied numeric mount."""
     def __init__(self, config, *, max_pending):
         self.reference = deepcopy(config['clock_reference'])
-        self.interpolate = config.get('interpolate', False)
         self.color_from_depth = config.get('color_from_depth')
         mount = config['declaration']
         self.mounts = CaptureMounts(mount, mount['child_frame'], config['source_clock'])
@@ -51,11 +50,19 @@ class CaptureClouds:
         self.pending.clear()
         self.mounts.packets.clear()
 
-    def matrix_at(self, stamp, frame):
-        matrix = self.mounts.matrix_at(stamp)
-        if matrix is not None and self.color_from_depth is not None and frame != self.mounts.frame:
-            matrix = matrix @ camera_transform(self.color_from_depth)
+    def _nearest(self, stamp):
+        numeric = (p for p in self.mounts.packets.values() if p.get('matrix') is not None)
+        return min(numeric, key=lambda p: abs(p['stamp_ns'] - stamp), default=None)
+
+    def _cloud_matrix(self, evidence, frame):
+        matrix = evidence['matrix']
+        if self.color_from_depth is not None and frame != self.mounts.frame:
+            matrix = (matrix @ camera_transform(self.color_from_depth)).tolist()
         return matrix
+
+    def matrix_at(self, stamp, frame):
+        evidence = self._nearest(stamp)
+        return self._cloud_matrix(evidence, frame) if evidence is not None else None
 
     def mount(self, packet, stream, *, now, measurement_now_ns):
         self.mounts.observe(packet, measurement_now_ns)
@@ -76,18 +83,11 @@ class CaptureClouds:
     def _drain(self, stream, now, measurement_now_ns):
         for stamp in sorted(self.pending):
             frame, cloud, count, received = self.pending[stamp]
-            packets = [p for p in self.mounts.packets.values() if p.get('matrix') is not None]
-            if not packets:
+            evidence = self._nearest(stamp)
+            if evidence is None:
                 stream.last_error = 'waiting for numeric capture mount'
                 continue
-            evidence = min(packets, key=lambda p: abs(p['stamp_ns']-stamp))
-            if self.interpolate:
-                matrix = self.matrix_at(stamp, frame)
-                if matrix is None:
-                    stream.last_error = 'waiting for numeric capture mount at cloud timestamp'
-                    continue
-                evidence = dict(evidence, stamp_ns=stamp, matrix=matrix.tolist())
             del self.pending[stamp]
-            context = dict(child_from_cloud=evidence['matrix'], extrinsic=deepcopy(evidence))
+            context = dict(child_from_cloud=self._cloud_matrix(evidence, frame), extrinsic=deepcopy(evidence))
             stream.cloud(stamp, frame, cloud, point_count=count, now=now,
                          measurement_now_ns=measurement_now_ns, capture_context=context, received=received)
