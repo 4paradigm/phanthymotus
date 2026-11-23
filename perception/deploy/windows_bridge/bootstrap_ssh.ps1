@@ -150,7 +150,11 @@ try {
     Get-NetFirewallRule -Name 'ParadigmBridge-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 
     $taskName = 'Paradigm Visitor Automation'
-    $action = New-ScheduledTaskAction -Execute $python `
+    # Interactive desktop access is required for Edge, but the Python
+    # console is not: discovery polls must not repeatedly steal focus.
+    $pythonWindowless = Join-Path $venv 'Scripts\pythonw.exe'
+    if (!(Test-Path -LiteralPath $pythonWindowless)) { throw 'Windowless Python executable missing' }
+    $action = New-ScheduledTaskAction -Execute $pythonWindowless `
         -Argument ('"' + (Join-Path $install 'ssh_worker.py') + '" --config "' + $cfgPath + '"') `
         -WorkingDirectory $install
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
@@ -168,7 +172,7 @@ try {
         -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName $taskName -Action $action -Principal $taskPrincipal -Settings $settings -Force | Out-Null
 
-    $loginAction = New-ScheduledTaskAction -Execute $python `
+    $loginAction = New-ScheduledTaskAction -Execute $pythonWindowless `
         -Argument ('"' + (Join-Path $install 'login_edge.py') + '" --automatic --config "' + $cfgPath + '"') `
         -WorkingDirectory $install
     $loginSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
