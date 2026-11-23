@@ -80,6 +80,10 @@ class BridgeError(Exception):
     """前台 SSH 自动化失败；message 可以直接转述给操作人员。"""
 
     def __init__(self, message: str, code: str = "bridge_error"):
+        if code == "query_button_missing":
+            # Keep the user-facing message current even during a Windows
+            # worker upgrade; older workers return the same stable code.
+            message = "未检测到访客查询功能，请打开正确的访客列表网址"
         super().__init__(message)
         self.code = code
 
@@ -430,10 +434,10 @@ class QLPrinterPlugin:
             "查询当天未入场访客并打印访客贴。",
             action_schema(actions, properties),
         )
-        definition['x-completion'] = {
+        definition['inputSchema']['x-completion'] = {
             'actions': ['print', 'find_and_print'], 'timeout': 180,
         }
-        definition['x-resource'] = 'visitor_badge_printer'
+        definition['inputSchema']['x-resource'] = 'visitor_badge_printer'
         definition["inputSchema"]["properties"]["printer_name"] = {"type": "string"}
         definition["configSchema"] = {
             "type": "object",
@@ -764,7 +768,7 @@ class QLPrinterPlugin:
                 self._print_action_id = None
             raise
         return {"status": "accepted", "action_id": action_id,
-                "message": "打印任务已接收，完成后通过 ACP 返回结果；请勿重复提交"}
+                "message": "打印任务已接收，正在执行；完成后返回成功或失败原因，请勿重复提交"}
 
     def _print_action(self, args: dict) -> dict:
         # Backward-compatible for an older Skill that still submits ticket/request_id.

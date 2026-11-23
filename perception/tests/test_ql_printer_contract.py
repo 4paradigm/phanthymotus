@@ -112,7 +112,8 @@ class VisitorBadgeTest(unittest.TestCase):
         definition = self.card.get_tool()
         self.assertEqual(definition["name"], "Visitor_Badge_Printer")
         self.assertEqual(definition["type"], "actuator")
-        self.assertEqual(definition["x-completion"], {"actions": ["print", "find_and_print"], "timeout": 180})
+        self.assertEqual(definition["inputSchema"]["x-completion"], {"actions": ["print", "find_and_print"], "timeout": 180})
+        self.assertEqual(definition["inputSchema"]["x-resource"], "visitor_badge_printer")
         actions = definition["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(set(actions), {"start", "stop", "info", "config", "list", "print", "printers", "initialize", "initialize_status"})
         schema_text = json.dumps(definition["inputSchema"], ensure_ascii=False)

@@ -16,17 +16,37 @@ path in a change about music. Worth doing separately.
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import os
+import ssl
 import threading
+import urllib.parse
 import urllib.request
 
 log = logging.getLogger(__name__)
 
 # Loopback by default because /api/acp/complete is loopback-only (auth.py
 # rejects anything else, loudly, and tells the caller to use the peer inbox).
-AGENT_CORE_URL = os.environ.get('AGENT_CORE_URL', 'http://127.0.0.1:15678')
+AGENT_CORE_URL = os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')
 TIMEOUT_S = 3
+
+
+def _ssl_context(url: str):
+    """Match Core's local self-signed HTTPS without relaxing remote TLS."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https':
+        return None
+    host = parsed.hostname or ''
+    try:
+        local = host.lower() == 'localhost' or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = False
+    context = ssl.create_default_context()
+    if local:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 def _post(action_id: str, status: str, result: dict) -> None:
@@ -36,7 +56,8 @@ def _post(action_id: str, status: str, result: dict) -> None:
         f'{AGENT_CORE_URL.rstrip("/")}/api/acp/complete', body,
         headers={'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_S,
+                                    context=_ssl_context(AGENT_CORE_URL)) as response:
             response.read()
     except Exception as error:   # noqa: BLE001
         # Deliberately not re-raised: the caller is a playback thread, and a
