@@ -85,6 +85,7 @@ def test_source_switch_shortens_hold_only_after_measured_stop(monkeypatch, first
     assert (state.feedback_guard_s == 0.) == settled
 
 
+@pytest.mark.parametrize("timing", ["speed_field", "sample_receipt", "declared_receipt"])
 @pytest.mark.parametrize("samples,settled", [
     ([(1010, 1005, 0.), (1050, 1040, 0.), (1060, 1040, 0.)], True),
     ([(1050, 1010, 0.), (1050, 1040, 0.)], False),  # Queue drained together.
@@ -93,26 +94,48 @@ def test_source_switch_shortens_hold_only_after_measured_stop(monkeypatch, first
     ([(1010, 1005, 0.), (1050, None, 0.)], False),
     ([(1010, 1005, 0.), (1050, 1040, .4)], False),
 ])
-def test_received_speed_recovery_uses_driver_speed_updates(monkeypatch, samples, settled):
+def test_received_speed_recovery_uses_driver_speed_updates(monkeypatch, samples, settled, timing):
     card, _, clock, snapshot = observation_card(monkeypatch)
     state = card._state
     state.motion_source = "command"
     state.commanded = (.15, 0., 0.)
     card.next_command()
     assert "等待底盘停稳" in card._last_decision.reason
+    if timing == "declared_receipt":
+        card._odom_interface = {"timing": {"stamp_source": "received"}}
     for receipt, speed_stamp, yaw in samples:
         clock[0] = receipt
-        payload = dict(schema="motus.odom/1", frame="body", stamp_ms=receipt,
-                       twist=[0., 0., None, None, None, yaw],
-                       vendor=dict(source="slamtec", stamp_source="received", sample_timestamps_ms={"speed": speed_stamp}))
+        vendor = {} if timing == "declared_receipt" else {"stamp_source": "received"}
+        if timing == "speed_field":
+            vendor["sample_timestamps_ms"] = {"speed": speed_stamp}
+        payload = dict(schema="motus.odom/1", frame="body", vendor=vendor,
+                       stamp_ms=receipt if timing == "speed_field" else speed_stamp,
+                       twist=[0., 0., None, None, None, yaw])
         card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
     clock[0] = 1070
     objects, depth, _, receipt = snapshot[0]
     odom = plugin.NaviPlugin._observation_snapshot(card, with_capture_timing=True)[2]
-    assert "stamp_ms" not in odom
+    assert "stamp_ms" not in (odom or {})
     snapshot[0] = objects, dict(depth, control_ms=1070), odom, receipt
     card.next_command()
     assert (state.feedback_guard_s == 0.) == settled
+
+
+@pytest.mark.parametrize("update", [{"valid": False}, {"twist": [None, None, None, None, None, 0.]}])
+def test_invalid_or_partial_speed_cannot_confirm_standstill(monkeypatch, update):
+    card, _, clock, snapshot = observation_card(monkeypatch)
+    for receipt in (1010, 1050):
+        clock[0] = receipt
+        payload = dict(schema="motus.odom/1", frame="body", stamp_ms=receipt - 5,
+                       twist=[0., 0., None, None, None, 0.], vendor={"stamp_source": "received"})
+        payload.update(update)
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+    odom = plugin.NaviPlugin._observation_snapshot(card, with_capture_timing=True)[2]
+    assert "received_speed_pair" not in odom
+    objects, depth, _, receipt = snapshot[0]
+    snapshot[0] = objects, dict(depth, control_ms=1050), odom, receipt
+    card.next_command()
+    assert not card._state.uses_received_speed
 
 
 @pytest.mark.parametrize("late_repeat", [False, True])

@@ -1832,7 +1832,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     feedback = planar_feedback(odom) if config.local_planning else None
     if config.local_planning and config.local_geometry is not None:
-        state.uses_received_speed |= "received_speed_ms" in (odom or {})
+        if odom and all(odom.get(axis) is not None for axis in ("vx", "vy", "wz")):
+            state.uses_received_speed = "received_speed_ms" in odom
         motion_pose = (odom or {}).get("motion_pose")
         velocity_history = (odom or {}).get("velocity_history")
         source = ("command" if feedback is None else

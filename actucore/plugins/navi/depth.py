@@ -507,7 +507,8 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
 
     lateral = tangent[None, :] * rows
     inside = np.abs(lateral - lateral_offset_m) <= half_width_m
-    valid = inside & np.isfinite(rows)
+    returns = np.isfinite(rows) & (rows > 0.)
+    valid = inside & returns
     # Ground returns still contribute to depth coverage. Holes remain unknown.
     if ground is not None:
         valid &= ~ground[top:bottom]
@@ -517,7 +518,7 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
     if clearance is None and ground is not None:
         # If everything we saw was floor, report a conservative observed
         # depth bound. Require floor returns across the width of the corridor.
-        floor = inside & ground[top:bottom]
+        floor = inside & returns & ground[top:bottom]
         strip_width = 2 * half_width_m / 3
         left = lateral_offset_m - half_width_m
         extents = []
@@ -543,6 +544,6 @@ def corridor(depth_m: np.ndarray, *, half_width_m: float, half_fov_rad: float,
         # The corridor is entirely outside the lens. Zero, not a division by
         # zero — and zero is the truth: the camera cannot see there at all.
         return clearance, 0.0
-    region = rows[:, window]
-    measured = float(np.isfinite(region).mean()) if region.size else 0.0
+    region = returns[:, window]
+    measured = float(region.mean()) if region.size else 0.0
     return clearance, round(measured * min(1.0, visible / wanted), 3)

@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Tuple
 
 import numpy as np
 
 from . import local_path
 
-Twist = tuple[float, float, float]
-Pose = tuple[float, float, float]
+Twist = Tuple[float, float, float]
+Pose = Tuple[float, float, float]
 _DEFAULT_ACCELERATION = (.5, .5, 1.)
 _DEFAULT_BRAKING = (.45, .45, .8)
 _BRAKE_BUDGET_S = 5.

@@ -1725,7 +1725,7 @@ class NaviPlugin:
                 # that cannot answer "am I moving" must not look stopped, and
                 # one that cannot answer "am I turning" must not have its own
                 # rotation assumed to be zero.
-                self._odom = {axis: odom_mod.axis_of(payload, axis)
+                self._odom = {axis: odom_mod.axis_of(payload, axis) if payload.get("valid") is not False else None
                               for axis in ("vx", "vy", "wz")}
                 stamp = payload.get("stamp_ms")
                 self._odom_received_ms = now
@@ -1757,16 +1757,20 @@ class NaviPlugin:
                                                    odom_mod.planar_feedback(feedback_odom)))
                 timing = self._odom_interface.get("timing") or {}
                 vendor = payload.get("vendor")
-                stamp_source = vendor.get("stamp_source", "robot") if isinstance(vendor, dict) else "robot"
-                # Tianyi may republish the same speed reading with a new envelope stamp.
-                # Keep the first callback time for each distinct Driver speed update.
+                vendor = vendor if isinstance(vendor, dict) else {}
+                stamp_source = vendor.get("stamp_source", timing.get("stamp_source", "robot"))
+                # A component timestamp, when provided, identifies the speed
+                # reading even if a producer republishes it in a newer envelope.
                 samples = self._received_speed_samples
-                stamps = (vendor.get("sample_timestamps_ms") if stamp_source == "received"
-                          and vendor.get("source") == "slamtec" else None)
-                speed_ms = stamps.get("speed") if isinstance(stamps, dict) else None
-                if isinstance(stamps, dict):
-                    self._odom["received_speed_ms"] = speed_ms if type(speed_ms) is int else None
+                speed_ms = None
                 twist = odom_mod.planar_feedback(self._odom)
+                if stamp_source == "received":
+                    stamps = vendor.get("sample_timestamps_ms")
+                    if "sample_timestamps_ms" not in vendor:
+                        speed_ms = stamp
+                    elif isinstance(stamps, dict):
+                        speed_ms = stamps.get("speed")
+                    self._odom["received_speed_ms"] = speed_ms if type(speed_ms) is int and twist is not None else None
                 if type(speed_ms) is not int or not 0 < speed_ms <= now or twist is None:
                     samples.clear()
                 elif not samples or speed_ms > samples[-1][1]:

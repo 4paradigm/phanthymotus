@@ -229,21 +229,23 @@ def test_the_corridor_still_ignores_what_the_robot_will_miss():
     assert clearance == pytest.approx(5.0)
 
 
-def test_a_corridor_full_of_holes_does_not_read_as_an_empty_one():
+@pytest.mark.parametrize("invalid", [np.nan, 0., -1.])
+def test_a_corridor_full_of_holes_does_not_read_as_an_empty_one(invalid):
     """`clearance` alone cannot express this: every invalid pixel drops silently
     out of the minimum, so a corridor nobody could measure and a corridor with
     nothing in it produce the same number. The things that make holes — chair
     legs, glass, dark edges — are the things that catch a shoulder."""
-    depth_map = np.full((D.HEIGHT, D.WIDTH), np.nan, dtype=np.float32)
+    depth_map = np.full((D.HEIGHT, D.WIDTH), invalid, dtype=np.float32)
     clearance, coverage = _corridor(depth_map)
     assert clearance is None
     assert coverage == 0.0
 
 
-def test_coverage_is_graduated_rather_than_a_flag():
+@pytest.mark.parametrize("invalid", [np.nan, 0.])
+def test_coverage_is_graduated_rather_than_a_flag(invalid):
     solid = _corridor(np.full((D.HEIGHT, D.WIDTH), 5.0, dtype=np.float32))[1]
     patchy = np.full((D.HEIGHT, D.WIDTH), 5.0, dtype=np.float32)
-    patchy[::2, :] = np.nan
+    patchy[::2, :] = invalid
     assert solid == pytest.approx(1.0, abs=0.02)
     assert 0.3 < _corridor(patchy)[1] < 0.7
 
