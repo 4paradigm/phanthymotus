@@ -269,6 +269,24 @@ def test_new_project_start_saves_stale_mapping_before_repreparing(card):
     assert call(card, 'start_mapping', map_name='Second')['state'] == 'running'
 
 
+def test_crashed_writer_retains_session_and_allows_a_new_project(card):
+    session = capture(card)
+
+    def crashed():
+        raise module.NativeWriterExited('RTAB-Map exited before graceful stop (exit -6)')
+
+    session.before_close = crashed
+    result = card.dispatch('pointcloud_slam', arguments())
+    assert result['state'] == 'error' and str(session.directory) in result['message']
+    assert 'retry stop_mapping' not in result['message']
+    assert session.database.exists() and session.destroyed
+    assert call(card, 'list_maps')['maps'] == []
+    assert call(card, 'stop_mapping')['state'] == 'error'
+    assert card.dispatch('pointcloud_slam', arguments())['state'] == 'ready'
+    assert call(card, 'start_mapping', map_name='Second')['state'] == 'running'
+    assert session.database.exists()
+
+
 def test_new_project_start_retries_prior_failed_save(card):
     session = capture(card)
     session.failure = 'transient close error'

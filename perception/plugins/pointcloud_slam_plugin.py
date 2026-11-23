@@ -15,7 +15,7 @@ from .pointcloud_slam_contract import SpatialSlamError, validate_slam_capability
 from .pointcloud_slam_input import InputContractError, resolve_inputs
 from .pointcloud_slam_preview import DEFAULT_PREVIEW_POINTS, PREVIEW_TOPIC
 from .pointcloud_slam_ros import RtabmapNode, discover_input_bindings
-from .pointcloud_slam_rtabmap import require_runtime
+from .pointcloud_slam_rtabmap import NativeWriterExited, require_runtime
 from .pointcloud_slam_transforms import rigid
 from .pointcloud_slam_view import SavedMapView
 from utils.ros_lifecycle import dispose_node
@@ -333,6 +333,8 @@ class PointCloudSlamPlugin:
             log.warning('[pointcloud_slam] new project start finalizing previous map session')
             try:
                 self._stop_mapping()  # commits native DB; never discards it
+            except NativeWriterExited:
+                raise
             except Exception as error:
                 raise RuntimeError('previous map save failed: ' + str(error) +
                                    '; retry stop_mapping') from error
@@ -545,6 +547,8 @@ class PointCloudSlamPlugin:
         self._session_dir, self._session_settings = session, settings
         self._node, self._map_name = node, name
         self._bound_map_id = bound
+        with self._operation_lock:
+            self._save_status = {'state': 'idle'}
         if self._capture_stop.is_set():
             node.freeze_capture()
             return {'state': 'idle', 'capture_stopped': True}
@@ -599,6 +603,18 @@ class PointCloudSlamPlugin:
                 with self._lock:
                     self._pending = self._session_dir = self._map_name = self._save_request = None
                     self._last_stop = result
+            except NativeWriterExited as error:
+                # All segment writers have stopped. Preserve their files for
+                # recovery and release the ROS node for the next project.
+                dispose_node(self._executor, pending, label=self.PREFIX)
+                message = f'{error}; session retained for recovery at {self._session_dir}'
+                result = {'state': 'error', 'message': message, 'request_id': save_request}
+                with self._lock:
+                    self._pending = self._session_dir = self._map_name = self._save_request = None
+                    self._last_stop = result
+                with self._operation_lock:
+                    self._save_status = dict(result)
+                raise NativeWriterExited(message) from error
             except Exception as error:
                 with self._operation_lock:
                     self._save_status = {'state': 'error', 'message': str(error), 'request_id': save_request}
@@ -640,7 +656,7 @@ class PointCloudSlamPlugin:
                         self._topics = {}
                     result = self._stop_mapping(request)
                     with self._operation_lock:
-                        self._save_status = dict(result, state='saved' if result['state'] == 'saved' else 'idle')
+                        self._save_status = dict(result, state='idle' if result['state'] == 'ready' else result['state'])
                 except Exception as error:
                     with self._operation_lock:
                         self._save_status = {**self._save_status, 'state': 'error', 'message': str(error)}

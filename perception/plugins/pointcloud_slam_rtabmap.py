@@ -110,6 +110,10 @@ def native_overrides(values):
 
 
 
+class NativeWriterExited(RuntimeError):
+    """The writer exited before its database could be finalized."""
+
+
 class RtabmapProcess:
     """One external VO segment owns one process and one fresh native database.
 
@@ -191,7 +195,7 @@ class RtabmapProcess:
         if code is not None and not self._stop_sent:
             if self._log is not None:
                 self._log.close()
-            raise RuntimeError('RTAB-Map exited before graceful stop (exit ' + str(code) + ')')
+            raise NativeWriterExited('RTAB-Map exited before graceful stop (exit ' + str(code) + ')')
         if code is None and not self._stop_sent:
             self._stop_sent = True
             try:
@@ -219,7 +223,7 @@ class RtabmapProcess:
         if self._log is not None:
             self._log.close()
         if code != 0:
-            raise RuntimeError('RTAB-Map failed to finalize database (exit ' + str(code) + ')')
+            raise NativeWriterExited('RTAB-Map failed to finalize database (exit ' + str(code) + ')')
         try:
             if not self.database_path.is_file() or not self.database_path.stat().st_size:
                 raise ValueError('native database is missing or empty')

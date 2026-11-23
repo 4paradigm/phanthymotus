@@ -164,8 +164,19 @@ public:
             const Vec up=rotate(poses.at(best->node).inverse(),Vec(0,0,1));
             for(int i=0;i<3;++i) for(int j=0;j<3;++j)
                 info.at<double>(3+i,3+j)+=1600.*up[i]*up[j];
-            map.addLink(rtabmap::Link(best->node,node,rtabmap::Link::kLocalSpaceClosure,
-                        bestPose,info));
+            // The wall supplies partial geometry. Keep its information within
+            // the measured odometry envelope, including on high-variance runs.
+            // Scale the full matrix so its correlated directions stay positive.
+            const auto & odomInfo=map.getMemory()->getOdomMaxInf();
+            if(odomInfo.size()==6)
+            {
+                double scale=1.;
+                for(int i=0;i<6;++i)
+                    scale=std::min(scale,odomInfo[i]/info.at<double>(i,i));
+                if(scale>0.)
+                    map.addLink(rtabmap::Link(best->node,node,rtabmap::Link::kLocalSpaceClosure,
+                                bestPose,info*scale));
+            }
         }
         history_.push_back(std::move(*current));
         if(history_.size()>96) history_.pop_front();

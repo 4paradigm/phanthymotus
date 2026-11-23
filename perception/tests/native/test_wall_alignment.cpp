@@ -36,6 +36,14 @@ static void replay(const std::string & database,bool differentScene,bool reset)
     if(map.getLocalOptimizedPoses().size()!=3 || !last ||
        last->hasLink(1,rtabmap::Link::kLocalSpaceClosure)!=(!differentScene && !reset))
         throw std::runtime_error("incorrect persisted wall constraint in "+database);
+    if(!differentScene && !reset)
+    {
+        const auto info=last->getLinks().find(1)->second.infMatrix();
+        const auto & odom=map.getMemory()->getOdomMaxInf();
+        for(int i=0;i<6;++i)
+            if(info.at<double>(i,i)>odom.at(i)+1e-5)
+                throw std::runtime_error("wall constraint exceeded measured neighbor information");
+    }
     map.close(false);
 }
 

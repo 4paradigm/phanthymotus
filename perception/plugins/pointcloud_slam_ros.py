@@ -23,7 +23,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import PointCloud2, PointField, CompressedImage
 from std_msgs.msg import String, UInt8MultiArray
 
-from .pointcloud_slam_rtabmap import RtabmapProcess, paired_sensor_odom
+from .pointcloud_slam_rtabmap import NativeWriterExited, RtabmapProcess, paired_sensor_odom
 from .pointcloud_slam_watchdog import BackendProgress
 from .pointcloud_slam_snapshot import rebuild as rebuild_snapshot
 from .pointcloud_slam_preview import DEFAULT_PREVIEW_POINTS, PREVIEW_TOPIC, with_places, update_place_position
@@ -1312,11 +1312,18 @@ class RtabmapNode(Node):
                 if worker and worker is not threading.current_thread():
                     worker.join()
             self._rgb_task = None
+            writer_error = None
             for segment in self._segments:
                 if not segment['finalized']:
                     segment['closing'] = True
-                    segment['process'].close()
+                    try:
+                        segment['process'].close()
+                    except NativeWriterExited as error:
+                        writer_error = error
+                        continue
                     segment['finalized'] = True
+            if writer_error is not None:
+                raise writer_error
             if self._runtime_error:
                 raise RuntimeError(self._runtime_error)
             self._closed = True
