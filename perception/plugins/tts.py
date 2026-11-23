@@ -33,6 +33,12 @@ log = logging.getLogger(__name__)
 
 XIAOYOU_TTS_ENGINE = "xiaoyou-zh-en"
 XIAOYOU_LANGUAGES = ("zh", "en")
+_XIAOYOU_FIXED_SETTINGS = {
+    "xiaoyou_device": "gpu",
+    "xiaoyou_speaker_id": 0,
+    "xiaoyou_speed": 1.0,
+}
+_XIAOYOU_CONFIG_KEYS = ("xiaoyou_language", "runtime_manifest_sha256", *_XIAOYOU_FIXED_SETTINGS)
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms @ 16kHz 16-bit mono
@@ -267,6 +273,9 @@ TOOLS = [
                                 "default": "cpu", "scope": "shared",
                                 "x-show-when": {"tts_engine": ["matcha-zh-en", "mms-th",
                                                                "kokoro-multi"]}},
+                "xiaoyou_device": {"title": "Inference device", "type": "string",
+                                   "enum": [_XIAOYOU_FIXED_SETTINGS["xiaoyou_device"]], "default": "gpu",
+                                   "scope": "shared", "x-show-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
                 # Kokoro takes `lang` per generate() call, so this is a scale on the
                 # resident model like `speed` — not a session key.
                 #
@@ -294,7 +303,7 @@ TOOLS = [
                     "x-show-when": {"tts_engine": ["kokoro-multi"]}},
                 "xiaoyou_language": {
                     "type": "string", "enum": ["auto", *XIAOYOU_LANGUAGES],
-                    "description": "Reading language for xiaoyou-zh-en",
+                    "description": "Pronunciation language for xiaoyou-zh-en. Auto reads by context.",
                     "default": "auto", "scope": "shared",
                     "x-show-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
                 # Thai has no spaces between words, and MMS was trained on text
@@ -308,8 +317,14 @@ TOOLS = [
                     "x-show-when": {"tts_engine": "mms-th"}},
                 "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared",
                                "x-hide-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
+                "xiaoyou_speaker_id": {"title": "Speaker ID", "type": "integer",
+                                       "enum": [_XIAOYOU_FIXED_SETTINGS["xiaoyou_speaker_id"]], "default": 0,
+                                       "scope": "shared", "x-show-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared",
                                "x-hide-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
+                "xiaoyou_speed": {"title": "Speech speed (1.0 = normal)", "type": "number",
+                                  "enum": [_XIAOYOU_FIXED_SETTINGS["xiaoyou_speed"]], "default": 1.0,
+                                  "scope": "shared", "x-show-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
             },
             "required": []
         },
@@ -2331,8 +2346,8 @@ class TTSPlugin:
         if engine == XIAOYOU_TTS_ENGINE:
             impl = self._build_xiaoyou(cfg)
         else:
-            cfg.pop("xiaoyou_language", None)
-            cfg.pop("runtime_manifest_sha256", None)
+            for key in _XIAOYOU_CONFIG_KEYS:
+                cfg.pop(key, None)
             cfg["engine"] = engine
             cfg["model_dir"] = self._model_dir_for(engine)
             impl = (self._build_vits2(cfg) if engine == "vits2-zh-en"
@@ -2558,7 +2573,7 @@ class TTSPlugin:
         """Apply shared config, switching engines when tts_engine changes."""
         requested = args.get("tts_engine") or args.get("engine")
         forwarded = {k: v for k, v in args.items()
-                     if k not in ("tts_engine", "engine", "xiaoyou_language", "runtime_manifest_sha256")}
+                     if k not in ("tts_engine", "engine", *_XIAOYOU_CONFIG_KEYS)}
         with self._lock:
             if self._closed:
                 return {"state": "error", "message": "TTS plugin has shut down"}
@@ -2567,6 +2582,9 @@ class TTSPlugin:
             switching = requested and not already_building and (
                 engine != self._impl_engine or self._impl is None)
             if engine == XIAOYOU_TTS_ENGINE:
+                for key, supported in _XIAOYOU_FIXED_SETTINGS.items():
+                    if key in args and (isinstance(args[key], bool) or args[key] != supported):
+                        return {"state": "error", "message": f"{key} must be {supported}"}
                 if switching:
                     from plugins.xiaoyou_tts.frontend.phonemizer import require_runtime
 
@@ -2585,7 +2603,7 @@ class TTSPlugin:
                         return self._impl.dispatch(name, {"action": "config", "language": language})
             else:
                 for key in SHARED_CONFIG_KEYS:
-                    if key != "xiaoyou_language" and key in args:
+                    if key in forwarded:
                         self._cfg[key] = args[key]
 
             if switching:
