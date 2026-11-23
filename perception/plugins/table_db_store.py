@@ -295,11 +295,13 @@ class TableStore:
 
     def _check_size(self, db: str, extra: int) -> None:
         path = self.db_path(db)
-        size = sum(os.path.getsize(part) for part in (path, path + "-wal")
+        size = sum(os.path.getsize(part) for part in (path, path + "-wal", path + "-shm")
                    if os.path.exists(part))
-        if size + extra > self.limits.max_db_bytes:
-            raise TableDbError("too_large", "库 %s 已有 %d 字节，再写 %d 字节会超过上限 %d"
-                               % (db, size, extra, self.limits.max_db_bytes))
+        # Account for SQLite B-tree/WAL page overhead on non-empty writes.
+        projected = extra + max(4096, extra // 10) if extra > 0 else 0
+        if size + projected > self.limits.max_db_bytes:
+            raise TableDbError("too_large", "库 %s 已有 %d 字节，再写约 %d 字节会超过上限 %d"
+                               % (db, size, projected, self.limits.max_db_bytes))
 
     # ── metadata ─────────────────────────────────────────────────────────────
 
@@ -647,13 +649,20 @@ class TableStore:
                make_reply: Optional[Callable[[List[dict]], dict]] = None,
                row_numbers: Optional[List[int]] = None, row_word: str = "条") -> dict:
         """Insert all records or none. Values: str/number/None, or FileValue."""
-        extra = sum(len(value.data) for record in records for value in record.values()
-                    if isinstance(value, FileValue))
-        self._check_size(db, extra)
+        extra = 0
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            for value in record.values():
+                if isinstance(value, FileValue):
+                    extra += len(value.data)
+                elif isinstance(value, str):
+                    extra += len(value.encode("utf-8"))
         with self._write(db) as conn:
             replay = self._replay(conn, request)
             if replay:
                 return replay
+            self._check_size(db, extra)
             if create_columns is not None:
                 tid, columns = self._create_in(conn, table, create_columns)
             else:
@@ -798,8 +807,8 @@ class TableStore:
 
     def attach(self, db: str, table: str, rid: Any, column_name: Any,
                value: FileValue) -> Tuple[int, dict]:
-        self._check_size(db, len(value.data))
         with self._write(db) as conn:
+            self._check_size(db, len(value.data))
             tid, columns = self._meta(conn, table)
             column = self._column(columns, column_name)
             if column.type != FILE:

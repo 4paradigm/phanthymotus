@@ -96,6 +96,7 @@ SAMPLE_ROWS = 3
 MAX_SKIPPED = 50
 EXPORT_BATCH = 200            # face_recognition's default max_batch
 CACHE_TTL_S = 24 * 3600
+DEFAULT_MAX_CACHE_BYTES = 512 * 1024 * 1024   # total budget for get_file + export_files cache
 
 _IMPORT_SUFFIXES = (".xlsx", ".xlsm", ".csv", ".tsv", ".docx", ".docm")
 _MIME_BY_MAGIC = (
@@ -362,6 +363,8 @@ class TableDbPlugin:
         cfg = dict(plugin_cfg or {})
         self._data_dir = str(cfg.get("data_dir") or DEFAULT_DATA_DIR)
         self._cache_dir = os.path.join(self._data_dir, "cache")
+        self._max_cache_bytes = int(cfg.get("max_cache_bytes") or DEFAULT_MAX_CACHE_BYTES)
+        self._cache_lock = threading.Lock()
         self._roots = tuple(str(root) for root in (cfg.get("image_roots") or DEFAULT_ROOTS))
         self._max_import_bytes = int(cfg.get("max_import_bytes") or 64 * 1024 * 1024)
         limits = StoreLimits(
@@ -1007,26 +1010,31 @@ class TableDbPlugin:
     # link — a browser, face/ocr/vop *_by_url, a curl the model runs — cannot add
     # an X-Access-Token header, so a header check made every advertised link a
     # 401 the moment ACCESS_TOKEN was set. When a token is configured, get_file
-    # signs the path with it (HMAC-SHA256, `?sig=`), and only a link this card
-    # issued opens. Without a token the service is gated by reachability, like
-    # /file/upload and tools/call, and the link carries no signature.
+    # signs the path + expiry timestamp (HMAC-SHA256, `?exp=<ts>&sig=<mac>`),
+    # matching `expires_in_s`, and expired or forged links get 401. Without a
+    # token the service is gated by reachability, like /file/upload and
+    # tools/call, and the link carries no signature.
 
     @staticmethod
     def _token() -> str:
         from utils.file_intake import access_token
         return access_token()
 
-    def _signature(self, path: str) -> str:
+    def _signature(self, path: str, exp: int) -> str:
         token = self._token()
         if not token:
             return ""
-        return hmac.new(token.encode("utf-8"), path.encode("utf-8"),
+        payload = ("%s?exp=%d" % (path, exp)).encode("utf-8")
+        return hmac.new(token.encode("utf-8"), payload,
                         hashlib.sha256).hexdigest()[:32]
 
-    def _signed_route(self, db: str, fid: int) -> str:
+    def _signed_route(self, db: str, fid: int, ttl_s: int = CACHE_TTL_S) -> str:
         path = "%s/%s/f_%d" % (HTTP_FILE_PREFIX, db, fid)
-        sig = self._signature(path)
-        return path + ("?sig=" + sig if sig else "")
+        if not self._token():
+            return path
+        exp = int(time.time()) + int(ttl_s)
+        sig = self._signature(path, exp)
+        return "%s?exp=%d&sig=%s" % (path, exp, sig)
 
     def handle_http_get(self, url_path: str,
                         headers: Optional[Dict[str, str]] = None
@@ -1036,23 +1044,38 @@ class TableDbPlugin:
         Returns (status, body, content_type, filename). Only `<db>/<f_N>` is
         accepted — both validated exactly as the tool would — so the URL names
         a row in the store, never a filesystem path. When ACCESS_TOKEN is set,
-        a valid `sig` (from get_file) or the X-Access-Token header is required.
+        an unexpired `exp`+`sig` (from get_file) or the X-Access-Token header
+        is required.
         """
         route, _, query = url_path.partition("?")
         if not route.startswith(HTTP_FILE_PREFIX + "/"):
             return None
         token = self._token()
         if token:
-            given = ""
-            for pair in query.split("&"):
-                if pair.startswith("sig="):
-                    given = pair[4:]
-            expected = self._signature(route)
-            header = (headers or {}).get("X-Access-Token", "")
-            if not (hmac.compare_digest(given, expected)
-                    or (header and hmac.compare_digest(header, token))):
-                return 401, b"missing or invalid signature: get a fresh url from get_file", \
-                    "text/plain; charset=utf-8", ""
+            header = ""
+            for key, value in (headers or {}).items():
+                if key.lower() == "x-access-token":
+                    header = value
+                    break
+            if not (header and hmac.compare_digest(header, token)):
+                params: Dict[str, str] = {}
+                for pair in query.split("&"):
+                    if "=" in pair:
+                        key, value = pair.split("=", 1)
+                        params[key] = value
+                try:
+                    exp = int(params.get("exp", ""))
+                except ValueError:
+                    return 401, b"missing or invalid signature: get a fresh url from get_file", \
+                        "text/plain; charset=utf-8", ""
+                given = params.get("sig", "")
+                expected = self._signature(route, exp)
+                if not hmac.compare_digest(given, expected):
+                    return 401, b"missing or invalid signature: get a fresh url from get_file", \
+                        "text/plain; charset=utf-8", ""
+                if time.time() > exp:
+                    return 401, b"link expired: get a fresh url from get_file", \
+                        "text/plain; charset=utf-8", ""
         parts = route[len(HTTP_FILE_PREFIX) + 1:].split("/")
         try:
             if len(parts) != 2:
@@ -1111,17 +1134,14 @@ class TableDbPlugin:
 
         files = self._store.read_files(db, [parse_file_id(item[column]["file_id"])
                                             for item in chosen])
-        tag = hashlib.sha1(("%s/%s/%s/%s" % (db, table, column, time.time())).encode()
-                           ).hexdigest()[:10]
-        directory = os.path.join(self._cache_dir, "export-%s" % tag)
-        os.makedirs(directory, exist_ok=True)
         manifest = []
+        exports: List[Tuple[str, bytes]] = []
+        key_parts = [db, table, column]
         for record in chosen:
             fid = parse_file_id(record[column]["file_id"])
             name, mime, data = files[fid]
             filename = "r%06d%s" % (record["_id"], _suffix(name, mime))
-            with open(os.path.join(directory, filename), "wb") as handle:
-                handle.write(data)
+            exports.append((filename, data))
             item: Dict[str, Any] = {"file": filename, "name": record[name_column],
                                     "person": "%s-%d" % (table, record["_id"])}
             extra = {key: record[key] for key in profile
@@ -1129,9 +1149,40 @@ class TableDbPlugin:
             if extra:
                 item["profile"] = extra
             manifest.append(item)
-        with open(os.path.join(directory, "manifest.json"), "w", encoding="utf-8") as handle:
-            json.dump(manifest, handle, ensure_ascii=False, indent=1)
-        self._prune_cache()
+            key_parts.append("%d:%d:%s" % (record["_id"], fid,
+                                           hashlib.sha256(data).hexdigest()[:16]))
+        manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=1).encode("utf-8")
+        key_parts.append(manifest_bytes.decode("utf-8"))
+        tag = hashlib.sha1("\n".join(key_parts).encode("utf-8")).hexdigest()[:12]
+        directory = os.path.join(self._cache_dir, "export-%s" % tag)
+        needed = sum(len(data) for _, data in exports) + len(manifest_bytes)
+
+        with self._cache_lock:
+            reusable = (
+                os.path.isdir(directory)
+                and os.path.isfile(os.path.join(directory, "manifest.json"))
+                and all(os.path.isfile(os.path.join(directory, fn)) for fn, _ in exports)
+            )
+            if reusable:
+                os.utime(directory, None)
+                self._prune_cache()
+            else:
+                self._make_cache_room(needed)
+                os.makedirs(self._cache_dir, exist_ok=True)
+                staging = "%s.tmp-%d" % (directory, time.time_ns())
+                os.makedirs(staging, exist_ok=True)
+                try:
+                    for filename, data in exports:
+                        with open(os.path.join(staging, filename), "wb") as handle:
+                            handle.write(data)
+                    with open(os.path.join(staging, "manifest.json"), "wb") as handle:
+                        handle.write(manifest_bytes)
+                    if os.path.exists(directory):
+                        shutil.rmtree(directory, ignore_errors=True)
+                    os.rename(staging, directory)
+                except Exception:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise
         reply = {"ok": True, "db": db, "table": table, "dir": directory,
                  "count": len(manifest), "skipped": skipped[:MAX_SKIPPED],
                  "expires_in_s": CACHE_TTL_S,
@@ -1143,17 +1194,94 @@ class TableDbPlugin:
 
     def _write_cache(self, db: str, fid: int, name: str, mime: str, data: bytes) -> str:
         directory = os.path.join(self._cache_dir, db)
-        os.makedirs(directory, exist_ok=True)
         path = os.path.join(directory, "f_%d%s" % (fid, _suffix(name, mime)))
-        if not (os.path.isfile(path) and os.path.getsize(path) == len(data)):
+        with self._cache_lock:
+            if os.path.isfile(path) and os.path.getsize(path) == len(data):
+                os.utime(path, None)
+                self._prune_cache()
+                return path
+            self._make_cache_room(len(data), keep=path)
+            os.makedirs(directory, exist_ok=True)
             partial = path + ".part"
-            with open(partial, "wb") as handle:
-                handle.write(data)
-            os.replace(partial, path)
-        else:
-            os.utime(path, None)
-        self._prune_cache()
+            try:
+                with open(partial, "wb") as handle:
+                    handle.write(data)
+                os.replace(partial, path)
+            except Exception:
+                try:
+                    os.unlink(partial)
+                except OSError:
+                    pass
+                raise
         return path
+
+    @staticmethod
+    def _entry_bytes(path: str, is_dir: bool) -> int:
+        if not is_dir:
+            try:
+                return os.path.getsize(path)
+            except OSError:
+                return 0
+        total = 0
+        for root, _, names in os.walk(path):
+            for name in names:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    continue
+        return total
+
+    def _make_cache_room(self, needed: int, keep: Optional[str] = None) -> None:
+        """Enforce self._max_cache_bytes before writing `needed` bytes to cache."""
+        if needed > self._max_cache_bytes:
+            raise TableDbError(
+                "too_large",
+                "本次导出/缓存需要 %d 字节，超过缓存上限 %d 字节；请用 where 分批导出"
+                % (needed, self._max_cache_bytes),
+            )
+        self._prune_cache()
+        try:
+            entries = list(os.scandir(self._cache_dir))
+        except OSError:
+            return
+        items: List[Tuple[float, str, bool, int]] = []
+        total = 0
+        for entry in entries:
+            try:
+                if entry.is_dir() and entry.name.startswith("export-"):
+                    size = self._entry_bytes(entry.path, True)
+                    total += size
+                    items.append((entry.stat().st_mtime, entry.path, True, size))
+                elif entry.is_dir():
+                    for item in os.scandir(entry.path):
+                        if item.is_file():
+                            size = item.stat().st_size
+                            total += size
+                            items.append((item.stat().st_mtime, item.path, False, size))
+            except OSError:
+                continue
+        if total + needed <= self._max_cache_bytes:
+            return
+        items.sort(key=lambda row: row[0])
+        for _, path, is_dir, size in items:
+            if total + needed <= self._max_cache_bytes:
+                break
+            if keep and os.path.abspath(path) == os.path.abspath(keep):
+                continue
+            try:
+                if is_dir:
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.unlink(path)
+                total = max(0, total - size)
+            except OSError:
+                continue
+        if total + needed > self._max_cache_bytes:
+            raise TableDbError(
+                "too_large",
+                "缓存空间不足：已有 %d 字节，本次需要 %d 字节，上限 %d 字节"
+                % (total, needed, self._max_cache_bytes),
+            )
 
     def _prune_cache(self) -> None:
         cutoff = time.time() - CACHE_TTL_S
@@ -1163,7 +1291,10 @@ class TableDbPlugin:
             return
         for entry in entries:
             try:
-                if entry.is_dir() and entry.name.startswith("export-"):
+                if entry.is_dir() and ".tmp-" in entry.name:
+                    if entry.stat().st_mtime < cutoff:
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                elif entry.is_dir() and entry.name.startswith("export-"):
                     if entry.stat().st_mtime < cutoff:
                         shutil.rmtree(entry.path, ignore_errors=True)
                 elif entry.is_dir():
@@ -1186,6 +1317,7 @@ class TableDbPlugin:
             "import_formats": list(_IMPORT_SUFFIXES),
             "limits": {"max_file_bytes": limits.max_file_bytes,
                        "max_import_bytes": self._max_import_bytes,
+                       "max_cache_bytes": self._max_cache_bytes,
                        "max_db_bytes": limits.max_db_bytes, "max_rows": limits.max_rows,
                        "max_columns": limits.max_columns, "max_tables": limits.max_tables,
                        "max_cell_chars": limits.max_cell_chars, "page_rows_max": MAX_PAGE_ROWS,

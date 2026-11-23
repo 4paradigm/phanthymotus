@@ -809,18 +809,188 @@ def test_with_access_token_issued_links_are_signed_and_open(tmp_path, monkeypatc
     _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
     got = _call(card, "get_file", table="名单", _id=2)
 
-    assert "sig=" in got["url"]
+    assert "exp=" in got["url"] and "sig=" in got["url"]
     assert (_served(card, got["url"])[0], _served(card, got["url"])[1]) == (200, PNG_B)
     curl_url = got["agent_core"]["download"].split()[-1].strip("'")
-    assert "sig=" in curl_url and _served(card, curl_url)[0] == 200
+    assert "exp=" in curl_url and "sig=" in curl_url and _served(card, curl_url)[0] == 200
 
-    bare = got["url"].split("?")[0]
+    bare, qs = got["url"].split("?", 1)
     assert _served(card, bare)[0] == 401                                   # unsigned
-    assert _served(card, bare + "?sig=" + "0" * 32)[0] == 401              # forged
-    other = bare.rsplit("f_", 1)[0] + "f_1?" + got["url"].split("?")[1]
+    assert _served(card, bare + "?sig=" + "0" * 32)[0] == 401              # missing exp
+    assert _served(card, bare + "?exp=9999999999&sig=" + "0" * 32)[0] == 401  # forged
+    # Extending exp invalidates the signature.
+    tampered_exp = bare + "?exp=9999999999&" + qs.split("&", 1)[1]
+    assert _served(card, tampered_exp)[0] == 401
+    other = bare.rsplit("f_", 1)[0] + "f_1?" + qs
     assert _served(card, other)[0] == 401                                  # sig of f_2 on f_1
     assert _served(card, bare, {"X-Access-Token": "s3cret"})[0] == 200     # header still works
+    assert _served(card, bare, {"x-access-token": "s3cret"})[0] == 200     # case-insensitive
     assert _served(card, bare, {"X-Access-Token": "wrong"})[0] == 401
+
+
+def test_signed_file_link_expires_after_ttl(tmp_path, monkeypatch):
+    """Signed URLs stop working once expires_in_s elapses, matching get_file's contract."""
+    import plugins.table_db as mod
+
+    now = [1_700_000_000.0]
+    monkeypatch.setattr(mod.time, "time", lambda: now[0])
+    monkeypatch.setenv("ACCESS_TOKEN", "s3cret")
+    card = _card(tmp_path)
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    got = _call(card, "get_file", table="名单", _id=2)
+
+    assert _served(card, got["url"])[0] == 200
+    now[0] += got["expires_in_s"] + 1
+    status, body, _, _ = _served(card, got["url"])
+    assert status == 401 and b"expired" in body
+
+    # A fresh link from get_file works again.
+    fresh = _call(card, "get_file", table="名单", _id=2)
+    assert _served(card, fresh["url"])[0] == 200
+
+
+def test_export_files_reuses_identical_cache_and_enforces_cache_quota(tmp_path):
+    """export_files reuses identical exports, evicts oldest entries to stay under
+    max_cache_bytes, and refuses a single export larger than the cache budget."""
+    import time as _time
+
+    card = _card(tmp_path)
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    first = _call(card, "export_files", table="名单", column="照片", name_column="姓名",
+                  where={"姓名": "张三"})
+    again = _call(card, "export_files", table="名单", column="照片", name_column="姓名",
+                  where={"姓名": "张三"})
+    assert first["ok"] is True and again["dir"] == first["dir"]
+
+    # Measure one single-row export and cap the cache so only one fits at a time.
+    one_size = sum(
+        os.path.getsize(os.path.join(first["dir"], fn))
+        for fn in os.listdir(first["dir"])
+    )
+    sub = tmp_path / "bounded"
+    sub.mkdir()
+    bounded = _card(sub, max_cache_bytes=one_size + 40)
+    assert _call(bounded, "import", table="名单",
+                 path=_write(sub, "r2.xlsx", ROSTER))["ok"] is True
+    e1 = _call(bounded, "export_files", table="名单", column="照片", name_column="姓名",
+               where={"姓名": "张三"})
+    assert e1["ok"] is True and os.path.isdir(e1["dir"])
+    # Ensure e1 is strictly older than e2 even on coarse filesystem clocks.
+    os.utime(e1["dir"], (_time.time() - 60, _time.time() - 60))
+
+    e2 = _call(bounded, "export_files", table="名单", column="照片", name_column="姓名",
+               where={"姓名": "李四"})
+    assert e2["ok"] is True and os.path.isdir(e2["dir"])
+    assert not os.path.exists(e1["dir"])       # oldest export evicted before writing e2
+
+    # A single export exceeding max_cache_bytes is refused without deleting e2.
+    too_big = _call(bounded, "export_files", table="名单", column="照片", name_column="姓名")
+    assert too_big["ok"] is False and too_big["reason"] == "too_large"
+    assert os.path.isdir(e2["dir"])
+
+
+def test_concurrent_attachments_cannot_bypass_max_db_bytes(tmp_path):
+    """_check_size runs inside the per-db write lock so concurrent writes cannot
+    both pass a stale size check and exceed max_db_bytes."""
+    blob = b"\x89PNG\r\n\x1a\n" + os.urandom(60 * 1024)
+    p1 = _write(tmp_path, "a.png", blob)
+    p2 = _write(tmp_path, "b.png", blob + b"x")
+    card = _card(tmp_path)
+    _call(card, "create", table="t", columns="姓名,照片:file")
+    ids = _call(card, "append", table="t",
+                records=[{"姓名": "甲"}, {"姓名": "乙"}])["ids"]
+
+    # Set max_db_bytes so one 60 KiB attachment fits (incl. SQLite WAL + 32 KiB
+    # -shm while the write connection is open) but two cannot both fit.
+    db_path = card._store.db_path("t")
+    base_size = sum(os.path.getsize(p) for p in (db_path, db_path + "-wal", db_path + "-shm")
+                    if os.path.exists(p))
+    card._store.limits.max_db_bytes = base_size + 120 * 1024
+
+    barrier = threading.Barrier(2)
+    results = []
+
+    def worker(rid, path):
+        barrier.wait()
+        results.append(_call(card, "attach_file", table="t", _id=rid,
+                             column="照片", file=path))
+
+    threads = [threading.Thread(target=worker, args=(ids[0], p1)),
+               threading.Thread(target=worker, args=(ids[1], p2))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    ok_count = sum(1 for r in results if r["ok"])
+    too_large = [r for r in results if not r["ok"] and r["reason"] == "too_large"]
+    assert ok_count == 1 and len(too_large) == 1
+
+
+def test_main_http_handler_serves_and_authorises_table_db_files(tmp_path, monkeypatch):
+    """Request-level GET through perception/main.py's make_handler() covers status,
+    headers, signed links, expiry, X-Access-Token and 404 fallback without sockets."""
+    import email.message
+    import io
+    import types
+    from vision_stubs import PERCEPTION_ROOT  # noqa: F401
+    pytest.importorskip("yaml")
+    import main
+    import plugins.table_db as mod
+
+    now = [1_700_000_000.0]
+    monkeypatch.setattr(mod.time, "time", lambda: now[0])
+    monkeypatch.setenv("ACCESS_TOKEN", "s3cret")
+
+    card = _card(tmp_path)
+    _call(card, "import", table="名单", path=_write(tmp_path, "r.xlsx", ROSTER))
+    got = _call(card, "get_file", table="名单", _id=2)
+    signed_route = got["url"][got["url"].index("/table_db/file/"):]
+    bare_route = signed_route.split("?", 1)[0]
+
+    monkeypatch.setattr(main, "_bundle", types.SimpleNamespace(_plugins=[card]))
+    handler_cls = main.make_handler()
+
+    def run_get(path, req_headers=None):
+        h = handler_cls.__new__(handler_cls)
+        h.path = path
+        h.command = "GET"
+        h.request_version = "HTTP/1.1"
+        h.requestline = "GET %s HTTP/1.1" % path
+        h.client_address = ("127.0.0.1", 0)
+        msg = email.message.Message()
+        for k, v in (req_headers or {}).items():
+            msg[k] = v
+        h.headers = msg
+        h.wfile = io.BytesIO()
+        h.do_GET()
+        raw = h.wfile.getvalue()
+        head, _, body = raw.partition(b"\r\n\r\n")
+        lines = head.decode("iso-8859-1").split("\r\n")
+        status = int(lines[0].split(" ", 2)[1])
+        resp_headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                resp_headers[k.strip().lower()] = v.strip()
+        return status, resp_headers, body
+
+    status, headers, body = run_get(signed_route)
+    assert status == 200
+    assert headers.get("content-type") == "image/png"
+    assert headers.get("content-length") == str(len(PNG_B))
+    assert "attachment;" in headers.get("content-disposition", "")
+    assert body == PNG_B
+
+    assert run_get(bare_route)[0] == 401
+    status, _, body = run_get(bare_route, {"x-access-token": "s3cret"})
+    assert status == 200 and body == PNG_B
+
+    now[0] += got["expires_in_s"] + 1
+    status, _, body = run_get(signed_route)
+    assert status == 401 and b"expired" in body
+
+    assert run_get("/not-a-route")[0] == 404
 
 
 def _zip_with(member, size, compress=True):

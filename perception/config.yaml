@@ -441,6 +441,7 @@ plugins:
     data_dir: /models/table_db
     max_file_bytes: 8388608         # 单个文件 8 MiB
     max_import_bytes: 67108864      # 导入的表格文件 64 MiB
+    max_cache_bytes: 536870912      # get_file / export_files 缓存总上限 512 MiB
     max_db_bytes: 2147483648        # 单个库 2 GiB（和模型共用一块盘）
     max_rows: 20000                 # 单表行数
     max_columns: 64
