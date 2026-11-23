@@ -1,0 +1,32 @@
+diff --git a/corelib/src/optimizer/toro3d/posegraph.h b/corelib/src/optimizer/toro3d/posegraph.h
+index a82a01d..7bdafbe 100644
+--- a/corelib/src/optimizer/toro3d/posegraph.h
++++ b/corelib/src/optimizer/toro3d/posegraph.h
+@@ -83,6 +83,18 @@ struct EVComparator{
+   }
+ };
+ 
++/** \brief Orders edges by their unordered vertex-id pair. Unlike pointer
++    order this is independent of allocation, stays valid when revertEdge()
++    swaps v1 and v2, and is unique because addEdge() rejects duplicates. **/
++template <class E>
++struct EdgeIdComparator{
++  inline bool operator() (const E& e1, const E& e2) const {
++    const int a1=std::min(e1->v1->id,e1->v2->id), b1=std::max(e1->v1->id,e1->v2->id);
++    const int a2=std::min(e2->v1->id,e2->v2->id), b2=std::max(e2->v1->id,e2->v2->id);
++    return a1<a2 || (a1==a2 && b1<b2);
++  }
++};
++
+ /** \brief The template class for representing an abstract tree
+     without specifing the dimensionality of the exact parameterization
+     of the nodes. This definition is passed in via the Operation (Ops)
+@@ -119,7 +131,7 @@ struct TreePoseGraph{
+   typedef typename std::list< Edge* > EdgeList;
+   typedef typename std::map< int, Vertex* > VertexMap;
+   typedef typename std::set< Vertex* > VertexSet;
+-  typedef typename std::map< Edge*, Edge* > EdgeMap;
++  typedef typename std::map< Edge*, Edge*, EdgeIdComparator<Edge*> > EdgeMap;
+   typedef typename std::multiset< Edge*, EVComparator<Edge*> > EdgeSet;
+ 
+   /** \brief Definition of a vertex in the graph based on the

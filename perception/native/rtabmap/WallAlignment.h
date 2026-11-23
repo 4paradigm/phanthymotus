@@ -2,9 +2,12 @@
 #pragma once
 #include <rtabmap/core/Rtabmap.h>
 #include <rtabmap/core/Memory.h>
+#include <rtabmap/core/Graph.h>
+#include <rtabmap/core/Optimizer.h>
 #include <rtabmap/core/Signature.h>
 #include <opencv2/imgproc.hpp>
 #include <deque>
+#include <memory>
 #include <optional>
 
 namespace motus {
@@ -29,6 +32,7 @@ class WallAlignment
     };
     std::deque<Patch> history_;
     double lastSample_=0.;
+    static constexpr float cellSize_=.15f;
 
     static std::optional<Patch> extract(int node,double stamp,const rtabmap::LaserScan & scan,const Pose & pose)
     {
@@ -44,14 +48,14 @@ class WallAlignment
             const Vec p=apply(sensor,Vec(xyz));
             if(!(cv::norm(p-position(sensor))<=8.f)) continue;
             points.push_back(p);
-            auto key=std::make_pair(int(std::floor(p[0]/.15f)),int(std::floor(p[1]/.15f)));
+            auto key=std::make_pair(int(std::floor(p[0]/cellSize_)),int(std::floor(p[1]/cellSize_)));
             auto & limits=columns.emplace(key,std::make_pair(p[2],p[2])).first->second;
             limits.first=std::min(limits.first,p[2]); limits.second=std::max(limits.second,p[2]);
         }
         std::vector<cv::Point2f> tall;
         for(const auto & c:columns)
             if(c.second.second-c.second.first>.65f)
-                tall.emplace_back((c.first.first+.5f)*.15f,(c.first.second+.5f)*.15f);
+                tall.emplace_back((c.first.first+.5f)*cellSize_,(c.first.second+.5f)*cellSize_);
         if(tall.size()<9) return {};
         // Bounded deterministic hypotheses, each tall column gets one vote.
         std::vector<cv::Point2f> best;
@@ -88,6 +92,102 @@ class WallAlignment
                 patch.context.push_back(apply(inverse,p));
         }
         return patch;
+    }
+
+    bool damagesAlignedWall(const rtabmap::Rtabmap & map,const rtabmap::Link & candidate) const
+    {
+        if(history_.size()<3) return false;
+        std::map<int,Pose> seed;
+        std::multimap<int,rtabmap::Link> links;
+        map.getGraph(seed,links,false,false);
+        const auto & cached=map.getLocalOptimizedPoses();
+        // Only compare complete local graphs. The raw graph query omits landmarks.
+        if(seed.empty() || seed.size()!=cached.size() || cached.begin()->first<=0) return false;
+        bool fromEnd=rtabmap::Parameters::defaultRGBDOptimizeFromGraphEnd();
+        rtabmap::Parameters::parse(map.getParameters(),rtabmap::Parameters::kRGBDOptimizeFromGraphEnd(),fromEnd);
+        const int root=fromEnd?map.getLastLocationId():seed.begin()->first;
+        for(auto & entry:seed)
+        {
+            const auto it=cached.find(entry.first);
+            if(it==cached.end()) return false;
+            // The native optimizer starts from the raw pose at its root.
+            if(entry.first!=root) entry.second=it->second;
+        }
+        if(!seed.count(root) || !seed.count(candidate.from()) || !seed.count(candidate.to())) return false;
+        const auto optimize=[&](){
+            std::unique_ptr<rtabmap::Optimizer> optimizer(rtabmap::Optimizer::create(map.getParameters()));
+            return optimizer->optimize(root,seed,links);
+        };
+        // A native constraint merged across bad intermediate nodes can already
+        // join the two nodes. Native graph assembly then omits the wall edge
+        // from the solve, so a trial cannot model it. The pair is already
+        // constrained; do not add a second edge.
+        if(rtabmap::graph::findLink(links,candidate.from(),candidate.to())!=links.end()) return true;
+        // These solves leave the native graph untouched. Without
+        // toro_edge_order_core.patch they still shift heap addresses, which
+        // set TORO's edge order and can perturb later native solutions.
+        const auto without=optimize();
+        // Match the direction and order used by Memory::getMetricConstraints().
+        const auto edge=candidate.from()<candidate.to()?candidate:candidate.inverse();
+        const auto range=links.equal_range(edge.from());
+        auto at=range.first;
+        while(at!=range.second && at->second.to()<edge.to()) ++at;
+        links.emplace_hint(at,edge.from(),edge);
+        const auto with=optimize();
+        if(without.size()!=seed.size() || with.size()!=seed.size()) return false;
+
+        struct Wall
+        {
+            const Patch *patch;
+            Vec first,last,base;
+            Pose after;
+        };
+        std::vector<Wall> witnesses;
+        for(const auto & patch:history_)
+        {
+            if(patch.node==edge.from() || patch.node==edge.to()) continue;
+            const auto before=without.find(patch.node),after=with.find(patch.node);
+            if(before==without.end() || after==with.end()) continue;
+            witnesses.push_back({&patch,apply(before->second,patch.first),apply(before->second,patch.last),
+                                 position(before->second),after->second});
+        }
+        // Check both ends of the same overlap in each solution. Use one wall
+        // extraction cell as the tolerance on already aligned, independent walls.
+        for(size_t i=0;i<witnesses.size();++i)
+        {
+            const auto & a=witnesses[i];
+            Vec axis=a.last-a.first; axis[2]=0;
+            const float length=cv::norm(axis);
+            if(length<.85f) continue;
+            axis/=length;
+            const Vec normal(-axis[1],axis[0],0);
+            Vec movedAxis=rotate(a.after*without.at(a.patch->node).inverse(),axis); movedAxis[2]=0;
+            movedAxis=cv::normalize(movedAxis);
+            const Vec movedNormal(-movedAxis[1],movedAxis[0],0);
+            for(size_t j=i+1;j<witnesses.size();++j)
+            {
+                const auto & b=witnesses[j];
+                if(b.patch->stamp-a.patch->stamp<10. ||
+                   normal.dot(a.base-a.first)*normal.dot(b.base-a.first)<=0) continue;
+                const Vec delta=b.last-b.first;
+                const float start=(b.first-a.first).dot(axis),end=(b.last-a.first).dot(axis);
+                if(std::abs(end-start)<.99f*std::hypot(delta[0],delta[1])) continue;
+                const float lo=std::max(0.f,std::min(start,end)),hi=std::min(length,std::max(start,end));
+                if(hi-lo<.85f) continue;
+                const auto distance=[&](float s){
+                    return std::abs(normal.dot(b.first+delta*((s-start)/(end-start))-a.first));
+                };
+                const float loBefore=distance(lo),hiBefore=distance(hi);
+                if(std::max(loBefore,hiBefore)>cellSize_) continue;
+                const auto movedDistance=[&](float s){
+                    const Vec p=a.patch->first+(a.patch->last-a.patch->first)*(s/length);
+                    const Vec q=b.patch->first+(b.patch->last-b.patch->first)*((s-start)/(end-start));
+                    return std::abs(movedNormal.dot(apply(b.after,q)-apply(a.after,p)));
+                };
+                if(movedDistance(lo)-loBefore>cellSize_ || movedDistance(hi)-hiBefore>cellSize_) return true;
+            }
+        }
+        return false;
     }
 
 public:
@@ -174,8 +274,10 @@ public:
                 for(int i=0;i<6;++i)
                     scale=std::min(scale,odomInfo[i]/info.at<double>(i,i));
                 if(scale>0.)
-                    map.addLink(rtabmap::Link(best->node,node,rtabmap::Link::kLocalSpaceClosure,
-                                bestPose,info*scale));
+                {
+                    const rtabmap::Link candidate(best->node,node,rtabmap::Link::kLocalSpaceClosure,bestPose,info*scale);
+                    if(!damagesAlignedWall(map,candidate)) map.addLink(candidate);
+                }
             }
         }
         history_.push_back(std::move(*current));
