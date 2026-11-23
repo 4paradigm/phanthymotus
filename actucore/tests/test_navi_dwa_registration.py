@@ -218,3 +218,30 @@ def test_registered_free_evidence_clears_only_a_fully_free_original_square(occup
         assert result is not None and len(result[2].centers) == 1
     else:
         assert result is None
+
+
+def test_one_stamped_body_pose_keeps_its_frame_after_the_capture_pair_window(monkeypatch):
+    card = plugin.NaviPlugin({}, executor=None)
+    now = 1240
+    monkeypatch.setattr(plugin.time, "time", lambda: now / 1000)
+    payload = dict(schema="motus.odom/1", frame="body", stamp_ms=1212, twist=[0.] * 6,
+                   pose=dict(stamp_ms=1221, frame_id="odom", child_frame_id="base_link",
+                             position=[1., 2., 0.], quaternion=[0., 0., 0., 1.]),
+                   vendor=dict(motus_slam=dict(segment_id="seg", measurement=dict(
+                       stamp_ns=1221000000, frame_id="odom", clock_epoch="epoch", source_generation="gen"))))
+    card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+    now = 1447
+    measured = card.observation(with_capture_timing=True)[2]["obstacle_pose"]
+    now = 1485
+    odom = card.observation(with_capture_timing=True)[2]
+    assert "obstacle_pose" not in odom
+    assert odom["motion_pose"] == measured
+    payload["stamp_ms"] = now
+    card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+    assert card.observation(with_capture_timing=True)[2]["motion_pose"] == measured
+    # A producer may restart at the same measurement timestamp.
+    payload["vendor"]["motus_slam"]["measurement"]["clock_epoch"] = "next"
+    card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+    changed = card.observation(with_capture_timing=True)[2]
+    assert changed["motion_pose"].frame != measured.frame
+    assert changed["pose_feedback"] is None

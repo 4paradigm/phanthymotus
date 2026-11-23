@@ -788,6 +788,8 @@ class State:
     motion_pose_frame: tuple | None = None
     feedback_boot_s: float = 0.
     feedback_guard_s: float = 0.
+    feedback_switch_ms: int | None = None
+    uses_received_speed: bool = False
     command_tail: tuple = (0., 0., 0.)
     command_tail_s: float = 0.
     missing_frames: int = 0
@@ -1343,6 +1345,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
             if state.use_body_mount and not paired:
                 scan = state.active_scan
                 if scan.active or any(state.commanded):
+                    state.feedback_switch_ms = None
                     state.feedback_guard_s = max(state.feedback_guard_s, (config.watchdog_ms + 50) / 1000)
                 state.active_scan = ActiveScan(obstacles=scan.obstacles, near_obstacles=scan.near_obstacles,
                                                near_projection=scan.near_projection,
@@ -1829,6 +1832,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     feedback = planar_feedback(odom) if config.local_planning else None
     if config.local_planning and config.local_geometry is not None:
+        state.uses_received_speed |= "received_speed_ms" in (odom or {})
         motion_pose = (odom or {}).get("motion_pose")
         velocity_history = (odom or {}).get("velocity_history")
         source = ("command" if feedback is None else
@@ -1855,13 +1859,32 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                            observed_world=previous_scan.observed_world)
             if needs_guard:
                 state.feedback_guard_s = (config.watchdog_ms + 50) / 1000
+                state.feedback_switch_ms = (depth or {}).get("control_ms")
         state.motion_source = source
         if source == "pose":
             state.motion_pose_frame = motion_pose.frame
         frame = (depth or {}).get("frame_id") or 0
+        if state.feedback_guard_s > 0. and state.feedback_switch_ms is not None and not any(state.commanded):
+            # Confirm standstill with distinct speed updates after the stop decision.
+            now_ms = (depth or {}).get("control_ms")
+            recent = ((velocity_history or ())[-2:] if (odom or {}).get("stamp_ms") is not None
+                      else (odom or {}).get("received_speed_pair", ()))
+            if (now_ms is not None and len(recent) == 2
+                    and all(row[1] is not None and row[2] is not None for row in recent)
+                    and state.feedback_switch_ms < recent[0][1] < recent[1][1] <= now_ms
+                    and now_ms - recent[0][1] <= config.max_feedback_gap_ms
+                    and all(math.hypot(*v[:2]) <= STILL_LINEAR and abs(v[2]) <= STILL_YAW
+                            for _, _, v in recent)):
+                state.feedback_guard_s = 0.
         if state.feedback_guard_s > 0.:
             state.feedback_guard_s = max(0., state.feedback_guard_s - dt)
             return Decision(_twist(0, 0, 0), AVOIDING, "运动反馈来源已切换，等待底盘停稳")
+        if config.local_controller == "dwa" and state.uses_received_speed:
+            speed_ms = (odom or {}).get("received_speed_ms")
+            now_ms = (depth or {}).get("control_ms") or (odom or {}).get("received_ms")
+            if (feedback is None or speed_ms is None or now_ms is None
+                    or not 0 <= now_ms - speed_ms <= config.max_feedback_gap_ms):
+                return Decision(_twist(0., 0., 0.), AVOIDING, "运动反馈已到期，停车等待新速度")
         if any(state.commanded):
             state.command_tail = state.commanded
             state.command_tail_s = (config.watchdog_ms + 50) / 1000

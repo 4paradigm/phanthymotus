@@ -52,7 +52,7 @@ from . import motion
 from . import local_path
 from . import odom as odom_mod
 from . import policy as policy_mod
-from .track import match_observation, observation_source, target_objects
+from .track import COASTING, CONFIRMED, match_observation, observation_source, target_objects
 from .active_scan import ActiveScan, DEPTH_RECHECK_HOLD, TURN_SPEED_REDUCTION
 
 log = logging.getLogger(__name__)
@@ -332,6 +332,7 @@ class NaviPlugin:
         self._odom_received_ms = 0
         self._odom_source_ms = None
         self._velocity_history = deque(maxlen=32)
+        self._received_speed_samples = deque(maxlen=2)
         self._motion_pose = None
         self._pose_feedback = None
         self._odom_stamp_verified = False
@@ -644,6 +645,7 @@ class NaviPlugin:
             self._odom_received_ms = 0
             self._odom_source_ms = None
             self._velocity_history.clear()
+            self._received_speed_samples.clear()
             self._motion_pose = None
             self._pose_feedback = None
             self._odom_stamp_verified = False
@@ -1483,6 +1485,7 @@ class NaviPlugin:
         # on the canvas. It goes into the degradations.
         bound["unknown"] = unknown
 
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
@@ -1537,7 +1540,9 @@ class NaviPlugin:
                 callback = self._on_depth_map
                 # The planner replaces its current depth map on every callback.
                 # Decoding older maps ahead of the newest one spends its time budget.
-                node.create_subscription(selected, topic, callback, _sensor_qos(depth=1))
+                # Depth decoding and ground fitting must not serialize odom and detector callbacks.
+                node.create_subscription(selected, topic, callback, _sensor_qos(depth=1),
+                                         callback_group=MutuallyExclusiveCallbackGroup())
                 self._cancel_pending_depth_bind(node)
                 with self._lock:
                     if self._last_error.startswith(f"深度话题 {topic} 等待超过"):
@@ -1727,13 +1732,19 @@ class NaviPlugin:
                 self._odom_source_ms = (int(stamp) if isinstance(stamp, (int, float))
                                         and not isinstance(stamp, bool)
                                         and math.isfinite(stamp) and stamp > 0 else None)
-                pose = odom_mod.planar_pose(payload, self._odom_source_ms)
+                # A stamped body fix keeps its measurement time and coordinate frame
+                # when DWA falls back from capture pairing to ordinary motion feedback.
+                if sample is not None and self._odom_source_ms is not None:
+                    pose = sample[1]
+                else:
+                    pose = odom_mod.planar_pose(payload, self._odom_source_ms)
                 previous = self._motion_pose
                 if pose is None or pose != previous:
                     feedback = (pose.feedback_since(previous, policy_mod.ODOM_GAP_MS)
                                 if previous is not None and pose is not None else None)
                     self._pose_feedback = (previous.stamp_ms, feedback) if feedback is not None else None
-                    if pose is None or previous is None or pose.stamp_ms > previous.stamp_ms:
+                    if (pose is None or previous is None or pose.frame != previous.frame
+                            or pose.stamp_ms > previous.stamp_ms):
                         self._motion_pose = pose
                 # Pose-only streams keep their absolute pose reference. Once
                 # a stream supplies velocity, keep one continuous history and
@@ -1747,6 +1758,24 @@ class NaviPlugin:
                 timing = self._odom_interface.get("timing") or {}
                 vendor = payload.get("vendor")
                 stamp_source = vendor.get("stamp_source", "robot") if isinstance(vendor, dict) else "robot"
+                # Tianyi may republish the same speed reading with a new envelope stamp.
+                # Keep the first callback time for each distinct Driver speed update.
+                samples = self._received_speed_samples
+                stamps = (vendor.get("sample_timestamps_ms") if stamp_source == "received"
+                          and vendor.get("source") == "slamtec" else None)
+                speed_ms = stamps.get("speed") if isinstance(stamps, dict) else None
+                if isinstance(stamps, dict):
+                    self._odom["received_speed_ms"] = speed_ms if type(speed_ms) is int else None
+                twist = odom_mod.planar_feedback(self._odom)
+                if type(speed_ms) is not int or not 0 < speed_ms <= now or twist is None:
+                    samples.clear()
+                elif not samples or speed_ms > samples[-1][1]:
+                    samples.append((now, speed_ms, twist))
+                elif speed_ms != samples[-1][1] or twist != samples[-1][2]:
+                    samples.clear()
+                if len(samples) == 2 and samples[0][0] < samples[1][1]:
+                    # The second update originated after Navi saw the first.
+                    self._odom["received_speed_pair"] = tuple(samples)
                 self._odom_stamp_verified = (timing.get("stamp_source") == "robot"
                                              and stamp_source == "robot")
                 if self._odom_interface:
@@ -2173,21 +2202,28 @@ class NaviPlugin:
         elif (front_required and revision[2] != check.input_revision[2] and isinstance(objects, dict)
               and any(target_objects(objects, check.target, config))):
             target_pending = True
+        memory_first_send = (target_pending and handoff_deadline_ms is None and guard.association is None
+                             and check.target == "person" and track is not None and track.state in (CONFIRMED, COASTING)
+                             and track.front_fix is not None and check.target_receipt_ms <= objects_ms <= now_ms
+                             and (track.latest_source is None or
+                                  (target_source is not None and target_source >= track.latest_source))
+                             and any(target_objects(objects, "person", config)))
         if target_pending:
             anchor = state.goal_anchor
             generation = track.generation if track is not None else None
             planned_anchor = check.planning_guard.target_revision[0]
-            if (handoff_deadline_ms is None or anchor is None or planned_anchor is None
+            if ((handoff_deadline_ms is None and not memory_first_send) or anchor is None or planned_anchor is None
                     or guard.generation != generation):
                 return reject("target_missing")
             # A frozen detour can already belong to an earlier track when
             # this command was selected. Compare against its own saved goal.
             _, _, _, _, planned_generation, _ = planned_anchor
-            if anchor.generation != planned_generation:
+            if anchor.generation != planned_generation or (memory_first_send and generation != planned_generation):
                 return reject("target_missing")
-            # The sent command can bridge this detector update only within its
-            # current window, subject to a fresh complete-stop check below.
-            deadline = min(deadline, guard.deadline_ms, handoff_deadline_ms)
+            # Retain the original window and validate the full stop against the new scene.
+            deadline = min(deadline, guard.deadline_ms)
+            if handoff_deadline_ms is not None:
+                deadline = min(deadline, handoff_deadline_ms)
             if now_ms >= deadline:
                 return reject("publish_expired")
 
@@ -2220,10 +2256,11 @@ class NaviPlugin:
             # decides identity. These measurements do not become target fixes.
             for person in target_objects(objects, "person", config):
                 box = person.get("bbox_norm")
-                if not box:
-                    continue
-                front = depth_mod.front_surface(depth["map"], box, geometry.horizontal, depth.get("ground"))
+                front = (depth_mod.front_surface(depth["map"], box, geometry.horizontal, depth.get("ground"))
+                         if box else None)
                 if front is None:
+                    if memory_first_send:
+                        return reject("target_missing")
                     continue
                 point = local_path.target_in_grid(geometry, front[0], -front[1])
                 spacing = tuple(view.points(point)), view.error(math.hypot(*point))
@@ -2772,7 +2809,7 @@ class NaviPlugin:
         staged = self._staged_dwa_command
         return staged[1] if staged is not None and staged[0] == message["seq"] else None
 
-    def _dwa_publish_rejection(self, message, origin, now_ms):
+    def _dwa_publish_rejection(self, message, origin, now_ms, *, sent=False):
         self._dwa_veto_detail = None
         track = self._state.tracker.track
         if (origin.epoch != self._output_epoch or origin.state_id != id(self._state)
@@ -2787,14 +2824,15 @@ class NaviPlugin:
                 or self._output_blocked or self._paused or not self._running
                 or (self._scheduled_command is not None and self._scheduled_command.stop_reason is not None)):
             return "superseded"
-        expires_ms = message["stamp_ms"] + message["ttl_ms"]
-        if origin.forward_check is not None and origin.forward_check.motion_guard is not None:
-            expires_ms = min(expires_ms, origin.forward_check.motion_guard.deadline_ms)
-        max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
-        if type(max_age) in (int, float) and 0 < max_age < math.inf:
-            expires_ms = min(expires_ms, message["obs_stamp_ms"] + max_age)
-        if not message["stamp_ms"] <= now_ms < expires_ms:
-            return "publish_expired"
+        if not sent:
+            expires_ms = message["stamp_ms"] + message["ttl_ms"]
+            if origin.forward_check is not None and origin.forward_check.motion_guard is not None:
+                expires_ms = min(expires_ms, origin.forward_check.motion_guard.deadline_ms)
+            max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
+            if type(max_age) in (int, float) and 0 < max_age < math.inf:
+                expires_ms = min(expires_ms, message["obs_stamp_ms"] + max_age)
+            if not message["stamp_ms"] <= now_ms < expires_ms:
+                return "publish_expired"
         values = message["values"]
         if values != self._dwa_values(origin):
             return self._note_dwa_veto_detail(origin, "publish_contract", "values_changed")
@@ -2880,7 +2918,7 @@ class NaviPlugin:
         handoff_deadline = None
         if self._continuing_dwa_output(origin):
             handoff_deadline = self._wire_dwa_origin.forward_check.motion_guard.deadline_ms
-        for _ in range(2):
+        for attempt in range(2):
             checked = self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
                                                renew=False, diagnostics=diagnostics,
                                                handoff_deadline_ms=handoff_deadline)
@@ -2888,7 +2926,14 @@ class NaviPlugin:
             if checked is not None and not checked[0] <= now_ms < checked[1]:
                 return "publish_expired", None
             if checked is None or not checked[2]:
-                return diagnostics.get("reason", "postcheck_veto"), None
+                reason = diagnostics.get("reason", "postcheck_veto")
+                if attempt == 0 and reason in ("stale_observation", "no_feedback", "geometry_mismatch", "target_missing"):
+                    latest = self._observation_snapshot(with_capture_timing=True)
+                    if _motion_inputs(*latest[:3]) != _motion_inputs(*snapshot[:3]) or latest[3] != snapshot[3]:
+                        snapshot = latest
+                        diagnostics.clear()
+                        continue
+                return reason, None
             newer = checked[3]
             # Either a cached comparison or a rebuild can overlap a new sample.
             # Compare the result with the newest snapshot before sending.
@@ -3104,7 +3149,7 @@ class NaviPlugin:
             if self._output_blocked or self._paused:
                 return
             remaining_ms = min(work.expires_ms - now_ms, round((work.expires_at - time.monotonic()) * 1000))
-            rejection = (self._dwa_publish_rejection(work.message, work.dwa_origin, now_ms)
+            rejection = (self._dwa_publish_rejection(work.message, work.dwa_origin, now_ms, sent=work.sent)
                          if work.dwa_origin is not None else None)
             stop = (rejection, False) if rejection is not None else None
             if stop is None and (work.turn is not None and not work.sent and not self._wire_moving
@@ -3113,6 +3158,10 @@ class NaviPlugin:
                 stop = (_UNSENT_TURN, False)
             elif stop is None and (remaining_ms <= 0 or now_ms < work.message["stamp_ms"]):
                 stop = ("速度指令窗口已到期", False)
+            elif stop is None and work.sent and work.dwa_origin is not None:
+                # The first wire packet owns its checked window. Only a new
+                # planner decision may issue more DWA motion.
+                return
             elif stop is None and work.turn is not None:
                 with self._obs_lock:
                     history = tuple(self._velocity_history)
@@ -3136,16 +3185,11 @@ class NaviPlugin:
             may_renew = (work.forward_check is not None and work.forward_check.renewable
                          and not (work.dwa_origin is not None and work.dwa_origin.acceptance.angle_controlled)
                          and remaining_ms <= math.ceil(2000 / self._rate_hz))
-            if stop is None and (may_renew or (work.sent and work.dwa_origin is not None)):
+            if stop is None and may_renew:
                 max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
-                handoff_deadline = None
-                if work.sent and self._continuing_dwa_output(work.dwa_origin):
-                    wire_deadline = self._wire_dwa_origin.forward_check.motion_guard.deadline_ms
-                    handoff_deadline = min(work.expires_ms, wire_deadline)
                 checked = self._recheck_forward(work.forward_check, work.message["values"],
                                                 max_age, now_ms, allow_same_depth=True,
-                                                diagnostics=recheck_diagnostics, renew=may_renew,
-                                                handoff_deadline_ms=handoff_deadline)
+                                                diagnostics=recheck_diagnostics)
                 now_ms = int(time.time() * 1000)
                 remaining_ms = min(work.expires_ms - now_ms,
                                    round((work.expires_at - time.monotonic()) * 1000))
@@ -3157,7 +3201,7 @@ class NaviPlugin:
                     obs_ms, deadline, clear, newer = checked
                     if not clear:
                         stop = ("局部规划：续发前扫掠复检发现障碍", True)
-                    elif may_renew and min(now_ms + self._ttl_ms, deadline) > now_ms + remaining_ms:
+                    elif min(now_ms + self._ttl_ms, deadline) > now_ms + remaining_ms:
                         work.forward_check = newer
                         work.message = dict(work.message, obs_stamp_ms=obs_ms)
                         remaining_ms = min(self._ttl_ms, deadline - now_ms)
@@ -3298,6 +3342,7 @@ class NaviPlugin:
             message = dict(message, seq=self._next_wire_seq(message["seq"]))
         payload = String()
         payload.data = json.dumps(message, ensure_ascii=False)
+        write_ms, write_tick = int(time.time() * 1000), time.monotonic()
         try:
             self._publisher.publish(payload)
         except Exception:
@@ -3315,6 +3360,22 @@ class NaviPlugin:
             raise
         self._published += 1
         moving = any(message["values"])
+        work = self._scheduled_command
+        if (moving and origin is not None and work is not None and work.dwa_origin is not None
+                and work.dwa_origin.identity == origin.identity):
+            # TTL is an admission deadline. Once written, ordinary translation
+            # has the receive-watchdog hold already swept by dwa_hold().
+            guard = origin.forward_check.motion_guard
+            watchdog = (self._descriptor.get("rate") or {}).get("watchdog_ms")
+            if (message["values"][0] > 0 and work.turn is None and work.leg is None
+                    and not origin.acceptance.angle_controlled and type(watchdog) in (int, float)
+                    and 0 < watchdog == self._config.watchdog_ms <= guard.prediction_horizon_s * 1000):
+                work.expires_ms = write_ms + watchdog
+                work.expires_at = write_tick + watchdog / 1000
+                self._command_window = (write_tick, work.expires_at)
+            else:
+                work.expires_ms = min(work.expires_ms, guard.deadline_ms)
+                work.expires_at = min(work.expires_at, write_tick + (work.expires_ms - write_ms) / 1000)
         self._wire_moving = moving
         self._wire_twist = tuple(message["values"][i] for i in (0, 1, 5))
         self._wire_dwa_origin = origin if moving else None

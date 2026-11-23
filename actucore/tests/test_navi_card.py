@@ -916,13 +916,15 @@ class _FakeNode:
         self.graph = graph or {}
         self.subscriptions = []
         self.subscription_details = []
+        self.subscription_groups = {}
         self.timers = []
         self.destroyed = False
 
     def get_topic_names_and_types(self):
         return list(self.graph.items())
 
-    def create_subscription(self, msg_type, topic, cb, depth):
+    def create_subscription(self, msg_type, topic, cb, depth, *, callback_group=None):
+        self.subscription_groups[topic] = callback_group
         self.subscriptions.append(topic)
         self.subscription_details.append((msg_type, topic, cb, depth))
 
@@ -937,6 +939,16 @@ class _FakeNode:
     def destroy_node(self):
         self.destroyed = True
         self.timers.clear()
+
+
+def test_depth_processing_leaves_odometry_and_object_callbacks_runnable():
+    topics = ["/cam/objects", "/cam/depth", "/state/odom"]
+    node = _FakeNode({"/cam/depth": ["sensor_msgs/msg/CompressedImage"]})
+    _, problem = _card()._bind_inputs(node, topics)
+    assert not problem
+    groups = node.subscription_groups
+    assert groups["/cam/depth"] is not groups["/state/odom"]
+    assert groups["/cam/depth"] is not groups["/cam/objects"]
 
 
 def test_camera_only_geometry_starts_separate_planning_and_velocity_timers(monkeypatch):

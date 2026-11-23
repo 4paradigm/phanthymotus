@@ -68,6 +68,83 @@ def advance_snapshot(snapshot, clock, stamp, *, obstacle=False, vx=.1):
                    dict(odom, vx=vx, received_ms=stamp, source_sample_id=stamp), target_ms)
 
 
+@pytest.mark.parametrize("first,last,yaw,settled", [
+    (1005, 1010, 0., True), (995, 1010, 0., False),
+    (1005, 1005, 0., False), (1005, 1010, .4, False)])
+def test_source_switch_shortens_hold_only_after_measured_stop(monkeypatch, first, last, yaw, settled):
+    card, _, clock, snapshot = observation_card(monkeypatch)
+    state = card._state
+    state.motion_source = "command"
+    state.commanded = (.15, 0., 0.)
+    card.next_command()
+    assert "等待底盘停稳" in card._last_decision.reason
+    advance_snapshot(snapshot, clock, 1010, vx=0.)
+    odom = snapshot[0][2]
+    odom.update(stamp_ms=last, velocity_history=((first, first, (0., 0., 0.)), (last, last, (0., 0., yaw))))
+    card.next_command()
+    assert (state.feedback_guard_s == 0.) == settled
+
+
+@pytest.mark.parametrize("samples,settled", [
+    ([(1010, 1005, 0.), (1050, 1040, 0.), (1060, 1040, 0.)], True),
+    ([(1050, 1010, 0.), (1050, 1040, 0.)], False),  # Queue drained together.
+    ([(1010, 995, 0.), (1050, 1040, 0.)], False),
+    ([(1010, 1005, 0.), (1050, 1005, 0.)], False),
+    ([(1010, 1005, 0.), (1050, None, 0.)], False),
+    ([(1010, 1005, 0.), (1050, 1040, .4)], False),
+])
+def test_received_speed_recovery_uses_driver_speed_updates(monkeypatch, samples, settled):
+    card, _, clock, snapshot = observation_card(monkeypatch)
+    state = card._state
+    state.motion_source = "command"
+    state.commanded = (.15, 0., 0.)
+    card.next_command()
+    assert "等待底盘停稳" in card._last_decision.reason
+    for receipt, speed_stamp, yaw in samples:
+        clock[0] = receipt
+        payload = dict(schema="motus.odom/1", frame="body", stamp_ms=receipt,
+                       twist=[0., 0., None, None, None, yaw],
+                       vendor=dict(source="slamtec", stamp_source="received", sample_timestamps_ms={"speed": speed_stamp}))
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+    clock[0] = 1070
+    objects, depth, _, receipt = snapshot[0]
+    odom = plugin.NaviPlugin._observation_snapshot(card, with_capture_timing=True)[2]
+    assert "stamp_ms" not in odom
+    snapshot[0] = objects, dict(depth, control_ms=1070), odom, receipt
+    card.next_command()
+    assert (state.feedback_guard_s == 0.) == settled
+
+
+@pytest.mark.parametrize("late_repeat", [False, True])
+def test_lost_received_speed_holds_after_source_guard_expires(monkeypatch, late_repeat):
+    card, _, clock, snapshot = observation_card(monkeypatch)
+    objects, depth, odom, receipt = snapshot[0]
+    snapshot[0] = objects, depth, dict(odom, received_speed_ms=1000), receipt
+    card.next_command()
+    for stamp in range(1100, 2400, 100):
+        clock[0] = stamp
+        # An old speed payload may arrive after a transport stall.
+        repeat = dict(odom, received_speed_ms=1000, received_ms=stamp) if late_repeat else None
+        snapshot[0] = objects, dict(depth, frame_id=stamp, control_ms=stamp), repeat, receipt
+        card.next_command()
+    assert card._state.feedback_guard_s == 0.
+    assert card._last_decision.reason == "运动反馈已到期，停车等待新速度"
+    assert not any(card._last_decision.values)
+
+
+@pytest.mark.parametrize("missing", ["depth", "feedback"])
+@pytest.mark.parametrize("recovers", [True, False])
+def test_first_write_recovers_only_with_valid_replacement(monkeypatch, missing, recovers):
+    card, packets, _, snapshot, message = selected_card(monkeypatch)
+    objects, depth, odom, stamp = snapshot[0]
+    partial = (objects, None if missing == "depth" else depth, None if missing == "feedback" else odom, stamp)
+    reads = iter([partial])
+    replacement = snapshot[0] if recovers else partial
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: next(reads, replacement))
+    card._publish_command(message)
+    assert packets[-1]["values"] == (message["values"] if recovers else [0.] * 6)
+
+
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
 def test_real_dwa_publication_counts_only_successful_wire_packets(monkeypatch, body):
     calls = observe_selector(monkeypatch)
@@ -206,45 +283,15 @@ def test_publish_error_never_counts_a_dwa_success(monkeypatch, body):
     assert "wire_seq" not in card._state.dwa_trace
 
 
-def test_renewals_keep_the_original_decision_and_full_tail_check(monkeypatch):
-    calls = observe_selector(monkeypatch)
-    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
+def test_expiry_reports_the_sent_decision_while_the_planner_selects_another(monkeypatch):
+    card, packets, clock, _, message = selected_card(monkeypatch, body=False, live_target=True)
     original = card._last_decision.dwa_acceptance
     assert card._stage_command(message, card._output_epoch)
-    assert card._scheduled_command.forward_check is not None
-    assert len(packets) == 1
-    predictions = []
-    predict = motion.predict_motion
-
-    def record(*args, **kwargs):
-        trace = predict(*args, **kwargs)
-        predictions.append(trace)
-        return trace
-
-    monkeypatch.setattr(motion, "predict_motion", record)
-    # A new planner tick can reset mutable diagnostic flags while the timer
-    # still owns a valid earlier command. The queued origin must survive.
-    card._state.dwa_selected = False
     card._state.dwa_trace = {"decision_id": original.decision_id + 1}
-    card._staged_dwa_command = None
-    objects, depth, odom, target_ms = snapshot[0]
-    for stamp in (1100, 1200, 1300):
-        clock[0] = stamp
-        snapshot[0] = (objects, dict(depth, frame_id=stamp, capture_ms=stamp,
-                                     control_ms=stamp, source_frame_id=stamp),
-                       dict(odom, received_ms=stamp, source_sample_id=stamp), target_ms)
-        card._dispatch_command()
-    assert len(packets) == 4
-    assert all(packet["values"] == message["values"] for packet in packets)
-    assert len(calls) == card._state.dwa_totals["select_calls"]
-    assert card._state.dwa_totals["attempted_ticks"] == 1
-    assert card._state.dwa_totals["published_decisions"] == 1
-    assert card._state.dwa_totals["published_packets"] == 4
-    assert len(predictions) == 3
-    assert all(t.stopped and t.duration >= original.motion_guard.prediction_horizon_s for t in predictions)
-    publication = card._info()["dwa"]["publication"]
-    assert publication["decision_id"] == original.decision_id
-    assert publication["wire_seq"] == packets[-1]["seq"] and publication["wire_values"] == packets[-1]["values"]
+    clock[0] = packets[0]["stamp_ms"] + packets[0]["ttl_ms"]
+    card._dispatch_command()
+    assert len(packets) == 2 and not any(packets[-1]["values"])
+    assert card._info()["dwa"]["publication"]["decision_id"] == original.decision_id
     assert card._state.dwa_trace == {"decision_id": original.decision_id + 1}
 
 
@@ -300,6 +347,10 @@ def test_queued_dwa_stops_on_cancellation_or_new_obstacle(monkeypatch, body, eve
                                      control_ms=1100, source_frame_id=1100),
                        dict(odom, received_ms=1100, source_sample_id=1100), target_ms)
         card._dispatch_command()
+        assert len(packets) == 1
+        card._tick()
+        assert len(packets) == 2 and packets[-1]["values"] != message["values"]
+        return
     card._dispatch_command()
     assert card._scheduled_command is None
     assert packets[-1]["values"] == [0.] * 6
@@ -336,15 +387,14 @@ def test_real_tick_rechecks_new_input_before_first_send(monkeypatch, body, live_
         assert card._state.dwa_totals["published_packets"] == 1
 
 
-def test_renewal_continues_valid_deceleration_from_fresh_measured_overspeed(monkeypatch):
+def test_timer_does_not_reissue_motion_on_fresh_measured_overspeed(monkeypatch):
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
     assert card._stage_command(message, card._output_epoch)
     advance_snapshot(snapshot, clock, 1100, vx=.36)
     assert policy._feedback_speed_reduction(card._config, snapshot[0][2]) < 1.
     card._dispatch_command()
     assert packets[-1]["values"] == message["values"]
-    assert card._state.dwa_totals["published_packets"] == 2
-    assert card._scheduled_command.forward_check.motion_guard.measured[0] == .36
+    assert card._state.dwa_totals["published_packets"] == 1
 
 
 def test_pause_stops_direct_motion_before_an_in_progress_plan_finishes(monkeypatch):
@@ -526,19 +576,16 @@ def test_changed_inputs_preserve_all_applicable_motion_limits(monkeypatch, body,
         assert card._wire_dwa_origin.forward_check.motion_guard.check.accepted
 
 
-def test_renewal_can_continue_beyond_a_local_reference_endpoint(monkeypatch):
+def test_fresh_feedback_at_a_local_endpoint_does_not_extend_the_sent_window(monkeypatch):
     card, packets, clock, snapshot, message = short_advance_card(monkeypatch, body=False, live_target=True)
-    assert card._state.tracker.track.observed and card._state.tracker.track.measured_range_m is not None
     assert card._stage_command(message, card._output_epoch)
-    assert card._scheduled_command.forward_check.renewable
-    for stamp in (1200, 1300):
-        advance_snapshot(snapshot, clock, stamp, vx=.1)
-        card._dispatch_command()
-        assert any(packets[-1]["values"]), "A fresh safe continuation remains executable"
-    advance_snapshot(snapshot, clock, 1400, vx=.1)
+    deadline = packets[0]["stamp_ms"] + packets[0]["ttl_ms"]
+    advance_snapshot(snapshot, clock, deadline - 1)
     card._dispatch_command()
-    assert packets[-1]["values"] == message["values"]
-    assert card._wire_dwa_origin.forward_check.motion_guard.check.accepted
+    assert len(packets) == 1
+    advance_snapshot(snapshot, clock, deadline)
+    card._dispatch_command()
+    assert packets[-1]["values"] == [0.] * 6
 
 
 def test_fresh_obstacle_uses_the_translated_body_corridor(monkeypatch):
@@ -757,13 +804,14 @@ def test_original_proof_records_memory_at_selection(monkeypatch, arrival):
     assert card._info()["dwa"]["publication"]["reason"] == "remembered_obstacle"
 
 
-def test_timer_stops_held_remembered_motion_on_a_new_hit(monkeypatch):
+def test_new_hit_is_handled_by_next_plan(monkeypatch):
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False)
     assert card._stage_command(message, card._output_epoch)
     advance_snapshot(snapshot, clock, 1020, obstacle=True)
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
-    assert card._info()["dwa"]["publication"]["reason"] == "footprint_collision"
+    assert len(packets) == 1
+    card._tick()
+    assert len(packets) == 2 and packets[-1]["values"] != message["values"]
 
 
 def test_obstacle_arriving_during_first_send_recheck_reaches_the_wire_as_zero(monkeypatch):
@@ -988,6 +1036,8 @@ def test_memory_layer_keeps_its_actual_projection_pose(monkeypatch, layer, path,
         card._stage_command(message, card._output_epoch)
     else:
         card._dispatch_command()
+        assert len(packets) == 1 and packets[0]["values"] == message["values"]
+        return
     assert packets[-1]["values"] == ([0.] * 6 if blocked else message["values"])
     if blocked:
         assert card._info()["dwa"]["publication"]["reason"] == "remembered_obstacle"
@@ -1008,33 +1058,7 @@ def test_held_timer_during_near_reprojection(monkeypatch, timing, world_y, block
     scan.update_near_obstacles(None, card._config.local_geometry, fresh, .20, 2., approaching=False)
     if timing == "after":
         card._dispatch_command()
-    assert packets[-1]["values"] == ([0.] * 6 if blocked else message["values"])
-    if blocked:
-        assert card._info()["dwa"]["publication"]["reason"] == "remembered_obstacle"
-
-
-def test_held_timer_checks_the_projection_used_by_its_revision(monkeypatch):
-    card, packets, _, scan, fresh = _moving_memory_case(monkeypatch, "near-camera", .20, "held")
-    scene = card._registered_dwa_scene
-    origin = scan.near_projection_pose
-    old_body_pose = replace(origin, x=0.)
-    memory = scan.near_obstacles
-    cell = (10, 4)
-
-    def reproject_while_rebuilding(*args, **kwargs):
-        # A clear observation retires the cell. The original occupied scene
-        # is restored before the publisher's final revision comparison.
-        memory.cells.remove(cell)
-        scan.update_near_obstacles(None, card._config.local_geometry, fresh, .20, 2., approaching=False)
-        result = scene(*args, **kwargs)
-        memory.cells.add(cell)
-        scan.update_near_obstacles(None, card._config.local_geometry, old_body_pose, .20, 2., approaching=False)
-        return result
-
-    monkeypatch.setattr(card, "_registered_dwa_scene", reproject_while_rebuilding)
-    card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
-    assert card._info()["dwa"]["publication"]["reason"] == "remembered_obstacle"
+    assert len(packets) == 1 and packets[0]["values"] == message["values"]
 
 
 @pytest.mark.parametrize("mode", ["direct", "scheduled", "copied_turn"])
@@ -1367,3 +1391,41 @@ def test_first_send_rechecks_visibility_of_the_complete_trace(monkeypatch, sched
         assert card._dwa_publication["reason"] == "occluded_prefix"
     else:
         assert packet["stamp_ms"] + packet["ttl_ms"] <= message["stamp_ms"] + message["ttl_ms"]
+
+
+@pytest.mark.parametrize("new_input", [False, True])
+def test_sent_dwa_command_runs_to_its_wire_deadline_without_rechecking(monkeypatch, new_input):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(message, card._output_epoch)
+    assert len(packets) == 1 and any(packets[0]["values"])
+    deadline = packets[0]["stamp_ms"] + packets[0]["ttl_ms"]
+    if new_input:
+        advance_snapshot(snapshot, clock, deadline - 1, obstacle=True)
+    else:
+        clock[0] = deadline - 1
+    monkeypatch.setattr(card, "_recheck_forward", lambda *a, **kw: pytest.fail("sent decision rechecked"))
+    card._dispatch_command()
+    assert len(packets) == 1
+    clock[0] = deadline
+    card._dispatch_command()
+    assert packets[-1]["values"] == [0.] * 6
+
+
+def test_admitted_drive_outlives_its_packet_ttl_until_the_declared_watchdog(monkeypatch):
+    card, packets, clock, _, message = selected_card(monkeypatch, body=False)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    card._ttl_ms = 500
+    # Reselect with the negotiated watchdog included in the prediction.
+    message = card.next_command()
+    assert card._last_decision.dwa_acceptance
+    message["ttl_ms"] = 112
+    assert card._stage_command(message, card._output_epoch)
+    packet, = packets
+    assert packet["ttl_ms"] == 112 and packet["values"][0] > 0
+    for stamp in (1112, 1285, 1499):
+        clock[0] = stamp
+        card._dispatch_command()
+        assert len(packets) == 1
+    clock[0] = 1500
+    card._dispatch_command()
+    assert len(packets) == 2 and not any(packets[-1]["values"])

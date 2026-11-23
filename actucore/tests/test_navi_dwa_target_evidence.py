@@ -144,7 +144,16 @@ def test_timer_during_coasting_selection_keeps_only_a_still_valid_sent_command(m
     monkeypatch.setattr(policy, "_dwa_detour", dispatch_during_selection)
     next_message = card.next_command()
     assert len(during) == 1, "The timer must run after tracking and before the real DWA selector"
-    if stop_reason is None:
+    if event in ("obstacle", "source_regression"):
+        assert during[0]["event"] == "published" and len(packets) == 1
+        assert card._stage_command(next_message, card._output_epoch)
+        assert len(packets) == 2
+        if event == "obstacle":
+            assert packets[-1]["values"] == [0.] * 6
+        else:
+            # The replacement was planned against the coasting goal.
+            assert packets[-1]["values"] == next_message["values"]
+    elif stop_reason is None:
         assert card._last_decision.dwa_acceptance is not None
         assert card._stage_command(next_message, card._output_epoch)
         assert len(packets) == 2 and all(packet["values"][0] > 0. for packet in packets)
@@ -172,7 +181,7 @@ def test_unpublished_observed_command_cannot_coast_after_tracker_consumes_a_miss
     assert card._dwa_publication["reason"] == "superseded"
 
 
-def test_original_target_reappearance_can_resume_checked_renewal_without_zero(monkeypatch):
+def test_original_target_reappearance_waits_for_a_new_plan(monkeypatch):
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
     objects = snapshot[0][0]
     original_target_ms = card._staged_dwa_command[1].forward_check.target_ms
@@ -185,8 +194,8 @@ def test_original_target_reappearance_can_resume_checked_renewal_without_zero(mo
     _, depth, odom, _ = snapshot[0]
     snapshot[0] = (dict(objects, timestamp=1.15), depth, odom, 1150)
     card._dispatch_command()
-    assert len(packets) == 2 and all(packet["values"] == message["values"] for packet in packets)
-    assert card._scheduled_command.expires_ms > 1250
+    assert [p["values"] for p in packets] == [message["values"]]
+    assert card._scheduled_command.expires_ms == 1250
     assert card._scheduled_command.forward_check.target_ms == original_target_ms
 
 
@@ -220,12 +229,8 @@ def test_sent_target_coast_checks_obstacles_and_holds_its_fixed_window(monkeypat
         card._state.tracker.track.front_required = True
     snapshot[0] = payload, depth, odom, 1100
     card._dispatch_command()
-    if change == "obstacle":
-        assert packets[-1]["values"] == [0.] * 6
-        assert card._dwa_publication["reason"] == "footprint_collision"
-    else:
-        assert [packet["values"] for packet in packets] == [message["values"]]
-        assert card._scheduled_command.expires_ms == message["stamp_ms"] + message["ttl_ms"]
+    assert [packet["values"] for packet in packets] == [message["values"]]
+    assert card._scheduled_command.expires_ms == message["stamp_ms"] + message["ttl_ms"]
 
 
 def test_repeated_matching_source_keeps_its_original_target_deadline(monkeypatch):
@@ -241,10 +246,10 @@ def test_repeated_matching_source_keeps_its_original_target_deadline(monkeypatch
         snapshot[0] = (original_payload, depth, odom, stamp)
         card._dispatch_command()
     nonzero = [packet for packet in packets if any(packet["values"])]
-    assert len(nonzero) > 1, "A real matching observation permits checked renewals"
+    assert len(nonzero) == 1
     assert all(packet["values"] == message["values"] for packet in nonzero)
     assert all(packet["stamp_ms"] + packet["ttl_ms"] <= target_deadline for packet in nonzero)
-    assert card._scheduled_command.forward_check.target_ms == original_target_ms
+    assert card._scheduled_command is None
     advance_snapshot(snapshot, clock, target_deadline)
     _, depth, odom, _ = snapshot[0]
     snapshot[0] = (original_payload, depth, odom, target_deadline)
@@ -276,7 +281,7 @@ def test_next_decision_cannot_promote_old_track_to_fresh_target_evidence(monkeyp
 
 
 @pytest.mark.parametrize("confidence", [.95, .87], ids=["unchanged", "confidence-jitter"])
-def test_genuine_fresh_matching_target_can_continue_the_original_command(monkeypatch, confidence):
+def test_matching_target_preserves_the_sent_packet_without_reissue(monkeypatch, confidence):
     calls = observe_selector(monkeypatch)
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
     track = card._state.tracker.track
@@ -289,9 +294,9 @@ def test_genuine_fresh_matching_target_can_continue_the_original_command(monkeyp
     objects = [dict(payload["objects"][0], confidence=confidence)]
     snapshot[0] = (dict(payload, timestamp=1.1, objects=objects), depth, odom, 1100)
     card._dispatch_command()
-    assert len(packets) == 2 and all(packet["values"] == message["values"] for packet in packets)
+    assert [p["values"] for p in packets] == [message["values"]]
     assert card._state.dwa_totals["published_decisions"] == 1
-    assert card._state.dwa_totals["published_packets"] == 2
+    assert card._state.dwa_totals["published_packets"] == 1
     assert len(calls) == card._state.dwa_totals["select_calls"]
 
 
@@ -353,12 +358,8 @@ def test_mixed_objects_keep_the_observation_actually_associated_by_the_planner(m
     snapshot[0] = (dict(payload, timestamp=1.1, count=len(objects), objects=objects), depth, odom, 1100)
     card._dispatch_command()
     assert all(packet["values"] == message["values"] for packet in packets)
-    if retain_original:
-        assert len(packets) == 2
-        assert card._scheduled_command.expires_ms > message["stamp_ms"] + message["ttl_ms"]
-    else:
-        assert len(packets) == 1
-        assert card._scheduled_command.expires_ms == message["stamp_ms"] + message["ttl_ms"]
+    assert len(packets) == 1
+    assert card._scheduled_command.expires_ms == message["stamp_ms"] + message["ttl_ms"]
 
 
 def coasting_person_case(monkeypatch, body, *, detached_anchor=False):
@@ -412,7 +413,7 @@ def test_coasting_person_uses_remembered_front_within_original_deadline(monkeypa
     assert packets[-1]["values"] == [0.] * 6
 
 
-def test_coasting_person_held_timer_rechecks_feedback_and_hits(monkeypatch):
+def test_coasting_person_timer_leaves_new_feedback_and_hits_for_planner(monkeypatch):
     card, packets, clock, snapshot, message = coasting_person_case(monkeypatch, False)
     card._stage_command(message, card._output_epoch)
     assert packets[-1]["values"] == message["values"]
@@ -423,8 +424,7 @@ def test_coasting_person_held_timer_rechecks_feedback_and_hits(monkeypatch):
     assert len(packets) == 1 and card._wire_moving
     advance_snapshot(snapshot, clock, 1020, obstacle=True)
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
-    assert card._info()["dwa"]["publication"]["reason"] == "footprint_collision"
+    assert len(packets) == 1 and card._wire_moving
 
 
 @pytest.mark.parametrize("event", ["clear", "tracker_first", "detached_anchor", "changed_anchor",
@@ -475,17 +475,16 @@ def test_sent_memory_command_rechecks_physics_during_target_reappearance(monkeyp
         replacement = card.next_command()
         assert card._stage_command(replacement, epoch)
         assert len(packets) == 2 and all(any(packet["values"]) for packet in packets)
-    else:
+    elif event in ("cancel", "expiry"):
         assert packets[-1]["values"] == [0.] * 6
-        if event != "cancel":
-            assert card._dwa_publication["reason"] == {
-                "near": "target_standoff", "near_new_depth": "target_standoff", "obstacle": "footprint_collision",
-                "expiry": "publish_expired", "changed_anchor": "target_missing",
-            }[event]
+        if event == "expiry":
+            assert card._dwa_publication["reason"] == "publish_expired"
+    else:
+        assert len(packets) == 1 and card._scheduled_command.expires_ms == deadline
 
 
-@pytest.mark.parametrize("change", ["new_detection", "dim_detection", "closer_front"])
-def test_new_evidence_can_veto_a_remembered_front_command(monkeypatch, change):
+@pytest.mark.parametrize("change", ["new_detection", "dim_detection", "missing_front", "near_detection", "closer_front"])
+def test_memory_first_send_checks_reappearing_people(monkeypatch, change):
     import numpy as np
     card, packets, clock, snapshot, message = coasting_person_case(monkeypatch, True)
     _, depth, odom, _ = snapshot[0]
@@ -494,13 +493,21 @@ def test_new_evidence_can_veto_a_remembered_front_command(monkeypatch, change):
         # The old memory decision has no accepted image region for this live fix.
         objects = {"timestamp": 1.01, "objects": [{"name": "person",
                    "confidence": .25 if change == "dim_detection" else .95, "bbox_norm": [.45, .11, .55, .31], "position": [0., -.58]}]}
+        if change == "missing_front":
+            del objects["objects"][0]["bbox_norm"]
+        if change == "near_detection":
+            depth["map"] = depth["map"].copy()
+            depth["map"][:150] = card._config.stop_distance_m
         snapshot[0] = (objects, depth, odom, 1010)
     else:
         card._state.tracker.track.front_fix = np.array([card._config.stop_distance_m + .01, 0.])
     card._publish_command(message)
-    assert packets[-1]["values"] == [0.] * 6
-    assert card._info()["dwa"]["publication"]["reason"] == (
-        "target_standoff" if change == "closer_front" else "target_missing")
+    if change in ("new_detection", "dim_detection"):
+        assert packets[-1]["values"] == message["values"]
+    else:
+        assert packets[-1]["values"] == [0.] * 6
+        assert card._info()["dwa"]["publication"]["reason"] == (
+            "target_missing" if change == "missing_front" else "target_standoff")
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
@@ -849,6 +856,7 @@ def test_fixed_window_keeps_detector_ordering_after_a_producer_stamp(monkeypatch
         snapshot[0] = missing_stamp, depth, odom, 1010
         card._stage_command(message, card._output_epoch)
         assert [p["values"] for p in packets] == [[0.] * 6]
+        assert card._dwa_publication["reason"] == "target_missing"
     else:
         snapshot[0] = dict(objects, timestamp=1.01), depth, odom, 1010
         card._stage_command(message, card._output_epoch)
@@ -859,8 +867,7 @@ def test_fixed_window_keeps_detector_ordering_after_a_producer_stamp(monkeypatch
         next_objects = objects if next_source is None else dict(objects, timestamp=next_source)
         snapshot[0] = next_objects, depth, odom, 1020
         card._dispatch_command()
-        assert packets[-1]["values"] == [0.] * 6
-    assert card._dwa_publication["reason"] == "target_missing"
+        assert [p["values"] for p in packets] == [message["values"]]
 
 
 @pytest.mark.parametrize("bad_receipt", [1005, 1025], ids=["regressing", "future"])
@@ -882,5 +889,4 @@ def test_duplicate_unstamped_receipt_preserves_its_fixed_window_and_order(monkey
     clock[0] = 1020
     snapshot[0] = objects, depth, odom, bad_receipt
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
-    assert card._dwa_publication["reason"] == "target_missing"
+    assert [p["values"] for p in packets] == [message["values"]]
