@@ -44,21 +44,185 @@ def test_payload_without_requested_target_cannot_make_memory_motion_renewable(mo
 
 
 @pytest.mark.parametrize("kind", ["empty", "unrelated"])
-def test_new_targetless_payload_stops_an_initially_valid_renewal(monkeypatch, kind):
+def test_targetless_payload_preserves_sent_motion_only_until_its_fixed_deadline(monkeypatch, kind):
     calls = observe_selector(monkeypatch)
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
     track = card._state.tracker.track
     assert track.observed and track.accepted_detection and track.measured_range_m == 5.
     assert card._stage_command(message, card._output_epoch)
     assert card._scheduled_command.forward_check.renewable
-    advance_snapshot(snapshot, clock, 1100)
-    _, depth, odom, _ = snapshot[0]
-    snapshot[0] = (absent_target_payload(kind, 1100), depth, odom, 1100)
+    deadline = message["stamp_ms"] + message["ttl_ms"]
+    assert deadline == 1250
+    for stamp in (1100, 1150, 1200, 1249):
+        advance_snapshot(snapshot, clock, stamp)
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = (absent_target_payload(kind, stamp), depth, odom, stamp)
+        card._dispatch_command()
+        assert all(any(packet["values"]) for packet in packets)
+        assert card._scheduled_command.expires_ms == deadline
+        assert card._scheduled_command.forward_check.motion_guard.deadline_ms == deadline
+    advance_snapshot(snapshot, clock, deadline)
     card._dispatch_command()
     assert packets[-1]["values"] == [0.] * 6
     assert len([packet for packet in packets if any(packet["values"])]) == 1
     assert card._scheduled_command is None
     assert len(calls) == card._state.dwa_totals["select_calls"]
+
+
+def test_targetless_timer_tick_does_not_insert_zero_before_legal_coasting_replan(monkeypatch):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(message, card._output_epoch)
+    advance_snapshot(snapshot, clock, 1100)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = (absent_target_payload("empty", 1100), depth, odom, 1100)
+    card._dispatch_command()
+    clock[0] = 1150
+    next_message = card.next_command()
+    assert card._last_decision.dwa_acceptance is not None
+    assert next_message["values"][0] > 0.
+    assert card._stage_command(next_message, card._output_epoch)
+    assert len(packets) == 2
+    assert all(packet["values"][0] > 0. for packet in packets)
+
+
+@pytest.mark.parametrize("event,stop_reason", [
+    ("clear", None),
+    ("obstacle", "footprint_collision"),
+    ("stranger", "target_missing"),
+    ("generation", "superseded"),
+    ("action", "superseded"),
+    ("epoch", "superseded"),
+    ("expired", "publish_expired"),
+    ("front_requirement", "target_missing"),
+    ("source_regression", "target_missing"),
+])
+def test_timer_during_coasting_selection_keeps_only_a_still_valid_sent_command(monkeypatch, event, stop_reason):
+    from plugins.navi import policy
+
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
+    objects = snapshot[0][0]
+    assert card._stage_command(message, card._output_epoch)
+    original = card._scheduled_command
+    assert original.expires_ms == 1250
+    advance_snapshot(snapshot, clock, 1100)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = absent_target_payload("empty", 1100), depth, odom, 1100
+    select = policy._dwa_detour
+    during = []
+
+    def dispatch_during_selection(*args, **kwargs):
+        if not during:
+            track = card._state.tracker.track
+            assert not track.observed and track.generation == 1
+            assert card._continuing_dwa_output(original.dwa_origin)
+            if event == "obstacle":
+                advance_snapshot(snapshot, clock, 1101, obstacle=True)
+            elif event == "stranger":
+                _, latest_depth, latest_odom, _ = snapshot[0]
+                person = dict(objects["objects"][0], position=[.98, -.6])
+                snapshot[0] = dict(objects, timestamp=1.1, objects=[person]), latest_depth, latest_odom, 1100
+            elif event == "generation":
+                track.generation += 1
+            elif event == "action":
+                card._acp_action_id = "replacement-action"
+            elif event == "epoch":
+                card._output_epoch += 1
+            elif event == "expired":
+                clock[0] = original.expires_ms
+            elif event == "front_requirement":
+                track.front_required = True
+            elif event == "source_regression":
+                payload, latest_depth, latest_odom, receipt = snapshot[0]
+                snapshot[0] = dict(payload, timestamp=.9), latest_depth, latest_odom, receipt
+            card._dispatch_command()
+            during.append(dict(card._dwa_publication))
+            if stop_reason is None:
+                assert card._scheduled_command is original
+                assert original.expires_ms == original.forward_check.motion_guard.deadline_ms == 1250
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(policy, "_dwa_detour", dispatch_during_selection)
+    next_message = card.next_command()
+    assert len(during) == 1, "The timer must run after tracking and before the real DWA selector"
+    if stop_reason is None:
+        assert card._last_decision.dwa_acceptance is not None
+        assert card._stage_command(next_message, card._output_epoch)
+        assert len(packets) == 2 and all(packet["values"][0] > 0. for packet in packets)
+    else:
+        assert packets[-1]["values"] == [0.] * 6
+        assert during[0]["reason"] == stop_reason
+
+
+@pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
+def test_unpublished_observed_command_cannot_coast_after_tracker_consumes_a_miss(monkeypatch, body):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=body, live_target=True)
+    advance_snapshot(snapshot, clock, 1100)
+    _, depth, odom, _ = snapshot[0]
+    payload = absent_target_payload("empty", 1100)
+    snapshot[0] = payload, depth, odom, 1100
+    track = card._state.tracker.step(detections=payload, depth=depth, target=card._state.target,
+                                     config=card._config, ego=(.1, 0., 0.), dt=.1)
+    assert track.generation == 1 and not track.observed
+    if body:
+        card._publish_command(message)
+    else:
+        card._stage_command(message, card._output_epoch)
+    assert all(packet["values"] == [0.] * 6 for packet in packets)
+    assert card._state.dwa_totals.get("published_packets", 0) == 0
+    assert card._dwa_publication["reason"] == "superseded"
+
+
+def test_original_target_reappearance_can_resume_checked_renewal_without_zero(monkeypatch):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
+    objects = snapshot[0][0]
+    original_target_ms = card._staged_dwa_command[1].forward_check.target_ms
+    assert card._stage_command(message, card._output_epoch)
+    advance_snapshot(snapshot, clock, 1100)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = (absent_target_payload("empty", 1100), depth, odom, 1100)
+    card._dispatch_command()
+    advance_snapshot(snapshot, clock, 1150)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = (dict(objects, timestamp=1.15), depth, odom, 1150)
+    card._dispatch_command()
+    assert len(packets) == 2 and all(packet["values"] == message["values"] for packet in packets)
+    assert card._scheduled_command.expires_ms > 1250
+    assert card._scheduled_command.forward_check.target_ms == original_target_ms
+
+
+@pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
+def test_first_send_still_requires_the_observed_original_target(monkeypatch, body):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=body, live_target=True)
+    advance_snapshot(snapshot, clock, 1100)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = (absent_target_payload("empty", 1100), depth, odom, 1100)
+    if body:
+        card._publish_command(message)
+    else:
+        card._stage_command(message, card._output_epoch)
+    assert all(packet["values"] == [0.] * 6 for packet in packets)
+    assert card._state.dwa_totals.get("published_packets", 0) == 0
+    assert card._dwa_publication["reason"] == "target_missing"
+
+
+@pytest.mark.parametrize("change", ["obstacle", "replacement", "front_requirement"])
+def test_sent_target_coast_still_checks_new_obstacles_and_different_people(monkeypatch, change):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
+    objects = snapshot[0][0]
+    assert card._stage_command(message, card._output_epoch)
+    advance_snapshot(snapshot, clock, 1100, obstacle=change == "obstacle")
+    _, depth, odom, _ = snapshot[0]
+    payload = absent_target_payload("empty", 1100)
+    if change == "replacement":
+        person = dict(objects["objects"][0], position=[.98, -.6])
+        payload = dict(objects, timestamp=1.1, objects=[person])
+    elif change == "front_requirement":
+        card._state.tracker.track.front_required = True
+    snapshot[0] = payload, depth, odom, 1100
+    card._dispatch_command()
+    assert packets[-1]["values"] == [0.] * 6
+    assert card._dwa_publication["reason"] == (
+        "footprint_collision" if change == "obstacle" else "target_missing")
 
 
 def test_repeated_matching_source_keeps_its_original_target_deadline(monkeypatch):

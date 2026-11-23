@@ -5355,6 +5355,151 @@ def test_turning_in_place_cannot_reset_progress_forever(monkeypatch):
     assert decision.status == P.FAILED and "progress" in decision.reason
 
 
+def _measured_target_search(*, feedback="turning", speed=.35, local_planning=True,
+                            seen_after=None, search_timeout_s=30., absolute="none"):
+    """Native target search with physical yaw samples and fresh empty images."""
+    from plugins.navi import local_path
+    from plugins.navi.odom import PlanarPose
+
+    geometry = local_path.Geometry(None, None, np.array([
+        [0., 0., 1., 0.], [-1., 0., 0., 0.], [0., -1., 0., 0.], [0., 0., 0., 1.],
+    ]), .275, .275, None)
+    cfg = _cfg(local_controller="dwa", local_planning=local_planning,
+               local_geometry=geometry if local_planning else None,
+               half_width_m=.275, use_lateral=False, vy_max=0.,
+               search_rate=.6, idle_timeout_s=10., search_timeout_s=search_timeout_s)
+    state = _state(motion_source="measured")
+    measured_yaw = 0.
+    for index in range(351):
+        stamp = 1000 + index * 100
+        rate = -speed if state.commanded[2] < 0. else 0.
+        if feedback == "stationary":
+            rate = 0.
+        elif feedback in ("oscillating", "revisited"):
+            # The wider twin visits new headings once, then repeats them.
+            amplitude = .1 if feedback == "oscillating" else .25
+            rate = (amplitude * math.sin(index * math.pi / 10)
+                    - amplitude * math.sin((index - 1) * math.pi / 10)) / .1 if index else 0.
+        measured_yaw += .1 * rate
+        sample = 1000 if feedback == "duplicate" else stamp
+        source = 36000 - index * 100 if feedback == "regressing" else sample
+        odom = dict(vx=0., vy=0., wz=rate, received_ms=sample,
+                    source_sample_id=source, control_ms=stamp)
+        absolute_present = (absolute == "late" and index >= 10 or
+                            absolute == "dropout" and index < 10 or
+                            absolute == "intermittent" and index % 20 >= 10 or
+                            absolute == "changing-frame" and index >= 10)
+        if absolute_present:
+            frame = ("odom", index // 10) if absolute == "changing-frame" else ("odom",)
+            yaw = 0. if feedback == "duplicate" else measured_yaw
+            # Absolute yaw has a different, perfectly valid zero from the
+            # velocity integrator. Registration must retain visited sectors.
+            odom["obstacle_pose"] = PlanarPose(sample, frame, 0., 0., 1.3 + yaw)
+        if feedback == "missing":
+            odom = None
+        depth = dict(map=np.full((120, 160), 5., dtype=np.float32),
+                     ground=np.ones((120, 160), dtype=bool), frame_id=stamp,
+                     source_frame_id=stamp, capture_ms=stamp, control_ms=stamp,
+                     bands=dict(left=5., center=5., right=5.))
+        objects = [_obj()] if seen_after is not None and index * .1 >= seen_after else []
+        detections = dict(timestamp=stamp / 1000., count=len(objects), objects=objects)
+        result = P.step(detections=detections, depth=depth, odom=odom,
+                        config=cfg, state=state, dt=.1)
+        yield index * .1, result, state
+        if result.status == P.FAILED:
+            return
+
+
+@pytest.mark.parametrize("local_planning", [False, True])
+def test_dwa_target_search_credits_new_measured_sectors(local_planning):
+    # Missing normal-search progress would abort at ten seconds after only
+    # half a measured sweep, although the robot is still looking in new sectors.
+    for elapsed, result, state in _measured_target_search(local_planning=local_planning):
+        assert result.status != P.FAILED
+        if elapsed >= 12.:
+            break
+    assert elapsed == pytest.approx(12.)
+    assert result.status == P.SEARCHING and result.values[5] < 0.
+    assert 3.5 < state.searched_rad < 4.5 and state.idle_for_s < 1.
+
+
+@pytest.mark.parametrize("feedback", ["stationary", "oscillating", "duplicate", "missing"])
+def test_dwa_target_search_without_new_measured_sectors_times_out(feedback):
+    # Commanded rotation, stale feedback and repeated views cannot buy time.
+    elapsed, result, state = list(_measured_target_search(feedback=feedback))[-1]
+    assert result.status == P.FAILED and "progress" in result.reason
+    assert elapsed <= 11. and state.idle_for_s >= 10.
+    assert result.values == [0.] * 6
+
+
+@pytest.mark.parametrize("speed,reason,minimum_elapsed", [
+    (.35, "swept", 18.), (.1, "searched 30s", 30.),
+])
+def test_dwa_target_search_retains_original_sweep_and_time_limits(speed, reason, minimum_elapsed):
+    elapsed, result, state = list(_measured_target_search(speed=speed))[-1]
+    assert result.status == P.FAILED and reason in result.reason
+    assert minimum_elapsed <= elapsed <= 31.
+    assert state.idle_for_s < 3.
+
+
+def test_dwa_target_search_can_reacquire_after_ten_seconds():
+    for elapsed, result, state in _measured_target_search(seen_after=11.7):
+        assert result.status != P.FAILED
+        if elapsed >= 12.5:
+            break
+    assert elapsed == pytest.approx(12.5)
+    assert state.tracker.track is not None and state.tracker.track.observed
+    assert result.values[0] > 0.
+
+
+@pytest.mark.parametrize("local_planning", [False, True])
+@pytest.mark.parametrize("absolute", ["late", "dropout", "intermittent"])
+def test_dwa_target_search_keeps_measured_sectors_across_absolute_pose_handoffs(local_planning, absolute):
+    for elapsed, result, state in _measured_target_search(local_planning=local_planning, absolute=absolute):
+        assert result.status != P.FAILED
+        if elapsed >= 12.:
+            break
+    assert elapsed == pytest.approx(12.) and result.status == P.SEARCHING
+    assert 3.5 < state.searched_rad < 4.5 and state.idle_for_s < 1.
+
+
+@pytest.mark.parametrize("local_planning", [False, True])
+@pytest.mark.parametrize("feedback", ["stationary", "duplicate", "regressing", "revisited"])
+def test_dwa_search_pose_handoffs_do_not_renew_old_or_unmeasured_views(local_planning, feedback):
+    baseline_elapsed, _, _ = list(_measured_target_search(
+        local_planning=local_planning, feedback=feedback))[-1]
+    elapsed, result, state = list(_measured_target_search(
+        local_planning=local_planning, absolute="intermittent", feedback=feedback))[-1]
+    assert result.status == P.FAILED and "progress" in result.reason
+    assert result.values == [0.] * 6 and state.idle_for_s >= 10.
+    # Brief occlusion delays search; the wider oscillation first covers its
+    # two sectors at 1.3/1.4 s and 2.6 s, then has no useful rotation left.
+    assert baseline_elapsed <= 13.
+    assert elapsed <= baseline_elapsed + .1, "a coordinate handoff cannot extend the measured idle budget"
+
+
+@pytest.mark.parametrize("local_planning", [False, True])
+def test_dwa_search_frame_changes_cannot_relabel_repeated_sectors(local_planning):
+    baseline_elapsed, _, _ = list(_measured_target_search(
+        local_planning=local_planning, feedback="revisited"))[-1]
+    elapsed, result, state = list(_measured_target_search(
+        local_planning=local_planning, absolute="changing-frame", feedback="revisited"))[-1]
+    assert result.status == P.FAILED and "progress" in result.reason
+    assert result.values == [0.] * 6 and baseline_elapsed <= 13.
+    assert elapsed <= baseline_elapsed + .1
+
+
+@pytest.mark.parametrize("local_planning", [False, True])
+@pytest.mark.parametrize("speed,reason,minimum_elapsed", [
+    (.35, "swept", 18.), (.1, "searched 30s", 30.),
+])
+def test_dwa_search_absolute_pose_handoff_retains_original_limits(local_planning, speed, reason, minimum_elapsed):
+    elapsed, result, state = list(_measured_target_search(
+        local_planning=local_planning, absolute="intermittent", speed=speed))[-1]
+    assert result.status == P.FAILED and reason in result.reason
+    assert minimum_elapsed <= elapsed <= 31. and state.idle_for_s < 3.
+
+
 @pytest.mark.parametrize("broken", [False, True])
 def test_continuous_velocity_history_counts_between_slow_ticks(broken):
     cfg = _cfg(local_controller="dwa", idle_timeout_s=.38)
@@ -5934,6 +6079,87 @@ def test_revisited_motion_needs_body_and_observed_target_closure(evidence):
     else:
         assert original.measured_range_m == pytest.approx(start_range, abs=.001)
     assert result.status == P.FAILED and result.values == [0.] * 6
+
+
+@pytest.mark.parametrize("admission", ["checked-dwa", "unselected-reference", "changed-command", "repeated-closure"])
+def test_checked_dwa_return_can_progress_through_a_previously_visited_corridor(admission):
+    from plugins.navi import dwa, local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.odom import PlanarPose
+
+    geometry = local_path.camera_square(HorizontalIntrinsics(160, 85., 80.),
+                                        (120, 72., 60.), .20, at_front=True)
+    cfg = _cfg(local_controller="dwa", local_planning=True, local_geometry=geometry,
+               half_width_m=.20, vx_max=.15625, use_lateral=False, vy_max=0., idle_timeout_s=.8)
+    scene = Sim(range_m=3., config=cfg)
+    state = seed(_state(motion_source="measured"), *scene.observe(), cfg)
+    original = state.tracker.track
+    stamp = 1000
+
+    def sample(x, vx, returning):
+        nonlocal stamp
+        stamp += 100
+        scene.pose[0] = x
+        objects, _ = scene.observe()
+        pose = PlanarPose(stamp, ("odom",), x, 0., 0.)
+        depth = dict(map=np.full((120, 160), scene.relative()[0], dtype=np.float32),
+                     frame_id=stamp, source_frame_id=stamp, capture_ms=stamp,
+                     control_ms=stamp, obstacle_capture_pose=pose)
+        state.tracker.step(detections=objects, depth=depth, target=state.target,
+                           config=cfg, ego=(vx, 0., 0.), dt=.1)
+        assert state.tracker.track is original and P.current_target_observed(state)
+        odom = dict(obstacle_pose=pose, vx=vx, vy=0., wz=0.,
+                    received_ms=stamp, source_sample_id=stamp)
+        state.dwa_odom = odom
+        state.active_scan.update(depth, odom, geometry, receipt_only=True)
+        route = ((0., 0.), (1. if returning else -1., 0.))
+        if returning:
+            # Run the real physical selector and admission, not a fabricated
+            # AVOIDING label. Only the reference path is supplied by the fixture.
+            state.dwa_trace = {}
+            state.dwa_budget = dwa.CandidateBudget(64)
+            state.dwa_projection = local_path.DepthProjection(depth["map"], None)
+            reference = local_path.Detour(None, route, geometry)
+            proposal = P._dwa_detour(depth, cfg, state, reference, scene.relative()[0], 0.,
+                                    candidate_commands=((.15625, 0., 0.),))
+            assert proposal is not None and proposal.guard.check.accepted
+            values = P._use_dwa(state, proposal, 0.)
+            decision = P.Decision(P._twist(*values[:3]), values[3], values[4])
+            assert state.dwa_selected and state.checked_prefix and decision.values[0] > 0.
+            if admission == "unselected-reference":
+                state.dwa_selected = False
+            elif admission == "changed-command":
+                decision.values[0] *= .5
+        else:
+            decision = P.Decision(P._twist(vx, 0., 0.), P.AVOIDING, "measured outbound leg")
+        result = P._account_dwa_progress(decision, state, cfg, odom, depth, route, .1)
+        state.commanded = tuple(decision.values[i] for i in (0, 1, 5))
+        return result
+
+    for index in range(33):
+        assert sample(-index / 64., -.15625, False).status == P.AVOIDING
+    initial_range = original.measured_range_m
+    credits = []
+    previous = -.5
+    for index in range(1, 97 if admission == "repeated-closure" else 33):
+        offset = min(index % 16, 16 - index % 16) if admission == "repeated-closure" else index
+        current = -.5 + offset / 64.
+        result = sample(current, (current - previous) / .1, True)
+        previous = current
+        if state.idle_for_s == 0.:
+            credits.append(index)
+        if result.status == P.FAILED:
+            break
+    if admission == "checked-dwa":
+        assert result.status == P.AVOIDING and index == 32
+        assert initial_range - original.measured_range_m == pytest.approx(.5, abs=.001)
+        assert state.idle_for_s < .5
+    else:
+        assert result.status == P.FAILED and "progress" in result.reason
+        assert result.values == [0.] * 6
+        if admission == "repeated-closure":
+            assert credits and index > 8
+            assert index <= 24, "the already credited approach cannot renew repeated local cycles"
 
 
 @pytest.mark.parametrize("pairing", ["precise", "receipt-lag", "ordinary", "missing", "outdated",

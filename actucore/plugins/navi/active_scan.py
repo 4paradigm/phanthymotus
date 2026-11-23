@@ -375,6 +375,7 @@ class ActiveScan:
     odom_source: int | None = None
     buffered_odom: bool = False
     pose_origin: PlanarPose | None = None
+    pose_registration: tuple[PlanarPose, PlanarPose] | None = None
     pose_feedback_since_ms: int = 0
     control_ms: int = 0
     turn_stop_ms: int | None = None
@@ -422,6 +423,8 @@ class ActiveScan:
         motion = planar_feedback(odom)
         if type(stamp) is not int or stamp <= 0 or geometry is None or motion is None:
             if self.receipt_only and self.active and geometry is not None:
+                if self.keep_physical_views:
+                    return self._hold_for_feedback_gap("主动观察：运动反馈暂不可用，停车后重规划")
                 return self.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
             return self.invalidate()
         history = odom.get("velocity_history")
@@ -465,6 +468,12 @@ class ActiveScan:
             self.poses.append((stamp, self.pose, motion[2]))
         self.odom_source = source
         self.motion = motion
+        if self.keep_physical_views and self.receipt_only and self.pose_origin is None:
+            absolute = odom.get("obstacle_pose") or odom.get("motion_pose")
+            if absolute is not None and self.pose_registration is None:
+                paired = self._pose_at(absolute.stamp_ms)
+                if paired is not None:
+                    self.pose_registration = self._relative_near_pose(absolute.stamp_ms, paired), absolute
         timeout = 2 * SCAN_TIMEOUT_MS if self.receipt_only else SCAN_TIMEOUT_MS
         if self.phase in ("brake", "turn", "return") and stamp - self.start_ms > timeout:
             return self.interrupt("主动观察：观测超时，停车")
@@ -522,6 +531,8 @@ class ActiveScan:
         intervals = []
         for received, identity, velocity in samples:
             if velocity is None:
+                if self.keep_physical_views:
+                    return self._hold_for_feedback_gap("主动观察：运动反馈暂不可用，停车后重规划")
                 hold = self.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
                 self.poses.clear()
                 return hold
@@ -551,10 +562,11 @@ class ActiveScan:
                  else math.hypot(vx, vy) > tolerance) for _, (vx, vy, _), _ in intervals):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
 
-    def _hold_for_feedback_gap(self):
-        hold = self.hold_for_replan("主动观察：运动反馈间隔过长，停车后重规划")
+    def _hold_for_feedback_gap(self, reason="主动观察：运动反馈间隔过长，停车后重规划"):
+        hold = self.hold_for_replan(reason)
         self.dwa_failures, self.dwa_view = 0, None
         self.motion_frame = object()
+        self.pose_registration = None
         self.poses.clear()
         return hold
 
@@ -1359,6 +1371,7 @@ class ActiveScan:
         self.observation_pose = None
         self.pose = (0., 0., 0.)
         self.pose_origin = None
+        self.pose_registration = None
         self.registered_history = ()
         self.pose_feedback_since_ms = 0
         self.turn_stop_ms = None

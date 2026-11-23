@@ -270,6 +270,7 @@ class NaviPlugin:
         self._staged_dwa_command = None
         self._dwa_last_published = None
         self._dwa_publication = None
+        self._dwa_veto_detail = None
         self._wire_diagnostic = None
         self._wire_dwa_origin = None
         self._output_epoch = 0
@@ -1972,7 +1973,9 @@ class NaviPlugin:
         """Express current and retained measurements at the new prediction origin."""
         guard = check.motion_guard
         current = policy_mod.dwa_grid_pose(sources, geometry, now_ms, odom)
-        old = policy_mod.dwa_registration(guard.pose, current, guard.checked_ms, now_ms, geometry, twists)
+        reference = policy_mod.dwa_pose_reference(sources, odom)
+        old = policy_mod.dwa_registration(guard.pose, current, guard.checked_ms, now_ms, geometry, twists,
+                                          reference=reference)
 
         def registration(stamp, capture=None, *, grid_pose=None):
             pose = grid_pose or policy_mod.dwa_grid_pose(sources, geometry, stamp, odom, capture=capture)
@@ -1983,7 +1986,8 @@ class NaviPlugin:
                     if saved is not None and (pose is None or (saved.frame == pose.frame
                             and abs(stamp - saved.stamp_ms) < abs(stamp - pose.stamp_ms))):
                         pose = saved
-            return policy_mod.dwa_registration(pose, current, stamp, now_ms, geometry, twists)
+            return policy_mod.dwa_registration(pose, current, stamp, now_ms, geometry, twists,
+                                               reference=reference)
 
         view = registration(depth_ms, depth.get("obstacle_capture_pose"))
         # Reprojection must read changed pixels even when an upstream source
@@ -2015,6 +2019,9 @@ class NaviPlugin:
                      local_path.target_in_grid(geometry, anchor.x, -anchor.y))
             goal, goal_error = tuple(anchor_tf.points(point)), anchor_tf.error(math.hypot(*point))
         measured_target = None
+        if guard.measured_target is not None:
+            point, error = guard.measured_target
+            measured_target = tuple(old.points(point)), error + old.error(math.hypot(*point))
         track = self._state.tracker.track
         if guard.association is None and track is not None and track.generation == guard.generation:
             measured_target = policy_mod.dwa_measured_target(
@@ -2064,7 +2071,8 @@ class NaviPlugin:
         return match_observation(association, objects, depth, ego_motion=delta, elapsed_s=elapsed,
                                  target=check.target, config=config, original_receipt=original_receipt)
 
-    def _recheck_dwa_motion(self, check, values, max_age, now_ms, snapshot, *, renew, diagnostics):
+    def _recheck_dwa_motion(self, check, values, max_age, now_ms, snapshot, *, renew, diagnostics,
+                            allow_target_coast=False):
         """Reuse the selected physical proof within its window or rebuild a complete stop."""
         config, state = self._config, self._state
         scan, guard = state.active_scan, check.motion_guard
@@ -2106,7 +2114,7 @@ class NaviPlugin:
         command = tuple(values[i] for i in (0, 1, 5))
         previous = self._wire_twist if self._wire_twist is not None else check.previous_twist
         revision = _motion_inputs(objects, depth, odom)
-        sources = policy_mod.dwa_scene_sources(scan, now_ms)
+        sources = policy_mod.dwa_scene_sources(scan, now_ms, odom)
         memory_revision = sources.revision
         target_revision = policy_mod.dwa_target_revision(state)
         track = state.tracker.track
@@ -2146,8 +2154,23 @@ class NaviPlugin:
         if guard.association is not None or (front_required and not check.front_required):
             match = self._dwa_target_match(check, objects, depth, odom, objects_ms, geometry, front_required)
             if match is None:
-                return reject("target_missing")
-            live_point = match.point[0], -match.point[1]
+                anchor = state.goal_anchor
+                coasting = (allow_target_coast and guard.association is not None
+                            and anchor is not None and anchor.generation == guard.generation
+                            and track is not None and track.generation == guard.generation
+                            and (not front_required or check.front_required)
+                            and not any(target_objects(objects, check.target, config)))
+                if not coasting:
+                    return reject("target_missing")
+                # A missing detector frame cannot extend the existing command,
+                # but it need not insert a zero before the planner's legal
+                # frozen-goal coast. Keep identity and its old physical deadline;
+                # fresh depth/feedback still rebuild the full response below.
+                deadline = min(deadline, guard.deadline_ms)
+                if now_ms >= deadline:
+                    return reject("publish_expired")
+            else:
+                live_point = match.point[0], -match.point[1]
         elif (front_required and revision[2] != check.input_revision[2] and isinstance(objects, dict)
               and any(target_objects(objects, check.target, config))):
             # This memory-only decision cannot associate newly visible people.
@@ -2200,14 +2223,15 @@ class NaviPlugin:
         return obs_ms, deadline, True, newer
 
     def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False,
-                         snapshot=None, diagnostics=None, renew=True):
+                         snapshot=None, diagnostics=None, renew=True, allow_target_coast=False):
         """Try the short motion against current depth and feedback without retiming either."""
         config = self._config
         if check.motion_guard is not None:
             if snapshot is None:
                 snapshot = self._observation_snapshot(with_capture_timing=True)
             return self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
-                                            renew=renew, diagnostics=diagnostics if diagnostics is not None else {})
+                                            renew=renew, diagnostics=diagnostics if diagnostics is not None else {},
+                                            allow_target_coast=allow_target_coast)
         distance_ms = check.target_ms or check.checked_ms
         target_deadline = distance_ms + min(max_age, config.max_obs_age_ms)
         if not distance_ms <= now_ms < target_deadline:
@@ -2502,6 +2526,11 @@ class NaviPlugin:
                                 else "postcheck_veto")
         if changed:
             values = [0.] * ACTION_DIM
+            if publication_veto == "postcheck_veto":
+                selected_values = self._dwa_values(origin)
+                detail = ("deadband_changed" if policy_mod.apply_deadband(
+                    selected_values, self._deadband_for(selected_values)) != selected_values else "values_changed")
+                self._note_dwa_veto_detail(origin, "postselection", detail)
             self._veto_dwa(origin, publication_veto)
             decision.values = values
             self._last_decision.values = values
@@ -2712,11 +2741,17 @@ class NaviPlugin:
         return staged[1] if staged is not None and staged[0] == message["seq"] else None
 
     def _dwa_publish_rejection(self, message, origin, now_ms):
+        self._dwa_veto_detail = None
         track = self._state.tracker.track
         if (origin.epoch != self._output_epoch or origin.state_id != id(self._state)
                 or origin.target != self._state.target or origin.action_id != self._acp_action_id
                 or origin.generation != (track.generation if track else None)
-                or (origin.acceptance.target_observed and (track is None or not track.observed))
+                # The planner can consume a miss before its replacement result
+                # is ready. An already sent command keeps its original window
+                # and still passes the target/physical recheck below; a first
+                # send cannot borrow that continuation privilege.
+                or (origin.acceptance.target_observed and (track is None or not track.observed)
+                    and not self._continuing_dwa_output(origin))
                 or self._output_blocked or self._paused or not self._running
                 or (self._scheduled_command is not None and self._scheduled_command.stop_reason is not None)):
             return "superseded"
@@ -2729,9 +2764,12 @@ class NaviPlugin:
         if not message["stamp_ms"] <= now_ms < expires_ms:
             return "publish_expired"
         values = message["values"]
-        if (values != self._dwa_values(origin) or origin.constraints != self._dwa_constraints()
-                or policy_mod.apply_deadband(values, self._deadband_for(values)) != values):
-            return "postcheck_veto"
+        if values != self._dwa_values(origin):
+            return self._note_dwa_veto_detail(origin, "publish_contract", "values_changed")
+        if origin.constraints != self._dwa_constraints():
+            return self._note_dwa_veto_detail(origin, "publish_contract", "constraints_changed")
+        if policy_mod.apply_deadband(values, self._deadband_for(values)) != values:
+            return self._note_dwa_veto_detail(origin, "publish_contract", "deadband_changed")
         config = self._config
         vx, vy, wz = origin.acceptance.command
         (floor_x, cap_x), (floor_y, cap_y) = policy_mod._local_velocity_limits(
@@ -2742,12 +2780,18 @@ class NaviPlugin:
         if vx < 0 or any(value and not floor <= abs(value) <= cap
                          for value, floor, cap in ((vx, floor_x, cap_x), (vy, floor_y, cap_y),
                                                    (wz, floor_wz, cap_wz))):
-            return "postcheck_veto"
+            return self._note_dwa_veto_detail(origin, "publish_contract", "policy_axis_bounds")
         limits = self._descriptor.get("limits") or {}
         lower, upper = limits.get("lower"), limits.get("upper")
         if lower and upper and any(not lo <= value <= hi for value, lo, hi in zip(values, lower, upper)):
-            return "postcheck_veto"
+            return self._note_dwa_veto_detail(origin, "publish_contract", "descriptor_bounds")
         return None
+
+    def _note_dwa_veto_detail(self, origin, stage, detail):
+        # One bounded diagnostic slot, bound to the actual decision. It cannot
+        # change eligibility or attach an old command's failure to a new one.
+        self._dwa_veto_detail = origin.diagnostic, stage, detail
+        return "postcheck_veto"
 
     def _remember_decision(self, message, epoch, action_id, veto=None):
         if self._config.local_controller == "dwa":
@@ -2765,6 +2809,11 @@ class NaviPlugin:
     def _dwa_event(self, identity, event, reason=None, *, packet=None):
         publication = dict(decision_id=identity.decision_id, epoch=identity.epoch, state_id=identity.state_id,
                            target=identity.target, action_id=identity.action_id, event=event, reason=reason)
+        detail = self._dwa_veto_detail
+        if reason == "postcheck_veto" and detail is not None and all(
+                getattr(detail[0], key) == getattr(identity, key)
+                for key in ("decision_id", "epoch", "state_id", "target", "action_id")):
+            publication.update(veto_stage=detail[1], veto_detail=detail[2])
         previous = self._dwa_publication
         if (event == "veto" and previous is not None and previous["event"] in ("veto", "stopped")
                 and all(previous[key] == value for key, value in publication.items() if key != "event")):
@@ -2773,6 +2822,9 @@ class NaviPlugin:
         current = id(self._state) == identity.state_id and trace.get("decision_id") == identity.decision_id
         if event == "veto" and current:
             trace.update(fallback_reason="publication_veto", veto_reason=reason)
+            for key in ("veto_stage", "veto_detail"):
+                if key in publication:
+                    trace[key] = publication[key]
         if packet is not None:
             wire = dict(wire_seq=packet["seq"], wire_values=list(packet["values"]))
             publication.update(wire)
@@ -2785,17 +2837,18 @@ class NaviPlugin:
         """A newer observation must be checked before the command reaches the wire."""
         check = origin.forward_check
         if check is None:
-            return "postcheck_veto", None
+            return self._note_dwa_veto_detail(origin, "physical_recheck", "missing_forward_check"), None
         snapshot = self._observation_snapshot(with_capture_timing=True)
         max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
         if not (type(max_age) in (int, float) and 0 < max_age < math.inf):
             max_age = self._config.max_obs_age_ms
         diagnostics = {}
         if check.motion_guard is None:
-            return "postcheck_veto", None
+            return self._note_dwa_veto_detail(origin, "physical_recheck", "missing_motion_guard"), None
         for _ in range(2):
             checked = self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
-                                               renew=False, diagnostics=diagnostics)
+                                               renew=False, diagnostics=diagnostics,
+                                               allow_target_coast=self._continuing_dwa_output(origin))
             now_ms = int(time.time() * 1000)
             if checked is not None and not checked[0] <= now_ms < checked[1]:
                 return "publish_expired", None
@@ -2811,6 +2864,11 @@ class NaviPlugin:
                 return None, checked
             check = newer
         return "stale_observation", None
+
+    def _continuing_dwa_output(self, origin):
+        return bool(origin is not None and self._wire_moving and self._wire_dwa_origin is not None
+                    and self._wire_dwa_origin.identity == origin.identity
+                    and self._dwa_last_published == origin.identity)
 
     def _veto_dwa(self, origin, reason):
         self._dwa_event(origin.diagnostic, "veto", reason)
@@ -3047,7 +3105,8 @@ class NaviPlugin:
                 max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
                 checked = self._recheck_forward(work.forward_check, work.message["values"],
                                                 max_age, now_ms, allow_same_depth=True,
-                                                diagnostics=recheck_diagnostics, renew=may_renew)
+                                                diagnostics=recheck_diagnostics, renew=may_renew,
+                                                allow_target_coast=work.sent and self._continuing_dwa_output(work.dwa_origin))
                 now_ms = int(time.time() * 1000)
                 remaining_ms = min(work.expires_ms - now_ms,
                                    round((work.expires_at - time.monotonic()) * 1000))

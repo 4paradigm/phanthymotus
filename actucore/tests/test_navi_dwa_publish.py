@@ -115,6 +115,45 @@ def test_changed_or_expired_candidate_cannot_reach_the_wire(monkeypatch, body, c
     assert card._state.dwa_totals.get("published_packets", 0) == 0
 
 
+@pytest.mark.parametrize("change,stage,detail", [
+    ("missing_check", "physical_recheck", "missing_forward_check"),
+    ("missing_guard", "physical_recheck", "missing_motion_guard"),
+    ("values", "publish_contract", "values_changed"),
+    ("constraints", "publish_contract", "constraints_changed"),
+    ("deadband", "publish_contract", "deadband_changed"),
+    ("axis", "publish_contract", "policy_axis_bounds"),
+    ("descriptor", "publish_contract", "descriptor_bounds"),
+])
+def test_postcheck_veto_reports_which_publication_contract_failed(monkeypatch, change, stage, detail):
+    card, packets, _, _, message = selected_card(monkeypatch, body=True)
+    origin = card._staged_dwa_command[1]
+    if change == "missing_check":
+        origin = replace(origin, forward_check=None)
+    elif change == "missing_guard":
+        origin = replace(origin, forward_check=replace(origin.forward_check, motion_guard=None))
+    elif change == "values":
+        message["values"][0] *= .5
+    elif change in ("constraints", "axis"):
+        card._config.vx_max = .01
+    elif change == "deadband":
+        card._descriptor["limits"] = {"min_magnitude": [.3, 0., 0., 0., 0., 0.]}
+    else:
+        card._descriptor["limits"] = {"lower": [-1.] * 6, "upper": [.01, 1., 1., 1., 1., 1.]}
+    if change in ("deadband", "axis", "descriptor"):
+        # Exercise the wire contract independently of the snapshot-identity
+        # gate. The real sampled twist still violates this explicit limit.
+        origin = replace(origin, constraints=card._dwa_constraints())
+    card._publish_command(message, dwa_origin=origin)
+    packet, = packets
+    assert packet["values"] == [0.] * 6
+    publication = card._info()["dwa"]["publication"]
+    assert publication["reason"] == "postcheck_veto"
+    assert publication["veto_stage"] == stage and publication["veto_detail"] == detail
+    assert card._state.dwa_trace["veto_stage"] == stage
+    assert card._state.dwa_trace["veto_detail"] == detail
+    assert card._state.dwa_totals["stop_reasons"]["postcheck_veto"] == 1
+
+
 def test_planning_expiry_clears_acceptance_but_retains_real_attempts(monkeypatch):
     config, state, depth, odom = observation_case()
     card, packets = card_for_case(monkeypatch, config, state, depth, odom)
@@ -232,6 +271,8 @@ def test_card_postselection_limits_cannot_modify_a_real_candidate(monkeypatch, c
     assert packets[-1]["values"] == [0.] * 6
     assert not state.dwa_selected
     assert state.dwa_trace["veto_reason"] == "postcheck_veto"
+    assert state.dwa_trace["veto_detail"] == (
+        "deadband_changed" if change == "deadband" else "constraints_changed")
 
 
 @pytest.mark.parametrize("body,event", [(False, event) for event in

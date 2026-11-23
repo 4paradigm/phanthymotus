@@ -1830,7 +1830,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
             needs_guard = any(state.commanded) or state.active_scan.active
             previous_scan = state.active_scan
             if source == "command" and previous_scan.active and not previous_scan.command_only:
-                hold = previous_scan.hold_for_replan("主动观察：运动反馈暂不可用，停车后重规划")
+                hold = (previous_scan._hold_for_feedback_gap if config.local_controller == "dwa"
+                        else previous_scan.hold_for_replan)("主动观察：运动反馈暂不可用，停车后重规划")
                 return Decision(_twist(0, 0, 0), AVOIDING, hold.reason)
             previous_scan.invalidate()
             state.active_scan = ActiveScan(obstacles=previous_scan.obstacles,
@@ -1859,6 +1860,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
         scan.odom_linear_tolerance_mps = config.scan_odom_linear_tolerance_mps
         scan.max_feedback_gap_ms = config.max_feedback_gap_ms
         obstacle_pose = _obstacle_reference(odom, depth)
+        if obstacle_pose is None and config.local_controller == "dwa" and scan.pose_registration is not None:
+            received = (odom or {}).get("received_ms")
+            if type(received) is int:
+                registered = dwa_body_pose(scan, received, odom)
+                if registered is not None and registered.stamp_ms == received:
+                    obstacle_pose = registered
         scan.project_history(obstacle_pose)
         scan.historical_free = scan.obstacles.project_free(obstacle_pose)
         if scan.obstacles.has_occupied and scan.historical_hits is None:
@@ -2270,6 +2277,34 @@ def _progress_world_pose(progress, pose, scan, odom):
     return pose
 
 
+def _register_progress_views(progress, pose, basis, source, odom, max_gap, bridged):
+    """Carry finite angular coverage through a measured coordinate handoff."""
+    before = progress.pose
+    if (not progress.viewed or progress.view_frame == basis.frame or before is None
+            or progress.interrupted or pose.stamp_ms <= before.stamp_ms
+            or (source is not None and progress.source is not None and source <= progress.source)):
+        return
+    reference = None
+    if pose.frame == progress.view_frame and before.frame == pose.frame:
+        if bridged or pose.stamp_ms - before.stamp_ms <= max_gap:
+            # The same measured scan pivot is now registered in world axes.
+            reference = pose
+    elif before.frame == progress.view_frame:
+        # Direct velocity integration may acquire its first absolute fix.
+        # Relate both headings at the same stamp using only covered feedback.
+        odom = odom or {}
+        motion = planar_feedback(odom)
+        if motion is not None and odom.get("received_ms") == pose.stamp_ms:
+            history = odom.get("velocity_history") or ((pose.stamp_ms, source, motion),)
+            reference = _extend_progress_pose(progress, before, pose.stamp_ms, history, max_gap)
+            if reference.stamp_ms != pose.stamp_ms:
+                reference = None
+    if reference is not None:
+        offset = reference.yaw - basis.yaw
+        progress.viewed[:] = [math.remainder(seen + offset, math.tau) for seen in progress.viewed]
+        progress.view_frame = basis.frame
+
+
 def _new_recovery_view(progress, scan, depth, max_age, heading):
     if (not scan.views or scan.command_only or not depth or depth.get("capture_invalid")
             or not scan.matches_route_view(depth)):
@@ -2296,8 +2331,15 @@ def _new_recovery_view(progress, scan, depth, max_age, heading):
 
 def _direct_return_progress(progress, state, decision, pose, moved, obstacle_pose):
     track, anchor = state.tracker.track, state.goal_anchor
-    if (decision.status != APPROACHING or state.checked_prefix or state.view_detour is not None
-            or state.executing_leg is not None or track is None or not track.observed
+    direct = (decision.status == APPROACHING and not state.checked_prefix
+              and state.view_detour is None and state.executing_leg is None)
+    proposal = state.dwa_proposal
+    checked_dwa = (decision.status == AVOIDING and state.dwa_selected and state.checked_prefix
+                   and isinstance(proposal, DwaProposal) and proposal.guard is state.dwa_motion_guard
+                   and proposal.guard.check.accepted and any(proposal.command[:2])
+                   and decision.values is not None and not any(decision.values[2:5])
+                   and tuple(decision.values[i] for i in (0, 1, 5)) == proposal.command)
+    if (not (direct or checked_dwa) or track is None or not track.observed
             or track.generation != progress.goal_generation
             or (anchor is not None and (anchor.target_missing or anchor.generation != track.generation))):
         progress.approach_fix = None
@@ -2359,6 +2401,8 @@ def _account_dwa_progress(decision, state, config, odom, depth, route, dt):
     before = progress.pose
     if pose is not None:
         basis = _progress_world_pose(progress, pose, state.active_scan, odom)
+        _register_progress_views(progress, pose, basis, source, odom,
+                                 config.max_feedback_gap_ms, bridged)
         relative = basis.frame in (("scan", state.active_scan.motion_frame),
                                    ("measured_velocity", True), ("measured_velocity", False))
         passage = progress.relative_passage if relative else progress.world_passage
@@ -2397,6 +2441,18 @@ def _account_dwa_progress(decision, state, config, odom, depth, route, dt):
         if advanced:
             progress.view_frame = basis.frame
             progress.viewed[:] = [-basis.yaw]
+        if (decision.status == SEARCHING and measured and decision.values is not None
+                and not any(decision.values[:2]) and basis.frame == progress.view_frame):
+            # Normal target search does not evaluate an ActiveScan route. A
+            # fresh measured turn into a new sector is nevertheless useful
+            # progress, bounded by the existing search sweep and deadline.
+            turn = math.remainder(pose.yaw - before.yaw, math.tau)
+            heading = -basis.yaw
+            if (turn * decision.values[5] > 0. and not any(
+                    abs(math.remainder(heading - seen, math.tau)) <= ANGLE / 2
+                    for seen in progress.viewed)):
+                progress.viewed.append(heading)
+                advanced = True
         if pose.frame == ("scan", state.active_scan.motion_frame) and basis.frame == progress.view_frame:
             # After an unregistered scan reset the new zero heading cannot
             # identify an unseen sector in the old frame.
@@ -2810,6 +2866,7 @@ class DwaSceneSources:
     near: NearProjection
     motion_frame: object
     pose_origin: PlanarPose | None
+    pose_registration: tuple[PlanarPose, PlanarPose] | None
     poses: tuple
     max_feedback_gap_ms: int
     receipt_only: bool
@@ -2824,7 +2881,11 @@ def _cell_revision(cells):
     return local_path.array_revision(cells)
 
 
-def dwa_scene_sources(scan, now_ms):
+def dwa_scene_sources(scan, now_ms, odom=None):
+    if odom is not None and scan.pose_registration is None:
+        # The command timer can receive the first absolute fix between policy
+        # ticks. Retain its measured pairing before freezing the scene revision.
+        scan.pose_registration = dwa_pose_reference(scan, odom)
     near = scan.near_projection
     frame, origin, pose = scan.motion_frame, scan.pose_origin, scan.pose
     poses = tuple(scan.poses)
@@ -2836,10 +2897,11 @@ def dwa_scene_sources(scan, now_ms):
     history = scan.historical_layers
     view_keys = tuple((v[0], v[1], local_path.array_revision(v[3]),
                        local_path.array_revision(v[4] if len(v) > 4 else v[2]), v[5:]) for v in views)
+    reference = scan.pose_registration
     revision = (frame, origin, poses, gap, pose, stamp, current, receipt, near.stamp_ms, near.origin,
                 _cell_revision(near.squares if near.squares is not None else near.hits),
-                tuple((p, _cell_revision(cells)) for p, cells in history), view_keys)
-    return DwaSceneSources(views, history, near, frame, origin, poses, gap, receipt, stamp, current, revision)
+                tuple((p, _cell_revision(cells)) for p, cells in history), reference, view_keys)
+    return DwaSceneSources(views, history, near, frame, origin, reference, poses, gap, receipt, stamp, current, revision)
 
 
 def dwa_memory_revision(scan, now_ms=None):
@@ -2884,8 +2946,44 @@ def _advance_dwa_pose(pose, stamp, odom, max_gap):
     return pose
 
 
-def dwa_grid_pose(scan, geometry, stamp, odom, *, capture=None):
-    """Locate the grid origin and retain the time actually covered by feedback."""
+def dwa_pose_reference(scan, odom):
+    """Pair an absolute fix with the same continuous measured relative pivot."""
+    previous = scan.pose_registration
+    if previous is not None:
+        # This is one rigid frame relation. A later world-frame reset cannot
+        # re-label the relative history, and a repeated fix cannot rewrite it.
+        return previous
+    odom = odom or {}
+    anchor = odom.get("obstacle_pose") or odom.get("motion_pose")
+    if not scan.receipt_only or scan.pose_origin is not None or not scan.poses or anchor is None:
+        return previous
+    coords = relative_pose_at(scan.poses, anchor.stamp_ms)
+    frame = ("navi_relative", scan.motion_frame)
+    if coords is not None:
+        relative = PlanarPose(anchor.stamp_ms, frame, coords[0], -coords[1], -coords[2])
+    elif anchor.stamp_ms > scan.poses[-1][0]:
+        stamp, (f, r, yaw), _ = scan.poses[-1]
+        relative = _advance_dwa_pose(PlanarPose(stamp, frame, f, -r, -yaw), anchor.stamp_ms,
+                                     odom, scan.max_feedback_gap_ms)
+        if relative.stamp_ms != anchor.stamp_ms:
+            return previous
+    else:
+        return previous
+    return relative, anchor
+
+
+def _registered_dwa_pose(pose, reference):
+    if pose is None or reference is None or pose.frame != reference[0].frame:
+        return pose
+    relative, absolute = reference
+    f, left, yaw = pose.relative_to(relative)
+    c, s = math.cos(absolute.yaw), math.sin(absolute.yaw)
+    return PlanarPose(pose.stamp_ms, absolute.frame, absolute.x + c * f - s * left,
+                      absolute.y + s * f + c * left, absolute.yaw + yaw)
+
+
+def dwa_body_pose(scan, stamp, odom, *, capture=None):
+    """Locate the measured body pivot without applying the camera-front offset."""
     odom = odom or {}
     pose = capture or odom.get("obstacle_pose") or odom.get("motion_pose")
     motion_pose = odom.get("motion_pose")
@@ -2904,12 +3002,21 @@ def dwa_grid_pose(scan, geometry, stamp, odom, *, capture=None):
             pose = PlanarPose(covered, origin.frame, f, -r, origin.yaw - coords[2])
     if pose is None:
         return None
+    pose = _registered_dwa_pose(pose, dwa_pose_reference(scan, odom))
     if pose.stamp_ms < stamp:
         pose = _advance_dwa_pose(pose, stamp, odom, scan.max_feedback_gap_ms)
-    return ActiveScan._footprint_origin(pose, geometry)
+    return pose
 
 
-def dwa_registration(source, current, source_ms, now_ms, geometry, velocities):
+def dwa_grid_pose(scan, geometry, stamp, odom, *, capture=None):
+    """Locate the grid origin and retain the time actually covered by feedback."""
+    pose = dwa_body_pose(scan, stamp, odom, capture=capture)
+    return ActiveScan._footprint_origin(pose, geometry) if pose is not None else None
+
+
+def dwa_registration(source, current, source_ms, now_ms, geometry, velocities, *, reference=None):
+    source = _registered_dwa_pose(source, reference)
+    current = _registered_dwa_pose(current, reference)
     f = left = yaw = 0.
     source_gap, current_gap = abs(now_ms - source_ms) / 1000, 0.
     if source is not None and current is not None:
@@ -2947,8 +3054,11 @@ def _rolling_origin(sources, view, geometry):
     return capture_ms, ActiveScan._footprint_origin(capture, geometry) if capture is not None else None
 
 
-def _retire_confirmed(layer, origin, clear, occupied):
+def _retire_confirmed(layer, origin, clear, occupied, reference=None):
     stamp, before, squares = layer
+    original = before
+    before = _registered_dwa_pose(before, reference)
+    origin = _registered_dwa_pose(origin, reference)
     if before is None or origin is None or before.frame != origin.frame:
         return layer
     forward, left, yaw = before.relative_to(origin)
@@ -2963,12 +3073,13 @@ def _retire_confirmed(layer, origin, clear, occupied):
         return None
     centers = squares.centers[~retire]
     centers.setflags(write=False)
-    return stamp, before, local_path.ObstacleSquares(centers, squares.yaw, squares.alignment_error)
+    return stamp, original, local_path.ObstacleSquares(centers, squares.yaw, squares.alignment_error)
 
 
 def _rolling_layers(scan, sources, geometry):
     keys = sources.revision[-1]
-    axes = (sources.motion_frame, sources.pose_origin, sources.receipt_only, geometry.front, geometry.rear)
+    axes = (sources.motion_frame, sources.pose_origin, sources.receipt_only, geometry.front, geometry.rear,
+            sources.pose_registration)
     cache = scan._physical_views
     layers, start = [], 0
     if cache is not None and cache[0] == axes and keys:
@@ -2988,7 +3099,8 @@ def _rolling_layers(scan, sources, geometry):
         clear = view[4] if len(view) > 4 else view[2]
         if layers and clear.any():
             layers = [remaining for layer in layers
-                      if (remaining := _retire_confirmed(layer, origin, clear, view[3])) is not None]
+                      if (remaining := _retire_confirmed(layer, origin, clear, view[3],
+                                                         sources.pose_registration)) is not None]
         cells = local_path.occupied_squares(view[3])
         if cells is not None and len(cells.centers):
             cells.centers.setflags(write=False)
@@ -3062,12 +3174,13 @@ def _dwa_motion_inputs(depth, config, state, geometry, target, motion):
     if state.dwa_projection is not None and raw is None:
         return None, "stale_observation"
 
-    sources = dwa_scene_sources(scan, now_ms)
+    sources = dwa_scene_sources(scan, now_ms, odom)
     current = dwa_grid_pose(sources, geometry, now_ms, odom)
+    reference = dwa_pose_reference(sources, odom)
 
     def registration(stamp, capture=None, *, grid_pose=None):
         pose = grid_pose or dwa_grid_pose(sources, geometry, stamp, odom, capture=capture)
-        return dwa_registration(pose, current, stamp, now_ms, geometry, velocities)
+        return dwa_registration(pose, current, stamp, now_ms, geometry, velocities, reference=reference)
 
     try:
         observed, remembered = dwa_obstacles(scan, sources, geometry, registration)
@@ -3194,7 +3307,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         origin = origin or dwa_grid_pose(scan, geometry, stamp, state.dwa_odom)
         try:
             view = dwa_registration(origin, inputs.pose, stamp, inputs.checked_ms,
-                                    geometry, (inputs.measured, inputs.previous))
+                                    geometry, (inputs.measured, inputs.previous),
+                                    reference=dwa_pose_reference(scan, state.dwa_odom))
         except DwaFrameMismatch:
             return unavailable("geometry_mismatch")
 
