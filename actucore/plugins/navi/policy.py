@@ -4117,7 +4117,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                     if prefix is not None:
                         return prefix
                 if (camera_routes and approach and may_scan and geometry is not None and feedback is not None
-                        and max(abs(feedback[1]), abs(state.commanded[1])) <= STILL_LINEAR
+                        and abs(feedback[1]) <= config.scan_odom_linear_tolerance_mps
+                        and abs(state.commanded[1]) <= STILL_LINEAR
                         and not scan.active and not scan.result_frame and scan.views and scan.matches_route_view(depth)):
                     room = min(ahead - stationary_line, target_distance - config.stop_distance_m)
                     prefix = _checked_forward_prefix(scan, geometry, config, state, odom, feedback,

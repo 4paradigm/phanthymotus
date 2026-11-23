@@ -945,3 +945,30 @@ def test_tick_checks_search_when_target_lost_before_first_send(monkeypatch, body
         assert "停稳" in card._last_decision.reason
     else:
         assert packet["values"][5] != 0
+
+
+@pytest.mark.parametrize("update", ["confirmed", "duplicate", "unrelated", "obstacle",
+                                    "stale_depth", "stale_feedback", "missing_feedback"])
+def test_slow_plan_refreshes_only_with_new_original_target_and_clear_sweep(monkeypatch, update):
+    card, _, clock, snapshot, message = selected_card(monkeypatch, live_target=True)
+    check = card._staged_dwa_command[1].forward_check
+    objects = snapshot[0][0]
+    card._config.max_obs_age_ms = 250
+    advance_snapshot(snapshot, clock, 1270, obstacle=update == "obstacle")
+    _, depth, odom, _ = snapshot[0]
+    payload = dict(objects, timestamp=1.27) if update != "duplicate" else objects
+    if update == "unrelated":
+        payload = absent_target_payload("unrelated", 1270)
+    if update == "stale_depth":
+        depth = dict(depth, capture_ms=1270-card._config.depth_age_limit_ms)
+    if update == "stale_feedback":
+        odom = dict(odom, stamp_ms=1270-card._config.max_feedback_gap_ms)
+    if update == "missing_feedback":
+        odom = None
+    snapshot[0] = payload, depth, odom, 1270
+    result = card._recheck_forward(check, message["values"], 800, 1270)
+    if update == "confirmed":
+        assert result and result[2] and result[1] > 1270
+        assert result[3].target_ms == 1270
+    else:
+        assert result is None or not result[2]

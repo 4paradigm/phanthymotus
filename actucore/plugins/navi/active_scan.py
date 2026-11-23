@@ -1267,6 +1267,14 @@ class ActiveScan:
             if not clear and vx:
                 vx = 0.
                 clear = check_motion((0., 0., yaw))
+            if not clear and not self.route_segment:
+                for scale in (.5, .25):
+                    slower = yaw * scale
+                    if abs(slower) < min_yaw_rate:
+                        break
+                    if check_motion((0., 0., slower)):
+                        yaw, yaw_rate, clear = slower, abs(slower), True
+                        break
         elif directional:
             near = self.near_squares
             occupied = self.grid(include_near=near is None)[1] | self.views[-1][3]

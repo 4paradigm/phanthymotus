@@ -228,8 +228,17 @@ def _route_segments(route):
         length = math.hypot(dx, dy)
         if length < 1e-8:
             continue
+        tangent = dx / length, dy / length
+        if segments and tangent == segments[-1].tangent:
+            # A straight run of grid cells is one projection segment. Retain
+            # the input waypoints for topology, visibility and publication.
+            prior = segments.pop()
+            fx, fy = prior.start
+            dx, dy = tx - fx, ty - fy
+            length = math.hypot(dx, dy)
+            walked = prior.walked
         segments.append(_RouteSegment((fx, fy), (dx, dy), length, length * length,
-                                      walked, (dx / length, dy / length)))
+                                      walked, tangent))
         walked += length
     return tuple(segments)
 
@@ -322,6 +331,17 @@ def _commands(previous, measured, preferred, limits, floors, extra, budget):
         pool = [cmd for cmd in product(xs, ys, ws) if legal(cmd) and cmd not in ordered]
         if len(pool) > slots:
             pool = [pool[i] for i in np.linspace(0, len(pool) - 1, slots, dtype=int)]
+        # Substitute only the tail of the unseeded lattice. Adding a route
+        # turn must not reshuffle the entire spread of lateral velocities.
+        entry = dict.fromkeys((vx, 0., yaw) for _, _, yaw in routes[:2] if abs(yaw) >= .1
+                              for vx in (0., low) if legal((vx, 0., yaw)))
+        missing_entry = [cmd for cmd in entry if cmd not in ordered and cmd not in pool]
+        if missing_entry:
+            for index in reversed(range(len(pool))):
+                if pool[index] not in entry:
+                    pool[index] = missing_entry.pop(0)
+                    if not missing_entry:
+                        break
         sampled.extend(pool)
     missed = [name for name, cmd in seeds if legal(cmd) and tuple(cmd) not in sampled]
     return sampled, missed
@@ -386,7 +406,12 @@ def score_candidate(command, trace, check, reference, previous, *, half_width, l
     heading_error = abs(math.remainder(end_pose[2] - desired_heading, math.tau))
     initial_error = abs(math.remainder(poses[0][2] - desired_heading, math.tau))
     turns_toward_route = command[0] == command[1] == 0. and heading_error < initial_error - 1e-10
-    if progress < .025 and not turns_toward_route:
+    # A creeping entry arc may gain heading before gaining half a grid cell.
+    # It still has to stay on the route and pass the complete braking sweep.
+    entering_turn = (command[0] > 0. and command[2] != 0. and progress > 0.
+                     and math.dist(start_body[:2], end_body[:2]) <= local_path.RESOLUTION
+                     and initial_error - heading_error >= .05)
+    if progress < .025 and not (turns_toward_route or entering_turn):
         return None, progress, "insufficient_progress"
     errors = [_project_to_route(p[:2], reference, segments)[1] for p in poses[:trace.moving_count:4]]
     # A front camera traces an arc while the chassis turns toward the route.
@@ -496,14 +521,28 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                             supported_region, target, stop_distance, acceleration, braking, rotation_center,
                             terminal_boundary, motion_frame, measured_target)
     outcomes = budget.for_context(context)
-    distinct, missing = (_commands(previous, measured, preferred, limits, floors, candidate_commands,
-                                   max_candidates) if slots else ((), []))
-    cached = (cmd for cmd in outcomes if _legal_command(cmd, limits, floors))
-    commands = dict.fromkeys((*distinct, *cached))
-    diag["uncovered_families"] = missing
-    if not commands:
-        diag["reason"] = "sample_budget_exhausted" if slots == 0 else "no_legal_commands"
-        return None
+    straight = (x_speed, 0., 0.)
+    continuing = previous == straight
+    straight_reference = (candidate_budget is not None and target is not None and target[0] > 0.
+                          and abs(math.atan2(target[1], target[0])) <= .1
+                          and all(f >= 0. and abs(r) <= (max(1e-8, min(local_path.RESOLUTION / 2, .1 * f))
+                                                         if continuing else 1e-8)
+                                  for f, r in references[0]))
+
+    def commands():
+        # The legal previous twist is normally the first seed. Build the rest
+        # only if its full current-view check or the straight preference fails.
+        first = (straight_reference and continuing and slots == MAX_SEARCH_CANDIDATES
+                 and _legal_command(previous, limits, floors))
+        if first:
+            yield previous
+        distinct, missing = (_commands(previous, measured, preferred, limits, floors, candidate_commands,
+                                       max_candidates) if slots else ((), []))
+        diag["uncovered_families"] = missing
+        cached = (cmd for cmd in outcomes if _legal_command(cmd, limits, floors))
+        for cmd in dict.fromkeys((*distinct, *cached)):
+            if not first or cmd != previous:
+                yield cmd
 
     def reject(reason):
         rejected[reason] = rejected.get(reason, 0) + 1
@@ -533,7 +572,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     bounded = candidate_budget is not None
     entries = []
     straight_check = None
-    for ordinal, cmd in enumerate(commands):
+    for ordinal, cmd in enumerate(commands()):
         if cmd in outcomes:
             prediction, check = outcomes[cmd]
             diag["cached_candidates"] += 1
@@ -572,11 +611,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         # Start or continue a capped straight command on a straight reference when the
         # entire braking sweep has zero proximity cost. Reuse the physical
         # result in ordinary ranking if it is close to an obstacle.
-        if (ordinal == 0 and bounded and target is not None and cmd == (x_speed, 0., 0.)
-                and (previous == cmd or (not any(previous) and x_speed == nominal))
-                and scores and scores[0][2] == 0 and target[0] > 0.
-                and abs(math.atan2(target[1], target[0])) <= .1
-                and all(f >= 0. and abs(r) < 1e-8 for f, r in references[0])):
+        if (ordinal == 0 and straight_reference and cmd == straight and scores and scores[0][2] == 0
+                and (continuing or (not any(previous) and x_speed == nominal))):
             checked = admissible(cmd)
             if checked is None:
                 continue
@@ -590,6 +626,10 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                               check.min_clearance_m, prediction, check, components, index)
         lower = min(((score.total, index, ordinal) for score, _, index in scores), default=(math.inf, 0, ordinal))
         entries.append((lower, ordinal, cmd, scores, rejection))
+
+    if not diag["considered_candidates"]:
+        diag["reason"] = "sample_budget_exhausted" if slots == 0 else "no_legal_commands"
+        return None
 
     # Collision cost is nonnegative. With the original tie order included,
     # no remaining lower bound can beat an already physically admitted winner.

@@ -74,11 +74,20 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
     best_target_cost = (target_cost[rows, cols].min()
                         if target_cost is not None and target_cells is not None else None)
 
+    if target_cells is not None:
+        top = target_cost[rows, cols] == best_target_cost if best_target_cost is not None else slice(None)
+        nearest_row = int(rows[top].min())
+        row, col = start
+        if (nearest_row > row and (1, 0) in steps and target_cells[nearest_row, col]
+                and (best_target_cost is None or target_cost[nearest_row, col] == best_target_cost)):
+            lane = np.s_[row+1:nearest_row+1, col]
+            # Every eligible best goal requires at least this much forward travel.
+            # A traversable axial path with zero added cost attains that lower bound.
+            if allowed[lane].all() and (cell_cost is None or not cell_cost[lane].any()):
+                return [(r, col) for r in range(row, nearest_row+1)]
+
     if best_target_cost is not None:
-        # Search toward the best rank first. The distance to its bounding box
-        # is a lower bound even when occupied cells force a detour. If none
-        # of that rank is reachable the search still exhausts the component.
-        top = target_cost[rows, cols] == best_target_cost
+        # Distance to the bounding box of the best-ranked goals is a lower bound.
         rr, cc = np.ogrid[:allowed.shape[0], :allowed.shape[1]]
         dr = np.maximum(0, np.maximum(rows[top].min() - rr, rr - rows[top].max()))
         dc = np.maximum(0, np.maximum(cols[top].min() - cc, cc - cols[top].max()))
@@ -761,7 +770,7 @@ def rectangle_clearance(poses, squares, front, rear, width, *, padding=0., cell_
     """
     if not len(poses) or squares is None or not squares.centers.size:
         return math.inf, None
-    padding += squares.alignment_error
+    padding = np.broadcast_to(padding, (len(poses),)) + squares.alignment_error
     f, r, yaw = np.asarray(poses).T
     length, shift = (front + rear) / 2, (front - rear) / 2
     f, r = f + shift * np.cos(yaw), r + shift * np.sin(yaw)
@@ -778,7 +787,7 @@ def rectangle_clearance(poses, squares, front, rear, width, *, padding=0., cell_
         dx, dy = ox - x[0], oy - y[0]
         u = np.maximum(abs(c[0]*dx + s[0]*dy) - length, 0.)
         v = np.maximum(abs(-s[0]*dx + c[0]*dy) - width, 0.)
-        cutoff = max(float(np.hypot(u, v).min()), padding) + 1e-10
+        cutoff = max(float(np.hypot(u, v).min()) - padding[0], 0.) + padding.max() + 1e-10
         ex, ey = length*abs(c) + width*abs(s) + half, length*abs(s) + width*abs(c) + half
         gap_x = np.maximum(0., np.maximum((x-ex).min() - ox, ox - (x+ex).max()))
         gap_y = np.maximum(0., np.maximum((y-ey).min() - oy, oy - (y+ey).max()))
@@ -810,7 +819,7 @@ def rectangle_clearance(poses, squares, front, rear, width, *, padding=0., cell_
                 py = np.maximum(abs(dy - i * length * b - j * width * a) - half, 0.)
                 distance2 = np.minimum(distance2, np.minimum(du*du + dv*dv, px*px + py*py))
             distance = np.sqrt(np.where(overlap, 0., distance2))
-        nearest = distance.min(axis=1) - padding
+        nearest = distance.min(axis=1) - padding[start:end]
         hits = np.flatnonzero(nearest <= 1e-10)
         if hits.size:
             return 0., start + int(hits[0])
@@ -869,7 +878,9 @@ class PreparedObstacleLayers:
         c, s = np.cos(delta), np.sin(delta)
         length, half = (front + rear) / 2, RESOLUTION / 2
         ids = self.layer_index
-        cell_pad = (padding + self.error)[ids]
+        padding = np.broadcast_to(padding, (len(f),))
+        cell_error = self.error[ids]
+        cell_pad = padding.max() + cell_error
         # Include the actual broadcast operands so cache reuse preserves
         # even a numerical kernel's last-bit differences across trace shapes.
         key = (pack("!7d", f[0], r[0], yaw[0], front, rear, width, half),
@@ -880,7 +891,7 @@ class PreparedObstacleLayers:
                 self.ox-x[0, ids], self.oy-y[0, ids], c[0, ids], s[0, ids],
                 s[0, ids] == 0., length, half, width)
             initial = self._first_pose = (key, unpadded)
-        first = initial[1] - cell_pad
+        first = initial[1] - (padding[0] + cell_error)
         hits = np.flatnonzero(first <= _CONTACT_EPS)
         if hits.size:
             return 0., 0, self.layers[ids[hits[0]]][1]
@@ -917,7 +928,7 @@ class PreparedObstacleLayers:
             if aligned.any():
                 witness[aligned] = np.hypot(np.maximum(abs(dx[aligned]) - length - half, 0.),
                                              np.maximum(abs(dy[aligned]) - width - half, 0.))
-            upper = witness - cell_pad[keep]
+            upper = witness - (padding[-1] + cell_error[keep])
             upper_bound = min(minimum, float(upper.min()) + _CONTACT_EPS)
             keep = keep[gap[keep] <= max(upper_bound, _CONTACT_EPS) + cell_pad[keep] + _CONTACT_EPS]
         first_hit, hit_layer = len(f), len(self.layers)
@@ -939,7 +950,7 @@ class PreparedObstacleLayers:
             time_index = row + 1
             distance = self.point_distances(dx[row, col], dy[row, col],
                                             c[time_index, source], s[time_index, source],
-                                            axis_aligned_tail[source], length, half, width) - cell_pad[cell[col]]
+                                            axis_aligned_tail[source], length, half, width) - (padding[time_index] + cell_error[cell[col]])
             minimum = min(minimum, float(distance.min()))
             hits = np.flatnonzero(distance <= _CONTACT_EPS)
             if hits.size:

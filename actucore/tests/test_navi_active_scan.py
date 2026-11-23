@@ -1683,3 +1683,22 @@ def test_retained_receipt_view_requires_a_registered_exposure(capture_time):
         assert (origin.x, origin.y) == pytest.approx((.20, 0.))
     else:
         assert not look.registered_history
+
+
+@pytest.mark.parametrize("floor, expected", [(.1, -.125), (.2, 0.)])
+def test_observation_tries_a_checked_smaller_yaw_before_giving_up(monkeypatch, floor, expected):
+    look, geometry, _, _ = _setup(monkeypatch)
+    _tick(look, geometry, 1000)
+    assert look.begin((1.,))
+    _tick(look, geometry, 1050)
+    look.update(_depth(1150), _odom(1150), geometry)
+    tried = []
+
+    def check(command):
+        tried.append(command)
+        return command == (0., 0., -.125)
+
+    result = look.command(geometry, .33, .25, 600, min_yaw_rate=floor, check_motion=check)
+    assert result.yaw == expected
+    assert tried[0] == (0., 0., -.25)
+    assert all(abs(command[2]) >= floor for command in tried)

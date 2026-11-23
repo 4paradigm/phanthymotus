@@ -639,3 +639,15 @@ def test_dwa_route_can_end_at_a_waypoint_with_limited_turning_space():
     end = finite.points[-1]
     assert np.hypot(2.55 - end[0], .55 - end[1]) <= .55 + 1e-9
     assert legacy is None or legacy.points[-1] != end
+
+
+@pytest.mark.parametrize("ranked", [True, False])
+def test_clear_straight_goal_uses_its_grid_path_without_expanding_neighbors(monkeypatch, ranked):
+    allowed = np.ones((20, 9), dtype=bool)
+    goals = np.zeros_like(allowed)
+    goals[14, 2:7] = True
+    ranks = np.abs(np.arange(9) - 4) + np.zeros_like(allowed) if ranked else None
+    monkeypatch.setattr(replay.heapq, "heappop", lambda _: pytest.fail("expanded a proven shortest path"))
+    path = replay.shortest_path(allowed, (2, 4), (14, 4), target_cells=goals, target_cost=ranks,
+                                cell_cost=np.zeros_like(allowed, dtype=float))
+    assert path == [(r, 4) for r in range(2, 15)]

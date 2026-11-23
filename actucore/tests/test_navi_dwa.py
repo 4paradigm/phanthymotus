@@ -646,3 +646,57 @@ def test_guidance_penalizes_driving_parallel_to_an_offset_lane():
         return score.heading
 
     assert heading(.10) > heading(0.)
+
+
+def test_slow_entry_arc_can_gain_heading_before_half_a_cell_of_progress():
+    cmd = (.015, 0., .30)
+    trace = dwa._predict(cmd, cmd, horizon=.8, dt=.05, acceleration=(1., 1., 1.),
+                         braking=(1., 1., 1.), stop=True)
+    def score(side):
+        return dwa.score_candidate(cmd, trace, None, ((0., 0.), (.4, side * .4)), cmd,
+                                   half_width=.26, limits=((0., .15), (0., 0.), (-1., 1.)),
+                                   progress_scale=.2, target=None)
+    good, progress, _ = score(-1)
+    assert 0 < progress < local_path.RESOLUTION / 2 and good is not None
+    assert score(1)[0] is None
+
+
+@pytest.mark.parametrize("offset,obstacles,fast", [
+    (.018, (), True), (.12, (), False), (.018, ((.35, .30),), False)])
+def test_only_clear_subcell_reference_jitter_keeps_checked_straight_speed(offset, obstacles, fast):
+    diag = {}
+    choice = _run(((0., 0.), (.30, offset), (.6, offset)), grid=_grid(obstacles=obstacles),
+                  measured=(.15, 0., 0.), previous=(.15, 0., 0.), x_limit=(0., .15),
+                  diagnostics=diag, candidate_budget=dwa.CandidateBudget(64))
+    if fast:
+        assert choice.command == (.15, 0., 0.)
+        assert diag["considered_candidates"] == 1
+    else:
+        assert diag["considered_candidates"] > 1
+
+
+def test_bent_reference_seeds_its_standing_turn_and_slow_entry_arc():
+    previous = (.15, 0., 0.)
+    preferred = ((.13, .12, .31),)
+    limits = ((0., .15), (-.4, .4), (-1., 1.))
+    sampled, _ = dwa._commands(previous, previous, preferred, limits, (0., 0., .1, .04), (), 24)
+    assert (0., 0., .31) in sampled
+    assert (.15 / 4, 0., .31) in sampled
+
+
+def test_scoring_compacts_straight_grid_steps_but_keeps_turns_and_reversals():
+    route = ((0., 0.), (.05, 0.), (.10, 0.), (.15, 0.), (.15, .05), (.15, 0.))
+    segments = dwa._route_segments(route)
+    assert len(segments) == 3
+    assert [s.tangent for s in segments] == [(1., 0.), (0., 1.), (0., -1.)]
+    progress, error, tangent = dwa._project_to_route((.09, .01), route, segments)
+    assert (progress, error) == pytest.approx((.09, .01))
+    assert tangent == (1., 0.)
+
+
+def test_previous_clear_straight_is_checked_before_building_the_command_lattice(monkeypatch):
+    monkeypatch.setattr(dwa, "_commands", lambda *args: pytest.fail("built unused command lattice"))
+    previous = (.15, 0., 0.)
+    choice = _run(STRAIGHT, previous=previous, measured=previous, x_limit=(0., .15),
+                  candidate_budget=dwa.CandidateBudget(64))
+    assert choice.command == previous and choice.check.accepted and choice.trace.stopped

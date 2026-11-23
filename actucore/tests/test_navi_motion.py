@@ -305,3 +305,19 @@ def test_registered_camera_view_keeps_its_exposure_offset():
     scan.poses.append((1000, scan.pose, 0.))
     inputs, _ = policy._dwa_motion_inputs(dict(control_ms=1000), config, state, current, (2., 0.), ZERO)
     assert tuple(inputs.observed[0].centers[0]) == pytest.approx((-.10, .30))
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_delayed_lateral_reversal_checks_contact_at_its_own_time(packed):
+    trace = predict((.08, .05, 0.), measured=(.002, -.038, -.001),
+                    previous=(.075, .016, -.056), hold=1.85, latency=.193)
+    cell = local_path.ObstacleSquares(np.array([[.18, .272]]), 0., .022)
+    layers = local_path.PreparedObstacleLayers(None, cell) if packed else None
+    result = check(trace, remembered=cell, prepared_layers=layers)
+    assert result.reason == "remembered_obstacle"
+    assert 0. < trace.times[result.first_hit] < .193
+
+
+def test_zero_duration_still_checks_initial_footprint():
+    cell = local_path.ObstacleSquares(np.array([[0., 0.]]), 0.)
+    assert check(predict(ZERO, hold=0.), remembered=cell).first_hit == 0

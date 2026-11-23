@@ -2145,12 +2145,18 @@ class NaviPlugin:
             depth_ms = min(depth_ms, check.depth_ms)
         if feedback_id == prior_feedback_id:
             odom_ms = min(odom_ms, check.feedback_ms)
-        target_ms = check.target_ms or check.checked_ms
+        fresh = depth_id > prior_depth_id or feedback_id > prior_feedback_id
+        target_source = observation_source(objects)
+        refresh_target = (renew and check.renewable and fresh and handoff_deadline_ms is None
+                          and guard.association is not None and check.target_source is not None
+                          and target_source is not None and target_source > check.target_source
+                          and check.target_receipt_ms < objects_ms <= now_ms)
+        # A newer receipt buys time only if the frozen association matches below.
+        target_ms = objects_ms if refresh_target else (check.target_ms or check.checked_ms)
         obs_ms = min(target_ms, depth_ms, odom_ms)
         deadline = int(min(now_ms + self._ttl_ms, target_ms + min(max_age, config.max_obs_age_ms),
                            depth_ms + config.depth_age_limit_ms, odom_ms + min(
                                self._odom_max_age_ms, config.max_feedback_gap_ms), obs_ms + max_age))
-        fresh = depth_id > prior_depth_id or feedback_id > prior_feedback_id
         if not (renew and check.renewable and fresh):
             deadline = min(deadline, guard.deadline_ms)
         if not max(target_ms, depth_ms, odom_ms) <= now_ms < deadline:
@@ -2162,7 +2168,6 @@ class NaviPlugin:
         memory_revision = sources.revision
         target_revision = policy_mod.dwa_target_revision(state)
         track = state.tracker.track
-        target_source = observation_source(objects)
         if (guard.association is not None and check.target_source is None
                 and not check.target_receipt_ms <= objects_ms <= now_ms):
             return reject("target_missing")
@@ -2175,7 +2180,7 @@ class NaviPlugin:
             # The live tracker can consume an intervening source without
             # changing identity. Its ordering floor also applies at first send.
             return reject("target_missing")
-        if (check.input_revision == revision and check.memory_revision == memory_revision
+        if (not refresh_target and check.input_revision == revision and check.memory_revision == memory_revision
                 and check.matches_target_receipt(objects_ms) and check.target_revision == target_revision
                 and deadline <= guard.deadline_ms and guard.measured == measured
                 and previous in (guard.previous, command)):
@@ -2201,6 +2206,8 @@ class NaviPlugin:
         if guard.association is not None or (front_required and not check.front_required):
             match = self._dwa_target_match(check, objects, depth, odom, objects_ms, geometry, front_required)
             if match is None:
+                if refresh_target:
+                    return reject("target_missing")
                 target_pending = True
             else:
                 live_point = match.point[0], -match.point[1]
@@ -2284,7 +2291,8 @@ class NaviPlugin:
                               pose=current, goal=goal, goal_error=goal_error, measured=measured,
                               previous=previous, observed=occupied, remembered=remembered,
                               measured_target=front_constraint, trace=prediction, check=result)
-        newer = replace(check, geometry=geometry, motion_guard=newer_guard, frame_id=depth["frame_id"],
+        newer = replace(check, target_ms=objects_ms if refresh_target else check.target_ms,
+                        geometry=geometry, motion_guard=newer_guard, frame_id=depth["frame_id"],
                         source_id=source, feedback_source=feedback, feedback_ms=odom_ms, depth_ms=depth_ms,
                         input_revision=revision, target_revision=target_revision, memory_revision=memory_revision,
                         target_source=target_source if live_point is not None else check.target_source,

@@ -111,6 +111,7 @@ class MotionTrace:
     camera_offset: tuple[float, float]
     mode: Mode
     straight_axis: int | None
+    interval_errors: tuple[tuple[float, float], ...]
 
     @property
     def duration(self):
@@ -197,6 +198,7 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
         offset = (mount[0, 3], -mount[1, 3]) if mount is not None else (0., 0.)
 
     times, velocities, poses = [0.], [tuple(measured)], [(*center, 0.)]
+    interval_errors = []
     early = tuple(measured)
     uncertain = latency_s > 0. and tuple(previous) != tuple(command)
     position_error = half_travel = half_turn = body_travel = 0.
@@ -264,14 +266,16 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
                 if same_target and early == before:
                     early = end
                     delay_position += travel * min(2., delay_yaw)
-                    continue
-                early, early_area = response(early, early_target, step, early_stable_area)
-                # Each component difference keeps its sign across the step.
-                # Its absolute integral bounds that of any intermediate delay.
-                velocity_error = abs(early_area[0]-area[0]) + abs(early_area[1]-area[1])
-                delay_travel += velocity_error
-                delay_yaw += abs(early_area[2]-area[2])
-                delay_position += velocity_error + travel * min(2., delay_yaw)
+                else:
+                    early, early_area = response(early, early_target, step, early_stable_area)
+                    # Each component difference keeps its sign across the step.
+                    # Its absolute integral bounds that of any intermediate delay.
+                    velocity_error = abs(early_area[0]-area[0]) + abs(early_area[1]-area[1])
+                    delay_travel += velocity_error
+                    delay_yaw += abs(early_area[2]-area[2])
+                    delay_position += velocity_error + travel * min(2., delay_yaw)
+            interval_errors.append((position_error + delay_position + half_speed_step,
+                                    delay_yaw + angular_gap))
 
     integrate(previous, command, latency_s)
     integrate(command, command, hold_s - latency_s)
@@ -294,7 +298,7 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
                      and (all(v[axis] >= 0. for v in inputs) or all(v[axis] <= 0. for v in inputs))), None)
     return MotionTrace(body, camera, tuple(times), tuple(velocities), moving_count, stopped,
                        position_error, half_travel, half_turn, delay_position, delay_yaw,
-                       body_travel, delay_travel, offset, mode, straight)
+                       body_travel, delay_travel, offset, mode, straight, tuple(interval_errors))
 
 
 def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
@@ -318,6 +322,11 @@ def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
     linear_error = trace.position_error + trace.half_travel + trace.delay_position_error
     angular_error = trace.half_turn + trace.delay_yaw_error
     padding = linear_error + radius * min(2., angular_error)
+    # Each endpoint covers its half of both adjacent intervals. Use the
+    # end-of-interval error to bound every delivery time within that interval.
+    intervals = np.asarray([linear + radius * min(2., angular)
+                            for linear, angular in trace.interval_errors])
+    sweep_padding = np.maximum(np.r_[0., intervals], np.r_[intervals, 0.])
     f, r, yaw = poses.T
     c, s = np.cos(yaw), np.sin(yaw)
     length, shift = (front+rear)/2, (front-rear)/2
@@ -330,14 +339,14 @@ def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
               (float(support(1., 0.)), float(support(0., 1.))))
     if prepared_layers is not None:
         clearance, first_hit, reason = prepared_layers.clearance(
-            poses, f, r, yaw, front, rear, width, padding)
+            poses, f, r, yaw, front, rear, width, sweep_padding)
     else:
         clearance, first_hit, reason = math.inf, None, None
         for evidence, collision in ((occupied, "footprint_collision"), (remembered, "remembered_obstacle")):
             # Several registered views can have different grid axes and alignment errors.
             for obstacles in evidence if isinstance(evidence, tuple) else (evidence,):
                 distance, hit = local_path.rectangle_clearance(
-                    poses, local_path.occupied_squares(obstacles), front, rear, width, padding=padding)
+                    poses, local_path.occupied_squares(obstacles), front, rear, width, padding=sweep_padding)
                 clearance = min(clearance, distance)
                 if hit is not None and (first_hit is None or hit < first_hit):
                     reason, first_hit = collision, hit
