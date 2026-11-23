@@ -10,7 +10,7 @@ import numpy as np
 from .camera_geometry import camera_transform
 from .pointcloud_slam_alignment import align_pose
 from .pointcloud_slam_odom import decode_slam_odom, decode_slam_prediction
-from .pointcloud_slam_transforms import rigid as _rigid
+from .pointcloud_slam_transforms import rigid as _rigid, within_measured_motion_bounds
 from .rgbd_body_mount import CaptureMounts
 
 
@@ -243,8 +243,7 @@ class SlamStream:
             max_interval = 1.5 if visual or pose.external_origin is not None else .5
             if last_origin == origin and (
                     (dt == 0 and distance <= 1e-6 and angle <= 1e-5) or
-                    (0 < dt <= max_interval and distance <= .1 + 1.5*dt and
-                     angle <= math.radians(10) + 2.5*dt)):
+                    (0 < dt <= max_interval and within_measured_motion_bounds(distance, angle, dt))):
                 token = previous.external_continuity
         elif self._suspended_run is not None and visual:
             token = self._resume_suspended_run(origin, pose, vendor)

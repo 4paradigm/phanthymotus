@@ -10,7 +10,7 @@ import uuid
 import numpy as np
 
 from .external_motion_learning import ExternalMotionLearner, se3_exp, se3_log, se3_right_jacobian
-from .pointcloud_slam_transforms import rigid
+from .pointcloud_slam_transforms import rigid, within_measured_motion_bounds
 from .rgbd_fusion import quaternion
 from .rgbd_imu import rotation_from_quaternion
 
@@ -324,6 +324,8 @@ class ExternalOdometry:
         self.base = _State(0, np.eye(4), np.eye(6), np.zeros((6, 12)), ExternalMotionLearner(enabled=learning))
         self.current = self.base
         self._output_stamp = 0
+        self._output_pose = None
+        self._slewing_output = False
         self._batch_changes = None
 
     @contextmanager
@@ -708,19 +710,45 @@ class ExternalOdometry:
                 if stamp > self._output_stamp and stamp >= earliest_stamp
                 and self.checkpoints[stamp].last_update is not None]
 
+    def _publication_pose(self, state):
+        pose = state.transform
+        previous = self.checkpoints.get(self._output_stamp)
+        interval = state.stamp - self._output_stamp
+        if (state.motion_model is None or previous is None or
+                self._output_pose is previous.transform or interval > _MAX_INTERVAL_NS):
+            return pose
+        dt = interval / 1e9
+
+        # A late observation is allowed to revise internal history. Preserve
+        # the interval measured since that revised stamp and release only the
+        # resulting correction to the already published pose gradually.
+        change = _world_pose_offset(self._output_pose, pose)
+        if not self._slewing_output and within_measured_motion_bounds(
+                np.linalg.norm(change[:3]), np.linalg.norm(change[3:]), dt):
+            return pose
+        advanced = self._output_pose @ np.linalg.solve(previous.transform, pose)
+        correction = se3_log(np.linalg.solve(advanced, pose))
+        # Use measurement time so a burst of publications cannot accelerate
+        # correction. Cap each step even after a sparse sampling interval.
+        step = min(.05, .5*dt)
+        size = max(np.linalg.norm(correction[:3]), np.linalg.norm(correction[3:]))
+        return advanced @ se3_exp(correction * (step/size)) if size > step else pose
+
     def output(self, state=None):
         if state is None:
             state = self.current
         if state.last_update is None or state.stamp <= self._output_stamp:
             return None
-        # Replay has already applied the filter's correction policy. Publish
-        # its estimate so the mean cannot depend on publication cadence.
-        pose = state.transform
-        self._output_stamp = state.stamp
+        pose = self._publication_pose(state)
+        self._output_stamp, self._output_pose = state.stamp, pose
+        self._slewing_output = pose is not state.transform
         axes = np.eye(4)
-        axes[:3, :3] = pose[:3, :3]
+        axes[:3, :3] = state.transform[:3, :3]
         frame_rotation = _adjoint(axes)
         covariance = frame_rotation @ state.covariance @ frame_rotation.T
+        if self._slewing_output:
+            unapplied = _world_pose_offset(pose, state.transform)
+            covariance += np.outer(unapplied, unapplied)
         fused = dict(position=pose[:3, 3].tolist(), quaternion=quaternion(pose[:3, :3]),
                      frame_id=self.segment+'_odom', child_frame_id=self.body_frame,
                      covariance=covariance.ravel().tolist())

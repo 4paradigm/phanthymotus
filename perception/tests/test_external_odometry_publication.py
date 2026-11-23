@@ -8,6 +8,7 @@ import pytest
 from plugins.rgbd_external_input import ExternalOdometryInput
 from plugins.pointcloud_slam_odom import decode_slam_odom
 from plugins.rgbd_imu import rotation_from_quaternion
+from test_pointcloud_slam_stream import stream as slam_stream
 from test_rgbd_odometry_status import sessions  # noqa: F401
 
 
@@ -90,3 +91,75 @@ def test_equal_information_fresh_publication_is_independent_of_input_batching(se
     for _, _, state, sample in runs:
         np.testing.assert_allclose(sample.position, state[:3, 3], atol=1e-12)
         np.testing.assert_allclose(rotation_from_quaternion(sample.quaternion), state[:3, :3], atol=1e-12)
+
+
+def test_delayed_visual_corrections_keep_measured_motion_continuous_for_slam(sessions):
+    _, now, _ = sessions
+    stream = ExternalOdometryInput('/fused/state/odom', dict(
+        frame_id='body', external_topic='/external', external_candidates=['/external']), learning=False)
+
+    def pose(x):
+        return dict(position=[x, 0., 0.], quaternion=[0., 0., 0., 1.])
+
+    try:
+        for index in range(6):
+            now[0] = START_NS + index*STEP_NS
+            receive_pose(stream, now[0], pose(.02*index))
+            if index == 0:
+                stream.visual(now[0], 'native', pose(0.))
+            drain(stream)
+        prior = decode_slam_odom(json.loads(stream.publisher.messages[-1]))
+        # Replay several corrections behind the published frontier. Each fits
+        # the filter's per-observation bound while their aggregate exceeds it.
+        for index in range(1, 6):
+            stream.visual(START_NS + index*STEP_NS, 'native', pose(.4 + .02*index))
+        drain(stream)
+        assert decode_slam_odom(json.loads(stream.publisher.messages[-1])).stamp_ns == prior.stamp_ns
+
+        now[0] += 25_000_000
+        receive_pose(stream, now[0], pose(.11))
+        drain(stream)
+        sample = decode_slam_odom(json.loads(stream.publisher.messages[-1]))
+        estimate = stream.fuser.current
+        assert estimate.transform[0, 3] - prior.position[0] > .15
+        assert sample.stamp_ns == now[0]
+        assert sample.segment_id == prior.segment_id
+        assert .01 <= sample.position[0] - prior.position[0] < .06
+        unapplied_x = estimate.transform[0, 3] - sample.position[0]
+        assert sample.covariance[0] == pytest.approx(estimate.covariance[0, 0] + unapplied_x**2)
+
+        gateway = slam_stream()
+        for message in stream.publisher.messages[:-1]:
+            gateway.odom(json.loads(message), now=prior.stamp_ns/1e9)
+        token = gateway.continuity_token
+        gateway.odom(json.loads(stream.publisher.messages[-1]), now=sample.stamp_ns/1e9)
+        assert token is not None and gateway.continuity_token == token
+
+        for index in range(1, 13):
+            now[0] += STEP_NS
+            receive_pose(stream, now[0], pose(.11 + .02*index))
+            drain(stream)
+        settled = decode_slam_odom(json.loads(stream.publisher.messages[-1]))
+        np.testing.assert_allclose(settled.position, stream.fuser.current.transform[:3, 3], atol=1e-9)
+    finally:
+        stream.close()
+
+
+def test_fresh_external_pose_jump_remains_visible_to_slam(sessions):
+    _, now, _ = sessions
+    stream = ExternalOdometryInput('/fused/state/odom', dict(
+        frame_id='body', external_topic='/external', external_candidates=['/external']), learning=False)
+    gateway = slam_stream()
+    try:
+        for offset_ns, x in ((0, 0.), (STEP_NS, .01), (STEP_NS+25_000_000, .4)):
+            now[0] = START_NS + offset_ns
+            receive_pose(stream, now[0], dict(position=[x, 0., 0.], quaternion=[0., 0., 0., 1.]))
+            drain(stream)
+            if stream.publisher.messages:
+                packet = json.loads(stream.publisher.messages[-1])
+                assert packet['pose']['position'][0] == pytest.approx(x)
+                prior_token = gateway.continuity_token
+                gateway.odom(packet, now=now[0]/1e9)
+        assert prior_token is not None and gateway.continuity_token != prior_token
+    finally:
+        stream.close()

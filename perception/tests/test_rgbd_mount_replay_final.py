@@ -82,8 +82,18 @@ def test_async_learning_revisits_eligible_solves_shifted_by_mount_replay(streams
     for stream in (ordered, late):
         stream._receive('/external', NS(data=json.dumps(packet(elapsed, 100.+elapsed))))
         flush(stream)
-    np.testing.assert_allclose(samples(late)[-1].position, samples(ordered)[-1].position, atol=1e-9)
+    np.testing.assert_allclose(late.fuser.current.transform, ordered.fuser.current.transform, atol=1e-9)
     assert samples(late)[-1].stamp_ns == START+round(elapsed*1e9)
+    # Replayed calibration agrees immediately at the capture-time estimate.
+    # A public pose that already departed from this history can converge over
+    # fresh measurements without exposing a single discontinuity to SLAM.
+    for step in range(1, 9):
+        stamp = elapsed + step*.25
+        now[0] = START+round(stamp*1e9)+10_000_000
+        for stream in (ordered, late):
+            stream._receive('/external', NS(data=json.dumps(packet(stamp, 100.+stamp))))
+            flush(stream)
+    np.testing.assert_allclose(samples(late)[-1].position, samples(ordered)[-1].position, atol=1e-9)
 
 
 @pytest.mark.parametrize('existing_owner', [True, False])

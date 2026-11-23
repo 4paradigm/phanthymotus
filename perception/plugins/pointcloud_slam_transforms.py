@@ -1,5 +1,12 @@
 """ROS-free numeric transforms shared by input admission and saved-map viewing."""
+import math
+
 import numpy as np
+
+
+def within_measured_motion_bounds(distance, angle, dt):
+    """Check motion between two dense odometry measurements in SI units."""
+    return distance <= .1 + 1.5*dt and angle <= math.radians(10) + 2.5*dt
 
 
 def rigid(value):
