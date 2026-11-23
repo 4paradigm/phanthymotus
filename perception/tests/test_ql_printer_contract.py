@@ -258,7 +258,7 @@ class VisitorBadgeTest(unittest.TestCase):
         with patch.object(BridgeClient, "request", side_effect=BridgeError("点击查询后 2 秒内未观察到匹配的 POST 请求，请检查页面查询功能及接口匹配配置", "query_request_timeout")):
             result = self.call("print", name="王磊")
         self.assertEqual(result["code"], "query_request_timeout")
-        self.assertEqual(result["error"], "未检测到访客查询请求，请确认已打开正确的访客列表网址；若网址正确，请稍后重试。")
+        self.assertEqual(result["error"], "查询操作超时（2 秒内未检测到访客查询请求），请稍后重试。")
 
     def test_direct_print_reuses_key_after_windows_printed_but_ssh_timed_out(self):
         original = BridgeClient.request

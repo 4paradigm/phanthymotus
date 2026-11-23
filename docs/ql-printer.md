@@ -35,18 +35,27 @@ a Perception restart; after a restart, verify uncertain jobs at the front desk
 before submitting another print.
 
 Browser authentication capture listens before the first navigation, so a
-successful initial query needs no extra reload. Navigation is limited to 5
-seconds, automatic query capture to 3 seconds, and the optional search fallback
-to 2 seconds (button click limit: 1 second). No fixed settling sleeps are used.
+successful initial query needs no extra reload. Navigation waits for document
+markup (`DOMContentLoaded`) with a 5-second ceiling, without waiting on images
+and other load-blocking resources. Requests are observed during navigation;
+there is no separate automatic-query wait. Without a captured request, a visible
+application loading mask gets at most 2 seconds to clear (no mask returns
+immediately), then query buttons are checked immediately. Missing buttons return
+`query_button_missing`; hidden buttons return `query_button_unavailable`.
+A visible button is clicked with a 1-second limit, and only then is a matching
+request awaited for at most 2 seconds. No fixed settling sleeps are used.
 These limits concern page/query capture, not printing or subsequent API calls.
 
-Failures retain their stage-specific code through ACP: `page_load_timeout`,
+Failures retain their stage-specific code through ACP: `page_load_failed`,
+`page_load_timeout`, `page_render_timeout`,
 `page_http_error` (with HTTP status), `login_required` (observed login redirect),
 `query_button_missing`, `query_click_timeout`, `query_request_timeout`,
 `browser_closed`, or `browser_operation_failed`. `query_method_mismatch` is used
 only when a request to the configured endpoint was actually observed with a
 different method. An absent request does not prove login expiry or an endpoint
 mismatch; the returned message describes the missing observation instead.
+An absent query button is not classified as a timeout or proof of a wrong URL.
+Overall tool-call time also includes SSH, Windows scheduling and browser startup.
 
 ## Optional remote startup
 

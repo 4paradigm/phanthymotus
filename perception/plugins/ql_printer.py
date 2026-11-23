@@ -83,9 +83,12 @@ class BridgeError(Exception):
         if code == "query_button_missing":
             # Keep the user-facing message current even during a Windows
             # worker upgrade; older workers return the same stable code.
-            message = "未检测到访客查询功能，请打开正确的访客列表网址"
+            message = "当前页面未找到访客查询按钮，请确认已打开正确的访客列表网址。"
         elif code == "query_request_timeout":
-            message = "未检测到访客查询请求，请确认已打开正确的访客列表网址；若网址正确，请稍后重试。"
+            message = "查询操作超时（2 秒内未检测到访客查询请求），请稍后重试。"
+        elif code == "booking_row_missing" and message == "页面上无法唯一定位预约编号，请前台核对列表":
+            # Older workers used this code for both zero and multiple rows.
+            message = "已查到访客预约，但无法在当前网页列表中确定对应记录，请前台核对列表筛选条件、页码及重复记录。"
         super().__init__(message)
         self.code = code
 

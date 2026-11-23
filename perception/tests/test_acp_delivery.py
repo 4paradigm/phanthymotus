@@ -115,5 +115,5 @@ def test_accepted_print_later_delivers_windows_failure_and_updated_message(tmp_p
     assert completion['action_id'] == accepted['action_id']
     assert completion['status'] == 'failed'
     assert completion['result']['code'] == 'query_button_missing'
-    assert completion['result']['error'] == '未检测到访客查询功能，请打开正确的访客列表网址'
+    assert completion['result']['error'] == '当前页面未找到访客查询按钮，请确认已打开正确的访客列表网址。'
 

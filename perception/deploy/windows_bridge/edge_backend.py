@@ -374,8 +374,11 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
         captured_request = None
         observed_methods = set()
         def observe(request):
+            nonlocal captured_request
             if self.query_marker in request.url:
                 observed_methods.add(request.method)
+                if request.method == "POST":
+                    captured_request = request
         def check_login():
             if "login" in page.url.lower():
                 raise BridgeFailure("login_required", "访客平台已跳转登录页，请在前台 Edge 重新登录")
@@ -386,35 +389,55 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
 
         page.on("request", observe)
         try:
-            navigated = False
             try:
-                with page.expect_request(
-                    lambda request: self.query_marker in request.url and request.method == "POST",
-                    timeout=3000,
-                ) as request_info:
-                    try:
-                        if page.url != self.list_url:
-                            response = page.goto(self.list_url, wait_until="domcontentloaded", timeout=5000)
-                        else:
-                            response = page.reload(wait_until="domcontentloaded", timeout=5000)
-                    except BrowserTimeout as exc:
-                        check_login()
-                        raise BridgeFailure("page_load_timeout", "访客列表页在 5 秒内未完成加载，请检查前台网络和平台") from exc
-                    navigated = True
-                    check_login()
-                    if response is not None and response.status >= 400:
-                        raise BridgeFailure("page_http_error", f"访客列表页返回 HTTP {response.status}")
-                captured_request = request_info.value
-            except BrowserTimeout:
-                if not navigated:
-                    raise
+                # Wait for usable document markup, not slow images or ads.
+                # Five seconds is a ceiling, not a sleep.
+                # Observe automatic queries while loading; never wait out a
+                # separate request timer before inspecting the loaded page.
+                if page.url != self.list_url:
+                    response = page.goto(self.list_url, wait_until="domcontentloaded", timeout=5000)
+                else:
+                    response = page.reload(wait_until="domcontentloaded", timeout=5000)
+            except BrowserTimeout as exc:
+                check_login()
+                raise BridgeFailure("page_load_timeout", "访客网页加载超时（超过 5 秒），请检查网络后重试。") from exc
+            except Exception as exc:
+                if page.is_closed() or self._target_was_closed(exc):
+                    raise browser_error(exc, "加载") from exc
+                raise BridgeFailure("page_load_failed", "无法打开访客网页，请检查网址和网络连接。") from exc
             check_login()
+            if response is not None and response.status >= 400:
+                raise BridgeFailure("page_http_error", f"访客列表页返回 HTTP {response.status}")
             if captured_request is None:
-                button = page.get_by_role("button", name=re.compile("查询|搜索")).first
-                if not button.count() or not button.is_visible():
+                try:
+                    # A visible application loading mask is evidence that the
+                    # form is still rendering. With no mask this returns at
+                    # once, including on an unrelated, fully loaded website.
+                    page.wait_for_function("""() => !Array.from(document.querySelectorAll(
+                        '.el-loading-mask, .ant-spin-spinning, [aria-busy="true"]'
+                    )).some(el => el.getClientRects().length &&
+                        getComputedStyle(el).visibility !== 'hidden')""", timeout=2000)
+                except BrowserTimeout as exc:
+                    check_login()
+                    raise BridgeFailure("page_render_timeout", "访客页面仍在加载（超过 2 秒），请稍后重试。") from exc
+                check_login()
+            if captured_request is None:
+                buttons = page.get_by_role("button", name=re.compile("查询|搜索"))
+                button = None
+                for index in range(buttons.count()):
+                    candidate = buttons.nth(index)
+                    if candidate.is_visible():
+                        button = candidate
+                        break
+                if captured_request is not None:
+                    check_login()
+                    return replay_auth_headers(captured_request.all_headers())
+                if button is None:
                     if observed_methods:
                         raise BridgeFailure("query_method_mismatch", "已观察到匹配查询接口的请求，但请求方法不是 POST，请检查平台接口配置")
-                    raise BridgeFailure("query_button_missing", "未检测到访客查询功能，请打开正确的访客列表网址")
+                    if buttons.count():
+                        raise BridgeFailure("query_button_unavailable", "当前页面的访客查询按钮不可见，请打开访客列表页后重试。")
+                    raise BridgeFailure("query_button_missing", "当前页面未找到访客查询按钮，请确认已打开正确的访客列表网址。")
                 try:
                     with page.expect_request(
                         lambda request: self.query_marker in request.url and request.method == "POST",
@@ -430,7 +453,7 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                     check_login()
                     if observed_methods:
                         raise BridgeFailure("query_method_mismatch", "已观察到匹配查询接口的请求，但请求方法不是 POST，请检查平台接口配置") from exc
-                    raise BridgeFailure("query_request_timeout", "未检测到访客查询请求，请确认已打开正确的访客列表网址；若网址正确，请稍后重试。") from exc
+                    raise BridgeFailure("query_request_timeout", "查询操作超时（2 秒内未检测到访客查询请求），请稍后重试。") from exc
             check_login()
             return replay_auth_headers(captured_request.all_headers())
         except BridgeFailure:
@@ -438,7 +461,12 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
         except Exception as exc:
             raise browser_error(exc, "操作") from exc
         finally:
-            page.remove_listener("request", observe)
+            try:
+                page.remove_listener("request", observe)
+            except Exception:
+                # Closing a browser may invalidate its event emitter too;
+                # cleanup must not replace the observed failure reason.
+                pass
 
     @staticmethod
     def _field(page, labels: tuple[str, ...]):
@@ -585,8 +613,10 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                 continue
             if visit.booking_code in text and candidate.get_by_text(visit.booking_code, exact=True).count():
                 matching.append(candidate)
-        if len(matching) != 1:
-            raise BridgeFailure("booking_row_missing", "页面上无法唯一定位预约编号，请前台核对列表")
+        if not matching:
+            raise BridgeFailure("booking_row_missing", "已查到访客预约，但当前网页列表中未找到对应记录，请核对列表筛选条件和页码后重试。")
+        if len(matching) > 1:
+            raise BridgeFailure("booking_row_ambiguous", "当前网页列表中有多条相同预约编号的记录，无法确定打印哪一条，请前台核对。")
         detail = matching[0].get_by_text("查看", exact=True)
         if detail.count() != 1:
             raise BridgeFailure("detail_action_missing", "对应预约行没有唯一的“查看”操作")
