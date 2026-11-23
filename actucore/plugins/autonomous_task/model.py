@@ -223,7 +223,9 @@ def _crop_regions(images, regions, step):
                 or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]):
             raise ValueError("Expected a normalized [left,top,right,bottom] box")
         jpeg = images[camera]
-        with Image.open(io.BytesIO(jpeg), formats=["JPEG"]) as original:
+        with Image.open(io.BytesIO(jpeg)) as original:
+            if original.format != "JPEG":
+                raise ValueError("Expected a JPEG observation")
             w, h = original.size
             if w*h > 16*1024*1024:
                 raise ValueError("Source JPEG exceeds 16 megapixels")

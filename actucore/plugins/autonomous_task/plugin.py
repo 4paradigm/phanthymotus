@@ -178,7 +178,7 @@ class AutonomousTaskPlugin:
         if self._node:
             if binding != self._binding or interface.descriptor != self._interface.descriptor:
                 raise ValueError("卡片已运行，请先停止再更换接线")
-            return self.dispatch("info", args | {"action": "info"})
+            return self.dispatch("info", {**args, "action": "info"})
         self._node = Node("autonomous_task")
         try:
             self._cameras = CameraInputs(self._node, cameras)

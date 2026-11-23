@@ -506,6 +506,21 @@ def test_invalid_region_is_a_bounded_readonly_observation(monkeypatch, model):
         assert expected in args["crop_error"]
 
 
+def test_native_crop_rejects_non_jpeg_observation(monkeypatch, model):
+    from PIL import Image
+
+    stream = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(stream, format="PNG")
+    request = {"status": "observe", "reason": "inspect",
+               "regions": [{"camera": "head", "bbox": [0, 0, 1, 1]}]}
+    monkeypatch.setattr(model, "_post", lambda body: reply(message(json.dumps(request))))
+
+    name, args = model.decide("inspect", ["left"], {"head": stream.getvalue()}, measured(), [])
+
+    assert name == "observe" and "JPEG" in args["crop_error"]
+    assert not model._pending_crops
+
+
 def test_transient_model_retry_keeps_crop_source_step_and_takes_new_images(monkeypatch, model):
     from PIL import Image
     from plugins.autonomous_task.model import TransientModelError
@@ -538,8 +553,9 @@ def test_transient_model_retry_keeps_crop_source_step_and_takes_new_images(monke
         assert image.format == "PNG" and image.size == (32, 32)
     for index, payload in enumerate(payloads[1:], start=2):
         texts = [p.get("text", "") for p in payload["input"][0]["content"]]
-        detail, = [s for s in texts if s.startswith("HISTORICAL native crop ")]
-        assert json.loads(detail.removeprefix("HISTORICAL native crop "))["source_observation"] == 1
+        prefix = "HISTORICAL native crop "
+        detail, = [s for s in texts if s.startswith(prefix)]
+        assert json.loads(detail[len(prefix):])["source_observation"] == 1
         assert f"CURRENT observation {index}: head RGB" in texts
 
 

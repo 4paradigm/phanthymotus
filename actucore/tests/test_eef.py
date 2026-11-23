@@ -262,7 +262,7 @@ def test_move_to_requires_complete_valid_target_and_fresh_state(wire):
         assert wire.call("move_to", **{k: v for k, v in valid.items() if k != key})["state"] == "error"
     for invalid in ({"arm": "both"}, {"x_m": True}, {"z_m": float("nan")}, {"qw": float("inf")},
                     {"qx": "0.1"}, {"qw": 0.}, {"x_m": .8}, {"y_m": .3}):
-        assert wire.call("move_to", **(valid | invalid))["state"] == "error"
+        assert wire.call("move_to", **{**valid, **invalid})["state"] == "error"
     wire.clock[0] += 2000
     assert wire.call("move_to", **valid)["state"] == "error"
     assert wire.pub.publish.call_count == before
