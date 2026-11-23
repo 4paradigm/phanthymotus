@@ -3474,6 +3474,10 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
 
     diagnostics = {}
     trace["select_calls"] += 1
+    track, anchor = state.tracker.track, state.goal_anchor
+    live_route = (branch in ("route", "reachable_prefix") and track is not None and track.observed
+                  and track.navigation_range_known and (anchor is None or
+                  (not anchor.target_missing and anchor.generation == track.generation)))
     proposed = dwa.select(
         route=route.points, grid=grid, geometry=geometry, footprint=inputs.footprint,
         occupied=inputs.observed, remembered=inputs.remembered, supported_region=local_path.SUPPORTED_REGION,
@@ -3484,6 +3488,7 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         floors=(floor_x, floor_y, config.floor_wz, config.floor_wz_moving),
         target=target, stop_distance=config.stop_distance_m,
         horizon=inputs.prediction_horizon_s, max_candidates=limit, allow_yaw=branch != "visual_probe",
+        straight_handoff_limit=config.vx_max if live_route else None,
         candidate_commands=candidate_commands, validate_candidate=visible if shadow is not None else None,
         diagnostics=diagnostics, alternate_routes=tuple(ref.points for ref in alternates),
         candidate_budget=state.dwa_budget, motion_frame=(scan.motion_frame, inputs.pose), guidance=guidance,

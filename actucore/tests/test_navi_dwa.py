@@ -729,3 +729,21 @@ def test_recheck_targets_a_remembered_cell_only_if_it_blocks_a_checked_candidate
     observed = replace(context, occupied=(side,))
     budget.for_context(observed)[command] = observed.check(command)
     assert policy._blocking_memory_view(scan, observed, budget) is None
+
+
+@pytest.mark.parametrize("case", ["open", "short", "bend", "obstacle", "shadow", "lower_limit"])
+def test_straight_tracking_speed_handoff(case):
+    route = ((0., 0.), (2., 0.))
+    if case == "short":
+        route = ((0., 0.), (.15, 0.))
+    if case == "bend":
+        route += ((2.3, .3),)
+    guard = (lambda cmd, *_: dwa.CandidateCheck(cmd[0] <= .15, "shadow")) if case == "shadow" else None
+    choice = _run(route, previous=(.30, 0., .01), x_limit=(0., .15),
+                  straight_handoff_limit=.25 if case == "lower_limit" else .30,
+                  candidate_budget=dwa.CandidateBudget(64), validate_candidate=guard,
+                  grid=_grid(obstacles=((.6, .15),) if case == "obstacle" else ()))
+    if case == "open":
+        assert choice.command == (.30, 0., 0.)
+    else:
+        assert choice is None or choice.command[0] <= .15

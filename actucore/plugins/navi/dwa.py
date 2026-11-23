@@ -440,7 +440,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            x_limit, y_limit, yaw_limit, floors, target=None, stop_distance=0.,
            horizon=1.2, max_candidates=MAX_SEARCH_CANDIDATES, allow_yaw=True,
            acceleration=_DEFAULT_ACCELERATION, braking=_DEFAULT_BRAKING,
-           candidate_commands: tuple[Twist, ...] = (),
+           candidate_commands: tuple[Twist, ...] = (), straight_handoff_limit=None,
            validate_candidate: Callable[[Twist, tuple[Pose, ...], float], CandidateCheck] | None = None,
            footprint_mode: Literal["body", "camera_approx"] = "body",
            rotation_center: tuple[float, float] | None = None, diagnostics: dict | None = None,
@@ -529,11 +529,20 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                                                          if continuing else 1e-8)
                                   for f, r in references[0]))
 
+    # Only this one straight command may retain the incoming tracking speed.
+    # A close obstacle or a stop beyond the observed reference restores the detour limit.
+    handoff = (previous[0], 0., 0.)
+    try_handoff = (straight_handoff_limit is not None and x_speed < previous[0] <= straight_handoff_limit
+                   and previous[0] >= floors[0] and not previous[1] and straight_reference and slots > 1
+                   and all(f >= 0. and abs(r) <= local_path.RESOLUTION / 2 for f, r in route))
+
     def commands():
         # The legal previous twist is normally the first seed. Build the rest
         # only if its full current-view check or the straight preference fails.
         first = (straight_reference and continuing and slots == MAX_SEARCH_CANDIDATES
                  and _legal_command(previous, limits, floors))
+        if try_handoff:
+            yield handoff
         if first:
             yield previous
         distinct, missing = (_commands(previous, measured, preferred, limits, floors, candidate_commands,
@@ -608,22 +617,25 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         if bounded and not scores:
             reject(rejection)
             continue
-        # Start or continue a capped straight command on a straight reference when the
-        # entire braking sweep has zero proximity cost. Reuse the physical
-        # result in ordinary ranking if it is close to an obstacle.
-        if (ordinal == 0 and straight_reference and cmd == straight and scores and scores[0][2] == 0
-                and (continuing or (not any(previous) and x_speed == nominal))):
+        retaining_speed = try_handoff and cmd == handoff
+        capped_straight = (ordinal == 0 and straight_reference and cmd == straight
+                           and (continuing or (not any(previous) and x_speed == nominal)))
+        if (retaining_speed or capped_straight) and scores and scores[0][2] == 0:
             checked = admissible(cmd)
             if checked is None:
                 continue
-            straight_check = checked
-            if _obstacle_score(checked[1]) == 0.:
-                prediction, check, poses = checked
+            prediction, check, poses = checked
+            if not retaining_speed:
+                straight_check = checked
+            if _obstacle_score(check) == 0. and (not retaining_speed or all(
+                    0. <= f <= route[-1][0] and abs(r) <= local_path.RESOLUTION / 2 for f, r, _ in poses)):
                 components, progress, index = scores[0]
                 diag.update(admissible_candidates=1, reference_scores=sum(scores_by_reference),
                             scores_by_reference=scores_by_reference, reason=None)
                 return Choice(cmd, poses[:prediction.moving_count], components.total, progress,
                               check.min_clearance_m, prediction, check, components, index)
+        if retaining_speed:
+            continue  # Ordinary detour ranking only admits speeds inside its cap.
         lower = min(((score.total, index, ordinal) for score, _, index in scores), default=(math.inf, 0, ordinal))
         entries.append((lower, ordinal, cmd, scores, rejection))
 
