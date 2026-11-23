@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import base64
+import gzip
+import re
 import sys
 import threading
 import unittest
@@ -36,6 +38,9 @@ class VisitorBadgeTest(unittest.TestCase):
         # Exercise the card contract against the existing mock business API;
         # SSH framing itself has dedicated tests below.
         self.card._client = lambda cfg=None: BridgeClient(self.url, TOKEN, 8)
+        client_patch = patch.object(QLPrinterPlugin, "_client", lambda card, cfg=None: BridgeClient(self.url, TOKEN, 8))
+        client_patch.start()
+        self.addCleanup(client_patch.stop)
 
     def tearDown(self):
         if self.server is not None:
@@ -43,9 +48,59 @@ class VisitorBadgeTest(unittest.TestCase):
             self.server.server_close()
 
     def call(self, action, **args):
-        result = self.card.dispatch("QL_printer", dict(args, action=action))
+        done = threading.Event()
+        completion = {}
+        def complete(action_id, status, result):
+            completion.update(action_id=action_id, status=status, result=result)
+            done.set()
+        with patch("plugins.ql_printer.acp.complete", side_effect=complete):
+            result = self.card.dispatch("QL_printer", dict(args, action=action))
+            if result.get("status") == "accepted":
+                self.assertTrue(done.wait(5), "ACP completion did not arrive")
+                self.assertEqual(completion["action_id"], result["action_id"])
+                result = completion["result"]
+                self.assertEqual(completion["status"], "completed" if result["status"] == "printed" else "failed")
         json.dumps(result, ensure_ascii=False)
         return result
+
+    def test_print_returns_before_io_and_freezes_config(self):
+        started, release, done = threading.Event(), threading.Event(), threading.Event()
+        observed = {}
+        def print_job(worker, args):
+            started.set()
+            release.wait(5)
+            observed.update(worker._cfg)
+            return {"status": "printed"}
+        def complete(*args):
+            done.set()
+        with patch.object(QLPrinterPlugin, "_print_action", print_job), patch("plugins.ql_printer.acp.complete", side_effect=complete):
+            try:
+                accepted = self.card.dispatch("print", {"name": "王磊"})
+                self.assertEqual(accepted["status"], "accepted")
+                self.assertTrue(started.wait(2))
+                self.assertFalse(done.is_set())
+                self.assertEqual(self.card.dispatch("print", {"name": "王磊"})["code"], "printer_busy")
+                self.card.dispatch("config", {"printer_name": "Changed"})
+            finally:
+                release.set()
+                self.assertTrue(done.wait(5))
+        self.assertEqual(observed["printer_name"], "Brother")
+        self.assertIsNone(self.card._print_action_id)
+
+    def test_worker_exception_reports_failure_and_releases_printer(self):
+        done = threading.Event()
+        outcomes = []
+        def complete(*args):
+            outcomes.append(args)
+            done.set()
+        with patch.object(QLPrinterPlugin, "_print_action", side_effect=RuntimeError("secret")), patch("plugins.ql_printer.acp.complete", side_effect=complete):
+            accepted = self.card.dispatch("print", {"name": "王磊"})
+            self.assertTrue(done.wait(5))
+        self.assertEqual(outcomes[0][0], accepted["action_id"])
+        self.assertEqual(outcomes[0][1], "failed")
+        self.assertEqual(outcomes[0][2]["code"], "print_internal_error")
+        self.assertNotIn("secret", str(outcomes))
+        self.assertIsNone(self.card._print_action_id)
 
     def find_ticket(self, name="王磊", host=""):
         _, visits = self.card._daily_visits()
@@ -57,6 +112,7 @@ class VisitorBadgeTest(unittest.TestCase):
         definition = self.card.get_tool()
         self.assertEqual(definition["name"], "Visitor_Badge_Printer")
         self.assertEqual(definition["type"], "actuator")
+        self.assertEqual(definition["x-completion"], {"actions": ["print", "find_and_print"], "timeout": 180})
         actions = definition["inputSchema"]["properties"]["action"]["enum"]
         self.assertEqual(set(actions), {"start", "stop", "info", "config", "list", "print", "printers", "initialize", "initialize_status"})
         schema_text = json.dumps(definition["inputSchema"], ensure_ascii=False)
@@ -231,12 +287,15 @@ class VisitorBadgeTest(unittest.TestCase):
             client.request("POST", "/list_visits", body={"visitor_page_url": "https://visitor.test/list"})
         command = run.call_args.args[0]
         script = base64.b64decode(command[-1].rsplit(" ", 1)[-1]).decode("utf-16le")
+        compressed = re.search(r"FromBase64String\('([^']+)'\)", script)
+        if compressed:
+            script = gzip.decompress(base64.b64decode(compressed.group(1))).decode("utf-8")
         self.assertIn("Paradigm Visitor Login", script)
         self.assertIn("login.stop", script)
         self.assertIn("Set-Content", script)
         self.assertIn("Start-Sleep -Milliseconds 250", script)
-        self.assertIn("($i % 20) -eq 0", script)
-        self.assertIn("$currentTask.State -ne 'Running'", script)
+        self.assertIn("($i % 4) -eq 0", script)
+        self.assertIn("$t.State -notin @('Running','Queued')", script)
         self.assertGreaterEqual(script.count("Start-ScheduledTask -TaskName 'Paradigm Visitor Automation'"), 2)
         self.assertNotIn("Stop-ScheduledTask -TaskName 'Paradigm Visitor Login'", script)
 

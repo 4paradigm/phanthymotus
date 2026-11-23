@@ -367,45 +367,78 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
         return self._page
 
     def _ensure_login(self, page):
-        # Use the operator-selected tab URL.  Navigating to a vendor-specific
-        # root here discarded the selection saved by the card and also broke
-        # deployments whose visitor portal uses a different host/path.
-        if page.url != self.list_url:
-            page.goto(self.list_url, wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_timeout(1200)
-        if "login" in page.url.lower():
-            raise BridgeFailure("login_required", "访客平台尚未登录，请在前台 Edge 登录后重新选择网页")
-        # 监听网页自身的查询请求，从中取得应用层认证头。只保存头名称和值在内存中，绝不写日志。
+        from playwright.sync_api import TimeoutError as BrowserTimeout
+
+        # Listen before navigation: the first load may already send the query.
+        # Never retain URLs, query strings or credentials in diagnostic errors.
         captured_request = None
+        observed_methods = set()
+        def observe(request):
+            if self.query_marker in request.url:
+                observed_methods.add(request.method)
+        def check_login():
+            if "login" in page.url.lower():
+                raise BridgeFailure("login_required", "访客平台已跳转登录页，请在前台 Edge 重新登录")
+        def browser_error(exc, stage):
+            if page.is_closed() or self._target_was_closed(exc):
+                return BridgeFailure("browser_closed", "前台访客网页或浏览器已关闭，请重新打开")
+            return BridgeFailure("browser_operation_failed", f"访客网页{stage}失败，请检查前台浏览器")
+
+        page.on("request", observe)
         try:
-            with page.expect_request(
-                lambda request: self.query_marker in request.url and request.method == "POST",
-                timeout=20_000,
-            ) as request_info:
-                page.reload(wait_until="domcontentloaded", timeout=30_000)
-            captured_request = request_info.value
-        except Exception:
-            # 部分页面进入列表后不会自动刷新；尝试点击一次查询按钮以触发真实请求。
-            button = page.get_by_role("button", name=re.compile("查询|搜索")).first
-            if button.count() and button.is_visible():
+            navigated = False
+            try:
+                with page.expect_request(
+                    lambda request: self.query_marker in request.url and request.method == "POST",
+                    timeout=3000,
+                ) as request_info:
+                    try:
+                        if page.url != self.list_url:
+                            response = page.goto(self.list_url, wait_until="domcontentloaded", timeout=5000)
+                        else:
+                            response = page.reload(wait_until="domcontentloaded", timeout=5000)
+                    except BrowserTimeout as exc:
+                        check_login()
+                        raise BridgeFailure("page_load_timeout", "访客列表页在 5 秒内未完成加载，请检查前台网络和平台") from exc
+                    navigated = True
+                    check_login()
+                    if response is not None and response.status >= 400:
+                        raise BridgeFailure("page_http_error", f"访客列表页返回 HTTP {response.status}")
+                captured_request = request_info.value
+            except BrowserTimeout:
+                if not navigated:
+                    raise
+            check_login()
+            if captured_request is None:
+                button = page.get_by_role("button", name=re.compile("查询|搜索")).first
+                if not button.count() or not button.is_visible():
+                    if observed_methods:
+                        raise BridgeFailure("query_method_mismatch", "已观察到匹配查询接口的请求，但请求方法不是 POST，请检查平台接口配置")
+                    raise BridgeFailure("query_button_missing", "页面加载后未观察到查询请求，也未找到可见的查询或搜索按钮，请确认选择了访客列表页")
                 try:
                     with page.expect_request(
                         lambda request: self.query_marker in request.url and request.method == "POST",
-                        timeout=15_000,
+                        timeout=2000,
                     ) as request_info:
-                        button.click()
+                        try:
+                            button.click(timeout=1000)
+                        except BrowserTimeout as exc:
+                            check_login()
+                            raise BridgeFailure("query_click_timeout", "查询按钮在 1 秒内无法点击，可能被遮挡或禁用，请检查前台页面") from exc
                     captured_request = request_info.value
-                except Exception:
-                    captured_request = None
-        page.wait_for_timeout(1200)
-        if "login" in page.url.lower():
-            raise BridgeFailure("login_required", "访客平台登录状态已失效，请重新登录")
-        if captured_request is None:
-            raise BridgeFailure(
-                "auth_capture_failed",
-                "没有捕获到网页自身的访客查询请求，请确认列表页能正常加载并显示数据",
-            )
-        return replay_auth_headers(captured_request.all_headers())
+                except BrowserTimeout as exc:
+                    check_login()
+                    if observed_methods:
+                        raise BridgeFailure("query_method_mismatch", "已观察到匹配查询接口的请求，但请求方法不是 POST，请检查平台接口配置") from exc
+                    raise BridgeFailure("query_request_timeout", "点击查询后 2 秒内未观察到匹配的 POST 请求，请检查页面查询功能及接口匹配配置") from exc
+            check_login()
+            return replay_auth_headers(captured_request.all_headers())
+        except BridgeFailure:
+            raise
+        except Exception as exc:
+            raise browser_error(exc, "操作") from exc
+        finally:
+            page.remove_listener("request", observe)
 
     @staticmethod
     def _field(page, labels: tuple[str, ...]):

@@ -17,6 +17,30 @@ and host, matches exactly one entry from that daily list, and retains the bridge
 ticket/idempotency protocol internally. Ambiguous, admitted and departed visits
 are rejected.
 
+`print` (including the legacy `find_and_print` action) returns `accepted` with an
+`action_id` immediately. This acknowledges submission, not a printed badge.
+The existing ACP callback reports `completed` with `result.status=printed`, or
+`failed` with the original business error. Wait for that result before announcing
+success. The completion timeout is 180 seconds; only one print job per card is
+accepted at a time, and each job keeps the configuration captured at submission.
+Perception must be able to reach Agent Core through its configured
+`AGENT_CORE_URL` for completion delivery. Do not automatically resubmit on a
+callback timeout: the frontdesk job may already have printed.
+
+Browser authentication capture listens before the first navigation, so a
+successful initial query needs no extra reload. Navigation is limited to 5
+seconds, automatic query capture to 3 seconds, and the optional search fallback
+to 2 seconds (button click limit: 1 second). No fixed settling sleeps are used.
+These limits concern page/query capture, not printing or subsequent API calls.
+
+Failures retain their stage-specific code through ACP: `page_load_timeout`,
+`page_http_error` (with HTTP status), `login_required` (observed login redirect),
+`query_button_missing`, `query_click_timeout`, `query_request_timeout`,
+`browser_closed`, or `browser_operation_failed`. `query_method_mismatch` is used
+only when a request to the configured endpoint was actually observed with a
+different method. An absent request does not prove login expiry or an endpoint
+mismatch; the returned message describes the missing observation instead.
+
 ## Optional remote startup
 
 Remote startup is enabled after initialization. Configure the Windows SSH user;

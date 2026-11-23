@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from utils import acp
 from typing import Any
 
 def action_schema(actions, properties):
@@ -385,6 +386,7 @@ class QLPrinterPlugin:
         }
         self._direct_request_ids: dict[tuple[str, str, str, str], str] = {}
         self._deploy_state = {"status": "idle"}
+        self._print_action_id = None
 
     # ── 卡片定义 ──────────────────────────────────────────────────────────
     def get_tool(self) -> dict:
@@ -424,6 +426,10 @@ class QLPrinterPlugin:
             "查询当天未入场访客并打印访客贴。",
             action_schema(actions, properties),
         )
+        definition['x-completion'] = {
+            'actions': ['print', 'find_and_print'], 'timeout': 180,
+        }
+        definition['x-resource'] = 'visitor_badge_printer'
         definition["inputSchema"]["properties"]["printer_name"] = {"type": "string"}
         definition["configSchema"] = {
             "type": "object",
@@ -494,8 +500,8 @@ class QLPrinterPlugin:
             # Keep old saved canvas actions working during rollout; find is no
             # longer advertised and now returns the same safe daily list.
             "find": self._list,
-            "find_and_print": self._find_and_print,
-            "print": self._print_action,
+            "find_and_print": self._submit_print,
+            "print": self._submit_print,
         }
         handler = handlers.get(action)
         if handler is None:
@@ -711,6 +717,43 @@ class QLPrinterPlugin:
             "error": str(payload.get("error") or "打印失败，请前台同事检查打印机"),
             "request_id": request_id,
         }
+
+    def _submit_print(self, args: dict) -> dict:
+        with self._lock:
+            if self._print_action_id:
+                return {"status": "error", "code": "printer_busy",
+                        "error": "已有打印任务执行中，请等待结果，不要重复提交"}
+            action_id = f"visitor-print-{uuid.uuid4().hex}"
+            self._print_action_id = action_id
+            config = dict(self._cfg)
+        # Freeze connection and page selection for this job. Changes in the
+        # settings dialog must never redirect an already accepted print.
+        worker = QLPrinterPlugin(config)
+        arguments = dict(args)
+
+        def run():
+            try:
+                result = worker._print_action(arguments)
+            except BridgeError as exc:
+                result = {"status": "error", "code": exc.code, "error": str(exc)}
+            except ValueError as exc:
+                result = {"status": "error", "code": "bad_args", "error": str(exc)}
+            except Exception:
+                result = {"status": "error", "code": "print_internal_error",
+                          "error": "打印任务异常，请检查前台自动化日志；不要直接重复打印"}
+            finally:
+                with self._lock:
+                    self._print_action_id = None
+            acp.complete(action_id, "completed" if result.get("status") == "printed" else "failed", result)
+
+        try:
+            threading.Thread(target=run, name=action_id, daemon=True).start()
+        except Exception:
+            with self._lock:
+                self._print_action_id = None
+            raise
+        return {"status": "accepted", "action_id": action_id,
+                "message": "打印任务已接收，完成后通过 ACP 返回结果；请勿重复提交"}
 
     def _print_action(self, args: dict) -> dict:
         # Backward-compatible for an older Skill that still submits ticket/request_id.
