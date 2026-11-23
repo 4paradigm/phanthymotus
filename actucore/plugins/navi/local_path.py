@@ -851,11 +851,34 @@ class PreparedObstacleLayers:
         self.counts = [len(square.centers) for square, _ in self.layers]
         ids = self.layer_index = np.repeat(np.arange(len(self.counts)), self.counts)
         sx, sy = np.concatenate([square.centers for square, _ in self.layers]).T
+        self.grid_f, self.grid_r = sx, sy
         self.ox = self.cos_yaws[ids] * sx + self.sin_yaws[ids] * sy
         self.oy = -self.sin_yaws[ids] * sx + self.cos_yaws[ids] * sy
         self.error = np.asarray([square.alignment_error for square, _ in self.layers])
         self.native_shapes = (np.isfinite(self.error).all() and np.isfinite(sx).all() and np.isfinite(sy).all()
                               and all(square.centers.dtype == np.float64 for square, _ in self.layers))
+
+    def axis_clearance(self, f, r, extent_f, extent_r, first_hit):
+        """Prove separation using grid-axis bounds, including each source's cell size and registration."""
+        cell = ((abs(self.cos_yaws) + abs(self.sin_yaws)) * (RESOLUTION / 2) + self.error)[self.layer_index]
+        df = abs(f[first_hit] - self.grid_f) - extent_f[first_hit] - cell
+        dr = abs(r[first_hit] - self.grid_r) - extent_r[first_hit] - cell
+        if np.any((df <= _CONTACT_EPS) & (dr <= _CONTACT_EPS)):
+            return 0.
+        # The initial separation bounds how many cells need a full time series.
+        minimum = np.hypot(df.clip(0.), dr.clip(0.)).min()
+        df = np.maximum((f-extent_f).min()-self.grid_f, self.grid_f-(f+extent_f).max()) - cell
+        dr = np.maximum((r-extent_r).min()-self.grid_r, self.grid_r-(r+extent_r).max()) - cell
+        nearby = np.flatnonzero((df <= minimum) & (dr <= minimum))
+        batch = max(1, _PREPARED_PAIR_BUDGET // len(f))
+        for start in range(0, len(nearby), batch):
+            indices = nearby[start:start+batch]
+            df = abs(f[:, None] - self.grid_f[indices]) - extent_f[:, None] - cell[indices]
+            dr = abs(r[:, None] - self.grid_r[indices]) - extent_r[:, None] - cell[indices]
+            minimum = min(minimum, np.hypot(df.clip(0.), dr.clip(0.)).min())
+            if minimum <= _CONTACT_EPS:
+                break
+        return float(minimum)
 
     def clearance(self, poses, f, r, yaw, front, rear, width, padding):
         if not self.layers:

@@ -633,11 +633,20 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
 
     # Collision cost is nonnegative. With the original tie order included,
     # no remaining lower bound can beat an already physically admitted winner.
+    score_band = local_path.RESOLUTION / progress_scale
+    def ranking_bound(entry):
+        (score, index, ordinal), _, cmd, _, _ = entry
+        if cmd == previous and cmd[0] > 0. and (cmd[1] or cmd[2]):
+            score -= score_band
+        return score, index, ordinal
+
     if bounded:
-        entries.sort(key=lambda entry: entry[0])
+        entries.sort(key=ranking_bound)
     best_key = None
-    for position, (lower, ordinal, cmd, scores, rejection) in enumerate(entries):
-        if bounded and best_key is not None and lower >= best_key:
+    retained = None
+    for position, entry in enumerate(entries):
+        _, ordinal, cmd, scores, rejection = entry
+        if bounded and best_key is not None and ranking_bound(entry) >= best_key:
             diag["bound_skips"] += len(entries) - position
             break
         checked = straight_check if ordinal == 0 and straight_check is not None else admissible(cmd)
@@ -652,10 +661,20 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         for components, progress, index in scores:
             components = replace(components, obstacle=obstacle)
             key = (components.total, index, ordinal)
+            if (cmd == previous and cmd[0] > 0. and (cmd[1] or cmd[2]) and obstacle == 0.
+                    and (retained is None or key[0] < retained.score)):
+                retained = Choice(cmd, poses[:prediction.moving_count], key[0], progress,
+                                  check.min_clearance_m, prediction, check, components, index)
             if best_key is None or key < best_key:
                 best_key = key
                 best = Choice(cmd, poses[:prediction.moving_count], key[0], progress,
                               check.min_clearance_m, prediction, check, components, index)
+    if (retained is not None and best is not None and retained.reference_index == best.reference_index
+            and math.dist(retained.trajectory[-1][:2], best.trajectory[-1][:2])
+                + half_width * abs(retained.trajectory[-1][2] - best.trajectory[-1][2]) <= local_path.RESOLUTION / 2
+            and retained.progress >= best.progress - local_path.RESOLUTION / 2
+            and retained.score <= best.score + score_band):
+        best = retained
     diag["reference_scores"] = sum(scores_by_reference)
     diag["scores_by_reference"] = scores_by_reference
     diag["reason"] = None if best is not None else "no_admissible_candidates"

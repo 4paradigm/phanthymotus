@@ -3288,6 +3288,14 @@ def _dwa_motion_inputs(depth, config, state, geometry, target, motion):
     return inputs, grid
 
 
+def _dwa_context(inputs, geometry, stop_distance, motion_frame):
+    return dwa.MotionContext(
+        inputs.measured, inputs.previous, inputs.prediction_horizon_s,
+        (inputs.deadline_ms - inputs.checked_ms) / 1000, geometry, inputs.footprint,
+        inputs.observed, inputs.remembered, local_path.SUPPORTED_REGION, inputs.goal,
+        stop_distance, frame=(motion_frame, inputs.pose), measured_target=inputs.measured_target)
+
+
 def _check_dwa_turn(depth, config, state, geometry, target, branch, command):
     if target is None or _dwa_unavailable_reason(depth, config, state, recovery=True):
         return False
@@ -3295,11 +3303,7 @@ def _check_dwa_turn(depth, config, state, geometry, target, branch, command):
     inputs, _ = _dwa_motion_inputs(depth, config, state, geometry, target, scan.motion)
     if inputs is None:
         return False
-    context = dwa.MotionContext(
-        inputs.measured, inputs.previous, inputs.prediction_horizon_s,
-        (inputs.deadline_ms - inputs.checked_ms) / 1000, geometry, inputs.footprint,
-        inputs.observed, inputs.remembered, local_path.SUPPORTED_REGION, target,
-        config.stop_distance_m, frame=(scan.motion_frame, inputs.pose), measured_target=inputs.measured_target)
+    context = _dwa_context(inputs, geometry, config.stop_distance_m, scan.motion_frame)
     outcomes = state.dwa_budget.for_context(context) if state.dwa_budget is not None else {}
     if command in outcomes:
         prediction, check = outcomes[command]
@@ -3331,6 +3335,29 @@ def dwa_trace_visible(poses, shadow, view=None):
     if view is not None:
         points = view.source_points(points)
     return local_path.visible_prefix(points, shadow) == len(points)
+
+
+def _blocking_memory_view(scan, context, budget):
+    view = scan.memory_recheck()
+    near = scan.near_projection.squares
+    if view is None or near is None or not context.remembered:
+        return None
+    # Registration preserves the order of the cells in the near projection.
+    point = (view["forward_m"], view["right_m"])
+    match = np.flatnonzero(np.max(np.abs(near.centers - point), axis=1) < 1e-7)
+    if not len(match):
+        return None
+    registered = context.remembered[-1]
+    cell = replace(registered, centers=registered.centers[match[:1]])
+    clear_scene = replace(context, remembered=())
+    one_cell = replace(context, remembered=(cell,))
+    for prediction, check in budget.for_context(context).values():
+        if check is not None and check.reason == "remembered_obstacle":
+            if clear_scene.evaluate(prediction).accepted and one_cell.evaluate(prediction).reason == check.reason:
+                return view
+            # Bound the extra recovery work to one checked trajectory per reference group.
+            break
+    return None
 
 
 def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
@@ -3416,6 +3443,12 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         trace["rejected"][key] = trace["rejected"].get(key, 0) + value
     trace["attempts"].append(dict(branch=branch, geometry_mode=mode, **diagnostics))
     if proposed is None:
+        if (scan.dwa_failures >= 2 and not scan.attempted and "memory_recheck" not in trace
+                and diagnostics["rejected"].get("remembered_obstacle")):
+            context = _dwa_context(inputs, geometry, config.stop_distance_m, scan.motion_frame)
+            view = _blocking_memory_view(scan, context, state.dwa_budget)
+            if view is not None:
+                trace["memory_recheck"] = view
         return unavailable(diagnostics["reason"])
     guard = DwaMotionGuard(**vars(inputs), trace=proposed.trace, check=proposed.check,
                            visibility_required=shadow is not None)
@@ -3741,6 +3774,10 @@ def _dwa_recovery_route(depth, config, state, geometry, ahead, distance, bearing
         if not (scan.active or scan.attempted):
             sides = tuple(side for side in directions
                           if _scan_yaw_rate(config, side) > 0. and _scan_yaw_rate(config, side) >= config.floor_wz)
+            view = state.dwa_trace.get("memory_recheck")
+            if view is not None:
+                preferred = math.copysign(1., view["right_m"])
+                sides = tuple(sorted(sides, key=lambda side: side != preferred))
             if scan.begin(sides):
                 return 0., 0., 0., AVOIDING, "主动观察：连续新观测没有可执行路线，停车后观察"
     return 0., 0., 0., AVOIDING, NO_LOCAL_ROUTE

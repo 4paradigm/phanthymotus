@@ -124,6 +124,11 @@ def test_delivery_delay_stays_inside_hold_window():
         diff = sampled - np.asarray(trace.body_poses)
         assert np.linalg.norm(diff[:, :2], axis=1).max() <= trace.delay_position_error + trace.position_error + .002
         assert abs(diff[:, 2]).max() <= trace.delay_yaw_error + .002
+        span = min(math.pi/2, trace.heading_span + trace.delay_yaw_error)
+        dx, dy = np.asarray(trace.delay_axes).T
+        linear = np.asarray(trace.interval_errors)[:, 0]
+        assert np.all(abs(diff[1:, 0]) <= linear - (1. - math.sin(span)) * dy + .002)
+        assert np.all(abs(diff[1:, 1]) <= linear - (1. - math.sin(span)) * dx + .002)
     assert trace.times[trace.moving_count - 1] == pytest.approx(.8)
     assert trace.stopped
 
@@ -321,3 +326,14 @@ def test_delayed_lateral_reversal_checks_contact_at_its_own_time(packed):
 def test_zero_duration_still_checks_initial_footprint():
     cell = local_path.ObstacleSquares(np.array([[0., 0.]]), 0.)
     assert check(predict(ZERO, hold=0.), remembered=cell).first_hit == 0
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_longitudinal_delivery_error_preserves_side_clearance(packed):
+    trace = predict((.3, 0., 0.), measured=ZERO, previous=ZERO, latency=.25)
+    for right, accepted in ((.26, True), (.24, False)):
+        side = local_path.ObstacleSquares(np.array([[.28, right]]), 0.)
+        layers = local_path.PreparedObstacleLayers(None, side) if packed else None
+        assert check(trace, remembered=side, prepared_layers=layers).accepted is accepted
+    front = local_path.ObstacleSquares(np.array([[.46, 0.]]), 0.)
+    assert not check(trace, occupied=front).accepted

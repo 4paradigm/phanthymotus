@@ -113,6 +113,8 @@ class ObservedObstacles:
     """Remember measured cells in one odometry frame."""
     frame: tuple | None = None
     cells: set = field(default_factory=set)
+    last_vote_source: int | None = None
+    cell_sources: dict = field(default_factory=dict, repr=False)
     last_source: int = 0
     free_cells: np.ndarray | None = field(default=None, repr=False, compare=False)
     free_center: tuple[int, int] = (0, 0)
@@ -170,9 +172,13 @@ class ObservedObstacles:
             window[tuple((cells - origin).T)] = UNKNOWN
 
     def remember_view(self, pose, free, occupied, *, remember_occupied=None, rolling_range=None,
-                      clear=None, physical_support=False):
+                      clear=None, physical_support=False, source_id=None):
         if self.has_cells and self.frame != pose.frame:
             return
+        if physical_support and source_id is not None:
+            if self.last_vote_source == source_id:
+                return
+            self.last_vote_source = source_id
         confirmed = (free if clear is None else clear) & ~occupied
         if self.has_occupied and confirmed.any():
             # A weak measurement can still overlap a cell that projects
@@ -238,6 +244,11 @@ class ObservedObstacles:
         window[tuple((confirmed_hits - origin).T)] = remembered
         retained = selected[self.hit_votes[tuple((selected-origin).T)] == OCCUPANCY_MEMORY_SAMPLES]
         self.cells.update(map(tuple, retained))
+        if physical_support and source_id is not None:
+            for cell in self.cells.intersection(map(tuple, hits)):
+                last = self.cell_sources.get(cell)
+                if last is None or last[0] != source_id:
+                    self.cell_sources[cell] = (source_id, pose, OCCUPANCY_MEMORY_SAMPLES if last is None else last[2] + 1)
         window[tuple((retained - origin).T)] = UNKNOWN
 
     def project_free(self, pose):
@@ -296,6 +307,8 @@ class ObservedObstacles:
         if cleared.any():
             cleared_cells = cells[cleared]
             self.cells.difference_update(map(tuple, cleared_cells))
+            for cell in cleared_cells:
+                self.cell_sources.pop(tuple(cell), None)
             if window is not None:
                 window[tuple((cleared_cells - origin).T)] = FREE
         hits = np.zeros(SHAPE, dtype=bool)
@@ -821,13 +834,33 @@ class ActiveScan:
                     selected = nearby if selected is None else selected | nearby
                 memory.remember_view(capture, free, occupied, remember_occupied=selected,
                                      rolling_range=CAMERA_OCCUPANCY_MEMORY_RANGE_M, clear=clear,
-                                     physical_support=self.keep_physical_views)
+                                     physical_support=self.keep_physical_views,
+                                     source_id=self.source_frame if self.source_frame is not None else self.current_frame)
         origin = self._footprint_origin(pose, geometry)
         hits, squares = memory.project(origin, include_squares=True)
         self.near_free = memory.project_free(origin)
         hits = hits if hits is not None and hits.any() else None
         occupied_origin = origin if hits is not None or squares is not None else None
         self.near_projection = NearProjection(hits, squares, occupied_origin, pose.stamp_ms)
+
+    def memory_recheck(self):
+        """Choose a nearby retained side face that the latest exposure did not confirm."""
+        memory = self.near_obstacles
+        pose = self.near_projection.origin
+        if not memory.cell_sources or pose is None or pose.frame != memory.frame:
+            return None
+        cells = np.asarray(list(memory.cell_sources))
+        rows, cols = memory._local_coordinates(pose, cells)
+        latest = self.source_frame if self.source_frame is not None else self.current_frame
+        for i in np.argsort((rows - START[0])**2 + (cols - START[1])**2):
+            forward, right = ((rows[i] - START[0]) * RESOLUTION, (cols[i] - START[1]) * RESOLUTION)
+            if math.hypot(forward, right) > CAMERA_OCCUPANCY_MEMORY_RANGE_M:
+                break
+            source, capture, count = memory.cell_sources[tuple(cells[i])]
+            if source != latest and forward >= 0. and abs(right) >= RESOLUTION:
+                return dict(forward_m=float(forward), right_m=float(right), source_id=source,
+                            source_pose=(capture.x, capture.y, capture.yaw), supporting_views=count)
+        return None
 
     def project_history(self, pose, *, current=None, capture_pose=None):
         """Keep each occupied layer's grid origin alongside the combined routing mask."""

@@ -1702,3 +1702,24 @@ def test_observation_tries_a_checked_smaller_yaw_before_giving_up(monkeypatch, f
     assert result.yaw == expected
     assert tried[0] == (0., 0., -.25)
     assert all(abs(command[2]) >= floor for command in tried)
+
+
+def test_memory_recheck_uses_distinct_exposures_and_keeps_unseen_side():
+    active = scan.ActiveScan()
+    memory = active.near_obstacles
+    pose = PlanarPose(1000, ("odom",), 0., 0., 0.)
+    occupied = np.isclose(scan.FORWARD, .4) & np.isclose(scan.RIGHT, .3)
+    empty = np.zeros_like(occupied)
+    for source in (1, 1, 1, 2, 3, 3):
+        memory.remember_view(pose, empty, occupied, remember_occupied=occupied,
+                             physical_support=True, source_id=source)
+        assert memory.has_occupied == (source == 3)
+    active.near_projection = scan.NearProjection(origin=pose)
+    active.source_frame = 3
+    assert active.memory_recheck() is None
+    active.source_frame = 4
+    view = active.memory_recheck()
+    assert view["source_id"] == 3 and view["supporting_views"] == 3
+    assert view["right_m"] == pytest.approx(.3)
+    memory.remember_view(pose, occupied, empty, clear=occupied, physical_support=True, source_id=4)
+    assert not memory.has_occupied and active.memory_recheck() is None

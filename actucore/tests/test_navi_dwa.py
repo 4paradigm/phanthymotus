@@ -700,3 +700,32 @@ def test_previous_clear_straight_is_checked_before_building_the_command_lattice(
     choice = _run(STRAIGHT, previous=previous, measured=previous, x_limit=(0., .15),
                   candidate_budget=dwa.CandidateBudget(64))
     assert choice.command == previous and choice.check.accepted and choice.trace.stopped
+
+
+def test_clear_near_equivalent_arc_retains_checked_chassis_command():
+    previous = (.5, 0., -.04)
+    route = ((0., 0.), (.45, -.03), (.75, -.03))
+    options = dict(previous=previous, measured=previous)
+    choice = _run(route, candidate_budget=dwa.CandidateBudget(64), **options)
+    assert choice.command == previous
+    guarded = _run(route, candidate_budget=dwa.CandidateBudget(64), **options,
+                   validate_candidate=lambda cmd, *_: dwa.CandidateCheck(cmd != previous))
+    assert guarded is not None and guarded.command != previous
+
+
+def test_recheck_targets_a_remembered_cell_only_if_it_blocks_a_checked_candidate():
+    from types import SimpleNamespace
+    from plugins.navi.motion import FootprintSpec
+    side = local_path.ObstacleSquares(np.array([[.32, .10]]), 0.)
+    context = dwa.MotionContext((.1, 0., 0.), (.1, 0., 0.), 1., 0., _geometry(),
+                                FootprintSpec(.3, .3, .2, .02), (), (side,), None, None, 0.)
+    budget = dwa.CandidateBudget(64)
+    view = dict(forward_m=.32, right_m=.10, source_id=37)
+    scan = SimpleNamespace(memory_recheck=lambda: view, near_projection=SimpleNamespace(squares=side))
+    command = (.1, 0., 0.)
+    budget.for_context(context)[command] = context.check(command)
+    assert policy._blocking_memory_view(scan, context, budget) == view
+    from dataclasses import replace
+    observed = replace(context, occupied=(side,))
+    budget.for_context(observed)[command] = observed.check(command)
+    assert policy._blocking_memory_view(scan, observed, budget) is None

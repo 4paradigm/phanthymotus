@@ -113,6 +113,10 @@ class MotionTrace:
     straight_axis: int | None
     interval_errors: tuple[tuple[float, float], ...]
 
+    # Cumulative longitudinal/lateral displacement differences between delivery times.
+    delay_axes: tuple[tuple[float, float], ...]
+    heading_span: float
+
     @property
     def duration(self):
         return self.times[-1]
@@ -199,6 +203,8 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
 
     times, velocities, poses = [0.], [tuple(measured)], [(*center, 0.)]
     interval_errors = []
+    delay_axes = []
+    delay_x = delay_y = heading_span = 0.
     early = tuple(measured)
     uncertain = latency_s > 0. and tuple(previous) != tuple(command)
     position_error = half_travel = half_turn = body_travel = 0.
@@ -224,6 +230,7 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
         return (end_x, end_y, end_yaw), (area_x, area_y, area_yaw)
 
     def integrate(target, early_target, seconds):
+        nonlocal delay_x, delay_y, heading_span
         nonlocal early, position_error, half_travel, half_turn, body_travel
         nonlocal delay_position, delay_yaw, delay_travel
         if seconds <= 0.:
@@ -270,10 +277,15 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
                     early, early_area = response(early, early_target, step, early_stable_area)
                     # Each component difference keeps its sign across the step.
                     # Its absolute integral bounds that of any intermediate delay.
-                    velocity_error = abs(early_area[0]-area[0]) + abs(early_area[1]-area[1])
+                    dx, dy = abs(early_area[0]-area[0]), abs(early_area[1]-area[1])
+                    delay_x += dx
+                    delay_y += dy
+                    velocity_error = dx + dy
                     delay_travel += velocity_error
                     delay_yaw += abs(early_area[2]-area[2])
                     delay_position += velocity_error + travel * min(2., delay_yaw)
+            heading_span += 2 * angular_gap
+            delay_axes.append((delay_x, delay_y))
             interval_errors.append((position_error + delay_position + half_speed_step,
                                     delay_yaw + angular_gap))
 
@@ -298,7 +310,7 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
                      and (all(v[axis] >= 0. for v in inputs) or all(v[axis] <= 0. for v in inputs))), None)
     return MotionTrace(body, camera, tuple(times), tuple(velocities), moving_count, stopped,
                        position_error, half_travel, half_turn, delay_position, delay_yaw,
-                       body_travel, delay_travel, offset, mode, straight, tuple(interval_errors))
+                       body_travel, delay_travel, offset, mode, straight, tuple(interval_errors), tuple(delay_axes), heading_span)
 
 
 def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
@@ -350,6 +362,24 @@ def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
                 clearance = min(clearance, distance)
                 if hit is not None and (first_hit is None or hit < first_hit):
                     reason, first_hit = collision, hit
+    heading_span = trace.heading_span + trace.delay_yaw_error
+    if first_hit is not None and trace.delay_travel_error > 0. and heading_span < math.pi / 2:
+        # The delivery-induced body-axis displacement can point in a different
+        # direction at each integration step. Nominal rotation plus the delivery yaw error bounds
+        # |sin(delta heading)| between any two points on the trace. The
+        # independent yaw/pose and between-sample allowances stay isotropic.
+        axes = np.asarray(trace.delay_axes)
+        mix = math.sin(heading_span)
+        # The earlier scalar allowance includes dx + dy. In each grid axis
+        # only one of those terms can contribute at full strength.
+        interval_f = intervals - (1. - mix) * axes[:, 1]
+        interval_r = intervals - (1. - mix) * axes[:, 0]
+        extent_f = length * abs(c) + width * abs(s) + np.maximum(np.r_[0., interval_f], np.r_[interval_f, 0.])
+        extent_r = length * abs(s) + width * abs(c) + np.maximum(np.r_[0., interval_r], np.r_[interval_r, 0.])
+        layers = prepared_layers or local_path.PreparedObstacleLayers(occupied, remembered)
+        refined = layers.axis_clearance(f, r, extent_f, extent_r, first_hit)
+        if refined > 1e-10:
+            clearance, first_hit, reason = refined, None, None
     if not trace.stopped:
         reason = "braking_incomplete"
     if reason is None and supported_region is not None:
