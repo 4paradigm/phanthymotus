@@ -45,6 +45,37 @@ function fixture(fetch) {
 
 const response = result => ({ok: true, json: async () => ({code: 200, data: result})});
 
+for (const toolName of ['Visitor_Badge_Printer', 'visual_depth']) {
+  test(`canvas gear opens the complete ${toolName} configuration dialog`, async () => {
+    const nodes = {};
+    const makeNode = () => {
+      const node = new Element();
+      node.style = {};
+      node.appendChild = child => node.children.push(child);
+      node.querySelector = () => null;
+      node.cloneNode = () => makeNode();
+      node.parentNode = {replaceChild() {}};
+      return node;
+    };
+    const hidden = new Set(['hidden']);
+    nodes['tool-config-overlay'] = makeNode();
+    nodes['tool-config-overlay'].classList = {
+      add: value => hidden.add(value), remove: value => hidden.delete(value),
+    };
+    const context = vm.createContext({
+      document: {createElement: makeNode, getElementById: id => nodes[id] ||= makeNode()},
+      isProjectRunning: () => false, ensureEdit: async () => true,
+      _toolConfigs: {}, _configEntries: props => Object.entries(props),
+    });
+    const start = source.indexOf('export async function openInstanceConfigModal(');
+    const end = source.indexOf('// ── Helpers', start);
+    vm.runInContext(source.slice(start, end).replace('export async', 'async'), context);
+    await context.openInstanceConfigModal('perception', toolName, 'card-1', {properties: {}});
+    assert.equal(hidden.has('hidden'), false);
+    assert.equal(nodes['tool-config-title'].textContent, `Instance Config: ${toolName}`);
+  });
+}
+
 test('automatic refresh discovers new pages and stops when dialog is removed', async () => {
   let pages = [];
   let calls = 0;

@@ -1490,6 +1490,7 @@ function _hideDetail() {
  * Only shows fields with scope === "instance".
  */
 export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema, description) {
+  const visitorPrinter = ['QL_printer', 'Visitor_Badge_Printer'].includes(toolName);
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
