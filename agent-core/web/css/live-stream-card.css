@@ -18,6 +18,7 @@
 .ls-meter { height: 5px; width: 100%; background: var(--bg-input); border-radius: 10px; overflow: hidden; }
 .ls-meter-fill { height: 100%; background: var(--accent); border-radius: inherit; transition: width 150ms ease; }
 .ls-platforms { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.ls-platforms > :last-child:nth-child(odd) { grid-column: 1 / -1; }
 .ls-choices { display: flex; flex-direction: column; gap: 7px; }
 .ls-btn {
   width: 100%; min-height: 42px; border: 1px solid var(--border-med);
