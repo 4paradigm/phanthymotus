@@ -855,17 +855,12 @@ function _setupDropZone() {
     }
   });
 
-  _canvasEl.addEventListener('drop', (e) => {
+  _canvasEl.addEventListener('drop', async (e) => {
     e.preventDefault();
     _canvasEl.classList.remove('drag-over');
 
     if (_editsLocked()) {
       _showDropReject(e, _editLockReason());
-      return;
-    }
-
-    if (!_isEditor) {
-      _showDropReject(e, _currentEditor ? '画布已被其他用户锁定' : '请先获取编辑权');
       return;
     }
 
@@ -888,6 +883,10 @@ function _setupDropZone() {
         return;
       }
     }
+
+    // Claim the lock only now, after the drag payload is read and validated —
+    // viewing a tool in the sidebar must not take the canvas from anyone.
+    if (!(await _ensureEdit())) return;
 
     // Convert screen coords → world coords
     const rect   = _canvasEl.getBoundingClientRect();
