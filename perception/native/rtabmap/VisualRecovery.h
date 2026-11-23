@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <set>
@@ -101,6 +102,7 @@ public:
                  const std::map<std::string,float> & statistics=std::map<std::string,float>())
     {
         recoveryNode_=recoveryAnchor_=recoveryInliers_=0;
+        frameRotation_=takeRotationHint(data);
         if(visualLossStamp_>0. && !(data.stamp()>visualLossStamp_))
         {
             walls_.reset();
@@ -234,7 +236,8 @@ public:
             imageMode_=images;
         }
         const auto framesBefore=estimator_->framesProcessed();
-        if(images) visual=processVisual(data,info);
+        const auto rotation=images?relativeRotation(visualRotation_,data.stamp()):rtabmap::Transform();
+        if(images) visual=processVisual(data,info,rotation);
         visualInliers_=info.reg.inliers;
         const bool tracked=!visual.isNull() && !info.lost &&
             visualInliers_>=minInliers_ && validCovariance(info.reg.covariance);
@@ -290,13 +293,16 @@ public:
             }
         }
         const bool recoveredVisual=reacquired>=minInliers_;
-        std::map<std::string,float> reacquisitionStats;
-        if(recoveredVisual)
+        std::map<std::string,float> registrationStats;
+        if(recoveredVisual || !rotation.isNull())
         {
-            reacquisitionStats=statistics;
-            reacquisitionStats["Motus/VisualReacquiredInliers/"]=static_cast<float>(reacquired);
+            registrationStats=statistics;
+            if(recoveredVisual)
+                registrationStats["Motus/VisualReacquiredInliers/"]=static_cast<float>(reacquired);
+            if(!rotation.isNull())
+                registrationStats["Motus/VisualRotationGuess/"]=1.f;
         }
-        const auto &acceptedStats=reacquisitionStats.empty()?statistics:reacquisitionStats;
+        const auto &acceptedStats=registrationStats.empty()?statistics:registrationStats;
         // A failed measured image can revoke VO alignment. A scan without
         // images leaves the visual estimator's established gauge unchanged.
         if(waiting_ && aligned_ && !tracked && !continuousExternal && images)
@@ -817,6 +823,7 @@ private:
         {
             // This seed is a verified global pose, never frozen external odometry.
             estimator_->reset(location);
+            visualRotation_.reset();
             rtabmap::OdometryInfo seed;
             const auto seeded=processVisual(data,seed);
             if(!seeded.isNull() && !seed.lost && estimator_->framesProcessed()==1)
@@ -827,6 +834,7 @@ private:
         if(!images)
         {
             estimator_->reset(location);
+            visualRotation_.reset();
             visualToNative_=rtabmap::Transform::getIdentity();
         }
         if(!external.isNull())
@@ -886,21 +894,64 @@ private:
         })>=minInliers_;
     }
 
-    static cv::Mat takePayload(rtabmap::SensorData & data, const char * tag, int columns)
+    static int payloadColumns(const cv::Mat & bytes)
     {
         // Private SensorData records use RTAB-Map's compressed byte-matrix format.
-        const auto & bytes=data.userDataCompressed();
         if(bytes.rows!=1 || bytes.type()!=CV_8UC1 || bytes.cols<=12 || bytes.cols>128)
-            return {};
+            return 0;
         int shape[3];
         std::memcpy(shape,bytes.data+bytes.cols-sizeof(shape),sizeof(shape));
-        if(shape[0]!=1 || shape[1]!=columns || shape[2]!=CV_8UC1)
+        return shape[0]==1 && shape[2]==CV_8UC1?shape[1]:0;
+    }
+
+    static cv::Mat takePayload(rtabmap::SensorData & data, const char * tag, int columns)
+    {
+        const auto & bytes=data.userDataCompressed();
+        if(payloadColumns(bytes)!=columns)
             return {};
         const auto payload=rtabmap::uncompressData(bytes);
         if(payload.empty() || std::memcmp(payload.data,tag,8)!=0)
             return {};
         data.setUserData(cv::Mat(),true);
         return payload;
+    }
+
+    struct RotationHint
+    {
+        double stamp;
+        std::uint64_t generation;
+        rtabmap::Transform orientation;
+    };
+
+    static std::optional<RotationHint> takeRotationHint(rtabmap::SensorData & data)
+    {
+        const auto & bytes=data.userDataCompressed();
+        constexpr int prefix=48;
+        const int columns=payloadColumns(bytes);
+        if(columns!=prefix && columns!=prefix+8 && columns!=prefix+24 && columns!=prefix+40)
+            return {};
+        const auto payload=rtabmap::uncompressData(bytes);
+        if(payload.empty() || std::memcmp(payload.data,"MOTUSRH1",8)!=0)
+            return {};
+        // Restore the independent pose/gauge marker even if the hint is invalid.
+        data.setUserData(columns==prefix?cv::Mat():rtabmap::compressData2(payload.colRange(prefix,columns)),true);
+        std::uint64_t generation;
+        double q[4];
+        std::memcpy(&generation,payload.data+8,sizeof(generation));
+        std::memcpy(q,payload.data+16,sizeof(q));
+        const double norm=std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
+        if(!generation || !std::isfinite(norm) || std::abs(norm-1.)>.001)
+            return {};
+        return RotationHint{data.stamp(),generation,
+            rtabmap::Transform(0,0,0,q[0]/norm,q[1]/norm,q[2]/norm,q[3]/norm)};
+    }
+
+    rtabmap::Transform relativeRotation(const std::optional<RotationHint> & anchor, double stamp) const
+    {
+        if(!anchor || !frameRotation_ || anchor->generation!=frameRotation_->generation ||
+           !(stamp>anchor->stamp && stamp-anchor->stamp<=.75))
+            return {};
+        return anchor->orientation.inverse()*frameRotation_->orientation;
     }
 
     static std::optional<ExternalRun> takeExternalRun(rtabmap::SensorData & data)
@@ -945,6 +996,7 @@ private:
         rtabmap::Transform pose;
         double referenceStamp; // Scan registrations do not extend their own recovery budget.
         bool recovered;
+        std::optional<RotationHint> rotation;
     };
 
     void rememberScan(rtabmap::Rtabmap & map, const rtabmap::SensorData & data)
@@ -967,7 +1019,8 @@ private:
         scan.setLaserScan(data.laserScanRaw());
         scan.setStamp(data.stamp());
         const double referenceStamp=state_==ScanTracking?scanAnchor_->referenceStamp:data.stamp();
-        scanAnchor_=ScanAnchor{std::move(scan),odom_,referenceStamp,state_==Localized || state_==ScanTracking};
+        scanAnchor_=ScanAnchor{std::move(scan),odom_,referenceStamp,
+                               state_==Localized || state_==ScanTracking,frameRotation_};
     }
 
     static cv::Mat scanCovariance(const cv::Mat & measurement)
@@ -984,19 +1037,74 @@ private:
     {
         if(map.getLocalOptimizedPoses().empty()) return false;
         rtabmap::RegistrationInfo result;
-        const auto relative=scanIcp_->computeTransformation(scanAnchor_->scan,data,
-            rtabmap::Transform::getIdentity(),&result);
         // Require more than a small matching patch to replace a measured
         // stream temporarily or to bridge an explicitly scan-only origin.
-        if(relative.isNull() || result.icpStructuralComplexity<.02 || result.icpCorrespondences<200 ||
-           ((externalOrigin_ || waitingForMeasuredRun) && !(result.icpInliersRatio>=minScanRelocalizationOverlap_)) ||
-           !validCovariance(result.covariance) || !plausibleMotion(relative,dt))
-            return false;
+        bool reciprocal=false;
+        const bool continuousRotation=frameRotation_ && scanAnchor_->rotation &&
+            frameRotation_->generation==scanAnchor_->rotation->generation;
+        const auto valid=[&](const rtabmap::Transform & relative, const rtabmap::Transform & guess)
+        {
+            reciprocal=false;
+            if(relative.isNull() || !(result.icpStructuralComplexity>=.02) || result.icpCorrespondences<200 ||
+               !validCovariance(result.covariance) || !plausibleMotion(relative,dt))
+                return false;
+            if(!(externalOrigin_ || waitingForMeasuredRun) || result.icpInliersRatio>=minScanRelocalizationOverlap_)
+                return true;
+            if(!continuousRotation || result.icpCorrespondences<1000 || !(result.icpInliersRatio>=.20f))
+                return false;
+            // Initialize the reverse solve from the inverse of the input guess.
+            rtabmap::RegistrationInfo reverse;
+            const auto back=scanIcp_->computeTransformation(data,scanAnchor_->scan,guess.inverse(),&reverse);
+            if(back.isNull() || reverse.icpCorrespondences<1000 || !(reverse.icpInliersRatio>=.20f) ||
+               !(reverse.icpStructuralComplexity>=.02) || !validCovariance(reverse.covariance))
+                return false;
+            const auto roundTrip=relative*back;
+            reciprocal=roundTrip.getNorm()<=.02 &&
+                roundTrip.getAngle(rtabmap::Transform::getIdentity())<=CV_PI/180.;
+            return reciprocal;
+        };
+        const auto rotation=relativeRotation(scanAnchor_->rotation,data.stamp());
+        auto relative=rotation.isNull()?rtabmap::Transform():
+            scanIcp_->computeTransformation(scanAnchor_->scan,data,rotation,&result);
+        const bool used=valid(relative,rotation);
+        if(!used)
+        {
+            result=rtabmap::RegistrationInfo();
+            relative=scanIcp_->computeTransformation(scanAnchor_->scan,data,rtabmap::Transform::getIdentity(),&result);
+            if(!valid(relative,rtabmap::Transform::getIdentity())) return false;
+        }
         const auto measured=scanAnchor_->pose*relative;
         auto stats=statistics;
         stats["Motus/ScanTrackingOverlap/"]=result.icpInliersRatio;
+        if(!rotation.isNull()) stats["Motus/ScanRotationGuess/"]=used?1.f:-1.f;
         const auto covariance=scanCovariance(result.covariance);
-        if(!map.process(data,measured,covariance,std::vector<float>(),stats))
+        rtabmap::ParametersMap restore;
+        if(reciprocal && used)
+        {
+            // Let a verified recovery frame record new geometry at a smaller spacing.
+            const auto & key=rtabmap::Parameters::kRGBDLinearUpdate();
+            float linearUpdate=rtabmap::Parameters::defaultRGBDLinearUpdate();
+            rtabmap::Parameters::parse(map.getParameters(),key,linearUpdate);
+            if(linearUpdate>.05f)
+            {
+                const auto value=map.getParameters().find(key);
+                restore[key]=value==map.getParameters().end()?
+                    rtabmap::Parameters::getDefaultParameters().at(key):value->second;
+                map.parseParameters({{key,".05"}});
+            }
+        }
+        bool accepted;
+        try
+        {
+            accepted=map.process(data,measured,covariance,std::vector<float>(),stats);
+        }
+        catch(...)
+        {
+            if(!restore.empty()) map.parseParameters(restore);
+            throw;
+        }
+        if(!restore.empty()) map.parseParameters(restore);
+        if(!accepted)
             return false;
         // Carry only scan motion that the map accepted. Its map anchor stays fixed.
         if(scanMapGuess_ && scanMapGuess_->stamp==scanAnchor_->scan.stamp())
@@ -1032,7 +1140,8 @@ private:
         return true;
     }
 
-    rtabmap::Transform processVisual(rtabmap::SensorData & data, rtabmap::OdometryInfo & info)
+    rtabmap::Transform processVisual(rtabmap::SensorData & data, rtabmap::OdometryInfo & info,
+                                     const rtabmap::Transform & rotation=rtabmap::Transform())
     {
         struct RestoreScan
         {
@@ -1043,7 +1152,11 @@ private:
         // Reg/Strategy=0 needs image geometry only. Keep its features on this
         // same envelope, while reserving scan processing for the native map.
         data.setLaserScan(rtabmap::LaserScan());
-        return estimator_->process(data,&info);
+        // F2M already retries a failed image registration without a guess.
+        const auto pose=rotation.isNull()?estimator_->process(data,&info):
+            estimator_->process(data,rtabmap::Transform(),&info,rotation);
+        if(!pose.isNull()) visualRotation_=frameRotation_;
+        return pose;
     }
     static bool validCovariance(const cv::Mat & c)
     {
@@ -1063,6 +1176,7 @@ private:
     double visualLossStamp_=0.;
     std::optional<VisualAlignment> visualAlignment_;
     std::optional<ScanAnchor> scanAnchor_;
+    std::optional<RotationHint> frameRotation_,visualRotation_;
     int scanMapAnchor_=0;
     struct ScanMapGuess
     {

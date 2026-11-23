@@ -30,6 +30,7 @@ from .pointcloud_slam_preview import DEFAULT_PREVIEW_POINTS, PREVIEW_TOPIC, with
 from .pointcloud_slam_stream import SlamStream
 from .pointcloud_slam_transforms import rigid, pose_matrix
 from .pointcloud_slam_motion import ScanMotion, MotionPending
+from .pointcloud_slam_rotation import SlamRotationHint
 from .spatial_input import POSE_QUEUE_DEPTH
 
 
@@ -142,6 +143,8 @@ class RtabmapNode(Node):
         self._Info, self._MapGraph, self._SensorData = Info, MapGraph, SensorData
         self._settings = deepcopy(settings)
         self._settings.update((input_contract or {}).get('settings', {}))
+        rotation_profile = self._settings.get('imu_rotation_hint')
+        self._rotation_hint = SlamRotationHint(rotation_profile) if rotation_profile is not None else None
         self._rgb = None
         self._rgb_mode, self._rgb_reason = 'pointcloud', None
         self._rgb_subscription_error = None
@@ -234,6 +237,8 @@ class RtabmapNode(Node):
                 on_pose_loss=self._retire_pose_work, scan_origin_recovery=self._scan_origin_recovery,
                 pose_capture_mount=pose_capture_mount, color_from_depth=baseline)
             self.stream.ingress_clock_id = input_registry.clock_id if input_registry else None
+            if self._rotation_hint is not None:
+                self.create_subscription(String, self._rotation_hint.topic, self._gyro, _POSE_QOS)
             self._capture_clouds = None
             if self._settings.get('capture_mount'):
                 if input_contract:
@@ -324,6 +329,15 @@ class RtabmapNode(Node):
     def _retire_pose_work(self):
         # Retire work that depended on the old pose without cancelling recovery scans.
         self._pose_loss_seq = self._admission_seq
+
+    def _gyro(self, msg):
+        try:
+            packet = json.loads(msg.data)
+        except (TypeError, ValueError):
+            packet = None
+        with self._lock:
+            if not self._stopped():
+                self._rotation_hint.observe(packet)
 
     def _capture_mount(self, msg):
         try:
@@ -622,11 +636,11 @@ class RtabmapNode(Node):
         deadlines = item[7] if len(item) > 7 else (0., 0.)
         depth = item[8] if len(item) > 8 else None
         native, rgb_generation = self._sensor_data(cloud, pose, matrix, motion_generation, observation, deadlines, depth)
+        payload = b''
         if predicted:
             # The standard odometry input stays null. Even an older native
             # runtime cannot mistake this private hint for a tracking pose.
             payload = struct.pack('<8s7d', b'MOTUSIMU', *pose.position, *pose.quaternion)
-            native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
         if (self._root_deadline and pose is not None and not native.left.data and
                 (self._rgb_task is None or self._rgb_task[1].done()) and self._prefer_next_root_observation()):
             return
@@ -651,9 +665,17 @@ class RtabmapNode(Node):
                 elif self._raw_scan_input and run is None:
                     payload = b'MOTUSRAW'
                 else:
-                    payload = b'MOTUSOD1' + run if run else None
-                if payload:
-                    native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
+                    payload = b'MOTUSOD1' + run if run else b''
+            hint = self._rotation_hint
+            if hint is not None and not predicted:
+                anchor = measured or self.stream._pose_anchor
+                base_frame = anchor.child_frame_id if anchor is not None else self.stream.child_frame
+                basis = observation.time_basis if observation is not None else self._settings.get('time_basis', 'source_capture')
+                if (basis == 'source_capture' and base_frame == hint.child_frame and
+                        (observation is None or observation.observation_stamp_ns == stamp)):
+                    payload = hint.payload(stamp) + payload
+            if payload:
+                native.user_data = array('B', zlib.compress(payload)+struct.pack('<iii', 1, len(payload), 0))
             if not dynamic_mount:
                 segment['tf_pub'].publish(tf)
             if measured is not None:
@@ -725,8 +747,8 @@ class RtabmapNode(Node):
         rgb_deadline, motion_deadline = deadlines
         data = self._SensorData()
         data.header = deepcopy(cloud.header)
-        # This card has no IMU input. Geometry message defaults may be identity;
-        # the native IMU converter uses a null local transform to mean absent.
+        # Keep gyro search initialization out of native gravity/pose observations.
+        # The native IMU converter uses a null local transform to mean absent.
         data.imu_local_transform.rotation.w = 0.
         data.laser_scan = deepcopy(cloud)
         if self._raw_scan_input:

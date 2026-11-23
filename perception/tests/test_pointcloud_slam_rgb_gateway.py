@@ -59,6 +59,48 @@ def test_fallback_does_not_bypass_required_odometry_loss(rgb_node):
     assert not published(n, '/sensor_data')
 
 
+def test_rotation_prior_requires_a_capture_bracket_in_the_declared_base(tmp_path, monkeypatch):
+    import struct
+    import zlib
+    import plugins.pointcloud_slam_ros as ros
+    from test_pointcloud_slam_stream import chassis
+
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    profile = dict(topic='/gyro', child_frame_id='body', gyro_frame_id='imu',
+                   child_from_gyro=[[0, -1, 0], [1, 0, 0], [0, 0, 1]])
+    n = ros.RtabmapNode('/o', '/c', settings(imu_rotation_hint=profile), session_dir=tmp_path)
+    n._receipt_clock = lambda: 1.
+    try:
+        callback = next(s.callback for s in n.subscriptions if s.topic == '/gyro')
+        def imu(ms, time_basis='source_capture'):
+            callback(NS(data=json.dumps(dict(schema='motus.imu/1', time_basis=time_basis,
+                stamp_ns=ms*10**6, gyro_frame_id='imu', angular_velocity=[1., 0., 0.]))))
+
+        n.start()
+        imu(990)
+        imu(1010)
+        imu(1120)  # Publication lag can put a later gyro gap before this cloud.
+        for index, stamp in enumerate((1000, 1020, 1040), start=1):
+            n._measurement_clock_ns = lambda s=stamp: s*10**6
+            if stamp == 1040:
+                imu(1030, 'receipt_estimated')
+                imu(1050)
+            n._odom(NS(data=json.dumps(chassis(stamp))))
+            n._cloud(cloud(stamp*10**6))
+            assert _wait_until(lambda: n.status()['forwarded_clouds'] == index)
+        envelopes = published(n, '/sensor_data')[0].raw_messages
+        payloads = [zlib.decompress(bytes(msg.user_data)[:-12]) for msg in envelopes]
+        assert payloads[0][48:56] == b'MOTUSCH1'
+        tag, generation, x, y, z, w = struct.unpack('<8sQ4d', payloads[0][:48])
+        assert tag == b'MOTUSRH1' and generation > 0
+        np.testing.assert_allclose([x, y, z, w], [0., np.sin(.005), 0., np.cos(.005)])
+        assert all(len(payload) == 40 and payload[:8] == b'MOTUSCH1' for payload in payloads[1:])
+        assert all(msg.imu_local_transform.rotation.w == 0. for msg in envelopes)
+    finally:
+        n.close()
+        n.destroy_node()
+
+
 def test_native_envelope_marks_only_continuous_measured_chassis_poses(rgb_node):
     import struct
     import zlib
@@ -121,6 +163,7 @@ def test_native_envelope_carries_only_witnessed_measured_visual_runs(rgb_node):
     assert zlib.decompress(bytes(reset.user_data)[:-12]) != old_run
     assert not getattr(unwitnessed, 'user_data', None)
     assert not getattr(delayed, 'user_data', None)
+
 
 
 def rgb_camera():

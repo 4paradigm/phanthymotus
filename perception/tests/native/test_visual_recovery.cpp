@@ -13,10 +13,24 @@
 #include <stdexcept>
 #include <chrono>
 
+static void appendRotationHint(rtabmap::SensorData &data, std::uint64_t generation, double roll)
+{
+    const auto existing=rtabmap::uncompressData(data.userDataCompressed());
+    cv::Mat payload(1,48+existing.cols,CV_8UC1);
+    const double orientation[]={std::sin(roll/2),0.,0.,std::cos(roll/2)};
+    std::memcpy(payload.data,"MOTUSRH1",8);
+    std::memcpy(payload.data+8,&generation,sizeof(generation));
+    std::memcpy(payload.data+16,orientation,sizeof(orientation));
+    if(!existing.empty()) existing.copyTo(payload.colRange(48,payload.cols));
+    data.setUserData(rtabmap::compressData2(payload),true);
+}
+
 static void testScanRelocalization(const std::string &root, const std::string &output,
                                   rtabmap::ParametersMap parameters, const std::string &mode)
 {
     const bool partialOverlap=mode=="partial_scan_relocalize";
+    const bool scanRotation=mode=="scan_rotation_hint" || mode=="scan_rotation_fallback" ||
+        mode=="scan_rotation_new_generation";
     const bool afterMotion=mode=="scan_relocalize_after_motion";
     const bool weakWitnessedBridge=mode=="witnessed_scan_weak_bridge";
     const bool longWitnessedGap=mode=="witnessed_scan_long_gap";
@@ -56,6 +70,15 @@ static void testScanRelocalization(const std::string &root, const std::string &o
         // A valid partial observation can occupy fewer than half of the scan's expected points.
         const int maxPoints=(weakBridge || weakWitnessedBridge) && stamp==2.?6*count:
             partialReset?4*count:partialOverlap && stamp==7.?2*count:0;
+        const double roll=mode=="scan_rotation_hint" && stamp>=2. ? .14 : 0.;
+        if(roll!=0.)
+            for(int j=0;j<count;++j)
+            {
+                auto &point=scan.at<cv::Vec3f>(0,j);
+                const float y=point[1], z=point[2];
+                point[1]=std::cos(roll)*y+std::sin(roll)*z;
+                point[2]=std::cos(roll)*z-std::sin(roll)*y;
+            }
         data.setLaserScan(rtabmap::LaserScan(scan.colRange(0,count),maxPoints,0.f,rtabmap::LaserScan::kXYZ));
         if(badGuess)
         {
@@ -79,6 +102,9 @@ static void testScanRelocalization(const std::string &root, const std::string &o
             std::fill_n(packet.data+8,16,origin);
             data.setUserData(rtabmap::compressData2(packet),true);
         }
+        if(scanRotation)
+            appendRotationHint(data,mode=="scan_rotation_new_generation" && stamp>=2. ? 2 : 1,
+                mode=="scan_rotation_fallback" && stamp>=2. ? CV_PI : roll);
         const float reportedX=origin==2?x-.18f:x;
         return recovery.process(map,data,hasPose?rtabmap::Transform(reportedX,0,0,0,0,0):rtabmap::Transform(),
                                 cv::Mat::eye(6,6,CV_64F)*.01);
@@ -88,6 +114,28 @@ static void testScanRelocalization(const std::string &root, const std::string &o
        !frame(1.5,.12f,true,earlierAnchor,false,false,startingToken))
         throw std::runtime_error("cannot seed a connected old scan map");
     const auto anchor=map.getLastLocationId();
+    if(scanRotation)
+    {
+        if(!frame(2.,.19f,false,false) || recovery.state()!=motus::VisualRecovery::ScanTracking ||
+           std::abs(recovery.odom().x()-.19f)>.025f ||
+           std::abs(std::atan2(recovery.odom().r32(),recovery.odom().r33())-
+               (mode=="scan_rotation_hint"?.14:0.))>.025)
+            throw std::runtime_error("a gyro initial guess must preserve verified scan tracking");
+        const auto &stats=map.getStatistics().data();
+        const auto hint=stats.find("Motus/ScanRotationGuess/");
+        const float expected=mode=="scan_rotation_hint"?1.f:mode=="scan_rotation_fallback"?-1.f:0.f;
+        if((hint==stats.end()?0.f:hint->second)!=expected)
+            throw std::runtime_error("scan gyro guess, rejected guess fallback, or generation guard was not exercised");
+        const auto poses=map.getLocalOptimizedPoses();
+        if(poses.size()!=3 || !poses.count(anchor))
+            throw std::runtime_error("scan motion must grow the existing map");
+        map.close();
+        map.init(parameters,output+".db");
+        if(map.getLocalOptimizedPoses()!=poses)
+            throw std::runtime_error("gyro-initialized scan tracking must preserve the graph on reopen");
+        map.close(false);
+        return;
+    }
     if(earlierAnchor)
     {
         const auto old=map.getLocalOptimizedPoses();
@@ -415,7 +463,8 @@ int main(int argc, char **argv)
     const bool shortVisualLoss=mode=="vo_reacquire" || mode=="vo_reacquire_expired" || regressedVisualCapture;
     const bool voHandoff=mode=="vo_handoff" || mode=="vo_handoff_gap" || shortVisualLoss;
     const bool failedVisualSeed=mode=="first_visual_seed_failed";
-    const bool firstVisualSeed=mode=="first_visual_seed" || failedVisualSeed;
+    const bool visualRotation=mode=="visual_rotation_hint";
+    const bool firstVisualSeed=mode=="first_visual_seed" || failedVisualSeed || visualRotation;
     std::map<int,int> imageMask;
     if(mode=="scan_mask")
     {
@@ -461,7 +510,8 @@ int main(int argc, char **argv)
         testChassisRgbdResume(root,output,p);
         return 0;
     }
-    if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" ||
+    if(mode=="scan_relocalize" || mode=="partial_scan_relocalize" || mode=="scan_rotation_hint" ||
+       mode=="scan_rotation_fallback" || mode=="scan_rotation_new_generation" ||
        mode=="scan_relocalize_after_motion" || mode=="scan_origin_change" || mode=="chassis_origin_change" || mode=="chassis_legacy_transition" ||
        mode=="scan_origin_weak_bridge" || mode=="rejected_prediction_fallback" || mode=="chassis_partial_reset_after_rgb_query" ||
        mode=="chassis_same_gauge_earlier_anchor" ||
@@ -591,7 +641,7 @@ int main(int argc, char **argv)
         const double skippedTime=externalContinuity && i>0?(mode=="external_continuity_stale"?5.1:2.1):0.;
         const double outageTime=continuityOutage?(i==2 && mode=="external_continuity_outage_stale"?4.:0.):skippedTime;
         const double stamp=bridgeScan?scanBridgeStamp+(returningPose?.8:scanBridgeOffsets[postClosureScans]):
-            crossedRecovery?1.+i*.5:regressedVisualCapture && i==7?6.5:
+            (crossedRecovery || visualRotation)?1.+i*.5:regressedVisualCapture && i==7?6.5:
             i+1.+outageTime+(mode=="vo_reacquire_expired" && i>=7?2.:0.)+
             (mode=="fallback_lost" && i==3?.5:0.); // F2M can track after the old map alignment expires.
         rtabmap::SensorData data(noImages?cv::Mat():rgb,noImages?cv::Mat():depth,camera,0,stamp);
@@ -677,6 +727,7 @@ int main(int argc, char **argv)
             if(measured.isNull() || (displaced.inverse()*measured).getNorm()<=.1)
                 throw std::runtime_error("fixture must produce valid ICP that disagrees with the external pose");
         }
+        if(visualRotation) appendRotationHint(data,i>=2?2:1,0.);
         const auto nodesBefore=map.getLocalOptimizedPoses().size();
         const int previousLocation=map.getLastLocationId();
         if(visualLost) beforeVisualFailure=map.getLocalOptimizedPoses();
@@ -695,6 +746,12 @@ int main(int argc, char **argv)
             ++overwrittenEvents;
         }
         const auto &s=map.getStatistics(); auto pose=map.getLastLocalizationPose();
+        if(visualRotation && (i==1 || i==2))
+        {
+            const auto hint=s.data().find("Motus/VisualRotationGuess/");
+            if(!accepted || (i==1)!=(hint!=s.data().end() && hint->second==1.f))
+                throw std::runtime_error("native visual initialization did not respect the gyro generation");
+        }
         if(nativeRecovery && (data.laserScanRaw().size()!=count ||
            cv::norm(data.laserScanRaw().data(),scan.colRange(0,count),cv::NORM_INF)!=0))
             throw std::runtime_error("visual odometry must preserve the original scan for native mapping");
