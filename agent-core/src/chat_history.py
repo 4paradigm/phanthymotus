@@ -314,34 +314,42 @@ def _contains_feishu_event(turn: list[dict]) -> bool:
 
 
 def get_last_session_turns(limit: int = 10) -> dict | None:
-    """获取主代理最近一个 session 的最后 N 轮，用于重启续跑。
+    """恢复最近一个含普通对话的主代理会话，最多取 N 轮。
 
     只认 main：子代理的对话也存在同一张表里，而"最近的一个 session"现在几乎总是
     某个后台子代理的 —— 它们每轮都落盘。续跑到那上面，主代理会把一段后台监控的
     transcript 当成自己的历史接着往下写，并且之后每个 turn 都追加进那个会话。
     老记录的 kind 列是迁移时统一填的 'main'，所以还要排掉带 `[subagent:` 前缀的，
-    并跳过旧版本写进 main 的飞书回合。
+    并跳过旧版本写进 main 的飞书回合。如果整个会话都是飞书回合，继续查找更早的会话。
     """
+    if limit == 0:
+        return None
+    filtered_feishu = False
     with _get_conn() as conn:
-        row = conn.execute(
+        sessions = conn.execute(
             "SELECT id FROM chat_sessions WHERE turn_count > 0 "
             "AND kind = 'main' AND summary NOT LIKE '[subagent:%' "
-            'ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 1'
-        ).fetchone()
-        if not row:
-            return None
-        session_id = row[0]
-        rows = conn.execute(
-            'SELECT messages FROM chat_messages WHERE session_id=? ORDER BY turn_index DESC LIMIT ?',
-            (session_id, limit)
-        ).fetchall()
-    if not rows:
-        return None
-    turns = [json.loads(r[0]) for r in reversed(rows)]
-    shared_turns = [turn for turn in turns if not _contains_feishu_event(turn)]
-    return {
-        'session_id': session_id,
-        'turns': shared_turns,
-        # Start a new writable session if filtering has shifted old turn indices.
-        'filtered_feishu': len(shared_turns) != len(turns),
-    }
+            'ORDER BY COALESCE(ended_at, started_at) DESC'
+        )
+        for (session_id,) in sessions:
+            shared_turns = []
+            rows = conn.execute(
+                'SELECT messages FROM chat_messages WHERE session_id=? ORDER BY turn_index DESC',
+                (session_id,),
+            )
+            for (messages,) in rows:
+                turn = json.loads(messages)
+                if _contains_feishu_event(turn):
+                    filtered_feishu = True
+                    continue
+                shared_turns.append(turn)
+                if len(shared_turns) == limit:
+                    break
+            if shared_turns:
+                return {
+                    'session_id': session_id,
+                    'turns': list(reversed(shared_turns)),
+                    # Start a new writable session after filtering to preserve old turn indices.
+                    'filtered_feishu': filtered_feishu,
+                }
+    return None

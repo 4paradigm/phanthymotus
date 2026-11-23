@@ -607,6 +607,7 @@ _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 _VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
     'WebSearch', 'search_history', 'memory_recall', 'raw_input_info',
 })
+_CONVERSATION_ARCHIVE_TOOLS = frozenset({'search_history', 'memory_recall'})
 
 
 def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True) -> bool:
@@ -2293,7 +2294,9 @@ class Event:
         if chat_only_turn:
             reconsider_event = None
         tool_restricted = chat_only_turn or bot_restricted or viewer_restricted
-        feishu_turn = bool(trigger_event.get('_feishu_chat'))
+        feishu_chat = trigger_event.get('_feishu_chat')
+        feishu_turn = bool(feishu_chat)
+        feishu_context_reset = feishu_turn and feishu_chat[-1] > 0
         use_shared_history = not (bot_restricted or feishu_turn)
         narration_start = len(_pending_narration_feedback) if feishu_turn else 0
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
@@ -2406,6 +2409,8 @@ class Event:
         from event.desktop import search_configured
         if not search_configured():
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
+        if feishu_context_reset:
+            system_tools = [t for t in system_tools if t['schema']['name'] not in _CONVERSATION_ARCHIVE_TOOLS]
         if chat_only_turn:
             system_tools = [self._sys_tools['finish']]
             bound_schemas = [chat_only.REPLY_SCHEMA] if any(
@@ -2698,6 +2703,12 @@ class Event:
 
                 if chat_only_turn:
                     result = await chat_only.dispatch(name, args, trigger_event)
+                elif feishu_context_reset and (
+                    name in _CONVERSATION_ARCHIVE_TOOLS
+                    or (name == 'raw_input_info' and isinstance(args, dict)
+                        and str(args.get('source', '')).startswith('dds:/channel/request'))
+                ):
+                    result = '当前飞书上下文已清除，只能使用清除后收到的对话消息。'
                 elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (

@@ -128,8 +128,8 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
         ):
             for role, generation, reply in [
                 ('viewer', 0, '没有清除上下文的权限'),
-                ('operator', 1, '已清除你在当前会话的上下文'),
-                ('owner', 2, '已清除你在当前会话的上下文'),
+                ('operator', 1, '已清除你在此飞书渠道的全部上下文'),
+                ('owner', 2, '已清除你在此飞书渠道的全部上下文'),
             ]:
                 with self.subTest(role=role):
                     get_user.return_value = {'role': role}
@@ -144,13 +144,17 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
                                                                           user_id='ou_a')],
                         ['自己的消息'] if role == 'viewer' else [],
                     )
+                    self.assertEqual(
+                        [e['text'] for e in self.manager.get_chat_history('feishu_r1', 'oc_b',
+                                                                          user_id='ou_a')],
+                        ['另一会话'] if role == 'viewer' else [],
+                    )
 
         set_reply_context.assert_not_called()
         self.assertEqual(adapter.send_message.await_count, 3)
         self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_a', user_id='ou_b')[0]['text'],
                          '同群的另一用户')
-        self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_b', user_id='ou_a')[0]['text'],
-                         '另一会话')
+        self.assertEqual(self.manager.chat_generation('feishu_r1', 'oc_b', 'ou_a'), 2)
         self.assertEqual(self.manager.get_chat_history('feishu_g1', 'oc_a', user_id='ou_a')[0]['text'],
                          '另一渠道')
         self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_a')[0]['text'], '旧版群聊摘要')
@@ -170,30 +174,45 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
         msg.sender_type = 'bot'
         self.assertFalse(self.manager._is_feishu_reset(msg))
 
+    def test_user_reset_supersedes_older_chat_specific_generations(self):
+        config.main['channel_chat_history'] = {
+            'feishu_r1': {'oc_b': {'users': {'ou_a': {'generation': 4, 'entries': []}}}},
+        }
+        self.assertEqual(self.manager.chat_generation('feishu_r1', 'oc_b', 'ou_a'), 4)
+
+        self.manager._clear_user_context('feishu_r1', 'ou_a')
+
+        self.assertEqual(self.manager.chat_generation('feishu_r1', 'oc_b', 'ou_a'), 5)
+        self.assertEqual(self.manager.chat_generation('feishu_r1', 'oc_new', 'ou_a'), 5)
+        self.assertEqual(self.manager.chat_generation('feishu_r1', 'oc_b', 'ou_b'), 0)
+        self.manager._record_chat_exchange('feishu_r1', 'oc_b', 'assistant', '旧回复',
+                                           user_id='ou_a', source_generation=4)
+        self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_b', user_id='ou_a'), [])
+
     async def test_in_flight_reply_cannot_restore_cleared_history(self):
-        self.manager._set_last_context('feishu_r1', 'oc_a', 'ou_a',
+        self.manager._set_last_context('feishu_r1', 'oc_b', 'ou_a',
                                        message_id='om_old', context_user_id='ou_a')
         self.manager._set_last_context('feishu_r1', 'oc_a', 'ou_b',
                                        message_id='om_other', context_user_id='ou_b')
 
         async def send(_msg):
-            self.manager._clear_chat_history('feishu_r1', 'oc_a', 'ou_a')
+            self.manager._clear_user_context('feishu_r1', 'ou_a')
 
         self.manager._adapters['feishu_r1'] = mock.Mock(platform='feishu', send_message=send)
         result = await self.manager.send_to_channel('feishu_r1', '旧回复',
                                                     source_message_id='om_old')
         self.assertIn('Reply sent', result)
-        self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_a', user_id='ou_a'), [])
+        self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_b', user_id='ou_a'), [])
         await self.manager.send_to_channel('feishu_r1', '给另一人的回复', source_message_id='om_other')
         self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_a', user_id='ou_b')[0]['text'],
                          '给另一人的回复')
 
     async def test_queued_trigger_is_discarded_only_for_the_sender_who_cleared(self):
-        def event(user_id, generation, text):
+        def event(user_id, generation, text, chat_id='oc_a'):
             return {
                 'source': 'dds:/channel/request/feishu_r1',
                 'text': json.dumps({
-                    'platform': 'feishu', 'channel_id': 'feishu_r1', 'chat_id': 'oc_a', 'user_id': user_id,
+                    'platform': 'feishu', 'channel_id': 'feishu_r1', 'chat_id': chat_id, 'user_id': user_id,
                     'context_generation': generation, 'text': text,
                 }, ensure_ascii=False),
                 'ts': 1,
@@ -208,12 +227,13 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(collector, '_priority_pending', []),
         ):
             old = event('ou_a', 0, '旧请求')
+            old_in_another_chat = event('ou_a', 0, '另一会话的旧请求', chat_id='oc_b')
             other = event('ou_b', 0, '同群另一人的请求')
-            await collector._emit_batch([old, other], urgent=True)
+            await collector._emit_batch([old, other, old_in_another_chat], urgent=True)
             collector._steering_queue.put_nowait(old)
-            self.manager._clear_chat_history('feishu_r1', 'oc_a', 'ou_a')
+            self.manager._clear_user_context('feishu_r1', 'ou_a')
             fresh = event('ou_a', 1, '新请求')
-            await collector._emit_batch([old, fresh], urgent=True)
+            await collector._emit_batch([old, old_in_another_chat, fresh], urgent=True)
 
             self.assertEqual(await collector.drain_steering(), [])
             with mock.patch.object(collector, '_current_trigger', {'_feishu_chat': ('feishu_r1', 'oc_a', 'ou_a', 0)}):
@@ -239,12 +259,28 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
         core._turns = [[{'role': 'user', 'content': '上一轮全局历史'}]]
         core._summary = '上一轮全局摘要'
         self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '清除前的消息', user_id='ou_a')
-        self.manager._clear_chat_history('feishu_r1', 'oc_a', 'ou_a')
+        self.manager._clear_user_context('feishu_r1', 'ou_a')
         self.manager.active_input_channels.add('feishu_r1')
         msg = InboundMessage('feishu', 'feishu_r1', 'ou_a', 'oc_a', 'Alice', '新消息',
                              message_id='om_fresh', chat_type='p2p')
+        archive_lookup = mock.AsyncMock(return_value='旧档案内容')
+        raw_lookup = mock.AsyncMock(return_value='当前传感器数据')
+        core._sys_tools = {
+            'search_history': {'schema': {'name': 'search_history'}, 'object': archive_lookup},
+            'memory_recall': {'schema': {'name': 'memory_recall'}, 'object': archive_lookup},
+            'raw_input_info': {'schema': {'name': 'raw_input_info'}, 'object': raw_lookup},
+        }
         call = mock.AsyncMock(side_effect=[
-            {'role': 'assistant', 'content': '回复'},
+            {'role': 'assistant', 'content': '', 'tool_calls': [
+                {'id': f'call_{index}', 'type': 'function',
+                 'function': {'name': name, 'arguments': json.dumps(args)}}
+                for index, (name, args) in enumerate([
+                    ('search_history', {'query': '之前的消息'}),
+                    ('memory_recall', {'query': '之前的消息'}),
+                    ('raw_input_info', {'source': 'dds:/channel/request/feishu_r1'}),
+                    ('raw_input_info', {'source': 'dds:/sensors/battery'}),
+                ])
+            ]},
             {'role': 'assistant', 'content': ''},
         ])
         with (
@@ -261,6 +297,7 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
                 {'source': f'dds:{topic}', 'text': raw, 'ts': 1},
             ], urgent=True)
         self.assertEqual(trigger['_feishu_chat'], ('feishu_r1', 'oc_a', 'ou_a', 1))
+        self.assertNotIn('<chat_history', trigger['text'])
 
         llm_module = sys.modules['event.llm']
         with (
@@ -276,7 +313,11 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
             await core._one_turn(trigger)
 
         self.assertEqual(call.await_count, 2)
+        archive_lookup.assert_not_awaited()
+        raw_lookup.assert_awaited_once_with(source='dds:/sensors/battery')
         for request in call.await_args_list:
+            tool_names = {tool['function']['name'] for tool in request.kwargs['tool_list']}
+            self.assertEqual(tool_names, {'raw_input_info'})
             prompt_text = json.dumps(request.kwargs['message_list'], ensure_ascii=False)
             self.assertIn('新消息', prompt_text)
             self.assertNotIn('清除前的消息', prompt_text)
@@ -298,7 +339,7 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(chat_history.delete_session, core._feishu_archive_id)
         core._current_turn.append({'role': 'assistant', 'content': '已收到代号'})
         core._save_current_turn(trigger)
-        self.manager._clear_chat_history('feishu_r1', 'oc_a', 'ou_a')
+        self.manager._clear_user_context('feishu_r1', 'ou_a')
 
         self.assertEqual(core._build_history(), [{'role': 'user', 'content': '普通渠道消息'}])
         restored = chat_history.get_last_session_turns()
@@ -340,6 +381,37 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored['turns'], [ordinary, telegram])
         self.assertTrue(restored['filtered_feishu'])
         self.assertEqual(chat_history.get_session_messages(session), turns)
+
+    def test_resume_falls_back_when_latest_legacy_session_only_has_feishu_turns(self):
+        import chat_history
+
+        ordinary_session = chat_history.create_session()
+        self.addCleanup(chat_history.delete_session, ordinary_session)
+        ordinary = [{'role': 'user', 'content': '较早的普通渠道消息'}]
+        chat_history.save_turn(ordinary_session, 0, ordinary)
+
+        latest_session = chat_history.create_session()
+        self.addCleanup(chat_history.delete_session, latest_session)
+        feishu = [{'role': 'user', 'content': (
+            '<event source="dds:/channel/request/legacy" ts="time">\n'
+            '{"platform":"feishu","text":"旧版飞书消息"}\n</event>'
+        )}]
+        chat_history.save_turn(latest_session, 0, feishu)
+
+        restored = chat_history.get_last_session_turns(limit=1)
+        self.assertEqual(restored['session_id'], ordinary_session)
+        self.assertEqual(restored['turns'], [ordinary])
+        self.assertTrue(restored['filtered_feishu'])
+        self.assertEqual(chat_history.get_session_messages(latest_session), [feishu])
+
+        # With an earlier ordinary turn in the latest session, filter before applying the limit.
+        latest_ordinary = [{'role': 'user', 'content': '同一会话中的普通渠道消息'}]
+        chat_history.save_turn(latest_session, 0, latest_ordinary)
+        chat_history.save_turn(latest_session, 1, feishu)
+        restored = chat_history.get_last_session_turns(limit=1)
+        self.assertEqual(restored['session_id'], latest_session)
+        self.assertEqual(restored['turns'], [latest_ordinary])
+        self.assertTrue(restored['filtered_feishu'])
 
 
 if __name__ == '__main__':

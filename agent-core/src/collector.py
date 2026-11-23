@@ -480,7 +480,13 @@ def _chat_history_blocks(batch: list[dict]) -> str:
     from channel.manager import manager as channel_manager
     seen = set()
     blocks = []
-    for payload in _channel_payloads(batch):
+    payloads = _channel_payloads(batch)
+    feishu_message_ids = frozenset(
+        payload['message_id'] for payload in payloads
+        if payload.get('platform') == 'feishu' and isinstance(payload.get('message_id'), str)
+        and payload['message_id']
+    )
+    for payload in payloads:
         channel_id = payload.get('channel_id')
         chat_id = payload.get('chat_id')
         if not isinstance(channel_id, str) or not isinstance(chat_id, str):
@@ -494,7 +500,10 @@ def _chat_history_blocks(batch: list[dict]) -> str:
         if not channel_id or not chat_id or history_key in seen:
             continue
         seen.add(history_key)
-        history = channel_manager.get_chat_history(channel_id, chat_id, user_id=user_id)
+        history = channel_manager.get_chat_history(
+            channel_id, chat_id, user_id=user_id,
+            exclude_message_ids=feishu_message_ids if user_id else frozenset(),
+        )
         if not history:
             continue
         lines = []
