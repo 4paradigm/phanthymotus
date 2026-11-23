@@ -12,6 +12,11 @@ export const PLATFORMS = Object.freeze({
     steps: ['登录虎牙并完成主播实名认证。', '直达主播设置，选择「开通远程推流」。', '填写直播分类和标题，获取完整 RTMP 地址，再交给 Bumi。'],
     defaultServer: '',
   },
+  other: {
+    name: '其他平台（RTMP）',
+    steps: ['在目标平台开通直播和第三方推流权限。', '从官方设置获取 RTMP/RTMPS 服务器地址及推流码。', '将两项分别填写到 Bumi，确认后才能公开开播。'],
+    defaultServer: '',
+  },
 });
 
 // User guidance is data, not Canvas branches. These are instructions, not account-status claims.
@@ -30,6 +35,12 @@ export const READINESS_BY_PLATFORM = Object.freeze({
     { id: 'ready', title: '我已经有本场服务器和推流码' },
   ],
   huya: READINESS,
+  other: [
+    { id: 'new', title: '我还没有直播权限' },
+    { id: 'permission', title: '能开播，但没有第三方推流权限' },
+    { id: 'find', title: '找不到服务器地址或推流码' },
+    { id: 'ready', title: '已有平台提供的服务器地址和推流码' },
+  ],
 });
 
 export function getReadiness(platform) {
@@ -71,6 +82,19 @@ export const GUIDES = Object.freeze({
       { stage: '本场直播', title: '获取并复制完整 RTMP 地址', detail: '点击「获取推流地址并开播」，复制完整 RTMP 地址，粘贴到 Bumi。', url: 'https://i.huya.com/index.php?m=ProfileSetting', linkText: '前往获取推流地址', helpUrl: 'https://help.huya.com/355', place: '电脑网页' },
     ],
   },
+  other: {
+    new: [
+      { stage: '账号准备', title: '在目标平台注册主播账号', detail: '登录官方主播中心，按平台要求开通直播权限；只有提供 RTMP/RTMPS 第三方推流的平台才能接入 Bumi。', place: '目标平台官方页面' },
+      { stage: '账号准备', title: '完成认证并申请推流权限', detail: '按平台规则完成实名认证、直播资质和第三方推流权限申请。直播权限不一定等于推流权限。', place: '目标平台官方页面' },
+    ],
+    permission: [
+      { stage: '推流权限', title: '开通第三方推流功能', detail: '在平台主播设置寻找「第三方推流」「RTMP 推流」或「推流工具」。如果平台不提供服务器地址和推流码，当前通道无法使用。', place: '目标平台官方页面' },
+    ],
+    find: [
+      { stage: '本场直播', title: '找到平台官方推流设置', detail: '在官方主播中心创建或准备本场直播，查找 RTMP/RTMPS 推流设置。不要使用来路不明的推流地址。', place: '目标平台官方页面' },
+      { stage: '本场直播', title: '复制服务器地址和推流码', detail: '分别复制官方 RTMP/RTMPS 服务器地址与本场推流码，回到 Bumi 分开填写。推流码相当于密钥，请勿发送到聊天。', place: '目标平台官方页面' },
+    ],
+  },
 });
 
 export const TROUBLESHOOT = Object.freeze({
@@ -95,6 +119,13 @@ export const TROUBLESHOOT = Object.freeze({
     '填写直播分类和标题': '依次选择直播品类、「普通直播」及本场标题。这几项都在主播设置的远程推流区域完成。',
     '获取并复制完整 RTMP 地址': '这是完整的一条 RTMP 地址，Bumi 直接粘贴即可。点击「获取推流地址并开播」可能同步启动平台侧直播，务必先准备好 Bumi。',
   },
+  other: {
+    '在目标平台注册主播账号': '仅支持提供 RTMP 或 RTMPS 第三方推流的平台。只有手机 App 直播、没有推流码的平台不适用。',
+    '完成认证并申请推流权限': '必须在平台官方渠道开通权限，Bumi 不能绕过平台审核。',
+    '开通第三方推流功能': '请查看目标平台自己的帮助文档，寻找「服务器地址」「Stream Key」，不要填写账号密码。',
+    '找到平台官方推流设置': '创建本场直播后查找推流信息，不同平台的位置不同。',
+    '复制服务器地址和推流码': '服务器地址以 rtmp:// 或 rtmps:// 开头；推流码只填官方提供的独立密钥。',
+  },
 });
 export function getGuideHelp(platform, title) {
   return TROUBLESHOOT[platform]?.[title]
@@ -109,6 +140,9 @@ export function getGuide(platform, readiness) {
   if (platform === 'xiaohongshu' && readiness === 'new') {
     return [...steps, ...guides.permission, ...guides.find];
   }
+  if (platform === 'other' && readiness === 'new') {
+    return [...steps, ...guides.permission, ...guides.find];
+  }
   return readiness === 'new' || readiness === 'permission'
     ? [...steps, ...guides.find] : steps;
 }
@@ -118,6 +152,26 @@ const STREAM_PROTOCOLS = new Set(['rtmp:', 'rtmps:']);
 const PORTS = new Set(['', '1935', '443']);
 // Both hosts were observed in the official Xiaohongshu live assistant.
 const XIAOHONGSHU_PUSH_HOSTS = new Set(['live-push.xhscdn.com', 'live-push-reg-tx.xhscdn.com']);
+const PRIVATE_SUFFIXES = ['.localhost', '.local', '.lan', '.internal', '.test', '.invalid', '.example', '.onion', '.arpa', '.localdomain'];
+
+function isPublicPushHost(host) {
+  if (!host || host === 'localhost' || host.length > 253 || host.endsWith('.')
+      || PRIVATE_SUFFIXES.some(suffix => host.endsWith(suffix))) return false;
+  const labels = host.split('.');
+  if (labels.length < 2 || !labels.every(label =>
+    label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label))) return false;
+  if (/^[0-9.]+$/.test(host) || host.includes(':')) return false;
+  return /[a-z]/.test(labels.at(-1));
+}
+
+export function makeOtherStreamUrl(server, streamKey) {
+  const base = String(server || '').trim();
+  const key = String(streamKey || '').trim();
+  if (!base) throw new Error('请填写平台提供的 RTMP/RTMPS 服务器地址');
+  if (!key) throw new Error('请填写平台提供的推流码');
+  if (/^rtmps?:\/\//i.test(key)) throw new Error('推流码栏只填写密钥，不要粘贴完整地址');
+  return makeStreamUrl('other', key, base);
+}
 
 export function makeXiaohongshuStreamUrl(server, streamKey) {
   const base = String(server || '').trim();
@@ -160,10 +214,17 @@ export function makeStreamUrl(platform, input, server = '') {
         || !parsed.searchParams.get('txSecret') || !parsed.searchParams.get('txTime')) {
       throw new Error('这不是有效的小红书推流信息，请检查是否复制完整');
     }
-  } else if (!((host === 'tx.direct.huya.com' || host.endsWith('.direct.huya.com'))
+  } else if (platform === 'huya' && !((host === 'tx.direct.huya.com' || host.endsWith('.direct.huya.com'))
       && parsed.pathname.startsWith('/huyalive/')
       && parsed.pathname.length > '/huyalive/'.length)) {
     throw new Error('这不是有效的虎牙推流地址，请从虎牙主播中心重新复制');
+  } else if (platform === 'other') {
+    if (!isPublicPushHost(host) || host.includes('.xhscdn.com')
+        || host === 'tx.direct.huya.com' || host.endsWith('.direct.huya.com')
+        || parsed.pathname.split('/').filter(Boolean).length < 2
+        || parsed.pathname.endsWith('/')) {
+      throw new Error('请输入其他平台提供的有效公网 RTMP/RTMPS 地址和推流码');
+    }
   }
   return url;
 }
