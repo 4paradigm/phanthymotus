@@ -555,6 +555,8 @@ export const SkeletonRenderer = {
     this._ro?.disconnect();
     this._controls?.dispose();
     if (this._threeRenderer) {
+      // See PointCloudRenderer.unmount: release the context, not just buffers.
+      this._threeRenderer.forceContextLoss();
       this._threeRenderer.dispose();
       this._threeRenderer.domElement?.remove();
     }

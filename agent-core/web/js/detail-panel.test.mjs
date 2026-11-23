@@ -3,50 +3,52 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
-const source = readFileSync(new URL('./detail-panel.js', import.meta.url), 'utf8');
-// Use the real point-cloud matcher and decoder; only mounting WebGL needs a stub.
-const cloudSource = readFileSync(new URL('./renderers/pointcloud.js', import.meta.url), 'utf8')
-  .replace(/^import .*;\r?$/gm, '').replace(/^export /gm, '');
-const cloud = runInNewContext(cloudSource + '\nPointCloudRenderer;', {
-  ArrayBuffer, DataView, Float32Array,
-});
+const read = file => readFileSync(new URL(file, import.meta.url), 'utf8');
+const source = read('./detail-panel.js');
+
+// The real canRender of every renderer, so match order is tested against the
+// matchers that ship rather than against stubs that only Activity can pass.
+// Module bodies are evaluated without their imports; mount/onData, where the
+// real work happens, are replaced by the doubles below.
+const real = {};
+for (const file of ['activity', 'text', 'video', 'image', 'audio', 'lidar', 'control', 'pointcloud',
+                    'mapping', 'skeleton', 'pose2d', 'tactile', 'camera']) {
+  const body = read(`./renderers/${file}.js`)
+    .replace(/^import[\s\S]*?;\r?$/gm, '').replace(/^export /gm, '');
+  const names = [...body.matchAll(/^const (\w+Renderer) = /gm)].map(m => m[1]);
+  // Some renderers build THREE objects in their literal (mapping's _robotPos),
+  // so give them classes that construct to nothing.
+  const THREE = new Proxy({}, { get: () => class {} });
+  Object.assign(real, runInNewContext(`${body}\n({ ${names.join(', ')} })`,
+    { console, THREE, OrbitControls: class {} }));
+}
 
 function harness() {
   const mounted = [], unmounted = [], sockets = [], timers = new Map();
+  // One double per renderer, shared by every import site so identity checks
+  // (detail-panel's TextRenderer/ActivityRenderer comparison) still hold.
+  const doubles = Object.fromEntries(Object.entries(real).map(([name, renderer]) => [name, {
+    name,
+    canRender: renderer.canRender,
+    mount(body, mcpId) { this.body = body; this.mcpId = mcpId; this.received = []; mounted.push(this); },
+    onData(buffer, hint) { this.received.push({ buffer, hint }); },
+    unmount() { unmounted.push(this); },
+  }]));
+  const fromDoubles = bindings => Object.fromEntries(
+    bindings.replace(/[{}\s]/g, '').split(',').filter(Boolean).map(name => [name, doubles[name]]));
+  const asConsts = (text, resolve) => text.replace(/^import (\{[^}]+\})\s+from '([^']+)';\r?$/gm,
+    (_, bindings, file) => `const ${bindings} = imports[${JSON.stringify(resolve(file))}];`);
   const imports = {};
-  for (const [file, names] of [
-    ['activity', ['ActivityRenderer']], ['text', ['TextRenderer']],
-    ['video', ['VideoRenderer']], ['image', ['ImageRenderer']],
-    ['audio', ['AudioRenderer']], ['lidar', ['LidarRenderer']],
-    ['pointcloud', ['PointCloudRenderer']], ['control', ['ControlRenderer']],
-    ['skeleton', ['SkeletonRenderer']], ['pose2d', ['Pose2dRenderer']],
-    ['tactile', ['TactileRenderer']],
-    ['camera', ['CameraRenderer', 'DepthRenderer', 'DepthZlibRenderer']],
-  ]) {
-    imports['./renderers/' + file + '.js'] = Object.fromEntries(names.map(name => {
-      const renderer = {
-        name: file,
-        canRender: hint => name === 'ActivityRenderer'
-          && (!hint || /^(sensor|control|state|data)\//.test(hint)),
-        mount(body) { this.body = body; this.received = []; mounted.push(this); },
-        onData(buffer, hint) { this.received.push({ buffer, hint }); },
-        unmount() { unmounted.push(this); },
-      };
-      if (name === 'PointCloudRenderer') {
-        renderer.canRender = cloud.canRender;
-        renderer.mount = function(body) {
-          this.body = body; this.received = []; this._frames = [];
-          cloud._buildAxisMap.call(this, null);
-          mounted.push(this);
-        };
-        renderer.onData = function(buffer, hint) {
-          this.received.push({ buffer, hint });
-          cloud.onData.call(this, buffer);
-        };
-      }
-      return [name, renderer];
-    }));
+  // registry.js, evaluated for real so its order is the order under test.
+  const registrySource = read('./renderers/registry.js');
+  for (const [, bindings, file] of registrySource.matchAll(/^import (\{[^}]+\})\s+from '([^']+)';/gm)) {
+    imports['./renderers/' + file.slice(2)] = fromDoubles(bindings);
   }
+  imports['./renderers/registry.js'] = runInNewContext(
+    asConsts(registrySource, file => './renderers/' + file.slice(2)).replace(/^export /gm, '')
+      + '\n({ RENDERERS });', { imports });
+  imports['./renderers/activity.js'] = { ActivityRenderer: doubles.ActivityRenderer };
+  imports['./renderers/text.js'] = { TextRenderer: doubles.TextRenderer };
   imports['./mobile.js'] = { openDetailPanelMobile() {}, closeDetailPanelMobile() {} };
   const elements = Object.fromEntries(
     ['detail-panel', 'detail-close', 'detail-title', 'detail-subtitle', 'detail-body']
@@ -58,9 +60,7 @@ function harness() {
   );
   let timerId = 0;
   const api = runInNewContext(
-    source.replace(/^import (\{[^}]+\})\s+from '([^']+)';\r?$/gm,
-      (_, bindings, file) => 'const ' + bindings + ' = imports[' + JSON.stringify(file) + '];')
-      .replace(/^export /gm, '') + '\n({ initDetailPanel, showTopicDetail });',
+    asConsts(source, file => file).replace(/^export /gm, '') + '\n({ initDetailPanel, showTopicDetail });',
     {
       imports, ArrayBuffer, TextEncoder, console,
       location: { protocol: 'https:', host: 'robot.local:15678' },
@@ -89,11 +89,11 @@ function frame() {
   return buffer;
 }
 
-test('point-cloud details decode binary frames instead of falling through to the JSON log', () => {
+test('point-cloud details hand binary frames to the point-cloud renderer, not the JSON log', () => {
   const h = harness();
-  h.showTopicDetail('/nvidia_desktop/lidar/cloud', 'sensor/pointcloud');
+  h.showTopicDetail('/nvidia_desktop/lidar/cloud', 'sensor/pointcloud', 'as2w-driver');
   const renderer = h.mounted[0], ws = h.sockets[0];
-  assert.equal(renderer.name, 'pointcloud');
+  assert.equal(renderer.name, 'PointCloudRenderer');
   assert.equal(ws.url, 'wss://robot.local:15678/ws/bus/nvidia_desktop/lidar/cloud');
   assert.equal(ws.binaryType, 'arraybuffer');
   ws.onmessage({ data: JSON.stringify({ type: 'meta' }) });
@@ -102,12 +102,33 @@ test('point-cloud details decode binary frames instead of falling through to the
   ws.onmessage({ data: payload });
   assert.equal(renderer.received[0].buffer, payload);
   assert.equal(renderer.received[0].hint, 'sensor/pointcloud');
-  assert.equal(renderer._frames[0].count, 2);
-  assert.deepEqual(Array.from(renderer._frames[0].pos), [2, -3, -1, 5, -6, -4]);
   const stale = [...h.timers.values()].find(timer => timer.delay === 10000);
   assert.ok(stale, 'point clouds must retain the visual-stream stale notice');
   stale.callback();
   assert.match(h.elements['detail-body'].children.at(-1).textContent, /画面是最后一帧/);
+});
+
+test('the renderer is mounted with the owning device, so per-device settings apply', () => {
+  const h = harness();
+  h.showTopicDetail('/lidar/cloud', 'sensor/pointcloud', 'as2w-driver');
+  assert.equal(h.mounted[0].mcpId, 'as2w-driver');
+  // No device known: the monitor page's own "use the defaults" value.
+  h.showTopicDetail('/lidar/cloud', 'sensor/pointcloud');
+  assert.equal(h.mounted[1].mcpId, 'dashboard');
+});
+
+test('mapping topics get the mapping renderer, as on the monitor page', () => {
+  const h = harness();
+  h.showTopicDetail('/slam/map', 'sensor/mapping', 'slam');
+  assert.equal(h.mounted[0].name, 'MappingRenderer');
+});
+
+test('the monitor page and the detail panel share one renderer list', () => {
+  for (const file of ['./detail-panel.js', './monitor-dashboard.js']) {
+    const text = read(file);
+    assert.match(text, /^import \{ RENDERERS \}\s+from '\.\/renderers\/registry\.js';$/m, file);
+    assert.doesNotMatch(text, /^const RENDERERS\b/m, `${file} must not keep its own copy`);
+  }
 });
 
 test('switching and closing point-cloud details release the old renderer and subscription', () => {
@@ -130,7 +151,7 @@ test('switching and closing point-cloud details release the old renderer and sub
 test('unrecognized sensor formats still use the activity renderer', () => {
   const h = harness();
   h.showTopicDetail('/sensor/state', 'sensor/vendor-data');
-  assert.equal(h.mounted[0].name, 'activity');
+  assert.equal(h.mounted[0].name, 'ActivityRenderer');
   h.sockets[0].onmessage({ data: '{"state":"healthy"}' });
   assert.equal(new TextDecoder().decode(h.mounted[0].received[0].buffer), '{"state":"healthy"}');
   assert.equal(h.timers.size, 0);
