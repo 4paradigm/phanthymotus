@@ -30,19 +30,36 @@ function fixture(fetch) {
   body.querySelector = selector => fields[selector.match(/data-key="([^"]+)"/)[1]];
   body.querySelectorAll = () => Object.values(fields);
   const jobs = [];
+  const polls = [];
   const context = vm.createContext({document: {createElement: () => new Element()},
     Option: function(text, value) { this.text = text; this.value = value; },
     fetch, ensureEdit: async () => true, _toolConfigs: {},
-    queueMicrotask: fn => jobs.push(fn), setTimeout: fn => { jobs.push(fn); return jobs.length; }, clearTimeout: () => {}});
+    queueMicrotask: fn => jobs.push(fn), setTimeout: (fn, delay) => { (delay === 2500 ? polls : jobs).push(fn); return jobs.length; }, clearTimeout: () => {}});
   vm.runInContext(reader + helper, context);
   const controls = context._bridgePrinterControls({mcpId: 'perception', toolName: 'Visitor_Badge_Printer',
     bodyEl: body, overlay: {classList: {contains: () => false}}, props, key: 'printer_name', saved: 'Brother'});
   fields.printer_name = controls.input;
   const flush = async () => { while (jobs.length) { jobs.shift()(); await new Promise(resolve => setImmediate(resolve)); } };
-  return {fields, body, controls, flush, context};
+  return {fields, body, controls, flush, context, polls};
 }
 
 const response = result => ({ok: true, json: async () => ({code: 200, data: result})});
+
+test('automatic refresh discovers new pages and stops when dialog is removed', async () => {
+  let pages = [];
+  let calls = 0;
+  const f = fixture(async () => { calls++; return response({printers: [{name: 'Brother'}], pages}); });
+  await f.flush();
+  pages = [{title: 'Visitors', url: 'https://visitor.test/list'}];
+  await f.polls.shift()();
+  assert.ok(f.fields.visitor_page_url.children.some(p => p.value === pages[0].url));
+  assert.equal(f.controls.input.value, 'Brother');
+  f.controls.controls[0].isConnected = false;
+  const before = calls;
+  await f.polls.shift()();
+  assert.equal(calls, before);
+  assert.equal(f.polls.length, 0);
+});
 
 test('initialization verifies SSH and persists connection before printer selection', async () => {
   const requests = [];

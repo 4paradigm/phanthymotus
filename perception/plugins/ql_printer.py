@@ -452,9 +452,9 @@ class QLPrinterPlugin:
                     "default": 22, "advanced": True,
                 },
                 "visitor_page_url": {
-                    "type": "string", "title": "已登录的访客网页", "scope": "instance",
+                    "type": "string", "title": "访客列表网页", "scope": "instance",
                     "format": "edge-page",
-                    "description": "一定选择已经登录、并且能看到访客列表的网页",
+                    "description": "首次请在自动化专用 Edge 中登录并打开访客列表，再获取并选择该网页。保存后可关闭 Edge，执行时会自动打开；登录过期需重新登录。",
                 },
             },
             # Connection credentials are required to discover the choices.

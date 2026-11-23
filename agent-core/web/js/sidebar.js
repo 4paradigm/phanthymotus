@@ -990,7 +990,9 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
     input.replaceChildren(new Option(selected || label, selected));
   };
   input.addEventListener('change', () => { selected = input.value; });
+  let loading = false;
   const loadPrinters = async (silent = false) => {
+    if (loading) return;
     const version = ++generation;
     const address = connection();
     const [bridge_url, remote_start_user, remote_start_password, remote_start_port] = automaticSsh ? ['', ''] : address;
@@ -1001,8 +1003,11 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       input.disabled = installing;
       return;
     }
-    input.disabled = true;
-    showPending('正在读取打印机…');
+    loading = true;
+    if (!silent) {
+      input.disabled = true;
+      showPending('正在读取打印机…');
+    }
     try {
       const result = await call(automaticSsh ? {action: 'printers'} : {action: 'printers', bridge_url, remote_start_user,
         remote_start_password, remote_start_port});
@@ -1021,14 +1026,17 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
         const savedPage = pageInput.value;
         pageInput.replaceChildren(new Option('请选择已登录且能看到访客列表的网页', ''));
         for (const page of result.pages) pageInput.add(new Option(`${page.title || '访客网页'} — ${page.url}`, page.url));
-        if (savedPage && !result.pages.some(page => page.url === savedPage)) pageInput.add(new Option(`${savedPage}（当前未打开）`, savedPage));
+        // Discovery is a snapshot, not a live browser or login-state check.
+        if (savedPage && !result.pages.some(page => page.url === savedPage)) pageInput.add(new Option(`${savedPage}（已选择，本次未获取到）`, savedPage));
         pageInput.value = savedPage;
       }
+      return true;
     } catch (error) {
       if (!current()) return;
-      showPending('暂时无法读取打印机');
+      if (!silent) showPending('暂时无法读取打印机');
       if (!silent) progress.textContent = error.message;
     } finally {
+      loading = false;
       if (current()) input.disabled = installing;
     }
   };
@@ -1084,7 +1092,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
       if (!response.ok) throw new Error('安装成功，但连接配置未保存，请点击“保存”后重试');
       _toolConfigs[cacheKey] = sharedValues;
       if (!alive() || identity() !== savedIdentity) return;
-      progress.textContent = 'Edge 已打开：请登录访客网站并确认能看到访客列表，然后关闭 Edge，再选择网页和打印机并保存。';
+      progress.textContent = '请在自动化 Edge 中登录并打开访客列表，网页列表会自动刷新，选择后保存。';
       await loadPrinters();
     } catch (error) {
       if (alive() && (unchanged() || identity() === pairedIdentity)) progress.textContent = error.message;
@@ -1098,6 +1106,16 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
         }
       }
     }
+  };
+
+  const pollChoices = async () => {
+    if (!alive()) return;
+    // Avoid replacing an open native select while the user is choosing.
+    if (!installing && document.activeElement !== input &&
+        document.activeElement !== bodyEl.querySelector('[data-key="visitor_page_url"]')) {
+      await loadPrinters(true);
+    }
+    if (alive()) setTimeout(pollChoices, 2500);
   };
 
   let reloadTimer;
@@ -1125,7 +1143,7 @@ function _bridgePrinterControls({mcpId, toolName, bodyEl, overlay, props, key, s
   queueMicrotask(() => {
     if (!alive()) return;
     lastAddress = read('bridge_url');
-    loadPrinters(true);
+    pollChoices();
   });
   return {input, controls: [initialize, progress]};
 }
