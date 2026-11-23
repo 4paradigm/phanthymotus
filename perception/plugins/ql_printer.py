@@ -1,7 +1,7 @@
 """通用访客贴打印卡片（QL_printer），独立于机器人硬件驱动。
 
 机器人与前台电脑之间只使用经过主机校验的 SSH。Windows 上的浏览器自动化运行时
-只监听 127.0.0.1；卡片通过 SSH 命令让 Windows 本机调用它，外部不开放业务端口，
+通过计划任务读取本地任务文件；外部不开放业务端口，
 也不需要在卡片中保存访问令牌。
 
     机器人 skill → QL_printer 卡片 ──SSH──> Windows 自动化运行时 → 范式+ / 打印机
@@ -179,7 +179,7 @@ def _safe_json(raw: bytes) -> Any:
 
 
 class SSHBridgeClient:
-    """通过唯一的 SSH 通道调用 Windows 本机回环接口。"""
+    """通过唯一的 SSH 通道提交 Windows 本地任务。"""
 
     MARKER = "VISITOR_RESULT:"
 
@@ -321,6 +321,10 @@ Write-Output ('{self.MARKER}' + [Convert]::ToBase64String($bytes))
         if result.returncode != 0:
             detail = _decode_process_output(result.stderr or result.stdout)
             detail = detail[-600:]
+            if any(marker in detail.lower() for marker in ("host key verification failed", "remote host identification has changed", "no ed25519 host key is known", "no rsa host key is known", "no ecdsa host key is known")):
+                raise BridgeError("前台电脑的 SSH 身份与已保存记录不一致，请核对是否更换电脑或重装了系统", "ssh_host_key_mismatch")
+            if "permission denied" in detail.lower():
+                raise BridgeError("Windows SSH 身份验证失败，请检查用户名、密码及账户权限", "ssh_auth_failed")
             if "Visitor automation job timed out" in detail:
                 # The on-demand worker never produced a result file.
                 # Extract the diagnostic tail the PowerShell script appended.
@@ -384,7 +388,7 @@ class QLPrinterPlugin:
             "remote_start_password": str(plugin_config.get("remote_start_password", "") or ""),
             "visitor_page_url": str(plugin_config.get("visitor_page_url", "") or ""),
         }
-        self._direct_request_ids: dict[tuple[str, str, str, str], str] = {}
+        self._direct_request_ids: dict[tuple, str] = {}
         self._deploy_state = {"status": "idle"}
         self._print_action_id = None
 
@@ -677,11 +681,11 @@ class QLPrinterPlugin:
         if not self._cfg["visitor_page_url"]:
             return {"status": "error", "code": "visitor_page_required", "error": "请先在卡片中选择已登录的访客网页"}
 
-        # A fresh direct request lets the front desk re-check current visitor
-        # status on every new card action. The Windows store remains
-        # idempotent for retries of an explicit ticket/request_id operation.
+        # An uncertain transport result must reuse the same Windows job key.
+        # Include the destination and selection to avoid reusing it elsewhere.
+        key = tuple(self._cfg[k] for k in ("bridge_url", "remote_start_user", "remote_start_port", "visitor_page_url", "printer_name")) + (name, host)
         with self._lock:
-            request_id = f"direct-{uuid.uuid4().hex}"
+            request_id = self._direct_request_ids.setdefault(key, f"direct-{uuid.uuid4().hex}")
             print_timeout_s = self._cfg["print_timeout_s"]
         try:
             payload = self._client().request(
@@ -698,11 +702,16 @@ class QLPrinterPlugin:
             )
         except BridgeError as exc:
             if exc.code == "not_found":
+                with self._lock:
+                    self._direct_request_ids.pop(key, None)
                 return {
                     "status": "not_found", "name": name, "visits": [],
                     "hint": "今天的未入场列表中没有匹配访客，不能打印访客贴",
                 }
             raise
+        if str(payload.get("code") or "") not in {"print_outcome_unknown", "status_unconfirmed"}:
+            with self._lock:
+                self._direct_request_ids.pop(key, None)
         if payload.get("ok") is True:
             return {"status": "printed", "request_id": request_id,
                     "say": "访客贴打好了，在前台打印机上"}
@@ -729,6 +738,8 @@ class QLPrinterPlugin:
         # Freeze connection and page selection for this job. Changes in the
         # settings dialog must never redirect an already accepted print.
         worker = QLPrinterPlugin(config)
+        worker._direct_request_ids = self._direct_request_ids
+        worker._lock = self._lock
         arguments = dict(args)
 
         def run():

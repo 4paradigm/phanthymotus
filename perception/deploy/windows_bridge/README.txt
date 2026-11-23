@@ -7,6 +7,7 @@ Visitor_Badge_Printer 前台 SSH 自动化说明
 管理员首次启用 Windows OpenSSH Server、确认用户名密码可登录，并安装打印机驱动。
 点击卡片的连接初始化按钮后，机器人通过 SSH/SCP 把按需自动化环境安装到：
 D:\ParadigmVisitorAutomation
+Windows 安装依赖仍随机器人镜像提供，初始化无需额外联网下载或手工登记公钥。
 
 日常 list 和 print 均通过 SSH 创建一次性任务，再由 Windows 交互用户的计划任务
 操作专用 Edge 和打印机。没有常驻网络服务；旧的 8765 服务、任务和防火墙规则会在

@@ -1,4 +1,4 @@
-"""Run at image build time; never download dependencies on the front desk."""
+"""Fetch source-pinned Windows dependencies at image build time."""
 import hashlib
 import json
 import time
@@ -58,25 +58,17 @@ def build(root):
         'https://mirrors.huaweicloud.com/python/3.12.10/python-3.12.10-amd64.exe',
         'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe',
     ], installer, '67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb')
-    # Explicit Windows artifacts avoid depending on the Jetson build host's
-    # Python ABI or old pip cross-platform resolver.
-    packages = [('playwright', '1.51.0', 'py3-none-win_amd64.whl'),
-                ('greenlet', '3.1.1', 'cp312-cp312-win_amd64.whl'),
-                ('pyee', '12.1.1', 'py3-none-any.whl'),
-                ('typing_extensions', '4.12.2', 'py3-none-any.whl')]
-    for name, version, suffix in packages:
-        with urllib.request.urlopen('https://pypi.org/pypi/%s/%s/json' % (name, version), timeout=60) as response:
-            metadata = json.load(response)
-        matches = [f for f in metadata['urls'] if f['filename'].endswith(suffix)]
-        if len(matches) != 1:
-            raise RuntimeError('Missing or ambiguous Windows wheel: ' + name)
-        artifact = matches[0]
+    packages = json.loads((Path(__file__).parent / 'offline-wheels.json').read_text(encoding='utf-8'))
+    for artifact in packages:
         target = assets / artifact['filename']
         path = urllib.parse.urlparse(artifact['url']).path
         download_from_mirrors([
             'https://mirrors.cloud.tencent.com/pypi' + path,
             artifact['url'],
-        ], target, artifact['digests']['sha256'])
+        ], target, artifact['sha256'])
+        if target.stat().st_size != artifact['size']:
+            target.unlink()
+            raise RuntimeError('Downloaded artifact size mismatch: ' + target.name)
     manifest = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in sorted(assets.iterdir()) if p.suffix in ('.exe', '.whl')}
     if len(manifest) != 5:

@@ -98,6 +98,8 @@ def test_failure_codes_describe_observed_stage(browser, failure):
     with pytest.raises(BridgeFailure) as caught:
         backend._ensure_login(page)
     assert caught.value.code == expected
+    if failure == "missing":
+        assert str(caught.value) == "未检测到访客查询功能，请打开正确的访客列表网址"
     assert "sensitive" not in str(caught.value)
     if failure == "http":
         assert "503" in str(caught.value)

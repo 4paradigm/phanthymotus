@@ -1,0 +1,26 @@
+[
+  {
+    "filename": "playwright-1.51.0-py3-none-win_amd64.whl",
+    "url": "https://files.pythonhosted.org/packages/20/0f/098488de02e3d52fc77e8d55c1467f6703701b6ea6788f40409bb8c00dd4/playwright-1.51.0-py3-none-win_amd64.whl",
+    "size": 34862693,
+    "sha256": "9ece9316c5d383aed1a207f079fc2d552fff92184f0ecf37cc596e912d00a8c3"
+  },
+  {
+    "filename": "greenlet-3.1.1-cp312-cp312-win_amd64.whl",
+    "url": "https://files.pythonhosted.org/packages/43/21/a5d9df1d21514883333fc86584c07c2b49ba7c602e670b174bd73cfc9c7f/greenlet-3.1.1-cp312-cp312-win_amd64.whl",
+    "size": 299655,
+    "sha256": "7124e16b4c55d417577c2077be379514321916d5790fa287c9ed6f23bd2ffd01"
+  },
+  {
+    "filename": "pyee-12.1.1-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/25/68/7e150cba9eeffdeb3c5cecdb6896d70c8edd46ce41c0491e12fb2b2256ff/pyee-12.1.1-py3-none-any.whl",
+    "size": 15527,
+    "sha256": "18a19c650556bb6b32b406d7f017c8f513aceed1ef7ca618fb65de7bd2d347ef"
+  },
+  {
+    "filename": "typing_extensions-4.12.2-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/26/9f/ad63fc0248c5379346306f8668cda6e2e2e9c95e01216d2b8ffd9ff037d0/typing_extensions-4.12.2-py3-none-any.whl",
+    "size": 37438,
+    "sha256": "04e5ca0351e0f3f85c6853954072df659d0d13fac324d0072316b67d7794700d"
+  }
+]

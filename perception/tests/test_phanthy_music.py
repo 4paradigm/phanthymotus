@@ -492,6 +492,7 @@ class MCPTests(unittest.TestCase):
         # explicitly for the bundle to hold just this card — the tool list
         # below is asserted exactly.
         bundle = main.PerceptionBundle({'plugins': {'phanthy_music': {'enabled': True, 'catalogue_type': 'mock'},
+                                                   'QL_printer': {'enabled': False},
                                                    'echo_cancellation': {'enabled': False},
                                                    'audio_mixer': {'enabled': False}}}, _FakeExecutor())
         captured = io.StringIO()

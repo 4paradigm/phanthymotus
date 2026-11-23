@@ -17,7 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from plugins.ql_printer import BridgeClient, QLPrinterPlugin, SSHBridgeClient  # noqa: E402
+from plugins.ql_printer import BridgeClient, BridgeError, QLPrinterPlugin, SSHBridgeClient  # noqa: E402
 from ql_printer_mock_bridge import MockBridge  # noqa: E402
 
 TOKEN = "test-token"
@@ -234,6 +234,42 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(second["status"], "printed")
         self.assertEqual(self.bridge.print_log, ["V1001"])
 
+    def test_direct_print_reuses_key_after_windows_printed_but_ssh_timed_out(self):
+        original = BridgeClient.request
+        request_ids = []
+        def request(client, method, path, **kwargs):
+            request_ids.append(kwargs["body"]["request_id"])
+            result = original(client, method, path, **kwargs)
+            if len(request_ids) == 1:
+                raise BridgeError("SSH timeout after submission", "request_timeout")
+            return result
+        with patch.object(BridgeClient, "request", request):
+            first = self.call("print", name="王磊", host="张三")
+            self.assertEqual(first["code"], "request_timeout")
+            self.assertEqual(len(self.card._direct_request_ids), 1)
+            retry = self.call("print", name="王磊", host="张三")
+        self.assertEqual(retry["status"], "printed")
+        self.assertEqual(request_ids[0], request_ids[1])
+        self.assertEqual(self.bridge.print_log, ["V1001"])
+        self.assertEqual(self.card._direct_request_ids, {})
+
+    def test_direct_print_retains_key_for_explicit_uncertain_outcome(self):
+        ids = []
+        def request(client, method, path, **kwargs):
+            ids.append(kwargs["body"]["request_id"])
+            return {"ok": False, "code": "print_outcome_unknown", "error": "核对打印机"}
+        with patch.object(BridgeClient, "request", request):
+            self.call("print", name="王磊", host="张三")
+            self.call("print", name="王磊", host="张三")
+        self.assertEqual(ids[0], ids[1])
+
+    def test_unknown_or_changed_host_key_is_reported_precisely(self):
+        client = SSHBridgeClient("10.100.10.14", "operator", "secret")
+        with patch("plugins.ql_printer.subprocess.run", return_value=CompletedProcess([], 255, b"", b"Host key verification failed.")):
+            with self.assertRaises(BridgeError) as caught:
+                client.request("GET", "/health")
+        self.assertEqual(caught.exception.code, "ssh_host_key_mismatch")
+
     def test_second_print_with_new_request_is_rejected(self):
         ticket = self.find_ticket()
         self.call("print", ticket=ticket, request_id="req-a")
@@ -278,6 +314,8 @@ class VisitorBadgeTest(unittest.TestCase):
         self.assertEqual(command[0], "ssh")
         self.assertIn("4paradigm@10.100.10.14", command)
         self.assertNotIn("curl", command)
+        self.assertIn("StrictHostKeyChecking=accept-new", command)
+        self.assertIn("UserKnownHostsFile=/tmp/visitor-printer-known_hosts", command)
 
     def test_browser_job_waits_for_login_edge_to_close_cleanly(self):
         client = SSHBridgeClient("10.100.10.14", "4paradigm", "secret")

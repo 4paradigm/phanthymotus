@@ -414,7 +414,7 @@ Get-CimInstance Win32_Printer | Where-Object Default | Select-Object -First 1 -E
                 if not button.count() or not button.is_visible():
                     if observed_methods:
                         raise BridgeFailure("query_method_mismatch", "已观察到匹配查询接口的请求，但请求方法不是 POST，请检查平台接口配置")
-                    raise BridgeFailure("query_button_missing", "页面加载后未观察到查询请求，也未找到可见的查询或搜索按钮，请确认选择了访客列表页")
+                    raise BridgeFailure("query_button_missing", "未检测到访客查询功能，请打开正确的访客列表网址")
                 try:
                     with page.expect_request(
                         lambda request: self.query_marker in request.url and request.method == "POST",
