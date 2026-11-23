@@ -14,7 +14,7 @@
 import { showToast } from './toast.js';
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired, syncToolConfigPermissions } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
 import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
@@ -57,95 +57,39 @@ let _allMcps    = [];
 const _sessionId = sessionId();
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
-let _editorRevision = 0;    // advances whenever an authoritative editor state is adopted
-let _editClaimPromise = null;
-let _dropEditLease = null;
-const _EDIT_REQUEST_TIMEOUT_MS = 8000;
-
-function _setEditorState(editor) {
-  _currentEditor = editor || null;
-  _isEditor = _currentEditor === _sessionId;
-  _editorRevision += 1;
-}
-
-async function _requestEditor(url, options = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), _EDIT_REQUEST_TIMEOUT_MS);
-  try {
-    const resp = await fetch(url, { ...options, signal: controller.signal });
-    let data;
-    try { data = await resp.json(); }
-    catch (error) {
-      if (controller.signal.aborted) throw error;
-      data = {};
-    }
-    return { resp, data };
-  } finally {
-    clearTimeout(timer);
-  }
-}
+let _clearing = false;
+let _layoutGen = 0;  // bumped on every _reloadLayout; see _clearCanvas
 
 /**
  * Ensure current session holds the edit lock, auto-claiming it if free.
  * Returns true if editing may proceed, false if the canvas is occupied by
  * another session (in which case a toast + locked UI state is shown).
- * Drops pass retain=false until validation accepts the edit; other callers
- * keep the lock even if a concurrent drop is rejected.
  */
-async function _ensureEdit(retain = true) {
-  if (_dropEditLease?.releasePromise) await _dropEditLease.releasePromise;
-  if (retain && _dropEditLease) _dropEditLease.retained = true;
-  if (_editClaimPromise) return _editClaimPromise;
-  if (_isEditor) return true;
-  _editorRevision += 1;  // invalidate reads started before this ownership change
-  _editClaimPromise = _claimEdit();
-  _updateEditorUI();
-  try {
-    return await _editClaimPromise;
-  } finally {
-    _editClaimPromise = null;
-    _updateEditorUI();
+async function _ensureEdit({ forClear = false } = {}) {
+  if (_clearing && !forClear) {
+    _showToast('正在清空画布，请稍候');
+    return false;
   }
-}
-
-async function _claimEdit() {
-  const revision = _editorRevision;
+  if (_isEditor) return true;
   try {
-    const { resp, data } = await _requestEditor('/api/canvas/claim-edit', {
+    const resp = await fetch('/api/canvas/claim-edit', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: _sessionId }),
     });
-    if (resp.status === 423) {
-      if (revision === _editorRevision) _setEditorState(data.editor);
-      _showToast('画布正被其他用户编辑，请稍后重试');
-      return false;
-    }
-    if (resp.status === 401 || resp.status === 403) {
-      throw new Error(`获取编辑权限失败（HTTP ${resp.status}），请重新登录后重试`);
-    }
-    if (!resp.ok) throw new Error(`获取编辑权限失败（HTTP ${resp.status}），请稍后重试`);
-    if (data.editor !== _sessionId) throw new Error('服务器未确认编辑权限，请刷新页面后重试');
-    // A WebSocket event or a newer operation may already have changed ownership.
-    if (revision === _editorRevision) _setEditorState(data.editor);
-    if (_isEditor) {
+    const data = await resp.json();
+    if (resp.ok) {
+      _isEditor = true;
+      _currentEditor = _sessionId;
+      _updateEditorUI();
       _showToast('已自动获取编辑权限');
-      return true;
+      return !_clearing || forClear;
     }
-    _showToast('画布编辑状态已变化，请重试');
+    _currentEditor = data.editor || null;
+    _updateEditorUI();
+    _showToast('画布正被其他用户编辑，请稍后重试');
     return false;
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      _showToast('获取编辑权限超时，正在核对服务器状态');
-      await _checkEditStatus(true);
-      if (_isEditor) {
-        _showToast('已确认获取编辑权限');
-        return true;
-      }
-      _showToast('获取编辑权限超时，请检查连接后重试');
-    } else {
-      _showToast(error instanceof TypeError
-        ? '无法获取编辑权限，请检查网络连接' : error.message);
-    }
+  } catch {
+    _showToast('无法获取编辑权限，请检查网络');
     return false;
   }
 }
@@ -207,10 +151,14 @@ export function cardsForTool(mcpId, toolName) {
 }
 
 /** Why editing is refused right now, or '' when it is allowed. */
-function _editLockReason() {
+function _projectEditLockReason() {
   if (!_projectStateKnown) return '正在确认运行状态，请稍候重试';
   if (_projectRunning) return '请停止智能控制后修改';
   return '';
+}
+
+function _editLockReason() {
+  return _clearing ? '正在清空画布，请稍候' : _projectEditLockReason();
 }
 
 /**
@@ -390,8 +338,8 @@ async function _rearmBrowserSources() {
 function _applyProjectState(running) {
   _projectRunning = !!running;
   _projectStateKnown = true;
-  syncToolConfigPermissions();
   _syncProjectBtn();
+  _syncEmptyState();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
     btn.classList.toggle('locked', !_projectRunning);
   });
@@ -563,7 +511,8 @@ export async function initCanvas(initialMcps) {
     }
 
     // Initialize editor lock state from layout response
-    _setEditorState(layoutJson.editor);
+    _currentEditor = layoutJson.editor || null;
+    _isEditor = _currentEditor === _sessionId;
   } catch { /* start empty */ }
 
   // Show editor status bar
@@ -870,7 +819,10 @@ function _setupControlButtons() {
     _viewportChanged();
   });
 
+  document.getElementById('canvas-clear')?.addEventListener('click', _clearCanvas);
+
   document.getElementById('canvas-project-toggle')?.addEventListener('click', () => {
+    if (_clearing) { _showToast('正在清空画布，请稍候'); return; }
     if (_projectRunning) { _stopProject(); return; }
     // _projectRunning only flips true once the start fetch resolves, so a
     // second click during that async window used to fire a second concurrent
@@ -890,34 +842,6 @@ function _setupControlButtons() {
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
 
-async function _withDropEdit(edit) {
-  if (_dropEditLease?.releasePromise) await _dropEditLease.releasePromise;
-  // Drops sharing an in-flight claim must finish validation before deciding
-  // whether to keep it. Any accepted drop or ordinary edit retains the lock.
-  const lease = _dropEditLease ||= {
-    pending: 0, retained: _isEditor || !!_editClaimPromise, releasePromise: null,
-  };
-  lease.pending += 1;
-  try {
-    if (!(await _ensureEdit(false))) return false;
-    const accepted = edit();
-    if (accepted) lease.retained = true;
-    return accepted;
-  } finally {
-    lease.pending -= 1;
-    if (lease.pending === 0) {
-      try {
-        if (!lease.retained && _isEditor) {
-          lease.releasePromise = _releaseEdit();
-          await lease.releasePromise;
-        }
-      } finally {
-        _dropEditLease = null;
-      }
-    }
-  }
-}
-
 function _setupDropZone() {
   _canvasEl.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -931,7 +855,7 @@ function _setupDropZone() {
     }
   });
 
-  _canvasEl.addEventListener('drop', async (e) => {
+  _canvasEl.addEventListener('drop', (e) => {
     e.preventDefault();
     _canvasEl.classList.remove('drag-over');
 
@@ -940,49 +864,43 @@ function _setupDropZone() {
       return;
     }
 
-    // Read the drag payload before awaiting: the browser only exposes it during
-    // the synchronous drop event. Claim the lock only for a canvas addition.
+    if (!_isEditor) {
+      _showDropReject(e, _currentEditor ? '画布已被其他用户锁定' : '请先获取编辑权');
+      return;
+    }
+
     let data;
     try {
       data = JSON.parse(e.dataTransfer.getData('application/x-cap-card'));
     } catch { return; }
 
-    return _withDropEdit(() => {
-      // Project state can change while the edit request is in flight.
-      if (_editsLocked()) {
-        _showDropReject(e, _editLockReason());
-        return false;
+    // Prevent unconfigured tools from being added
+    if (data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {
+      _showDropReject(e, '请先配置后再使用');
+      return;
+    }
+
+    // Prevent same tool from being added twice (unless multiInstance)
+    if (!data.multiInstance) {
+      const existing = _cards.find(c => c.mcpId === data.mcpId && c.toolName === data.toolName);
+      if (existing) {
+        _showDropReject(e, '不能两次加入同样的组件');
+        return;
       }
+    }
 
-      // Prevent unconfigured tools from being added
-      if (data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {
-        _showDropReject(e, '请先配置后再使用');
-        return false;
-      }
+    // Convert screen coords → world coords
+    const rect   = _canvasEl.getBoundingClientRect();
+    const screenX = e.clientX - rect.left;
+    const screenY = e.clientY - rect.top;
+    let x = (screenX - _tx) / _zoom - 110;
+    let y = (screenY - _ty) / _zoom - 24;
 
-      // Prevent same tool from being added twice (unless multiInstance)
-      if (!data.multiInstance) {
-        const existing = _cards.find(c => c.mcpId === data.mcpId && c.toolName === data.toolName);
-        if (existing) {
-          _showDropReject(e, '不能两次加入同样的组件');
-          return false;
-        }
-      }
+    // Avoid overlapping existing cards
+    ({ x, y } = _findNonOverlappingPos(x, y));
 
-      // Convert screen coords → world coords
-      const rect   = _canvasEl.getBoundingClientRect();
-      const screenX = e.clientX - rect.left;
-      const screenY = e.clientY - rect.top;
-      let x = (screenX - _tx) / _zoom - 110;
-      let y = (screenY - _ty) / _zoom - 24;
-
-      // Avoid overlapping existing cards
-      ({ x, y } = _findNonOverlappingPos(x, y));
-
-      const id = 'card-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-      _addCard({ id, mcpId: data.mcpId, toolName: data.toolName, driverName: data.driverName, x, y }, true);
-      return true;
-    });
+    const id = 'card-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    _addCard({ id, mcpId: data.mcpId, toolName: data.toolName, driverName: data.driverName, x, y }, true);
   });
 }
 
@@ -1100,6 +1018,93 @@ async function _removeCard(id) {
   // Cancel any pending debounced save, then save immediately with updated state
   clearTimeout(_saveTimer);
   _saveLayout();
+}
+
+async function _clearCanvas() {
+  if (!_cards.length || _refuseEdit()) return;
+  if (!confirm('确定清空画布上的所有卡片和连线吗？已安装的技能不会被删除。')) return;
+
+  // Flush a pending autosave instead of cancelling it: every abort below
+  // returns without saving, so a cancelled save was the user's last edit lost.
+  if (_saveTimer) {
+    clearTimeout(_saveTimer);
+    _saveTimer = null;
+    _saveLayout();
+  }
+  // A reload while we wait (a solution load, another tab's save) means the
+  // canvas the user agreed to clear is not the one on screen any more.
+  const gen = _layoutGen;
+  _clearing = true;
+  _syncEmptyState();
+  try {
+    if (!(await _ensureEdit({ forClear: true }))) return;
+    // An earlier autosave must finish before the empty layout is sent, or a
+    // delayed write can put the deleted cards back on the server.
+    let waitTimer;
+    const settled = await Promise.race([
+      Promise.all([..._pendingLayoutSaves]).then(() => true),
+      new Promise(resolve => { waitTimer = setTimeout(() => resolve(false), 15000); }),
+    ]);
+    clearTimeout(waitTimer);
+    if (!settled) { _showToast('等待画布保存超时，请检查网络后重试'); return; }
+    const stateKnown = await Promise.race([
+      _syncProjectState(),
+      new Promise(resolve => { waitTimer = setTimeout(() => resolve(false), 15000); }),
+    ]);
+    clearTimeout(waitTimer);
+    if (!stateKnown) {
+      _showToast('无法确认运行状态，请检查网络后重试');
+      return;
+    }
+    const reason = _projectEditLockReason();
+    if (reason) { _showToast(reason); return; }
+    if (!_isEditor) { _showToast('编辑权已释放，请重试'); return; }
+    if (_layoutGen !== gen) { _showToast('画布刚刚被更新，未清空，请确认后重试'); return; }
+
+    const doomed = _cards;
+    if (await _writeLayout([], [], [], { timeout: 15000 })) {
+      // Something reloaded the canvas while the write was in flight; show what
+      // the server ended up with rather than the empty canvas we assume.
+      if (_layoutGen !== gen) await _reloadLayout();
+    } else {
+      // A 403 has already reloaded the server's layout in _writeLayout.
+      if (!_isEditor) { _showToast('编辑权已被其他会话获取，画布未清空'); return; }
+      // The server persists the layout first and only then stops each removed
+      // instance, so a slow teardown outlasts the timeout after the clear has
+      // in fact happened. Ask the server instead of reporting a failure.
+      await _reloadLayout();
+      if (_cards.length) {
+        _showToast('未能确认画布是否清空，请检查网络后重试');
+        return;
+      }
+    }
+
+    // The server stops the removed instances as part of the layout write.
+    // Browser-owned sources live in this tab and have to be stopped here —
+    // including when a reload above has already taken their cards off screen.
+    for (const card of doomed) {
+      if (card.toolName === 'remote_camera') stopCameraStream();
+      if (card.toolName === 'remote_mic') stopMicStream();
+      card.el.remove();
+    }
+    if (_cards === doomed) {
+      _cards = [];
+      _connections = [];
+      _execConnections = [];
+    }
+    _syncGeometryObservers();
+    _scheduleRedraw();
+    _syncEmptyState();
+    _showToast('画布已清空');
+  } finally {
+    _clearing = false;
+    _syncEmptyState();
+    // Pans, zooms and topic refreshes that tried to save during the clear.
+    if (_saveDeferred) {
+      _saveDeferred = false;
+      _debouncedSave();
+    }
+  }
 }
 
 // ── Card rendering ────────────────────────────────────────────────────────────
@@ -2787,7 +2792,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
       const parsed = _parseMcpCallResult(await resp.json());
       const liveTopic = parsed?.topic_out?.find(t => t && t.topic);
       if (liveTopic) {
-        showTopicDetail(liveTopic.topic, liveTopic.format || '');
+        showTopicDetail(liveTopic.topic, liveTopic.format || '', mcpId);
         return;
       }
     } catch (e) {
@@ -2803,7 +2808,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
     _showToast('该卡片还没有解析出输出 topic —— 先点「开始控制」把它启动起来');
     return;
   }
-  showTopicDetail(candidate.topic, candidate.format || '');
+  showTopicDetail(candidate.topic, candidate.format || '', mcpId);
 }
 
 /**
@@ -3176,14 +3181,22 @@ function _makeDraggable(el, cardData) {
 // ── Layout persistence ────────────────────────────────────────────────────────
 
 let _saveTimer = null;
+let _saveDeferred = false;  // a save was skipped during a clear; replay it after
+const _pendingLayoutSaves = new Set();
 function _debouncedSave() {
   clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(_saveLayout, 400);
+  _saveTimer = setTimeout(() => { _saveTimer = null; _saveLayout(); }, 400);
 }
 
-async function _saveLayout() {
-  if (!_isEditor) return;  // only the current editor may persist; system-triggered saves must not auto-claim
-  const revision = _editorRevision;
+function _saveLayout() {
+  // System-triggered saves must not auto-claim.
+  if (!_isEditor) return Promise.resolve(false);
+  // Nor race the clear's empty write — but remember them, or an aborted clear
+  // leaves the server on a layout older than what this editor shows.
+  if (_clearing) {
+    _saveDeferred = true;
+    return Promise.resolve(false);
+  }
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
@@ -3195,28 +3208,47 @@ async function _saveLayout() {
     topicOut:   c.topicOut || [],
     topicOutFrom: c.topicOutFrom,
   }));
-  try {
-    const resp = await fetch('/api/canvas/layout', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
-    });
-    if (resp.status === 403) {
-      // Lost edit permission — reload layout from server
-      const data = await resp.json();
-      if (revision === _editorRevision) {
-        _applyEditorState(data.editor, '');
+  return _writeLayout(cards, _connections, _execConnections);
+}
+
+function _writeLayout(cards, connections, execConnections, { timeout = 0 } = {}) {
+  const pending = (async () => {
+    const controller = timeout ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeout) : null;
+    try {
+      const resp = await fetch('/api/canvas/layout', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ cards, connections, execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
+        signal: controller?.signal,
+      });
+      if (resp.status === 403) {
+        // Lost edit permission — reload layout from server
+        _isEditor = false;
+        _updateEditorUI();
         await _reloadLayout();
       }
-    }
-  } catch { /* silent */ }
+      return resp.ok;
+    } catch { return false; }
+    finally { if (timer) clearTimeout(timer); }
+  })();
+  _pendingLayoutSaves.add(pending);
+  pending.then(() => _pendingLayoutSaves.delete(pending));
+  return pending;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _syncEmptyState() {
-  if (!_emptyEl) return;
-  _emptyEl.style.display = _cards.length === 0 ? '' : 'none';
+  if (_emptyEl) _emptyEl.style.display = _cards.length === 0 ? '' : 'none';
+  // Disabled wherever a click could only end in a refusal: running or unknown
+  // project state, or another session holding the edit lock. On a phone this is
+  // a floating red action over the canvas — it must not invite a tap it refuses.
+  const clearBtn = document.getElementById('canvas-clear');
+  if (clearBtn) {
+    clearBtn.disabled = _cards.length === 0 || _clearing || _editsLocked()
+      || (!_isEditor && !!_currentEditor);
+  }
 }
 
 function _esc(s) {
@@ -3237,14 +3269,11 @@ function _createEditorBar() {
 }
 
 function _updateEditorUI() {
-  syncToolConfigPermissions();
   let bar = document.getElementById('canvas-editor-bar');
   if (!bar) bar = _createEditorBar();
   bar.classList.toggle('canvas-editor-bar--locked', !_isEditor && !!_currentEditor);
 
-  if (_editClaimPromise) {
-    bar.innerHTML = `${_SVG_PEN}<button class="editor-btn" disabled>正在获取编辑权…</button>`;
-  } else if (_isEditor) {
+  if (_isEditor) {
     bar.innerHTML = `${_SVG_PEN}<span class="editor-label editor-label--active">编辑中</span><button class="editor-btn" id="canvas-release-btn">释放</button>`;
     bar.querySelector('#canvas-release-btn').onclick = _releaseEdit;
     _setCanvasReadonly(false);
@@ -3257,7 +3286,7 @@ function _updateEditorUI() {
     bar.innerHTML = `${_SVG_PEN}<button class="editor-btn editor-btn--claim" id="canvas-claim-btn">编辑</button>`;
     bar.querySelector('#canvas-claim-btn').onclick = _ensureEdit;
     _setCanvasReadonly(true);
-  }
+  }  _syncEmptyState();  // the clear button follows the lock
 }
 
 function _setCanvasReadonly(readonly) {
@@ -3269,28 +3298,15 @@ function _setCanvasReadonly(readonly) {
 }
 
 async function _releaseEdit() {
-  const revision = ++_editorRevision;
   try {
-    const { resp, data } = await _requestEditor('/api/canvas/release-edit', {
+    await fetch('/api/canvas/release-edit', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: _sessionId }),
     });
-    if (resp.status === 409) {
-      if (revision === _editorRevision) _applyEditorState(data.editor, 'release');
-      return;
-    }
-    if (!resp.ok) throw new Error(`释放编辑权限失败（HTTP ${resp.status}），请重试`);
-    if (revision === _editorRevision) {
-      _setEditorState(null);
-      _updateEditorUI();
-    }
-  } catch (error) {
-    // A lost response may have followed a successful release. Read the server
-    // state before changing the local owner or allowing another edit attempt.
-    await _checkEditStatus();
-    _showToast(error.name === 'AbortError' ? '释放编辑权限超时，请核对状态后重试'
-      : error instanceof TypeError ? '无法释放编辑权限，请检查网络连接' : error.message);
-  }
+  } catch { /* silent */ }
+  _isEditor = false;
+  _currentEditor = null;
+  _updateEditorUI();
 }
 
 /**
@@ -3300,7 +3316,8 @@ async function _releaseEdit() {
  */
 function _applyEditorState(editor, reason) {
   const wasEditor = _isEditor;
-  _setEditorState(editor);
+  _currentEditor = editor;
+  _isEditor = editor === _sessionId;
   _updateEditorUI();
 
   if (wasEditor && !_isEditor) {
@@ -3325,7 +3342,7 @@ let _lastReloadToast = 0;
 function _scheduleReload(silent = false) {
   clearTimeout(_reloadTimer);
   _reloadTimer = setTimeout(async () => {
-    if (!(await _reloadLayout())) return;
+    await _reloadLayout();
     // Throttled, and skipped when the caller already explained what happened —
     // otherwise the reload toast would immediately replace that message.
     if (!silent && Date.now() - _lastReloadToast > 5000) {
@@ -3335,13 +3352,10 @@ function _scheduleReload(silent = false) {
   }, 800);
 }
 
-async function _checkEditStatus(duringClaim = false) {
-  if (_editClaimPromise && !duringClaim) return;
-  const revision = _editorRevision;
+async function _checkEditStatus() {
   try {
-    const { resp, data } = await _requestEditor(`/api/canvas/edit-status?session_id=${encodeURIComponent(_sessionId)}`);
-    if (!resp.ok || !Object.hasOwn(data, 'editor') || revision !== _editorRevision
-        || (_editClaimPromise && !duringClaim)) return;
+    const resp = await fetch(`/api/canvas/edit-status?session_id=${encodeURIComponent(_sessionId)}`);
+    const data = await resp.json();
     const editor = data.editor || null;
     if (editor === _currentEditor) return;   // no change — don't re-render or reload
     // The server echoes why it was freed, so a client whose WS is down (the case
@@ -3379,7 +3393,6 @@ function _pingEdit() {
 
 async function _sendPing() {
   if (!_isEditor) return;
-  const revision = _editorRevision;
   _lastPingAt = Date.now();
   try {
     const resp = await fetch('/api/canvas/keep-edit', {
@@ -3389,7 +3402,7 @@ async function _sendPing() {
     if (resp.status === 409) {
       // Already expired or reassigned — adopt the truth instead of acting editor.
       const data = await resp.json().catch(() => ({}));
-      if (revision === _editorRevision) _applyEditorState(data.editor || null, data.editor ? '' : 'idle');
+      _applyEditorState(data.editor || null, data.editor ? '' : 'idle');
     }
   } catch { /* silent — the poll will reconcile */ }
 }
@@ -3398,13 +3411,10 @@ async function _sendPing() {
   document.addEventListener(ev, _pingEdit, { capture: true, passive: true }));
 
 async function _reloadLayout() {
-  const revision = _editorRevision;
   try {
     const layoutRes = await fetch('/api/canvas/layout');
     const layoutJson = await layoutRes.json();
-    // Readers can acquire editing while this GET is in flight. Its earlier
-    // snapshot must not replace their newly granted lock or local canvas edits.
-    if (!layoutRes.ok || revision !== _editorRevision || _editClaimPromise) return false;
+    _layoutGen++;
     // Clear current cards
     for (const c of _cards) c.el.remove();
     _cards = [];
@@ -3420,10 +3430,10 @@ async function _reloadLayout() {
     _scheduleRedraw();
     _syncEmptyState();
     // Update editor info
-    _setEditorState(layoutJson.editor);
+    _currentEditor = layoutJson.editor || null;
+    _isEditor = _currentEditor === _sessionId;
     _updateEditorUI();
-    return true;
-  } catch { return false; }
+  } catch { /* silent */ }
 }
 
 // Release on page close — a fast path only: correctness comes from the backend

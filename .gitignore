@@ -35,6 +35,7 @@ resource/frame_rgb.jpg
 **/resource/log/
 **/resource/certs/
 **/resource/channel_files/
+**/resource/qq-credentials/
 
 # llm_bench 的实际配置里有明文密钥，只有 bench.yaml.example 进库。
 # 这个模式只匹配 bench.yaml 本身，不影响 bench.yaml.example。
