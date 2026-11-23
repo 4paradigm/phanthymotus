@@ -75,6 +75,10 @@ class SlamStream:
         return (self._measured_run is not None and not self._measured_run[0][-1] and
                 self.continuity_token == self._last_admitted_run)
 
+    @property
+    def _measured_chassis_run(self):
+        return self._measured_run is not None and self._measured_run[1].chassis_origin is not None
+
     def _lose(self, now):
         """Retire unavailable poses and offer the latest fresh scan for registration."""
         latest = max(self._pending, key=lambda item: item[0], default=None)
@@ -94,8 +98,10 @@ class SlamStream:
             self._offer_unlocalized(latest, now)
 
     def _offer_unlocalized(self, pending, now):
-        if self._live_visual_run:
-            # A live, witnessed VO run can still lack a bracket for one scan.
+        live_chassis_run = (self._measured_chassis_run and
+                            self.continuity_token == self._last_admitted_run)
+        if self._live_visual_run or live_chassis_run:
+            # A live, witnessed pose run can still lack a bracket for one scan.
             # Skip that scan without sending a false pose outage to RTAB-Map.
             # A real outage clears the run before offering scans for recovery.
             self._dropped_pending += 1
@@ -136,7 +142,14 @@ class SlamStream:
                 self._lose(now)
                 return
         if pose.prediction_anchor_ns is None:
+            previous = self._measured_run
             pose = self._track_measured_run(sample, pose, context)
+            if self._measured_chassis_run:
+                # A queued measurement can still bracket a fresh scan. Detect
+                # source silence from delivered progress, not time spent queued.
+                progressed = (previous is None or previous[0] != self._measured_run[0] or
+                              pose.stamp_ns > previous[1].stamp_ns)
+                received = now if progressed else self._last_received
             if self._scan_origin_recovery and pose.declared_origin is None:
                 # Scan-only built-in VO declares this same identity on the native wire.
                 pose = replace(pose, visual_origin=(pose.segment_id, pose.frame_id))
@@ -209,7 +222,21 @@ class SlamStream:
         mapping = measurement.get('mapping')
         reference = quality.get('clock_reference')
         fusion = vendor.get('fusion')
-        origin += (measurement.get('clock_epoch'), measurement.get('source_generation'),
+        epoch = measurement.get('clock_epoch')
+        device_ms = measurement.get('source_stamp')
+        # This driver keeps its spatial generation when only its verified
+        # uptime-to-host mapping changes. Other epoch declarations keep their
+        # original meaning.
+        if (chassis and measurement.get('source_generation') == pose.segment_id and
+                measurement.get('source_clock') == 'slamware_uptime_ms' and measurement.get('source_unit') == 'ms' and
+                isinstance(epoch, str) and epoch and type(device_ms) is int and device_ms > 0 and
+                isinstance(mapping, dict) and mapping.get('method') == 'chassis_clock_request_interval_slew' and
+                mapping.get('verified') is True):
+            pose = replace(pose, chassis_clock_epoch=epoch, chassis_device_ms=device_ms)
+            # Before a clock switch this driver used its segment ID as the
+            # epoch. Keep that original native gauge, including for saved maps.
+            epoch = pose.segment_id
+        origin += (epoch, measurement.get('source_generation'),
                    measurement.get('source_clock'), reference.get('domain_id') if isinstance(reference, dict) else None,
                    observation.source_id if observation is not None else None,
                    observation.source_epoch if observation is not None else None, chassis)
@@ -235,6 +262,19 @@ class SlamStream:
         if self._measured_run is not None:
             last_origin, previous = self._measured_run
             dt = (pose.stamp_ns - previous.stamp_ns) / 1e9
+            clock_switched = (pose.chassis_clock_epoch is not None and previous.chassis_clock_epoch is not None and
+                              pose.chassis_clock_epoch != previous.chassis_clock_epoch)
+            if clock_switched:
+                # Discard old time brackets and queued work, keeping the spatial
+                # witness only if source time and measured motion both agree.
+                dt = (pose.chassis_device_ms - previous.chassis_device_ms) / 1000.
+                self._poses.clear()
+                self._pose_anchor = None
+                self._dropped_pending += len(self._pending) + len(self._unmatched_clouds)
+                self._pending.clear()
+                self._unmatched_clouds.clear()
+                if self.on_pose_loss is not None:
+                    self.on_pose_loss()
             distance = math.dist(pose.position, previous.position)
             dot = abs(sum(a*b for a, b in zip(pose.quaternion, previous.quaternion)))
             angle = 2*math.acos(min(1., dot))
@@ -242,7 +282,7 @@ class SlamStream:
             # is still valid. Match the visual runtime's 1.5 s output bound.
             max_interval = 1.5 if visual or pose.external_origin is not None else .5
             if last_origin == origin and (
-                    (dt == 0 and distance <= 1e-6 and angle <= 1e-5) or
+                    (not clock_switched and dt == 0 and distance <= 1e-6 and angle <= 1e-5) or
                     (0 < dt <= max_interval and within_measured_motion_bounds(distance, angle, dt))):
                 token = previous.external_continuity
         elif self._suspended_run is not None and visual:
@@ -400,8 +440,11 @@ class SlamStream:
         can_localize = self.on_unlocalized_frame is not None
         # Give late visual results a bounded opportunity to pair with the scan.
         wait_s = min(1.5, self.max_age_s)
-        scan_wait_s = self.max_age_s if self._live_visual_run else wait_s
-        if can_localize and self._last_received is not None and now-self._last_received >= wait_s:
+        # Projection and input delivery consume the same original ingress budget.
+        # A measured chassis can still bracket the scan within that budget.
+        pose_wait_s = self.max_age_s if self._measured_chassis_run else wait_s
+        scan_wait_s = self.max_age_s if self._live_visual_run else pose_wait_s
+        if can_localize and self._last_received is not None and now-self._last_received >= pose_wait_s:
             self._lose(now)
             return
         if len(self._pending) > self.max_pending:
@@ -414,7 +457,7 @@ class SlamStream:
         while self._pending:
             pending = self._pending.popleft()
             stamp, cloud, received, context = pending
-            if can_localize and self._live_visual_run and now-received > self.max_age_s:
+            if can_localize and (self._live_visual_run or self._measured_chassis_run) and now-received > self.max_age_s:
                 self._dropped_pending += 1
                 continue
             try:

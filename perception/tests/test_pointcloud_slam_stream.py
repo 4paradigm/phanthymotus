@@ -126,16 +126,56 @@ def test_dense_chassis_run_has_one_continuity_token_at_aligned_scan_stamps():
     assert len(tokens) == 4 and len(tokens[0]) == 16 and len(set(tokens)) == 1
 
 
-def test_delayed_chassis_delivery_can_leave_an_unposed_scan_inside_a_certified_run():
+def test_unpaired_scan_does_not_interrupt_a_certified_chassis_run():
     unposed = []
     s = stream(max_pending=1, on_unlocalized_frame=lambda stamp, _, pose, *args: unposed.append((stamp, pose)))
     s.odom(chassis(1000), now=1.)
     for ms in (1000, 1100, 1200):
         s.cloud(ms*1_000_000, 'camera', [[0, 0, 1]], now=ms/1000)
-    assert unposed == [(1_100_000_000, None)]
+    assert unposed == []
+    assert s.status(now=1.2)['dropped_pending'] == 1
     s.odom(chassis(1250, .04), now=1.25)
     first, resumed = (frame.pose.external_continuity for frame in s.accepted)
     assert first and resumed == first
+
+
+@pytest.mark.parametrize('lease_delay', [0., 1.65])
+def test_delayed_measured_chassis_brackets_within_original_cloud_lifetime(lease_delay):
+    missing = []
+    s = stream(max_age_s=2, on_unlocalized_frame=lambda stamp, *args: missing.append(stamp))
+    s.odom(chassis(1000), now=2.65, received=2.65-lease_delay)
+    s.cloud(1_050_000_000, 'camera', [[0, 0, 1]], now=2.66, received=1.1)
+    s.odom(chassis(1100, .02), now=2.75, received=2.75-lease_delay)
+    assert not missing
+    assert [frame.pose.position[0] for frame in s.accepted] == pytest.approx([.01])
+    # Silence beyond the configured horizon still retires this source run.
+    s.cloud(2_900_000_000, 'camera', [[0, 0, 1]], now=3.)
+    s.poll(now=4.8)
+    assert s.continuity_token is None
+    assert missing == [2_900_000_000]
+
+
+def test_backlogged_chassis_progress_keeps_run_but_not_expired_cloud():
+    missing = []
+    s = stream(max_age_s=2, on_unlocalized_frame=lambda stamp, *args: missing.append(stamp))
+    s.odom(chassis(1000), now=2.95, received=1.)
+    s.cloud(1_000_000_000, 'camera', [[0, 0, 1]], now=2.95, received=1.2)
+    s.cloud(1_050_000_000, 'camera', [[0, 0, 1]], now=3.01, received=1.25)
+    s.odom(chassis(1100, .02), now=3.18, received=1.1)
+    s.cloud(1_100_000_000, 'camera', [[0, 0, 1]], now=3.19, received=1.1)
+    assert [f.cloud_stamp_ns for f in s.accepted] == [1_000_000_000, 1_050_000_000]
+    assert s.accepted[0].pose.external_continuity == s.accepted[1].pose.external_continuity
+    assert not missing
+    assert s.status(now=3.19)['dropped_pending'] == 1
+
+
+def test_repeated_chassis_measurement_does_not_extend_source_liveness():
+    s = stream(max_age_s=2, on_unlocalized_frame=lambda *args: None)
+    s.odom(chassis(1000), now=1., received=1.)
+    s.cloud(1_000_000_000, 'camera', [[0, 0, 1]], now=1.)
+    s.odom(chassis(1000), now=2.8, received=2.8)
+    s.cloud(2_900_000_000, 'camera', [[0, 0, 1]], now=3.01)
+    assert s.continuity_token is None
 
 
 @pytest.mark.parametrize('second', [
@@ -548,3 +588,25 @@ def test_pose_loss_offers_newest_pending_scan_to_recovery_once():
         (1_200_000_000, [[1, 0, 3]], None)]
     assert s.pending_count == 0
     assert s.status(now=1.4)['admitted_frames'] == 0
+
+
+@pytest.mark.parametrize('segment,x,source_ms,continuous', [
+    ('a', .05, 1100, True), ('reset', .05, 1100, False),
+    ('a', 2., 1100, False), ('a', .05, 900, False),
+])
+def test_verified_chassis_clock_switch_keeps_only_continuous_spatial_run(segment, x, source_ms, continuous):
+    s = stream()
+    for wall, device, epoch, origin, position in [
+            (1000, 1000, 'first', 'a', 0.), (800, source_ms, 'second', segment, x)]:
+        sample = chassis(wall, position, origin)
+        sample['vendor']['motus_slam']['measurement'] = dict(
+            clock_epoch=epoch, source_generation=origin, source_clock='slamware_uptime_ms',
+            source_unit='ms', source_stamp=device, mapping=dict(verified=True,
+                method='chassis_clock_request_interval_slew'))
+        s.odom(sample, now=device/1000)
+        s.cloud(wall*1_000_000, 'camera', [[0, 0, 1]], now=device/1000)
+    before, after = [frame.pose for frame in s.accepted]
+    assert (before.external_continuity == after.external_continuity) == continuous
+    if continuous:
+        assert before.chassis_origin == after.chassis_origin
+        assert list(s._poses) == [after]
