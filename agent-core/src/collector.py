@@ -386,6 +386,15 @@ def _feishu_chat(events: list[dict]) -> _FeishuChat | None:
                 and isinstance(user_id, str) and user_id
                 and isinstance(generation, int)):
             return channel_id, chat_id, user_id, generation
+    for event in events:
+        if event.get('source', '').startswith('subagent:'):
+            from history_scope import from_metadata
+
+            payload = event.get('payload')
+            if isinstance(payload, dict):
+                scope = from_metadata(payload)
+                if scope is not None:
+                    return scope
     return None
 
 

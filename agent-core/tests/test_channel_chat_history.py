@@ -346,8 +346,8 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
                 {'id': f'call_{index}', 'type': 'function',
                  'function': {'name': name, 'arguments': json.dumps(args)}}
                 for index, (name, args) in enumerate([
-                    ('search_history', {'query': '之前的消息'}),
-                    ('memory_recall', {'query': '之前的消息'}),
+                    ('search_history', {'query': '明确请求查找归档'}),
+                    ('memory_recall', {'query': '明确请求查找记忆'}),
                     ('raw_input_info', {'source': 'dds:/channel/request/feishu_r1'}),
                     ('raw_input_info', {'source': 'dds:/sensors/battery'}),
                 ])
@@ -384,11 +384,11 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
             await core._one_turn(trigger)
 
         self.assertEqual(call.await_count, 2)
-        archive_lookup.assert_not_awaited()
+        self.assertEqual(archive_lookup.await_count, 2)
         raw_lookup.assert_awaited_once_with(source='dds:/sensors/battery')
         for request in call.await_args_list:
             tool_names = {tool['function']['name'] for tool in request.kwargs['tool_list']}
-            self.assertEqual(tool_names, {'raw_input_info'})
+            self.assertEqual(tool_names, {'raw_input_info', 'search_history', 'memory_recall'})
             prompt_text = json.dumps(request.kwargs['message_list'], ensure_ascii=False)
             self.assertIn('新消息', prompt_text)
             self.assertNotIn('清除前的消息', prompt_text)
@@ -419,6 +419,96 @@ class ChatHistoryIsolationTest(unittest.IsolatedAsyncioTestCase):
         archived = chat_history.get_session_messages(core._feishu_archive_id)
         self.assertEqual(len(archived), 1)
         self.assertEqual(archived[0], core._current_turn)
+
+    async def test_recall_tools_filter_feishu_scope_before_applying_limit(self):
+        import chat_history
+        import history_scope
+        from event.llm import _memory_recall, _search_history
+
+        def archive(kind, scope, label):
+            session = chat_history.create_session(kind, feishu_scope=scope)
+            self.addCleanup(chat_history.delete_session, session)
+            chat_history.save_turn(session, 0, [{'role': 'user', 'content': f'ctxprobe {label}'}])
+            chat_history.save_conclusion(session, 'ctxprobe', label, 'user_task', feishu_scope=scope)
+
+        def clean_conclusions():
+            with config._get_conn() as conn:
+                conn.execute("DELETE FROM subagent_conclusions WHERE goal='ctxprobe'")
+                conn.commit()
+
+        self.addCleanup(clean_conclusions)
+        alice_old = ('feishu_r1', 'oc_a', 'ou_a', 0)
+        alice_new = ('feishu_r1', 'oc_b', 'ou_a', 1)
+        bob = ('feishu_r1', 'oc_a', 'ou_b', 0)
+        self.manager._clear_user_context('feishu_r1', 'ou_a')
+        archive(chat_history.KIND_FEISHU, history_scope.encode(alice_new), 'alice-current')
+        archive(chat_history.KIND_FEISHU, history_scope.encode(bob), 'bob-current')
+        archive(chat_history.KIND_FEISHU, history_scope.encode(alice_old), 'alice-late')
+        archive(chat_history.KIND_FEISHU, None, 'legacy')
+
+        with mock.patch('channel.manager.manager', self.manager):
+            for scope, expected in [(alice_new, 'alice-current'), (bob, 'bob-current')]:
+                token = history_scope.current_feishu_scope.set(scope)
+                try:
+                    for result in (
+                        await _search_history('ctxprobe', limit=1),
+                        await _memory_recall('ctxprobe', source='conversation', limit=1),
+                        await _memory_recall('ctxprobe', source='subagent', limit=1),
+                    ):
+                        self.assertIn(expected, result)
+                        self.assertNotIn('alice-late', result)
+                        self.assertNotIn('legacy', result)
+                finally:
+                    history_scope.current_feishu_scope.reset(token)
+
+        archive(chat_history.KIND_MAIN, history_scope.UNSCOPED, 'ordinary')
+        self.assertIn('ordinary', await _search_history('ctxprobe', limit=1))
+        self.assertIn('ordinary', await _memory_recall('ctxprobe', source='subagent', limit=1))
+
+    async def test_subagent_keeps_origin_after_checkpoint_and_late_completion(self):
+        import chat_history
+        import history_scope
+        from event.llm import _memory_recall, _search_history
+        from subagent.agent import Subagent
+        from subagent.manager import SubagentManager
+        from subagent.protocol import SubagentResult, SubagentSpec
+
+        scope = ('feishu_r1', 'oc_a', 'ou_a', 0)
+        mgr = SubagentManager(llm_client=None)
+        token = history_scope.current_feishu_scope.set(scope)
+        try:
+            with mock.patch('subagent.manager.push_event', new_callable=mock.AsyncMock):
+                agent_id = await mgr.spawn(SubagentSpec(goal='handoverprobe'))
+        finally:
+            history_scope.current_feishu_scope.reset(token)
+        spec_json = json.loads(json.dumps(mgr._agents[agent_id].spec.to_dict()))
+        restored = Subagent(SubagentSpec.from_dict(spec_json), agent_id=agent_id)
+        self.manager._clear_user_context('feishu_r1', 'ou_a')
+        restored.persist_turn([{'role': 'assistant', 'content': 'handoverprobe old'}])
+        self.addCleanup(chat_history.delete_session, restored.history_session_id)
+
+        def clean_conclusion():
+            with config._get_conn() as conn:
+                conn.execute('DELETE FROM subagent_conclusions WHERE agent_id=?', (agent_id,))
+
+        self.addCleanup(clean_conclusion)
+        with (
+            mock.patch('event_bus.enqueue', new_callable=mock.AsyncMock) as enqueue,
+            mock.patch('subagent.manager.push_event', new_callable=mock.AsyncMock),
+        ):
+            await mgr._notify_completion(restored, SubagentResult(agent_id, 'completed', 'old'))
+        with config._get_conn() as conn:
+            self.assertEqual(
+                conn.execute('SELECT feishu_scope FROM subagent_conclusions WHERE agent_id=?',
+                             (agent_id,)).fetchone()[0], history_scope.encode(scope),
+            )
+        event_payload = enqueue.await_args.kwargs['payload']
+        notification = {'source': f'subagent:{agent_id}', 'payload': event_payload}
+        self.assertEqual(collector._feishu_chat([notification]), scope)
+        with mock.patch('channel.manager.manager', self.manager):
+            self.assertFalse(collector.feishu_context_is_current(scope))
+        self.assertNotIn('handoverprobe old', await _search_history('handoverprobe'))
+        self.assertNotIn('[subagent:', await _memory_recall('handoverprobe', source='subagent'))
 
     def test_legacy_feishu_turn_is_excluded_when_restoring_shared_history(self):
         import chat_history

@@ -161,6 +161,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # Columns added after the tables shipped; existing DBs need them backfilled.
     for table, column, ddl in (
         ('chat_sessions', 'kind', 'kind TEXT DEFAULT \'main\''),
+        ('chat_sessions', 'feishu_scope', 'feishu_scope TEXT'),
         ('chat_messages', 'updated_at', 'updated_at REAL'),
     ):
         try:
@@ -218,6 +219,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_conclusions_ts ON subagent_conclusions(created_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_conclusions_type ON subagent_conclusions(source_type)')
+    try:
+        conn.execute('ALTER TABLE subagent_conclusions ADD COLUMN feishu_scope TEXT')
+    except sqlite3.OperationalError:
+        pass  # already present
     # ── 已配对的 peer（另一台 Agent Core）─────────────────────────────────────
     # peer_id 是 Ed25519 公钥指纹，不是 IP，也不是平台账号 —— 同一个 peer 从
     # mDNS / 云名册多条路径被发现时仍是同一行，这是链路降级能成立的前提。

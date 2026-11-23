@@ -6,6 +6,7 @@ import time
 import uuid
 
 from config import _get_conn
+import history_scope
 
 
 KIND_MAIN = 'main'
@@ -14,20 +15,34 @@ KIND_SUBAGENT = 'subagent'
 KIND_BG_SUBAGENT = 'bg_subagent'
 
 
-def create_session(kind: str = KIND_MAIN) -> str:
+def create_session(kind: str = KIND_MAIN, *, feishu_scope: str | None = history_scope.UNSCOPED) -> str:
     """Create a new chat session, return its ID.
 
     `kind` separates the main agent's own conversation from delegated ones, so the
     history UI can group them without parsing the summary text.
     """
+    if kind == KIND_FEISHU and feishu_scope == history_scope.UNSCOPED:
+        feishu_scope = None  # An unlabelled Feishu archive is never public to model tools.
     sid = str(uuid.uuid4())
     with _get_conn() as conn:
         conn.execute(
-            'INSERT INTO chat_sessions (id, started_at, kind) VALUES (?, ?, ?)',
-            (sid, time.time(), kind)
+            'INSERT INTO chat_sessions (id, started_at, kind, feishu_scope) VALUES (?, ?, ?, ?)',
+            (sid, time.time(), kind, feishu_scope)
         )
         conn.commit()
     return sid
+
+
+def save_conclusion(agent_id: str, goal: str, conclusion: str, source_type: str,
+                    *, feishu_scope: str | None):
+    with _get_conn() as conn:
+        conn.execute(
+            'INSERT INTO subagent_conclusions '
+            '(agent_id, goal, conclusion, source_type, created_at, feishu_scope) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (agent_id, goal, conclusion, source_type, time.time(), feishu_scope),
+        )
+        conn.commit()
 
 
 def save_turn(session_id: str, turn_index: int, turn_messages: list[dict]):
@@ -246,8 +261,9 @@ def rebuild_fts():
         conn.commit()
 
 
-def search(query: str, limit: int = 10) -> list[dict]:
+def search(query: str, limit: int = 10, *, since: float = 0) -> list[dict]:
     """全文搜索历史对话。"""
+    scopes = history_scope.searchable_scopes()
     with _get_conn() as conn:
         _ensure_fts(conn)
         try:
@@ -255,10 +271,11 @@ def search(query: str, limit: int = 10) -> list[dict]:
                 SELECT cm.session_id, cm.turn_index, cm.messages, cm.created_at
                 FROM chat_messages_fts fts
                 JOIN chat_messages cm ON cm.id = fts.rowid
-                WHERE fts MATCH ?
+                JOIN chat_sessions cs ON cs.id = cm.session_id
+                WHERE chat_messages_fts MATCH ? AND cs.feishu_scope IN (?, ?) AND cm.created_at >= ?
                 ORDER BY rank
                 LIMIT ?
-            ''', (query, limit)).fetchall()
+            ''', (query, *scopes, since, limit)).fetchall()
         except Exception:
             return []
     results = []

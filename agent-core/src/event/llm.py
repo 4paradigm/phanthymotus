@@ -20,6 +20,7 @@ import time
 import typing
 
 import log
+import history_scope
 import config
 import client
 import event
@@ -607,7 +608,6 @@ _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 _VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
     'WebSearch', 'search_history', 'memory_recall', 'raw_input_info',
 })
-_CONVERSATION_ARCHIVE_TOOLS = frozenset({'search_history', 'memory_recall'})
 
 
 def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True) -> bool:
@@ -1476,16 +1476,11 @@ async def _memory_recall(
                 params = []
                 for kw in keywords:
                     params.extend([f'%{kw}%', f'%{kw}%'])
-                if time_cutoff > 0:
-                    sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
-                           f'FROM subagent_conclusions WHERE ({where_clauses}) AND created_at > ? '
-                           f'ORDER BY created_at DESC LIMIT ?')
-                    params.extend([time_cutoff, limit])
-                else:
-                    sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
-                           f'FROM subagent_conclusions WHERE ({where_clauses}) '
-                           f'ORDER BY created_at DESC LIMIT ?')
-                    params.append(limit)
+                sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
+                       f'FROM subagent_conclusions WHERE ({where_clauses}) '
+                       'AND feishu_scope IN (?, ?) AND created_at >= ? '
+                       'ORDER BY created_at DESC LIMIT ?')
+                params.extend([*history_scope.searchable_scopes(), time_cutoff, limit])
                 rows = conn.execute(sql, params).fetchall()
                 for agent_id, goal, conclusion, source_type, ts in rows:
                     time_str = _dt.datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
@@ -1500,10 +1495,8 @@ async def _memory_recall(
     if source in ('all', 'conversation'):
         try:
             import chat_history
-            hist_results = chat_history.search(query, limit=limit)
+            hist_results = chat_history.search(query, limit=limit, since=time_cutoff)
             for r in hist_results:
-                if time_cutoff > 0 and r['ts'] < time_cutoff:
-                    continue
                 time_str = _dt.datetime.fromtimestamp(r['ts']).strftime('%m-%d %H:%M')
                 results.append({
                     'ts': r['ts'],
@@ -1942,6 +1935,7 @@ class Event:
             # task's whole duration, and the checks below only run between rounds.
             from peer.delegation import current_cancel_event as _cancel_ctx
             _cancel_token = _cancel_ctx.set(cancel_ev)
+            scope_token = history_scope.current_feishu_scope.set(ev.get('_feishu_chat'))
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev, reconsider_event=reconsider_ev)
             except TurnCancelled:
@@ -1972,6 +1966,7 @@ class Event:
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
                 _cancel_ctx.reset(_cancel_token)
+                history_scope.current_feishu_scope.reset(scope_token)
                 collector.set_cancel_event(None)
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
@@ -1988,7 +1983,9 @@ class Event:
         import chat_history
         if trigger_event.get('_feishu_chat'):
             if not self._feishu_archive_id:
-                self._feishu_archive_id = chat_history.create_session(chat_history.KIND_FEISHU)
+                self._feishu_archive_id = chat_history.create_session(
+                    chat_history.KIND_FEISHU, feishu_scope=history_scope.encode(trigger_event['_feishu_chat']),
+                )
             session_id = self._feishu_archive_id
             turn_index = 0
         else:
@@ -2411,8 +2408,6 @@ class Event:
         from event.desktop import search_configured
         if not search_configured():
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
-        if feishu_context_reset:
-            system_tools = [t for t in system_tools if t['schema']['name'] not in _CONVERSATION_ARCHIVE_TOOLS]
         if chat_only_turn:
             system_tools = [self._sys_tools['finish']]
             bound_schemas = [chat_only.REPLY_SCHEMA] if any(
@@ -2711,9 +2706,8 @@ class Event:
                 if chat_only_turn:
                     result = await chat_only.dispatch(name, args, trigger_event)
                 elif feishu_context_reset and (
-                    name in _CONVERSATION_ARCHIVE_TOOLS
-                    or (name == 'raw_input_info' and isinstance(args, dict)
-                        and str(args.get('source', '')).startswith('dds:/channel/request'))
+                    name == 'raw_input_info' and isinstance(args, dict)
+                    and str(args.get('source', '')).startswith('dds:/channel/request')
                 ):
                     result = '当前飞书上下文已清除，只能使用清除后收到的对话消息。'
                 elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
