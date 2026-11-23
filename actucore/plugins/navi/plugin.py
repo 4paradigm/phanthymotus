@@ -2072,7 +2072,7 @@ class NaviPlugin:
                                  target=check.target, config=config, original_receipt=original_receipt)
 
     def _recheck_dwa_motion(self, check, values, max_age, now_ms, snapshot, *, renew, diagnostics,
-                            allow_target_coast=False):
+                            handoff_deadline_ms=None):
         """Reuse the selected physical proof within its window or rebuild a complete stop."""
         config, state = self._config, self._state
         scan, guard = state.active_scan, check.motion_guard
@@ -2122,6 +2122,10 @@ class NaviPlugin:
         if (guard.association is not None and check.target_source is None
                 and not check.target_receipt_ms <= objects_ms <= now_ms):
             return reject("target_missing")
+        if (guard.association is not None and check.target_source is not None
+                and (target_source is None or target_source < check.target_source
+                     or (target_source != check.target_source and objects_ms < check.target_receipt_ms))):
+            return reject("target_missing")
         if (guard.association is not None and track is not None and track.generation == guard.generation
                 and track.latest_source is not None and (target_source is None or target_source < track.latest_source)):
             # The live tracker can consume an intervening source without
@@ -2149,32 +2153,33 @@ class NaviPlugin:
                                                     self._config.local_geometry.min_obstacle_height))
         front_required = bool(track is not None and track.front_required)
         live_point = None
-        # A coasting decision has a trusted remembered front and no live ROI.
-        # A newly imposed front constraint still needs an accepted observation.
+        target_pending = False
         if guard.association is not None or (front_required and not check.front_required):
             match = self._dwa_target_match(check, objects, depth, odom, objects_ms, geometry, front_required)
             if match is None:
-                anchor = state.goal_anchor
-                coasting = (allow_target_coast and guard.association is not None
-                            and anchor is not None and anchor.generation == guard.generation
-                            and track is not None and track.generation == guard.generation
-                            and (not front_required or check.front_required)
-                            and not any(target_objects(objects, check.target, config)))
-                if not coasting:
-                    return reject("target_missing")
-                # A missing detector frame cannot extend the existing command,
-                # but it need not insert a zero before the planner's legal
-                # frozen-goal coast. Keep identity and its old physical deadline;
-                # fresh depth/feedback still rebuild the full response below.
-                deadline = min(deadline, guard.deadline_ms)
-                if now_ms >= deadline:
-                    return reject("publish_expired")
+                target_pending = True
             else:
                 live_point = match.point[0], -match.point[1]
         elif (front_required and revision[2] != check.input_revision[2] and isinstance(objects, dict)
               and any(target_objects(objects, check.target, config))):
-            # This memory-only decision cannot associate newly visible people.
-            return reject("target_missing")
+            target_pending = True
+        if target_pending:
+            anchor = state.goal_anchor
+            generation = track.generation if track is not None else None
+            planned_anchor = check.planning_guard.target_revision[0]
+            if (handoff_deadline_ms is None or anchor is None or planned_anchor is None
+                    or guard.generation != generation):
+                return reject("target_missing")
+            # A frozen detour can already belong to an earlier track when
+            # this command was selected. Compare against its own saved goal.
+            _, _, _, _, planned_generation, _ = planned_anchor
+            if anchor.generation != planned_generation:
+                return reject("target_missing")
+            # The sent command can bridge this detector update only within its
+            # current window, subject to a fresh complete-stop check below.
+            deadline = min(deadline, guard.deadline_ms, handoff_deadline_ms)
+            if now_ms >= deadline:
+                return reject("publish_expired")
 
         twists = (measured, previous, command, *(row[2] for row in odom.get("velocity_history", ())
                                                 if row[2] is not None))
@@ -2200,6 +2205,21 @@ class NaviPlugin:
             point = local_path.target_in_grid(geometry, *live_point)
             front_constraint = tuple(view.points(point)), view.error(math.hypot(*point))
         result = dwa.check_measured_standoff(prediction, result, front_constraint, config.stop_distance_m)
+        if result.accepted and (target_pending or (handoff_deadline_ms is not None and guard.association is None)):
+            # Check current people as spacing constraints while the tracker
+            # decides identity. These measurements do not become target fixes.
+            for person in target_objects(objects, "person", config):
+                box = person.get("bbox_norm")
+                if not box:
+                    continue
+                front = depth_mod.front_surface(depth["map"], box, geometry.horizontal, depth.get("ground"))
+                if front is None:
+                    continue
+                point = local_path.target_in_grid(geometry, front[0], -front[1])
+                spacing = tuple(view.points(point)), view.error(math.hypot(*point))
+                result = dwa.check_measured_standoff(prediction, result, spacing, config.stop_distance_m)
+                if not result.accepted:
+                    break
         if not result.accepted:
             diagnostics["reason"] = result.reason
             return obs_ms, deadline, False, check
@@ -2218,12 +2238,13 @@ class NaviPlugin:
                         target_source=target_source if live_point is not None else check.target_source,
                         target_receipt_ms=(objects_ms if live_point is not None and
                                            (target_source is None or target_source != check.target_source)
-                                           else check.target_receipt_ms), front_required=front_required,
+                                            else check.target_receipt_ms),
+                        front_required=check.front_required if target_pending else front_required,
                         guard_horizon_s=prediction.duration)
         return obs_ms, deadline, True, newer
 
     def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False,
-                         snapshot=None, diagnostics=None, renew=True, allow_target_coast=False):
+                         snapshot=None, diagnostics=None, renew=True, handoff_deadline_ms=None):
         """Try the short motion against current depth and feedback without retiming either."""
         config = self._config
         if check.motion_guard is not None:
@@ -2231,7 +2252,7 @@ class NaviPlugin:
                 snapshot = self._observation_snapshot(with_capture_timing=True)
             return self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
                                             renew=renew, diagnostics=diagnostics if diagnostics is not None else {},
-                                            allow_target_coast=allow_target_coast)
+                                            handoff_deadline_ms=handoff_deadline_ms)
         distance_ms = check.target_ms or check.checked_ms
         target_deadline = distance_ms + min(max_age, config.max_obs_age_ms)
         if not distance_ms <= now_ms < target_deadline:
@@ -2845,10 +2866,13 @@ class NaviPlugin:
         diagnostics = {}
         if check.motion_guard is None:
             return self._note_dwa_veto_detail(origin, "physical_recheck", "missing_motion_guard"), None
+        handoff_deadline = None
+        if self._continuing_dwa_output(origin):
+            handoff_deadline = self._wire_dwa_origin.forward_check.motion_guard.deadline_ms
         for _ in range(2):
             checked = self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
                                                renew=False, diagnostics=diagnostics,
-                                               allow_target_coast=self._continuing_dwa_output(origin))
+                                               handoff_deadline_ms=handoff_deadline)
             now_ms = int(time.time() * 1000)
             if checked is not None and not checked[0] <= now_ms < checked[1]:
                 return "publish_expired", None
@@ -3103,10 +3127,14 @@ class NaviPlugin:
                          and remaining_ms <= math.ceil(2000 / self._rate_hz))
             if stop is None and (may_renew or (work.sent and work.dwa_origin is not None)):
                 max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+                handoff_deadline = None
+                if work.sent and self._continuing_dwa_output(work.dwa_origin):
+                    wire_deadline = self._wire_dwa_origin.forward_check.motion_guard.deadline_ms
+                    handoff_deadline = min(work.expires_ms, wire_deadline)
                 checked = self._recheck_forward(work.forward_check, work.message["values"],
                                                 max_age, now_ms, allow_same_depth=True,
                                                 diagnostics=recheck_diagnostics, renew=may_renew,
-                                                allow_target_coast=work.sent and self._continuing_dwa_output(work.dwa_origin))
+                                                handoff_deadline_ms=handoff_deadline)
                 now_ms = int(time.time() * 1000)
                 remaining_ms = min(work.expires_ms - now_ms,
                                    round((work.expires_at - time.monotonic()) * 1000))
@@ -3240,8 +3268,12 @@ class NaviPlugin:
             if rejection is None:
                 rejection, checked = self._recheck_dwa_inputs(origin, message["values"], now_ms)
                 if checked is not None:
-                    origin = replace(origin, forward_check=checked[3])
                     message = dict(message, ttl_ms=min(message["ttl_ms"], checked[1] - message["stamp_ms"]))
+                    proof = checked[3]
+                    wire_deadline = message["stamp_ms"] + message["ttl_ms"]
+                    if wire_deadline < proof.motion_guard.deadline_ms:
+                        proof = replace(proof, motion_guard=replace(proof.motion_guard, deadline_ms=wire_deadline))
+                    origin = replace(origin, forward_check=proof)
                 now_ms = int(time.time() * 1000)
                 rejection = rejection or self._dwa_publish_rejection(message, origin, now_ms)
             if rejection is not None:

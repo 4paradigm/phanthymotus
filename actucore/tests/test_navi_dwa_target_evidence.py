@@ -88,12 +88,12 @@ def test_targetless_timer_tick_does_not_insert_zero_before_legal_coasting_replan
 @pytest.mark.parametrize("event,stop_reason", [
     ("clear", None),
     ("obstacle", "footprint_collision"),
-    ("stranger", "target_missing"),
+    ("stranger", None),
     ("generation", "superseded"),
     ("action", "superseded"),
     ("epoch", "superseded"),
     ("expired", "publish_expired"),
-    ("front_requirement", "target_missing"),
+    ("front_requirement", None),
     ("source_regression", "target_missing"),
 ])
 def test_timer_during_coasting_selection_keeps_only_a_still_valid_sent_command(monkeypatch, event, stop_reason):
@@ -206,7 +206,7 @@ def test_first_send_still_requires_the_observed_original_target(monkeypatch, bod
 
 
 @pytest.mark.parametrize("change", ["obstacle", "replacement", "front_requirement"])
-def test_sent_target_coast_still_checks_new_obstacles_and_different_people(monkeypatch, change):
+def test_sent_target_coast_checks_obstacles_and_holds_its_fixed_window(monkeypatch, change):
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
     objects = snapshot[0][0]
     assert card._stage_command(message, card._output_epoch)
@@ -220,9 +220,12 @@ def test_sent_target_coast_still_checks_new_obstacles_and_different_people(monke
         card._state.tracker.track.front_required = True
     snapshot[0] = payload, depth, odom, 1100
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
-    assert card._dwa_publication["reason"] == (
-        "footprint_collision" if change == "obstacle" else "target_missing")
+    if change == "obstacle":
+        assert packets[-1]["values"] == [0.] * 6
+        assert card._dwa_publication["reason"] == "footprint_collision"
+    else:
+        assert [packet["values"] for packet in packets] == [message["values"]]
+        assert card._scheduled_command.expires_ms == message["stamp_ms"] + message["ttl_ms"]
 
 
 def test_repeated_matching_source_keeps_its_original_target_deadline(monkeypatch):
@@ -349,11 +352,16 @@ def test_mixed_objects_keep_the_observation_actually_associated_by_the_planner(m
     objects = [original, other] if retain_original else [other]
     snapshot[0] = (dict(payload, timestamp=1.1, count=len(objects), objects=objects), depth, odom, 1100)
     card._dispatch_command()
-    assert packets[-1]["values"] == (message["values"] if retain_original else [0.] * 6)
-    assert len(packets) == 2
+    assert all(packet["values"] == message["values"] for packet in packets)
+    if retain_original:
+        assert len(packets) == 2
+        assert card._scheduled_command.expires_ms > message["stamp_ms"] + message["ttl_ms"]
+    else:
+        assert len(packets) == 1
+        assert card._scheduled_command.expires_ms == message["stamp_ms"] + message["ttl_ms"]
 
 
-def coasting_person_case(monkeypatch, body):
+def coasting_person_case(monkeypatch, body, *, detached_anchor=False):
     from plugins.navi import policy
     card, packets, clock, snapshot = observation_card(monkeypatch, body=body)
     state, config = card._state, card._config
@@ -367,7 +375,8 @@ def coasting_person_case(monkeypatch, body):
                            target=state.target, config=config, ego=(0., 0., 0.), ego_measured=True, dt=.1)
     track = state.tracker.track
     assert track.observed and track.front_required and track.front_fix is not None
-    state.goal_anchor = policy.DetourGoal(*track.front_fix, generation=track.generation)
+    generation = track.generation - 1 if detached_anchor else track.generation
+    state.goal_anchor = policy.DetourGoal(*track.front_fix, generation=generation)
     message = card.next_command()
     assert track.state == "coasting" and state.goal_anchor.target_missing
     check = card._staged_dwa_command[1].forward_check
@@ -416,6 +425,63 @@ def test_coasting_person_held_timer_rechecks_feedback_and_hits(monkeypatch):
     card._dispatch_command()
     assert packets[-1]["values"] == [0.] * 6
     assert card._info()["dwa"]["publication"]["reason"] == "footprint_collision"
+
+
+@pytest.mark.parametrize("event", ["clear", "tracker_first", "detached_anchor", "changed_anchor",
+                                  "no_front", "near", "near_new_depth", "obstacle", "expiry", "cancel"])
+def test_sent_memory_command_rechecks_physics_during_target_reappearance(monkeypatch, event):
+    card, packets, clock, snapshot, message = coasting_person_case(
+        monkeypatch, False, detached_anchor=event == "detached_anchor")
+    assert card._stage_command(message, card._output_epoch)
+    work = card._scheduled_command
+    epoch, deadline = card._output_epoch, work.expires_ms
+    before = card._state.goal_anchor
+    goal = before.x, before.y, before.generation
+    advance_snapshot(snapshot, clock, 1010, obstacle=event == "obstacle")
+    _, depth, odom, _ = snapshot[0]
+    person = {"name": "person", "position": [0., -.6], "confidence": .95,
+              "bbox_norm": [.45, .10, .55, .30]}
+    if event == "near":
+        # The high image region isolates person spacing from the obstacle grid.
+        depth["map"][48:144, 288:352] = card._config.stop_distance_m + .03
+    elif event == "no_front":
+        del person["bbox_norm"]
+    objects = {"timestamp": 1.01, "objects": [person]}
+    snapshot[0] = objects, depth, odom, 1010
+    if event == "changed_anchor":
+        before.generation += 1
+    if event == "tracker_first":
+        state = card._state
+        for stamp in (1008, 1009, 1010):
+            state.tracker.step(detections=dict(objects, timestamp=stamp / 1000), depth=depth,
+                               target=state.target, config=card._config, ego=(0., 0., 0.), dt=.01)
+        assert state.tracker.track.observed
+    if event == "expiry":
+        clock[0] = deadline
+    if event == "cancel":
+        card._stop_navigation()
+    card._dispatch_command()
+    if event == "near_new_depth":
+        assert [p["values"] for p in packets] == [message["values"]]
+        advance_snapshot(snapshot, clock, 1020)
+        snapshot[0][1]["map"][48:144, 288:352] = card._config.stop_distance_m + .03
+        card._dispatch_command()
+    if event in ("clear", "tracker_first", "detached_anchor", "no_front"):
+        assert [p["values"] for p in packets] == [message["values"]]
+        assert card._output_epoch == epoch
+        assert card._scheduled_command is work and work.expires_ms == deadline
+        assert (before.x, before.y, before.generation) == goal
+        clock[0] = 1020
+        replacement = card.next_command()
+        assert card._stage_command(replacement, epoch)
+        assert len(packets) == 2 and all(any(packet["values"]) for packet in packets)
+    else:
+        assert packets[-1]["values"] == [0.] * 6
+        if event != "cancel":
+            assert card._dwa_publication["reason"] == {
+                "near": "target_standoff", "near_new_depth": "target_standoff", "obstacle": "footprint_collision",
+                "expiry": "publish_expired", "changed_anchor": "target_missing",
+            }[event]
 
 
 @pytest.mark.parametrize("change", ["new_detection", "dim_detection", "closer_front"])
