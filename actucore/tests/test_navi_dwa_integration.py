@@ -610,6 +610,22 @@ def test_dwa_registration_uses_measurement_and_only_uncovered_residual():
     assert registered.shift_error == pytest.approx(.20 * .002)
     assert registered.turn_error == 0.
 
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_front_camera_prefix_steers_into_approaching_bend(monkeypatch, side):
+    config, state, depth, _ = prepared_reference_case()
+    geometry = config.local_geometry
+    points = ((0., 0.), (.30, 0.), (.40, side * .10), (.75, side * .10), (1.4, side * .60))
+    route = local_path.Detour(None, points, geometry, reachable_prefix=True)
+    monkeypatch.setattr(local_path, "opening_route", lambda *args: None)
+    monkeypatch.setattr(state.local_plan, "route", lambda *args, **kwargs: route)
+    calls = observe_selector(monkeypatch)
+    policy._start_detour_segment(depth, config, state, geometry, 2., (side,), 3., 0.)
+    choice = next(choice for _, choice in calls if choice is not None)
+    vx, vy, wz = choice.command
+    assert state.dwa_trace["branch"] == "reachable_prefix"
+    assert choice.check.accepted and vx > 0. and vy == 0. and wz * side < 0.
+
+
 def test_partial_reference_precedes_scan_exhaustion(monkeypatch):
     config, state, depth, odom = observation_case(attempted=False)
     wall = np.isclose(local_path.FORWARD, 1.15)

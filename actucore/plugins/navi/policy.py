@@ -3717,7 +3717,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                 depth, config, state, references[0], target_distance, target_bearing,
                 branch=branch, motion=rolling[1] if rolling is not None else scan.motion,
                 speed_limit=max(floor_x, LOCAL_BLOCKED_APPROACH_MAX_MPS), shadow=shadow,
-                recovery=dwa_only, alternates=references[1:])
+                recovery=dwa_only, alternates=references[1:],
+                guidance=branch == "reachable_prefix" and not (config.use_lateral and config.vy_max))
             if proposal is not None:
                 side = math.copysign(1., proposal.reference.points[-1][1])
                 return _use_dwa(state, proposal, side)

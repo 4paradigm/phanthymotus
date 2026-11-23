@@ -1645,3 +1645,33 @@ def test_filtered_feedback_sweep_agrees_with_exact_registered_scene(monkeypatch,
         outcomes.append((verified[:3], diagnostics.get("reason")))
     assert outcomes[0] == outcomes[1]
     assert outcomes[0][0][2] == (not obstacle)
+
+
+@pytest.mark.parametrize("change,compact,stationary", [
+    ("moving", True, False), ("stationary", True, True),
+    ("changed_twist", False, False), ("intervening_twist", False, False),
+    ("regressed_source", False, False), ("missing_overlap", False, False),
+    ("coordinate_jump", False, False), ("retimed", False, False), ("unchanged_history", False, False),
+])
+def test_repeated_speed_sample_with_independently_updated_pose(change, compact, stationary):
+    rate = (0., 0., 0.) if change == "stationary" else (.15, 0., 0.)
+    pose = plugin.odom_mod.PlanarPose(995, ("odom",), .5, 0., 0.)
+    history = ((1000, 995, rate),)
+    before = dict(vx=rate[0], vy=0., wz=0., stamp_ms=995, source_sample_id=995,
+                  motion_pose=pose, obstacle_pose=pose, velocity_history=history)
+    latest = replace(pose, x=pose.x + (.003 if rate[0] else 0.), stamp_ms=1015)
+    if change == "coordinate_jump":
+        latest = replace(latest, x=latest.x + 1.)
+    mid_rate = (.12, 0., 0.) if change == "intervening_twist" else rate
+    end_rate = (.1, 0., 0.) if change == "changed_twist" else rate
+    tail = ((1010, 994 if change == "regressed_source" else 995, mid_rate), (1020, 995, end_rate))
+    after = dict(before, vx=end_rate[0], motion_pose=latest, obstacle_pose=latest,
+                 velocity_history=tail if change == "missing_overlap" else history + tail)
+    if change == "retimed":
+        after["stamp_ms"] = 1020
+    elif change == "unchanged_history":
+        after["velocity_history"] = history
+    old = plugin._motion_inputs(None, None, before)
+    new = plugin._motion_inputs(None, None, after)
+    assert plugin._continuous_feedback_update(old, new, 350, stationary=False) == compact
+    assert plugin._continuous_feedback_update(old, new, 350, stationary=True) == stationary

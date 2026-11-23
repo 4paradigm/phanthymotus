@@ -91,60 +91,62 @@ def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None,
         rr, cc = np.ogrid[:allowed.shape[0], :allowed.shape[1]]
         dr = np.maximum(0, np.maximum(rows[top].min() - rr, rr - rows[top].max()))
         dc = np.maximum(0, np.maximum(cols[top].min() - cc, cc - cols[top].max()))
-        ranked_distance = np.hypot(dr, dc).tolist()
+        ranked_distance = np.hypot(dr, dc)
 
-    def distance_to_goals(point):
-        if best_target_cost is not None:
-            return ranked_distance[point[0]][point[1]]
-        row, col = point
-        return math.hypot(max(goal_row - row, row - last_row, 0),
-                          max(goal_col - col, col - last_col, 0))
-
-    queue = [(distance_to_goals(start), 0.0, start)]
-    cost = {start: 0.0}
-    parents = {}
+    # Give each grid cell a row-major heap key. Scalar distance and parent
+    # lookups dominate repeated side and footprint searches on the control tick.
+    row_count, col_count = allowed.shape
+    if best_target_cost is None:
+        row_gap = [max(goal_row - r, r - last_row, 0) for r in range(row_count)]
+        col_gap = [max(goal_col - c, c - last_col, 0) for c in range(col_count)]
+        ranked_distance = [[math.hypot(dr, dc) for dc in col_gap] for dr in row_gap]
+    # Block the border so diagonal moves can test both cardinal neighbours
+    # with the same offsets at every cell, including corners.
+    moves = [(dr, dc) for dr, dc in steps if abs(dr) < row_count and abs(dc) < col_count]
+    pad_row = max((abs(dr) for dr, _ in moves), default=0)
+    pad_col = max((abs(dc) for _, dc in moves), default=0)
+    padding = ((pad_row, pad_row), (pad_col, pad_col))
+    traversable = np.pad(allowed, padding).ravel().tolist()
+    stride = col_count + 2 * pad_col
+    origin = pad_row * stride + pad_col
+    start_id = origin + start[0] * stride + start[1]
+    heuristic = np.pad(ranked_distance, padding).ravel().tolist()
+    costs = np.pad(cell_cost, padding).ravel().tolist() if cell_cost is not None else [0.] * len(traversable)
+    queue = [(heuristic[start_id], 0.0, start_id)]
+    cost = [math.inf] * len(traversable)
+    cost[start_id] = 0.
+    parents = [-1] * len(traversable)
     best, best_score = None, (math.inf, math.inf)
 
-    def path_to(point):
-        path = [point]
-        while point != start:
-            point = parents[point]
-            path.append(point)
+    def path_to(cell):
+        path = []
+        while cell != -1:
+            path.append(divmod(cell - origin, stride))
+            cell = parents[cell]
         return path[::-1]
 
-    # Scalar access in the inner A* loop is cheaper on Python lists.
-    traversable = allowed.tolist()
-    row_count, col_count = allowed.shape
-    costs = cell_cost.tolist() if cell_cost is not None else [[0.] * col_count] * row_count
-    moves = [(dr, dc, math.hypot(dr, dc)) for dr, dc in steps]
+    offsets = [(dr * stride + dc, dr * stride, dc, math.hypot(dr, dc)) for dr, dc in moves]
     while queue:
         _, walked, current = heapq.heappop(queue)
-        row, col = current
         if walked > cost[current]:
             continue
+        row, col = divmod(current - origin, stride)
         if (goal_col <= col <= last_col and goal_row <= row <= last_row
-                and (target_cells is None or target_cells[current])):
-            # The heuristic vanishes on every best-ranked goal.
-            if target_cost is None or target_cost[current] == best_target_cost:
+                and (target_cells is None or target_cells[row, col])):
+            if target_cost is None or target_cost[row, col] == best_target_cost:
                 return path_to(current)
-            score = (target_cost[current], walked)
+            score = (target_cost[row, col], walked)
             if score < best_score:
                 best, best_score = current, score
-        for dr, dc, step_cost in moves:
-            next_row, next_col = row + dr, col + dc
-            if not (0 <= next_row < row_count and 0 <= next_col < col_count):
+        for offset, along, across, step_cost in offsets:
+            nxt = current + offset
+            if not (traversable[nxt] and traversable[current + along] and traversable[current + across]):
                 continue
-            # With a fixed-heading rectangular footprint, check both cardinal
-            # translations so a diagonal cannot cut an occupied corner.
-            if not (traversable[next_row][next_col] and traversable[next_row][col]
-                    and traversable[row][next_col]):
-                continue
-            nxt = (next_row, next_col)
-            distance = walked + step_cost * (1. + costs[next_row][next_col])
-            if distance < cost.get(nxt, math.inf):
+            distance = walked + step_cost * (1. + costs[nxt])
+            if distance < cost[nxt]:
                 cost[nxt] = distance
                 parents[nxt] = current
-                heapq.heappush(queue, (distance + distance_to_goals(nxt), distance, nxt))
+                heapq.heappush(queue, (distance + heuristic[nxt], distance, nxt))
     return path_to(best) if best is not None else None
 
 

@@ -166,7 +166,7 @@ def _continuous_feedback_update(before, after, max_gap_ms, *, stationary):
     stopped = (0., 0., 0.)
     if (old_twist is None or twist is None or (stationary and not old_twist == twist == stopped)
             or old_id is None or sample_id is None
-            or not 0 < sample_id - old_id <= max_gap_ms or not old_history or not history
+            or not 0 <= sample_id - old_id <= max_gap_ms or not old_history or not history
             or pose is None or old_pose is None or (stamp is None) != (old_stamp is None)
             or (stamp is not None and not 0 <= stamp - old_stamp <= max_gap_ms)):
         return False
@@ -190,13 +190,17 @@ def _continuous_feedback_update(before, after, max_gap_ms, *, stationary):
     if old_history[-1] not in history:
         return False
     overlap = history.index(old_history[-1]) + 1
-    if (history[:overlap] != old_history[-overlap:] or old_history[-1][1:] != (old_id, old_twist)
+    if ((sample_id == old_id and (stamp != old_stamp or overlap == len(history)))
+            or history[:overlap] != old_history[-overlap:] or old_history[-1][1:] != (old_id, old_twist)
             or history[-1][1:] != (sample_id, twist)):
         return False
     receipt, source, _ = old_history[-1]
     for next_receipt, next_source, next_twist in history[overlap:]:
         if (next_source is None or not 0 <= next_source - source <= max_gap_ms
                 or not 0 <= next_receipt - receipt <= max_gap_ms or next_twist is None
+                # Pose can advance while the producer repeats its last speed
+                # sample. The same speed stamp cannot identify different rates.
+                or (sample_id == old_id and next_twist != old_twist)
                 or (stationary and next_twist != stopped)):
             return False
         receipt, source = next_receipt, next_source
@@ -3189,7 +3193,7 @@ class NaviPlugin:
                 check = origin.forward_check
             checked = self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
                                                renew=renew, diagnostics=diagnostics,
-                                               handoff_deadline_ms=handoff_deadline)
+                                               handoff_deadline_ms=handoff_deadline, bounds_only=True)
             now_ms = int(time.time() * 1000)
             if checked is not None and not checked[0] <= now_ms < checked[1]:
                 diagnostics["reason"] = "publish_expired"
