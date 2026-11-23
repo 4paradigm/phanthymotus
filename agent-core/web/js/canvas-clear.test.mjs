@@ -5,19 +5,20 @@ import { runInNewContext } from 'node:vm';
 
 // Exercise the actual canvas handlers with a small DOM and controllable network.
 const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
-function section(start, end) {
-  const from = source.indexOf(start);
-  const to = source.indexOf(end, from);
-  assert.ok(from >= 0 && to > from, `missing canvas section: ${start}`);
-  return source.slice(from, to);
+// By function name, as config-topic-refresh.test.mjs does — slicing between
+// comment strings broke on unrelated comment edits.
+function code(name) {
+  const at = source.search(new RegExp(`(?:async )?function ${name}\\(`));
+  assert.ok(at >= 0, `missing canvas function: ${name}`);
+  // A one-line function ends on its own line; reading on to the next '\n}\n'
+  // would pull in the function after it and shadow this file's stubs.
+  const line = source.slice(at, source.indexOf('\n', at) + 1);
+  if (line.split('{').length === line.split('}').length) return line;
+  return source.slice(at, source.indexOf('\n}\n', at) + 3);
 }
-const handlers = [
-  section('async function _ensureEdit(', '// Thin wrapper'),
-  section('function _projectEditLockReason()', '/** Same question without'),
-  section('async function _clearCanvas()', '// ── Card rendering'),
-  section('let _saveTimer = null;', '// ── Helpers'),
-  section('function _syncEmptyState()', 'function _esc('),
-].join('\n');
+const handlers = ['_ensureEdit', '_projectEditLockReason', '_editLockReason', '_refuseEdit',
+  '_editsLocked', '_clearCanvas', '_debouncedSave', '_saveLayout', '_writeLayout',
+  '_syncEmptyState'].map(code).join('\n');
 
 function fixture({ confirmed = true, editor = true, running = false, known = true } = {}) {
   const removed = [], toasts = [], calls = [], stopped = [];
@@ -33,7 +34,8 @@ function fixture({ confirmed = true, editor = true, running = false, known = tru
     _execConnections: [{ fromCardId: 'card-1', toCardId: 'card-2' }],
     _isEditor: editor, _currentEditor: editor ? 'this-tab' : null,
     _sessionId: 'this-tab', _projectRunning: running, _projectStateKnown: known,
-    _clearing: false, _zoom: 1.2, _tx: 10, _ty: 20, _emptyEl: { style: {} },
+    _clearing: false, _layoutGen: 0, _saveTimer: null, _saveDeferred: false,
+    _pendingLayoutSaves: new Set(), _zoom: 1.2, _tx: 10, _ty: 20, _emptyEl: { style: {} },
     document: { getElementById: id => id === 'canvas-clear' ? clearButton : null },
     confirm: () => { confirms++; return confirmed; },
     fetch: async (url, options) => {
@@ -48,7 +50,7 @@ function fixture({ confirmed = true, editor = true, running = false, known = tru
     stopCameraStream: () => stopped.push('camera'),
     setTimeout, clearTimeout, AbortController,
   };
-  const api = runInNewContext(`${handlers}\n({ _clearCanvas, _saveLayout, _ensureEdit })`, ctx);
+  const api = runInNewContext(`${handlers}\n({ _clearCanvas, _saveLayout, _ensureEdit, _debouncedSave, _syncEmptyState })`, ctx);
   return { ctx, api, removed, toasts, calls, stopped, clearButton,
     confirms: () => confirms, reloads: () => reloads };
 }
@@ -101,7 +103,8 @@ test('another editor prevents deletion', async () => {
   assert.deepEqual(f.calls.map(c => c.url), ['/api/canvas/claim-edit']);
   assert.equal(f.ctx._cards.length, 3);
   assert.deepEqual(f.removed, []);
-  assert.equal(f.clearButton.disabled, false);
+  // Read-only now: the button must not invite a click it can only refuse.
+  assert.equal(f.clearButton.disabled, true);
 });
 
 test('a failed layout write keeps the cards visible and reports an uncertain result', async () => {
@@ -143,4 +146,77 @@ test('a project that starts during clear preparation prevents the layout write',
   assert.equal(f.calls.length, 0);
   assert.equal(f.ctx._cards.length, 3);
   assert.match(f.toasts.at(-1), /停止智能控制/);
+});
+
+test('a write that times out but did land is reported as cleared and stops browser sources', async () => {
+  const f = fixture();
+  f.ctx.fetch = async () => { throw new Error('aborted'); };
+  // The server saved [] before its slow teardown; reloading reads that back.
+  f.ctx._reloadLayout = async () => {
+    for (const c of f.ctx._cards) c.el.remove();
+    f.ctx._cards = []; f.ctx._connections = []; f.ctx._execConnections = [];
+    f.ctx._layoutGen++;
+  };
+  await f.api._clearCanvas();
+  assert.deepEqual(f.stopped, ['mic', 'camera']);
+  assert.equal(f.ctx._cards.length, 0);
+  assert.equal(f.toasts.at(-1), '画布已清空');
+});
+
+test('a 403 reloads once and says the edit lock was lost, not the network', async () => {
+  const f = fixture();
+  f.ctx.fetch = async (url, options) => {
+    f.calls.push({ url, body: JSON.parse(options.body) });
+    return { ok: false, status: 403, json: async () => ({}) };
+  };
+  await f.api._clearCanvas();
+  assert.equal(f.reloads(), 1);
+  assert.match(f.toasts.at(-1), /编辑权/);
+  assert.deepEqual(f.stopped, []);
+});
+
+test('a pending autosave is flushed, not dropped, when the clear is then aborted', async () => {
+  const f = fixture();
+  f.ctx._syncProjectState = async () => { f.ctx._projectRunning = true; return true; };
+  f.api._debouncedSave();
+  await f.api._clearCanvas();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].body.cards.length, 3);
+  assert.equal(f.ctx._cards.length, 3);
+});
+
+test('saves attempted during the clear are replayed once it ends', async () => {
+  const f = fixture();
+  f.ctx._syncProjectState = async () => {
+    f.api._saveLayout();  // e.g. a pan while the clear waits
+    f.ctx._projectRunning = true;
+    return true;
+  };
+  await f.api._clearCanvas();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.ctx._saveDeferred, false);
+  assert.notEqual(f.ctx._saveTimer, null);
+  clearTimeout(f.ctx._saveTimer);
+});
+
+test('a reload during the clear wait aborts instead of wiping the new layout', async () => {
+  const f = fixture();
+  f.ctx._syncProjectState = async () => { f.ctx._layoutGen++; return true; };
+  await f.api._clearCanvas();
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.ctx._cards.length, 3);
+  assert.match(f.toasts.at(-1), /更新/);
+});
+
+test('the clear button is disabled while read-only or running', () => {
+  for (const state of [{ _isEditor: false, _currentEditor: 'other' }, { _projectRunning: true },
+                       { _projectStateKnown: false }]) {
+    const f = fixture();
+    Object.assign(f.ctx, state);
+    f.api._syncEmptyState();
+    assert.equal(f.clearButton.disabled, true, JSON.stringify(state));
+  }
+  const f = fixture({ editor: false });  // nobody holds the lock: clicking claims it
+  f.api._syncEmptyState();
+  assert.equal(f.clearButton.disabled, false);
 });

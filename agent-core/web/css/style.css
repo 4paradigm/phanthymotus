@@ -1452,9 +1452,13 @@ html, body {
   white-space: nowrap;
   cursor: pointer;
 }
-.canvas-clear-btn:hover:not(:disabled) {
-  background: var(--red-bg);
-  color: var(--red);
+/* Hover-capable pointers only: a tap leaves an emulated :hover behind on touch
+   screens, so the button stayed red after 取消 as if the clear were still armed. */
+@media (hover: hover) {
+  .canvas-clear-btn:hover:not(:disabled) {
+    background: var(--red-bg);
+    color: var(--red);
+  }
 }
 .canvas-clear-btn:disabled {
   opacity: .45;
@@ -1462,6 +1466,13 @@ html, body {
 }
 @media (pointer: coarse) {
   .canvas-clear-btn { min-height: 44px; }
+}
+/* Tablets: the clear button sits inline in the zoom bar, so its 44px would
+   stretch the bar around 24px zoom buttons. Give those the same floor. Phones
+   are excluded — there the clear button floats above the bar, and the zoom
+   buttons keep their own 32px from the max-width: 768px block. */
+@media (pointer: coarse) and (min-width: 769px) {
+  .canvas-ctrl-btn { width: 44px; height: 44px; }
 }
 
 /* ── Canvas Top Control (智能控制 button) ─────────────────────────────── */

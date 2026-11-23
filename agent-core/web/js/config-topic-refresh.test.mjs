@@ -69,7 +69,7 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     _buildCardEl: c => cards.find(old => old.id === c.id).el,
     _makeDraggable() {}, _syncGeometryObservers() {}, _syncEmptyState() {},
     _debouncedSave() { saves++; },
-    _viewport: viewport, _isEditor: true, _clearing: false, _pendingLayoutSaves: new Set(),
+    _viewport: viewport, _isEditor: true, _clearing: false, _layoutGen: 0, _pendingLayoutSaves: new Set(),
     _sessionId: 'editor', _execConnections: [], AbortController, setTimeout, clearTimeout,
     _zoom: 1, _tx: 0, _ty: 0, _updateEditorUI() {},
     fetch: async (url, init) => {
