@@ -516,6 +516,37 @@ def test_fallback_retains_native_timing_for_old_landmark_verification(fused):
     assert s.gate.pause_context.budget_ns == 1_900*MS
 
 
+@pytest.mark.parametrize('speed,yaw_rate,imu_step_ms,probe_lost,expect_fallback', [
+    (0.2, 0., 10, False, True), (0., 0.2, 10, False, True),
+    (0., 0., 100, False, True), (0.2, 0., 10, True, False),
+])
+def test_measured_visual_fallback_during_startup(fused, speed, yaw_rate, imu_step_ms, probe_lost, expect_fallback):
+    from test_rgbd_fusion import pose
+    make, now, _ = fused
+    s = make()
+    probe = s.observations.startup_gate
+    for i in range(7):
+        stamp = (1000 + 100*i)*MS
+        now[0] = stamp + 20*MS
+        for offset in range(100 - imu_step_ms, -1, -imu_step_ms):
+            imu(s, stamp - offset*MS)
+        x = speed*i/10
+        half_yaw = yaw_rate*i/20
+        q = (0., 0., np.sin(half_yaw), np.cos(half_yaw))
+        assert not s.fusion._initialize(stamp, pose(x, q))
+        msg, info = native(s, stamp, x=x, lost=probe_lost)
+        msg.pose.pose.orientation.z, msg.pose.pose.orientation.w = q[2:]
+        probe.input(stamp)
+        probe.accept(msg, info, now[0])
+        s.gate.input(stamp)
+    s._check_initialization(s.started + 0.7)
+    assert (s.fallback is not None) == expect_fallback
+    if expect_fallback:
+        feed(s, now, stamp + 100*MS, x=speed*0.7)
+        assert last(s)['pose'] is not None
+        assert last(s)['vendor']['motus_slam']['segment_id'] == s.segment
+
+
 @pytest.mark.parametrize('first_half', [None, 'pose', 'info'])
 def test_visual_startup_uses_pending_native_measurement_at_handoff(fused, first_half):
     make, now, _ = fused

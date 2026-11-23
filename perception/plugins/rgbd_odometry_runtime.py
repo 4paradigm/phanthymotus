@@ -1233,11 +1233,12 @@ class RgbdSession:
                 self.fusion.fault('camera IMU unavailable during startup; using visual tracking')
                 self._check_fusion(now_ns)
                 return
-        if self._fusing() and elapsed >= 5.:
+        if self._fusing() and self.fusion.filter is None:
             probe = getattr(self.observations, 'startup_gate', None)
             now_ns = time.time_ns()
             if (probe is not None and probe.state == 'tracking' and
-                    0 <= now_ns-probe.last_stamp <= MAX_VISUAL_RESULT_AGE_NS and self.fusion.filter is None):
+                    0 <= now_ns-probe.last_stamp <= MAX_VISUAL_RESULT_AGE_NS and
+                    (elapsed >= 5. or probe.last_stamp == self.fusion.visual_fallback_stamp)):
                 self.fusion.fault('ESKF awaits low-motion initialization; measured visual tracking available')
                 self._check_fusion(now_ns)
                 return

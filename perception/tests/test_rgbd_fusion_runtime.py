@@ -752,6 +752,7 @@ def test_startup_can_fall_back_to_repeated_measured_visual_before_the_full_timeo
     session.fallback = None
     session.fusion = Fusion()
     session.fusion.filter = None
+    session.fusion.visual_fallback_stamp = None
     session.fusion.input_period_ns = 350_000_000
     session._check_fusion = lambda now: None
     session.gate = EstimateGate('run', 'camera_optical', 'clock')

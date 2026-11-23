@@ -268,6 +268,7 @@ class ShortTermFusion:
         self.samples = deque(maxlen=1024)
         self.imu_coverage = deque(maxlen=self.samples.maxlen)
         self.warmup = deque(maxlen=30)
+        self.visual_fallback_stamp = None
         self.filter = None
         self.lever = self.translations = None
         self.geometry = DepthRegistration(K) if depth_geometry else None
@@ -389,15 +390,29 @@ class ShortTermFusion:
         if len(self.warmup) < 3 or stamp-self.warmup[0][0] < 500_000_000:
             return False
         first_stamp, first_pose = self.warmup[0]
-        if (not self.samples or self.samples[0][0] > first_stamp or self.samples[-1][0] < stamp or
-                (self.imu_coverage and not self._imu_covers(first_stamp, stamp))):
+        positions = np.array([p['position'] for _, p in self.warmup])
+        first_rotation = pose_values(first_pose)[1]
+        angular_motion = max(np.linalg.norm(log_rotation(first_rotation.T@pose_values(p)[1]))
+                             for _, p in self.warmup)
+        velocity = (positions[-1]-positions[0])/((stamp-first_stamp)/1e9)
+        if (angular_motion > .005 or np.linalg.norm(velocity) > .05 or
+                np.max(np.linalg.norm(positions-positions[-1], axis=1)) > .025):
+            self.visual_fallback_stamp = stamp
+            return False
+        if (not self.samples or self.samples[0][0] > first_stamp or self.samples[-1][0] < stamp):
             return False
         entries = [s for s in self.samples if first_stamp <= s[0] <= stamp]
+        if len(entries) < 20:
+            # Both boundaries have arrived. This window cannot initialize the filter.
+            self.visual_fallback_stamp = stamp
+            return False
+        if self.imu_coverage and not self._imu_covers(first_stamp, stamp):
+            return False
         # Include the measured samples bracketing both interpolation boundaries.
         times = np.array([s[0]-first_stamp for s in self.samples], dtype=float)
         begin = np.searchsorted(times, 0, side='right')-1
         end = np.searchsorted(times, stamp-first_stamp)
-        if len(entries) < 20 or np.max(np.diff(times[begin:end+1])) > MAX_IMU_GAP_NS:
+        if np.max(np.diff(times[begin:end+1])) > MAX_IMU_GAP_NS:
             return False
         # Interpolate the independently sampled IMU at both visual boundaries.
         values = np.array([np.r_[s[1], s[2]] for s in self.samples])
@@ -405,14 +420,8 @@ class ShortTermFusion:
                       for t in (first_stamp, stamp)]
         entries = [(first_stamp, boundaries[0][:3], boundaries[0][3:])] + entries + [
                    (stamp, boundaries[1][:3], boundaries[1][3:])]
-        positions = np.array([p['position'] for _, p in self.warmup])
         gyro, accel = np.array([s[1] for s in entries]), np.array([s[2] for s in entries])
-        first_rotation = pose_values(first_pose)[1]
-        angular_motion = max(np.linalg.norm(log_rotation(first_rotation.T@pose_values(p)[1]))
-                             for _, p in self.warmup)
-        velocity = (positions[-1]-positions[0])/((stamp-first_stamp)/1e9)
-        if (angular_motion > .005 or np.linalg.norm(velocity) > .05 or np.max(np.linalg.norm(positions-positions[-1], axis=1)) > .025 or
-                np.max(np.linalg.norm(gyro, axis=1)) > .1 or np.max(np.std(accel, axis=0)) > .15 or
+        if (np.max(np.linalg.norm(gyro, axis=1)) > .1 or np.max(np.std(accel, axis=0)) > .15 or
                 abs(np.linalg.norm(accel.mean(axis=0))-9.80665) > .3):
             return False
         self.filter = InertialFilter(stamp, pose, velocity, accel.mean(axis=0), gyro.mean(axis=0), self.lever)
