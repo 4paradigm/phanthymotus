@@ -308,7 +308,7 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
     async def test_single_chat_uses_userid_as_chat_id(self):
         adapter = await self._adapter()
         frame = _msg_frame(chattype='single')
-        parsed = adapter._extract_inbound(frame, frame['body'])
+        parsed = adapter._extract_inbound(frame['body'])
         self.assertEqual(parsed['chat_type'], 'p2p')
         self.assertEqual(parsed['chat_id'], 'u1')
         self.assertEqual(parsed['message_id'], 'm1')
@@ -332,7 +332,7 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
         frame = _msg_frame()
         frame['body']['msgtype'] = 'file'
         frame['body']['text'] = None
-        parsed = adapter._extract_inbound(frame, frame['body'])
+        parsed = adapter._extract_inbound(frame['body'])
         self.assertIn('不支持的非文本消息', parsed['text'])
 
     async def test_image_is_prepared_after_authorization(self):
@@ -358,7 +358,7 @@ class WecomInboundTest(unittest.IsolatedAsyncioTestCase):
             {'msgtype': 'text', 'text': {'content': '这是什么？'}},
             {'msgtype': 'image', 'image': {'url': 'https://example.test/image', 'aeskey': 'key'}},
         ]})
-        parsed = adapter._extract_inbound(frame, frame['body'])
+        parsed = adapter._extract_inbound(frame['body'])
         self.assertEqual(parsed['text'], '这是什么？')
         self.assertEqual(len(parsed['images']), 1)
 

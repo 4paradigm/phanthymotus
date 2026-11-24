@@ -7483,6 +7483,20 @@ html, body {
   flex-wrap: wrap;
   margin-top: 0;
 }
+.channel-wecom-onboarding {
+  text-align: center;
+}
+.channel-wecom-onboarding img:not([hidden]) {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 16px auto;
+  padding: 8px;
+  background: white;
+}
+.channel-wecom-onboarding .channel-form-actions {
+  justify-content: center;
+}
 /* Trusted Bots — one card per Bot instead of a table row, since a group
    chat_id + open_id pair is long enough that a 4-column grid forces every
    field below a usable width in a 640px modal. Name/ID share a row (short,

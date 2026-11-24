@@ -121,7 +121,7 @@ def _image_failure_reason(error: Exception) -> str:
     status = re.fullmatch(r'WeCom image download failed \(HTTP (\d{3})\)\.', text)
     if status:
         return f'http_status={status[1]}'
-    if 'missing its URL or decryption key' in text or 'Invalid WeCom image metadata' in text:
+    if 'Invalid WeCom image metadata' in text:
         return 'missing_metadata'
     if 'exceeds the 10 MiB limit' in text:
         return 'size_limit'
@@ -399,7 +399,7 @@ class WecomAdapter(ChannelAdapter):
             self._seen_set.discard(self._seen_ids.pop(0))
         return False
 
-    def _extract_inbound(self, frame: dict, body: dict) -> dict:
+    def _extract_inbound(self, body: dict) -> dict:
         """Normalize the official SDK message payload, without guessed aliases."""
         sender = body.get('from') or {}
         user_id = str(sender.get('userid') or '')
@@ -430,7 +430,6 @@ class WecomAdapter(ChannelAdapter):
             'chat_id': chat_id,
             'chat_type': chat_type,
             'text': text,
-            'msgtype': msgtype,
             'images': images,
         }
 
@@ -500,7 +499,7 @@ class WecomAdapter(ChannelAdapter):
             msg.text += f' [图片处理失败或超限：{failures} 张]'
 
     async def _process_message(self, frame: dict, body: dict) -> None:
-        parsed = self._extract_inbound(frame, body)
+        parsed = self._extract_inbound(body)
         req_id = _frame_req_id(frame)
         msg_id = parsed['message_id']
         if not msg_id or not req_id or not parsed['user_id'] or not parsed['chat_id']:
@@ -561,9 +560,8 @@ class WecomAdapter(ChannelAdapter):
                 await self._prepare_images(msg, parsed['images'])
 
         async def notify_pending_approval():
-            notice = OutboundMessage(chat_id=msg.chat_id, text='Pending approval. An admin has been notified.',
-                                     source_message_id=msg_id)
-            await self._send_reply(req_id, notice, stream_id=stream_id)
+            await self._send_reply(req_id, 'Pending approval. An admin has been notified.',
+                                   stream_id=stream_id)
 
         msg.prepare = prepare_authorized_message
         msg.notify_pending_approval = notify_pending_approval
@@ -571,9 +569,9 @@ class WecomAdapter(ChannelAdapter):
 
     # ── 出站 ────────────────────────────────────────────────────────────────
 
-    def _lookup_reply_context(self, msg: OutboundMessage) -> tuple[str, str]:
+    def _lookup_reply_context(self, source_id: str) -> tuple[str, str]:
         # 方案 B：manager.send_to_channel 已把触发事件的 message_id 透传进来
-        source_id = str(getattr(msg, 'source_message_id', '') or '')
+        source_id = str(source_id or '')
         entry = self._msgid_to_req.get(source_id) if source_id else None
         if entry:
             req_id, ts, stream_id = entry
@@ -589,9 +587,8 @@ class WecomAdapter(ChannelAdapter):
         )
 
     async def _send_progress(self, message_id: str) -> None:
-        msg = OutboundMessage(chat_id='', text='正在处理…', source_message_id=message_id)
-        req_id, stream_id = self._lookup_reply_context(msg)
-        await self._send_reply(req_id, msg, stream_id=stream_id, finish=False)
+        req_id, stream_id = self._lookup_reply_context(message_id)
+        await self._send_reply(req_id, '正在处理…', stream_id=stream_id, finish=False)
 
     async def send_message(self, msg: OutboundMessage) -> None:
         """回复原消息。失败必须抛异常，让上层如实回报给 LLM / 用户。"""
@@ -607,7 +604,7 @@ class WecomAdapter(ChannelAdapter):
             raise WecomError('WeCom supports at most 10 images in one reply.')
         if not msg.text and not count and not msg.image_caption:
             return
-        req_id, stream_id = self._lookup_reply_context(msg)
+        req_id, stream_id = self._lookup_reply_context(msg.source_message_id)
 
         def read_image(path: str) -> bytes:
             with open(path, 'rb') as source:
@@ -628,11 +625,9 @@ class WecomAdapter(ChannelAdapter):
         if msg.image_caption:
             captions.append(msg.image_caption)
         content = '\n'.join(part for part in [msg.text, *captions] if part)
-        reply = OutboundMessage(chat_id=msg.chat_id, text=content,
-                                source_message_id=msg.source_message_id)
         # Finish the existing progress stream before sending standalone media;
         # otherwise the client's "processing" indicator remains visible.
-        await self._send_reply(req_id, reply, stream_id=stream_id)
+        await self._send_reply(req_id, content, stream_id=stream_id)
         sent = ['text'] if content else []
         failures = []
         for index, (data, extension) in enumerate(zip(images, extensions), 1):
@@ -651,13 +646,13 @@ class WecomAdapter(ChannelAdapter):
                 raise PartialSendError(sent, failures)
             raise WecomError('; '.join(failures))
 
-    async def _send_reply(self, req_id: str, msg: OutboundMessage, *, stream_id: str,
+    async def _send_reply(self, req_id: str, text: str, *, stream_id: str,
                           finish: bool = True) -> None:
         await self._send_request(
             req_id,
             lambda client: client.reply_stream(
                 {'headers': {'req_id': req_id}}, stream_id=stream_id,
-                content=msg.text, finish=finish,
+                content=text, finish=finish,
             ),
         )
 

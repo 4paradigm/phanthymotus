@@ -225,6 +225,37 @@ async def qq_qr_session(action: str, req: QQSessionRef, response: fastapi.Respon
     return await asyncio.to_thread(session.snapshot)
 
 
+class WecomSessionRef(BaseModel):
+    session_id: str = Field(min_length=43, max_length=43)
+
+
+def _wecom_setup():
+    if not auth.is_enabled():
+        raise fastapi.HTTPException(403, 'Enable Dashboard authentication before connecting WeCom')
+    from channel import wecom_qr_onboarding
+    return wecom_qr_onboarding
+
+
+@router.post('/wecom/qr/start')
+async def start_wecom_qr(response: fastapi.Response):
+    response.headers['Cache-Control'] = 'no-store'
+    session = _wecom_setup().start()
+    if session is None:
+        raise fastapi.HTTPException(429, 'Too many QR sessions')
+    return session
+
+
+@router.post('/wecom/qr/{action}')
+async def wecom_qr_session(action: str, req: WecomSessionRef, response: fastapi.Response):
+    response.headers['Cache-Control'] = 'no-store'
+    session = _wecom_setup().get(req.session_id)
+    if session is None or action not in ('status', 'cancel'):
+        raise fastapi.HTTPException(404, 'WeCom QR session not found')
+    if action == 'cancel':
+        session.cancel()
+    return session.snapshot()
+
+
 # ── User Management ──────────────────────────────────────────────────────────
 
 @router.get('/users')
