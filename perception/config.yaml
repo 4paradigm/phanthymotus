@@ -14,6 +14,25 @@ file_intake:
   retention_days: 7
 
 plugins:
+  hand_landmarks:
+    enabled: true
+    backend: rtmpose
+    model_dir: /models/hand
+    hand: Right
+    num_hands: 1
+    hand_confidence: 0.3
+    landmark_min_cutoff: 1.0
+    landmark_beta: 0.08
+    detection_hold_frames: 0
+    slew_rate: 20.0
+    rate_hz: 10
+    # Stable ROS topics: existing motus.hand/1 subscribers need no change.
+    keypoint_topic: /actucore/handdrive/keypoints
+    view_topic: /actucore/handdrive/view
+    draw_view: true
+    line_width: 1
+    point_radius: 3
+    view_jpeg_quality: 90
   # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
   phanthy_music:
     # 没有别的键了：曲库连接内置在卡片里，超时是实现细节，音量和自动续播是动作
