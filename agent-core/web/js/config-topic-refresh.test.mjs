@@ -81,7 +81,7 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     },
   };
   const api = runInNewContext(
-    (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
+    code('_withOptionalInputPorts') + (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
     + (revalidate ? code('_inputTopicsFor') + code('_revalidateDerivedTopics') : '')
     + code('_parseMcpCallResult') + code('_fetchTopicsFromDriver') + code('_refreshConfiguredTopics')
     + code('updateCanvasMcps') + code('_resolveAllTopics') + code('_addCard') + code('_saveLayout') + code('_writeLayout') + code('_reloadLayout')
@@ -285,4 +285,59 @@ test('restored processors revalidate saved output provenance once per page', asy
   p.resolve();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(reads, 1, 'successful same-input verification stays cached');
+});
+
+
+function slamMetadata(withRgb = true) {
+  return [{ id: 'robot', tools: [{ name: 'pointcloud_slam', type: 'processor', multiInstance: false,
+    topic_in: [{ format: 'state/odom' }, { format: 'sensor/pointcloud2' },
+      ...(withRgb ? [{ format: 'image/jpeg', optional: true }] : [])],
+    topic_out: [{ topic: '/pointcloud_slam/map', format: 'sensor/mapping' }] }] }];
+}
+const slamInputs = [
+  { topic: '/tracking/odom', format: 'state/odom' },
+  { topic: '/measured/cloud', format: 'sensor/pointcloud2' },
+];
+const inputPorts = card => Array.from(card.el.querySelectorAll('.canvas-port.in'));
+
+test('restored SLAM inputs append the optional RGB port and retain saved required wire indices', async () => {
+  const metadata = slamMetadata();
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [],
+    { dom: true, metadata });
+  p.add({ id: 'slam', mcpId: 'robot', toolName: 'pointcloud_slam', topicIn: [...slamInputs] }, false);
+  const c = p.cards()[0];
+  assert.deepEqual(inputPorts(c).map(port => [port.dataset.idx, port.dataset.format, port.dataset.topic]), [
+    ['0', 'state/odom', '/tracking/odom'], ['1', 'sensor/pointcloud2', '/measured/cloud'],
+    ['2', 'image/jpeg', ''],
+  ]);
+  await p.save();
+  assert.deepEqual(p.persisted().cards[0].topicIn, [
+    ...slamInputs, { format: 'image/jpeg', optional: true },
+  ]);
+});
+
+test('metadata polling adds the optional RGB port to an existing saved SLAM card', () => {
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [],
+    { dom: true, metadata: slamMetadata(false) });
+  p.add({ id: 'slam', mcpId: 'robot', toolName: 'pointcloud_slam', topicIn: [...slamInputs] }, false);
+  assert.equal(inputPorts(p.cards()[0]).length, 2);
+  p.poll(slamMetadata());
+  assert.deepEqual(inputPorts(p.cards()[0]).map(port => port.dataset.format),
+    ['state/odom', 'sensor/pointcloud2', 'image/jpeg']);
+});
+
+test('configured RGB input survives saved-card restoration and metadata/config refresh without duplicates', async () => {
+  const metadata = slamMetadata();
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 200,
+    data: { topic_out: metadata[0].tools[0].topic_out } }) }), [], { dom: true, metadata });
+  p.add({ id: 'slam', mcpId: 'robot', toolName: 'pointcloud_slam', topicIn: [
+    ...slamInputs, { topic: '/connected/color', format: 'image/jpeg' },
+  ] }, false);
+  p.poll(metadata);
+  await p.config({ mcp_id: 'robot', tool: 'pointcloud_slam' });
+  assert.deepEqual(Array.from(p.cards()[0].topicIn, port => [port.format, port.topic]), [
+    ['state/odom', '/tracking/odom'], ['sensor/pointcloud2', '/measured/cloud'],
+    ['image/jpeg', '/connected/color'],
+  ]);
+  assert.equal(inputPorts(p.cards()[0]).length, 3);
 });

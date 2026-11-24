@@ -53,7 +53,7 @@ export const PointCloudRenderer = {
 
     // Camera
     this._camera = new THREE.PerspectiveCamera(60, w / h, 0.1, 200);
-    this._camera.position.set(0, 5, 8);
+    this._camera.position.set(5, 8, 5);
     this._camera.lookAt(0, 0, 0);
 
     // Renderer

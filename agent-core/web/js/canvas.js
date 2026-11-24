@@ -584,6 +584,15 @@ export async function initCanvas(initialMcps) {
   _syncEmptyState();
 }
 
+function _withOptionalInputPorts(topics, declarations) {
+  const ports = topics || [];
+  // New optional inputs must also appear on cards saved before their release.
+  // Append by format without disturbing existing topics or wire indices.
+  const missing = (declarations || []).filter(port => port.optional &&
+    !ports.some(saved => saved.format === port.format));
+  return missing.length ? [...ports, ...missing] : ports;
+}
+
 export function updateCanvasMcps(mcps) {
   _allMcps = mcps || [];
   // This runs on a 10s poll and can replace card elements wholesale. Doing that
@@ -615,6 +624,8 @@ export function updateCanvasMcps(mcps) {
         // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
         if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
       }
+      const mergedTopicIn = _withOptionalInputPorts(card.topicIn, liveTopicIn);
+      if (mergedTopicIn !== card.topicIn) { card.topicIn = mergedTopicIn; topicsChanged = true; }
       if (card.topicOutFrom === undefined && liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
         if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
       }
@@ -955,15 +966,14 @@ function _addCard(data, save = true) {
   // Restore or initialize persisted topic data
   let topicInData  = data.topicIn  || [];
   let topicOutData = data.topicOut || [];
-  if (!topicInData.length || !topicOutData.length) {
-    // Try to initialize from current MCP tool data (for newly dropped cards)
-    const _mcp = _allMcps.find(m => m.id === mcpId);
-    const _tools = _mcp?.tools || [];
-    const _toolObj = _tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
-    if (typeof _toolObj === 'object') {
-      if (!topicInData.length  && _toolObj.topic_in)  topicInData  = _toolObj.topic_in;
-      if (topicOutFrom === undefined && !topicOutData.length && _toolObj.topic_out) topicOutData = _toolObj.topic_out;
-    }
+  // Initialize new cards and append optional inputs absent from older layouts.
+  const _mcp = _allMcps.find(m => m.id === mcpId);
+  const _tools = _mcp?.tools || [];
+  const _toolObj = _tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
+  if (typeof _toolObj === 'object') {
+    if (!topicInData.length  && _toolObj.topic_in)  topicInData  = _toolObj.topic_in;
+    topicInData = _withOptionalInputPorts(topicInData, _toolObj.topic_in);
+    if (topicOutFrom === undefined && !topicOutData.length && _toolObj.topic_out) topicOutData = _toolObj.topic_out;
   }
 
   const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData, topicOutFrom };
@@ -1132,7 +1142,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const staticOutHasReal = toolTopicOut?.some(t => t.topic);
   const savedInHasReal = savedTopicIn?.some(t => t.topic);
   const staticInHasReal = toolTopicIn?.some(t => t.topic);
-  const topicIn  = (savedInHasReal  ? savedTopicIn  : null) || (staticInHasReal  ? toolTopicIn  : null) || (savedTopicIn?.length  ? savedTopicIn  : null) || (toolTopicIn?.length  ? toolTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
+  const topicIn = _withOptionalInputPorts((savedInHasReal ? savedTopicIn : null) || (staticInHasReal ? toolTopicIn : null) || (savedTopicIn?.length ? savedTopicIn : null) || (toolTopicIn?.length ? toolTopicIn : (toolType || isBundleMcp ? [] : mcp?.topic_in || [])), toolTopicIn);
   const topicOut = topicOutFrom !== undefined ? (savedTopicOut || []) : (savedOutHasReal ? savedTopicOut : null) || (staticOutHasReal ? toolTopicOut : null) || (savedTopicOut?.length ? savedTopicOut : null) || (toolTopicOut?.length ? toolTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
   const effectiveType = toolType || (topicIn.length && topicOut.length ? 'processor' : topicOut.length ? 'sensor' : topicIn.length ? 'actuator' : '');
 
