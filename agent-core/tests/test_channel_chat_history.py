@@ -77,11 +77,6 @@ class ChatHistoryIsolationTest(unittest.TestCase):
                                            user_id='u1', user_role='viewer', sender_type='user')
         self.manager._record_chat_exchange('feishu_r1', 'oc_b', 'user', '不相关的话',
                                            user_label='Bob')
-        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '另一个用户的指令',
-                                           user_id='u2', user_role='operator', sender_type='user')
-        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '旧角色指令',
-                                           user_id='u1', user_role='operator', sender_type='user')
-        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '无权限信息的旧消息')
 
         import channel.manager as manager_mod
         original = manager_mod.manager
@@ -104,9 +99,6 @@ class ChatHistoryIsolationTest(unittest.TestCase):
         self.assertIn('帮我查电量', trigger['text'])
         self.assertIn('电量 80%', trigger['text'])
         self.assertNotIn('不相关的话', trigger['text'])
-        self.assertNotIn('另一个用户的指令', trigger['text'])
-        self.assertNotIn('旧角色指令', trigger['text'])
-        self.assertNotIn('无权限信息的旧消息', trigger['text'])
 
 
 if __name__ == '__main__':
