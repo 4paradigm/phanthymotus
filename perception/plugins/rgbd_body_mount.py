@@ -60,6 +60,7 @@ class CaptureMounts:
         self.packets=OrderedDict()
         self._retained={}
         self._missing={}
+        self._static_matrix = None
         self.last_stamp=0
         self.state,self.reason='unavailable','waiting for a numeric body-camera transform'
 
@@ -88,8 +89,22 @@ class CaptureMounts:
                 raise ValueError('body mount must contain an integer timestamp')
             packet = dict(packet, stamp_ns=packet.get('stamp_ns', now_ns))
             stamp=packet['stamp_ns']
-            if packet.get('matrix') is not None:
-                packet['matrix'] = _mount_matrix(packet['matrix']).tolist()
+            matrix = packet.get('matrix')
+            if matrix is not None:
+                # Static JSON packets often repeat the same geometry at every
+                # capture. Reuse validation while keeping all timed evidence.
+                key = None
+                if (packet.get('mode') == 'static' and type(matrix) is list and
+                        all(type(row) is list and all(type(v) in (float, int) for v in row)
+                            for row in matrix)):
+                    key = tuple(tuple(row) for row in matrix)
+                cached = self._static_matrix
+                if key is not None and cached is not None and key == cached[0]:
+                    packet['matrix'] = cached[1]
+                else:
+                    packet['matrix'] = _mount_matrix(matrix).tolist()
+                    if key is not None:
+                        self._static_matrix = key, packet['matrix']
             previous = self.packets.get(stamp)
             if previous is None:
                 previous = next((evidence[stamp] for evidence in self._retained.values()

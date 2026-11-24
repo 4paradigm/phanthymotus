@@ -40,6 +40,31 @@ def mounts():
     return CaptureMounts(declaration(), 'camera_optical', 'camera-clock')
 
 
+def test_repeated_static_mount_validation_preserves_each_capture(monkeypatch):
+    from plugins import rgbd_body_mount
+
+    observer = mounts()
+    validate = rgbd_body_mount._mount_matrix
+    validations = []
+
+    def record(matrix):
+        validations.append(matrix)
+        return validate(matrix)
+
+    monkeypatch.setattr(rgbd_body_mount, '_mount_matrix', record)
+    first, second, third = 1_000_000_000, 1_030_000_000, 1_060_000_000
+    observer.observe(packet(first, mode='static'), first)
+    observer.observe(packet(second, mode='static'), second)
+    changed = np.eye(4)
+    changed[0, 3] = .2
+    observer.observe(packet(third, changed, mode='static'), third)
+
+    assert len(validations) == 2
+    assert list(observer.packets) == [first, second, third]
+    np.testing.assert_array_equal(observer.matrix_at(second), np.eye(4))
+    np.testing.assert_array_equal(observer.matrix_at(third), changed)
+
+
 def test_late_future_tf_diagnostic_keeps_exact_numeric_evidence():
     observer = mounts()
     stamp = 1_000_000_123
