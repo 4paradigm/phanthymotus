@@ -28,7 +28,7 @@ def arguments():
 
 class Session(_FakeNode):
     def __init__(self, odom_topic, cloud_topic, config, *, session_dir,
-                 input_contract=None, capture_stop=None):
+                 input_contract=None, capture_stop=None, input_registry=None, input_declarations=None):
         super().__init__('fake_native_session')
         self.inputs = (odom_topic, cloud_topic)
         self.directory = Path(session_dir)
@@ -105,7 +105,7 @@ def test_card_starts_mapping_with_cloud_and_existing_odom_without_rgbd(card):
     assert call(card, 'start_mapping', map_name='Hall')['state'] == 'running'
     assert card._node.inputs == ('/pose', '/cloud')
     assert call(card, 'info')['topic_out'] == card.get_tools()[0]['topic_out']
-    assert len(card.get_tools()[0]['topic_out']) == 1
+    assert [port['format'] for port in card.get_tools()[0]['topic_out']] == ['sensor/mapping', 'data/json']
 
 
 def test_duplicate_start_reports_the_current_mapping_session(card):
@@ -905,8 +905,8 @@ def test_retired_robot_selector_is_ignored_on_replay(card):
 def test_stable_mapping_output_for_live_and_saved_views(card):
     from plugins.pointcloud_slam_preview import PREVIEW_TOPIC
     expected = card.get_tools()[0]['topic_out']
-    assert expected == [{'topic': PREVIEW_TOPIC, 'format': 'sensor/mapping',
-                         'desc': 'Live or saved RTAB-Map preview'}]
+    assert [(port['topic'], port['format']) for port in expected] == [
+        (PREVIEW_TOPIC, 'sensor/mapping'), ('/pointcloud_slam/status', 'data/json')]
     assert call(card, 'info')['topic_out'] == expected
     assert card.dispatch('pointcloud_slam', arguments())['topic_out'] == expected
     running = call(card, 'start_mapping', map_name='Hall')
@@ -926,6 +926,88 @@ def test_stable_mapping_output_for_live_and_saved_views(card):
     assert previous_view.destroyed and card._view is None
     assert call(card, 'info')['topic_out'] == expected
     assert 'closed_topics' not in resumed
+
+
+def test_bundle_publishes_slam_status_through_mapping_and_saved_view(card, monkeypatch):
+    from main import PerceptionBundle
+
+    timers = {}
+    create_timer = _FakeNode.create_timer
+
+    def record_timer(node, interval, callback):
+        timer = create_timer(node, interval, callback)
+        timers[node] = timer
+        return timer
+
+    monkeypatch.setattr(_FakeNode, 'create_timer', record_timer)
+    executor = _FakeExecutor()
+    bundle = PerceptionBundle({'plugins': {'pointcloud_slam': {'enabled': True, **settings()}}}, executor)
+    try:
+        plugin = next(p for p in bundle._plugins if p.PREFIX == 'pointcloud_slam')
+        tool = next(t for t in bundle.get_all_tools() if t['name'] == 'pointcloud_slam')
+        topic = tool['topic_out'][1]['topic']
+        node, publisher = next((n, p) for n in executor.nodes for p in n.publishers if p.topic == topic)
+        timer = timers[node]
+        assert timer.interval == 1
+
+        def sample():
+            timer.callback()
+            return json.loads(publisher.messages[-1])
+
+        idle = sample()
+        assert idle['state'] == 'idle'
+        assert idle['relocalization']['can_attempt'] is False
+        ready(plugin)
+        assert sample()['state'] == 'ready'
+
+        session = capture(plugin)
+        health = {'odometry': 'lost', 'cloud': 'active', 'integration': 'waiting_for_tracking',
+                  'admitted_frames': 3, 'native_updates': 0, 'backend_progress': {'state': 'processing'}}
+        monkeypatch.setattr(session, 'status', lambda: health)
+        waiting = sample()
+        assert (waiting['state'], waiting['map_name'], waiting['odometry']) == ('running', 'Hall', 'lost')
+        assert waiting['admitted_frames'] == 3 and waiting['native_updates'] == 0
+        assert waiting['relocalization']['can_attempt'] is False
+
+        health.update(native_updates=1, native_recovery_fresh=True,
+                      backend_progress={'state': 'responsive_without_new_nodes', 'connected_nodes': 1},
+                      native_recovery={'state': 'searching', 'relocalizations': 0})
+        searching = sample()['relocalization']
+        assert searching['state'] == 'searching' and searching['can_attempt'] is True
+        assert searching['localized'] is False
+
+        health['native_recovery'] = {'state': 'localized', 'relocalizations': 1, 'relocalization_source': 'scan'}
+        localized = sample()['relocalization']
+        assert localized['localized'] is True and localized['successes'] == 1 and localized['source'] == 'scan'
+
+        health['native_recovery_fresh'] = False
+        stale = sample()['relocalization']
+        assert stale['state'] == 'localized' and stale['fresh'] is False
+        assert stale['can_attempt'] is None and stale['localized'] is None
+
+        health.update(state='storage_limit', capture_stopped=True, stop_reason='map disk budget reached')
+        session.capture_stop.set()
+        stopped = sample()
+        assert stopped['state'] == 'storage_limit' and stopped['reason'] == health['stop_reason']
+        assert stopped['relocalization']['can_attempt'] is False and stopped['relocalization']['localized'] is False
+
+        saving = []
+        session.before_close = lambda: saving.append(sample()['state'])
+        saved = call(plugin, 'stop_mapping')
+        assert saving and set(saving) == {'saving'}
+        assert sample()['save_state'] == 'saved'
+        call(plugin, 'select_map', map_name='Hall')
+        archive = sample()
+        assert archive['state'] == 'map_selected' and archive['map_id'] == saved['map_id']
+        assert archive['map_name'] == 'Hall' and archive['revision'] == saved['revision']
+        assert archive['relocalization']['state'] == 'unavailable'
+        assert archive['relocalization']['can_attempt'] is False and archive['relocalization']['localized'] is False
+    finally:
+        bundle.shutdown()
+    assert not executor.nodes and node.destroyed
+    count = len(publisher.messages)
+    timer.callback()
+    assert len(publisher.messages) == count
 
 
 def test_reselect_saved_map_is_idempotent_and_renames_without_ports(card):
@@ -959,7 +1041,7 @@ def test_core_main_topics_can_resolve_generic_geometry_without_robot_name(card, 
         assert plugin._session_settings['cloud_frame'] == 'sensor'
         assert plugin._session_settings['child_frame'] == '{segment_id}_base'
         assert call(plugin, 'info')['input_provenance']['resolution'] == 'observed_ros_messages'
-        assert len(plugin.get_tools()[0]['topic_out']) == 1
+        assert [port['format'] for port in plugin.get_tools()[0]['topic_out']] == ['sensor/mapping', 'data/json']
     finally:
         plugin.shutdown()
 

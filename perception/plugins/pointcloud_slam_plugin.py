@@ -21,6 +21,7 @@ from .pointcloud_slam_view import SavedMapView
 from utils.ros_lifecycle import dispose_node
 
 log = logging.getLogger(__name__)
+_STATUS_TOPIC = '/pointcloud_slam/status'
 _ARCHIVE_DIR = '/models/pointcloud_slam'
 _DEFAULTS = {'max_gap_ms': 200, 'max_age_s': 2,
              'max_measurement_age_ms': 1500, 'max_future_skew_ms': 100,
@@ -72,6 +73,7 @@ class PointCloudSlamPlugin:
         self._deployment_config = deepcopy(deployment)
         self._config = {**_DEFAULTS, **deployment}
         self._executor = executor
+        self._status_node = self._status_publisher = None
         self._node = self._pending = self._view = None
         self._view_id = self._session_dir = self._map_name = self._save_request = None
         self._project_inputs = None
@@ -133,7 +135,93 @@ class PointCloudSlamPlugin:
                  'topic_out': self._outputs()}]
 
     def start(self):
-        pass  # Canvas start supplies the connected native inputs.
+        from rclpy.node import Node
+        from std_msgs.msg import String
+
+        with self._lock:
+            if self._executor is None or self._status_node is not None:
+                return
+            node = Node('pointcloud_slam_status')
+            try:
+                publisher = node.create_publisher(String, _STATUS_TOPIC, 1)
+                node.create_timer(1., self._publish_status)
+                self._executor.add_node(node)
+            except Exception:
+                dispose_node(self._executor, node, label=self.PREFIX)
+                raise
+            self._status_node, self._status_publisher = node, publisher
+
+    def _publish_status(self):
+        from std_msgs.msg import String
+
+        # A map operation can hold the card lock while waiting for ROS inputs.
+        # The status timer skips that tick so the executor can deliver them.
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            if self._status_publisher is None or not self._operation_lock.acquire(blocking=False):
+                return
+            try:
+                stopping = self._project_stopping or self._blocking_stops
+                save = self._save_status
+            finally:
+                self._operation_lock.release()
+            health = self._node.status() if self._node and not stopping else {}
+            view = self._view.outputs()[0]['metadata']['map_view'] if self._view else {}
+            progress = health.get('backend_progress', {})
+            recovery = health.get('native_recovery', {})
+            native_state = recovery.get('state', 'unavailable')
+            backend_state = health.get('state')
+            native_active = bool(health and not health.get('capture_stopped') and backend_state != 'error')
+            fresh = native_active and health.get('native_recovery_fresh', False)
+            localized = native_active and native_state in ('localized', 'visual_tracking', 'scan_tracking')
+            connected_nodes = progress.get('connected_nodes')
+            can_attempt = None
+            if not native_active or connected_nodes == 0 or (
+                    connected_nodes is None and not health.get('native_updates')):
+                can_attempt = False
+            elif fresh and connected_nodes and (localized or native_state == 'searching'):
+                can_attempt = True
+            state = 'idle'
+            if view:
+                state = 'map_selected'
+            elif save['state'] in ('saving', 'error'):
+                state = save['state']
+            elif health:
+                state = backend_state if backend_state in ('error', 'storage_limit', 'stopped') else 'running'
+            elif self._project_inputs and not stopping and not self._capture_stop.is_set():
+                state = 'ready'
+            status = {
+                'state': state,
+                'map_name': view.get('name', self._map_name),
+                'map_id': view.get('map_id', self._bound_map_id if self._map_name else None),
+                'revision': view.get('revision'),
+                'save_state': save['state'],
+                'odometry': health.get('odometry', 'waiting'),
+                'cloud': health.get('cloud', 'waiting'),
+                'integration': health.get('integration', 'inactive'),
+                'backend_progress': progress.get('state', 'idle'),
+                'admitted_frames': health.get('admitted_frames', 0),
+                'native_updates': health.get('native_updates', 0),
+                'connected_nodes': connected_nodes,
+                'reason': health.get('stop_reason') or health.get('last_error') or save.get('message'),
+                'relocalization': {
+                    'state': native_state,
+                    'fresh': fresh,
+                    # Current native search or tracking shows the matcher can
+                    # use this graph. Null means the evidence is inconclusive.
+                    'can_attempt': can_attempt,
+                    'localized': localized if fresh or not native_active else None,
+                    'successes': recovery.get('relocalizations'),
+                    'source': recovery.get('relocalization_source') or
+                              ('visual' if recovery.get('relocalization_inliers') else None),
+                },
+            }
+            message = String()
+            message.data = json.dumps(status, ensure_ascii=False)
+            self._status_publisher.publish(message)
+        finally:
+            self._lock.release()
 
     def _inputs(self):
         # Stable positional ports preserve canvas wires across lifecycle refreshes.
@@ -143,10 +231,12 @@ class PointCloudSlamPlugin:
                 for fmt in ('state/odom', 'sensor/pointcloud2', 'image/jpeg')]
 
     def _outputs(self):
-        # Stable even before project start and after it stops. The saved-map
-        # viewer and native mapping node take turns publishing this one topic.
+        # The live and saved preview share the first port, including when
+        # opening a canvas whose preview wire was saved at that position.
         return [{'topic': PREVIEW_TOPIC, 'format': 'sensor/mapping',
-                 'desc': 'Live or saved RTAB-Map preview'}]
+                 'desc': 'Live or saved RTAB-Map preview'},
+                {'topic': _STATUS_TOPIC, 'format': 'data/json',
+                 'desc': 'SLAM input, mapping and relocalization status'}]
 
     def _dispose(self, node):
         if node is None:
@@ -695,7 +785,14 @@ class PointCloudSlamPlugin:
                 self._blocking_stops -= 1
 
     def shutdown(self):
-        result = self.stop()
+        try:
+            result = self.stop()
+        finally:
+            with self._lock:
+                node, self._status_node = self._status_node, None
+                self._status_publisher = None
+            if node is not None:
+                dispose_node(self._executor, node, label=self.PREFIX)
         if result['state'] == 'error':
             raise RuntimeError(result['message'])
 

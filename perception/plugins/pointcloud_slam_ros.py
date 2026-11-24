@@ -1215,6 +1215,7 @@ class RtabmapNode(Node):
                     has_recovery_state = True
                     segment['native_recovery'] = dict(state=states[int(recovery[0])],
                         relocalizations=int(recovery[1]), visual_inliers=int(recovery[2]))
+                    segment['native_recovery_received'] = self._receipt_clock()
                     if recovery[0] == 1 and segment.get('preview_pending'):
                         try:
                             if self._stamp(msg) >= segment['preview_key'][0]:
@@ -1285,7 +1286,11 @@ class RtabmapNode(Node):
             active = self._active
             frame = active['frame_id'] if active else None
             segment = active['segment_id'] if active else None
-            progress = active['progress'].status(self._receipt_clock()) if active else {'state': 'idle'}
+            now = self._receipt_clock()
+            progress = active['progress'].status(now) if active else {'state': 'idle'}
+            recovery = deepcopy(active['native_recovery']) if active else {'state': 'unavailable'}
+            recovery_received = active.get('native_recovery_received') if active else None
+            recovery_fresh = recovery_received is not None and now - recovery_received <= active['progress'].timeout_s
             rejections = dict(self._native_rejections)
             streaks = dict(self._native_rejection_streaks)
         rgb_info = self._rgb.info() if self._rgb is not None else {'state': 'disconnected', 'reason': None}
@@ -1295,7 +1300,7 @@ class RtabmapNode(Node):
             temporal_motion=self._motion.status() if self._motion is not None else {'state':'disconnected'},
             temporal_pending=motion_pending,
             rgb_preparation=rgb_preparation,
-            native_recovery=deepcopy(active['native_recovery']) if active else {'state': 'unavailable'},
+            native_recovery=recovery, native_recovery_fresh=recovery_fresh,
             state='error' if self._runtime_error else
             'storage_limit' if self._stop_reason else 'stopped' if stopped else health['odometry'],
             capture_stopped=stopped, stop_reason=self._stop_reason,

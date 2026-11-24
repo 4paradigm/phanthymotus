@@ -438,6 +438,24 @@ def test_native_info_counts_real_accepted_closures_without_duplicate_inflation(n
     assert status['native_loop_closures'] == 1 and status['native_proximity_detections'] == 1
 
 
+def test_native_recovery_status_expires_without_a_new_recovery_report(node):
+    send(node)
+    assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
+    callback = next(s.callback for s in node.subscriptions if s.topic.endswith('/info'))
+    keys = ['Motus/RecoveryState/', 'Motus/Relocalizations/', 'Motus/VisualInliers/']
+    assert node.status()['native_recovery_fresh'] is False
+    callback(NS(header=NS(stamp=NS(sec=1, nanosec=0)), ref_id=0, loop_closure_id=0,
+                proximity_detection_id=0, stats_keys=keys, stats_values=[1, 0, 0]))
+    assert node.status()['native_recovery']['state'] == 'searching'
+    assert node.status()['native_recovery_fresh'] is True
+
+    node._receipt_clock = lambda: 12.
+    callback(NS(header=NS(stamp=NS(sec=2, nanosec=0)), ref_id=1,
+                loop_closure_id=0, proximity_detection_id=0))
+    assert node.status()['native_recovery']['state'] == 'searching'
+    assert node.status()['native_recovery_fresh'] is False
+
+
 def test_native_activity_does_not_count_unconnected_or_repeated_graph_nodes(node):
     send(node)
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
