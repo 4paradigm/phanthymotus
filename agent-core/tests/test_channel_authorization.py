@@ -44,7 +44,7 @@ class BotChannelAuthorizationTest(unittest.TestCase):
             **bot, 'text': '[]',
         }]))
         self.assertEqual(collector.bot_channel_message_ids([bot]), ['om_bot'])
-        batches = collector._split_by_authorization([human, bot, human])
+        batches = collector._split_by_bot_trust([human, bot, human])
         self.assertEqual([len(batch) for batch in batches], [1, 1, 1])
         self.assertEqual(
             [collector.has_bot_channel_event(batch) for batch in batches],
