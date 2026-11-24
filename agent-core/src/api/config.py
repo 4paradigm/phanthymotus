@@ -1222,6 +1222,9 @@ async def stop_removed_cards(old_cards, new_cards) -> int:
     """
     live = {c.get('id', '') for c in (new_cards or []) if c.get('id')}
     removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
+    removed = [c for c in removed
+               if (tool := find_tool(c.get('mcpId', ''), c.get('toolName', ''))).get('type') != 'sensor'
+               or tool.get('multiInstance')]
     if not removed:
         return 0
     results = await _stop_cards(removed)

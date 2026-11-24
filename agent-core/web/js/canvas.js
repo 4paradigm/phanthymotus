@@ -997,7 +997,10 @@ async function _removeCard(id) {
   // leave it, so its ROS node, subscription and any CUDA context would live
   // until perception exits — publishing to a topic no card accounts for.
   // `stop` is idempotent, so doing this to a card that was never started is fine.
-  _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
+  const tool = _allMcps.find(m => m.id === removed.mcpId)?.tools?.find(t => t.name === removed.toolName);
+  if (tool?.type !== 'sensor' || tool.multiInstance) {
+    _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
+  }
   removed.el.remove();
   _cards.splice(idx, 1);
   // Trigger stop for connections where this card was the source
