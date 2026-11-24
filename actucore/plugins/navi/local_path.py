@@ -1214,8 +1214,16 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
         return None
     remaining = np.hypot(FORWARD-target[0], RIGHT-target[1])
     goal = (remaining >= stop) & (remaining <= stop + RESOLUTION)
-    if not goal.any():
-        return None
+    reachable_prefix = not goal.any()
+    if reachable_prefix:
+        # Plan around a visible blocker before the true standoff ring enters
+        # the grid. Keep enough room for the footprint at the local endpoint.
+        edge = FORWARD[-1, 0]
+        end = edge - geometry.front - RESOLUTION
+        angle = math.atan2(target[1], target[0])
+        if target[0] - stop <= edge or segment_clear(occupied, geometry, half_width, angle, end):
+            return None
+        goal = abs(FORWARD - end) <= RESOLUTION / 2
     rows, cols = occupied.shape
     columns = np.arange(cols)
     # Squared Euclidean distance to the nearest occupied centre, by two
@@ -1271,7 +1279,8 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     topology = tuple((FORWARD[cell], RIGHT[cell]) for cell in path)
     relative = tuple((f - pivot, r) for f, r in topology)
     look = next((i for i, point in enumerate(relative) if math.hypot(*point) >= .40), len(relative) - 1)
-    return Detour(None, ((0., 0.), *relative[look:]), geometry, topology=topology)
+    return Detour(None, ((0., 0.), *relative[look:]), geometry,
+                  reachable_prefix=reachable_prefix, topology=topology)
 
 
 def opening_route(frame, occupied, geometry, half_width, plane, target, allow_detour=False):

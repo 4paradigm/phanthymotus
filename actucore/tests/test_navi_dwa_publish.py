@@ -155,6 +155,77 @@ def test_lost_received_speed_holds_after_source_guard_expires(monkeypatch, late_
     assert not any(card._last_decision.values)
 
 
+@pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
+def test_selected_route_first_write_uses_planning_snapshot(monkeypatch, body):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=body, live_target=True)
+    origin = card._staged_dwa_command[1]
+    assert origin.acceptance.route_points
+    advance_snapshot(snapshot, clock, 1010, obstacle=True)
+    monkeypatch.setattr(card, "_recheck_dwa_inputs", lambda *_: pytest.fail("first send rescanned the route"))
+    if body:
+        card._publish_command(message)
+    else:
+        assert card._stage_command(message, card._output_epoch)
+    packet, = packets
+    assert packet["values"] == message["values"]
+    assert packet["obs_stamp_ms"] == message["obs_stamp_ms"]
+    assert packet["stamp_ms"] + packet["ttl_ms"] == message["stamp_ms"] + message["ttl_ms"]
+
+
+def test_admitted_arc_finishes_before_new_target_or_hold_takes_the_wire(monkeypatch):
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms
+    assert card._stage_command(message, card._output_epoch)
+    work = card._scheduled_command
+    assert work.sent
+    deadline = work.forward_check.motion_guard.deadline_ms
+    advance_snapshot(snapshot, clock, 1010, obstacle=True)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, count=0, objects=[]), depth, odom, clock[0]
+    hold = card._command_message([0.] * 6, clock[0] / 1000, clock[0])
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: pytest.fail("admitted arc rescanned"))
+    assert card._stage_command(hold, card._output_epoch)
+    card._dispatch_command()
+    assert card._scheduled_command is work and len(packets) == 1
+    assert any(packets[0]["values"])
+
+    clock[0] = deadline
+    assert card._stage_command(hold, card._output_epoch)
+    assert packets[-1]["values"] == [0.] * 6
+    assert len(packets) == 2
+
+
+def test_next_arc_is_ready_at_the_cutoff_without_an_intermediate_zero(monkeypatch):
+    card, packets, clock, snapshot, first = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(first, card._output_epoch)
+    old = card._scheduled_command
+    cutoff = old.forward_check.motion_guard.deadline_ms
+    advance_snapshot(snapshot, clock, cutoff - 45, vx=first["values"][0])
+    successor = card.next_command()
+    assert card._staged_dwa_command is not None
+    assert card._stage_command(successor, card._output_epoch)
+    assert old.successor is not None
+    assert len(packets) == 1
+
+    clock[0] = cutoff
+    card._dispatch_command()
+    assert len(packets) == 2
+    assert all(any(packet["values"]) for packet in packets)
+    assert packets[-1]["stamp_ms"] == cutoff
+    assert packets[-1]["seq"] > packets[0]["seq"]
+    assert packets[-1]["stamp_ms"] + packets[-1]["ttl_ms"] == (
+        successor["stamp_ms"] + successor["ttl_ms"])
+
+
+def test_operator_can_cancel_an_admitted_arc(monkeypatch):
+    card, packets, clock, _, message = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(message, card._output_epoch)
+    assert card._arc_in_progress(card._scheduled_command, clock[0])
+    card._cancel_scheduled_motion(block=True)
+    assert packets[-1]["values"] == [0.] * 6
+    assert card._scheduled_command is None
+
+
 @pytest.mark.parametrize("missing", ["depth", "feedback"])
 @pytest.mark.parametrize("recovers", [True, False])
 def test_first_write_recovers_only_with_valid_replacement(monkeypatch, missing, recovers):

@@ -180,7 +180,7 @@ def _travel(start, end, integrals, target, acceleration, braking, dt):
 
 
 def predict_motion(measured, previous, command, *, hold_s, latency_s, acceleration, braking,
-                   geometry, mode, dt=.04, rotation_center=None, stop=True):
+                   geometry, mode, dt=.04, rotation_center=None, stop=True, initial_bounds=None):
     """Hold includes the uncertain old-command interval. Then brake all axes to zero.
 
     The nominal switch is at the latest possible arrival. For each scalar
@@ -206,6 +206,7 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
     delay_axes = []
     delay_x = delay_y = heading_span = 0.
     early = tuple(measured)
+    lower, upper = initial_bounds if initial_bounds is not None else (None, None)
     uncertain = latency_s > 0. and tuple(previous) != tuple(command)
     position_error = half_travel = half_turn = body_travel = 0.
     delay_position = delay_yaw = delay_travel = 0.
@@ -231,7 +232,7 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
 
     def integrate(target, early_target, seconds):
         nonlocal delay_x, delay_y, heading_span
-        nonlocal early, position_error, half_travel, half_turn, body_travel
+        nonlocal early, lower, upper, position_error, half_travel, half_turn, body_travel
         nonlocal delay_position, delay_yaw, delay_travel
         if seconds <= 0.:
             return
@@ -242,6 +243,11 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
         target, early_target = tuple(target), tuple(early_target)
         stable_area = steady_area(target, step)
         early_stable_area = stable_area if same_target or not uncertain else steady_area(early_target, step)
+        if initial_bounds is not None:
+            low_target = tuple(map(min, target, early_target))
+            high_target = tuple(map(max, target, early_target))
+            low_area = steady_area(low_target, step)
+            high_area = steady_area(high_target, step)
         # A converged phase still emits every time and pose. Its response area,
         # travelled distance and interpolation allowances are constant.
         steady = None
@@ -268,7 +274,16 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
             half_travel = max(half_travel, half_speed_step)
             half_turn = max(half_turn, angular_gap)
             position_error += travel * angular_gap
-            if uncertain:
+            if initial_bounds is not None:
+                lower, a = response(lower, low_target, step, low_area)
+                upper, b = response(upper, high_target, step, high_area)
+                dx, dy, da = (max(abs(x - lo), abs(x - hi)) for x, lo, hi in zip(area, a, b))
+                delay_x += dx
+                delay_y += dy
+                delay_travel += dx + dy
+                delay_yaw += da
+                delay_position += dx + dy + travel * min(2., delay_yaw)
+            elif uncertain:
                 # Equal states under the same request have identical scalar responses.
                 if same_target and early == before:
                     early = end
@@ -293,17 +308,23 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
     integrate(command, command, hold_s - latency_s)
     moving_count = len(times)
     terminal = velocities[-1]
-    if uncertain:
+    if initial_bounds is not None:
+        terminal = tuple(max(abs(v), abs(w)) for v, w in zip(lower, upper))
+    elif uncertain:
         terminal = tuple(max(abs(v), abs(w)) for v, w in zip(terminal, early))
     required = max(abs(v) / b for v, b in zip(terminal, braking))
     if stop:
         integrate((0., 0., 0.), (0., 0., 0.), min(required, _BRAKE_BUDGET_S))
     stopped = required <= _BRAKE_BUDGET_S and max(map(abs, velocities[-1])) <= 1e-10
-    if uncertain:
+    if initial_bounds is not None:
+        stopped = stopped and max(map(abs, (*lower, *upper))) <= 1e-10
+    elif uncertain:
         stopped = stopped and max(map(abs, early)) <= 1e-10
     body = tuple(poses)
     camera = _offset_poses(body, offset)
     inputs = (measured, command, previous) if latency_s > 0. else (measured, command)
+    if initial_bounds is not None:
+        inputs += initial_bounds
     # A fixed-heading single-axis path is a segment only without reversals.
     straight = next((axis for axis in (0, 1)
                      if all(v[2] == v[1-axis] == 0. for v in inputs)

@@ -74,3 +74,29 @@ def test_feedback_loss_keeps_measured_progress_required(feedback_after):
     assert all(row[1].values[0] > 0. for row in after_loss)
     assert after_loss[-1][3] < after_loss[0][3]
     assert loss_tick <= records[-1][0] < loss_tick + 7
+
+
+@pytest.mark.parametrize("corner", [False, True], ids=["obstacle", "wall-corner"])
+def test_unwired_navi_uses_a_forward_arc_on_a_clear_side(monkeypatch, corner):
+    geometry = local_path.camera_square(HorizontalIntrinsics(160, 85., 80.),
+                                        (120, 72., 60.), .20, at_front=True)
+    config = policy.Config(vx_max=.5, half_width_m=.20, use_lateral=False,
+                           local_planning=True, local_geometry=geometry)
+    scene = Sim(range_m=2.6, config=config)
+    objects, depth = scene.observe()
+    state = seed(policy.State(target="chair"), objects, depth, config)
+    f, r = local_path.FORWARD, local_path.RIGHT
+    occupied = (f >= .95) & (f <= 1.20) & (r <= .10)
+    if not corner:
+        occupied &= r >= -.5
+    monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~occupied, occupied))
+    result = None
+    for stamp in (1000, 1100, 1200):
+        objects, depth = scene.observe()
+        depth.update(bands={"left": .95, "center": .95, "right": 3.},
+                     frame_id=stamp, source_frame_id=stamp, capture_ms=stamp, control_ms=stamp)
+        result = policy.step(detections=objects, depth=depth, odom=None, config=config, state=state,
+                             dt=.1, control_period_s=.1, dwa_admission_ms=200)
+    assert state.motion_source == "command"
+    assert result.values[0] > 0. and result.values[5] < 0., result
+    assert not state.dwa_progress.requires_feedback

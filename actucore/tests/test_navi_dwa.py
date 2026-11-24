@@ -522,6 +522,20 @@ def test_soft_clearance_starts_a_wide_detour_earlier():
     assert min(passing) >= .69
 
 
+def test_distant_goal_gets_early_clearance_around_a_visible_obstacle():
+    forward, right = local_path.FORWARD, local_path.RIGHT
+    obstacle = (forward >= 1.55) & (forward <= 1.95) & (abs(right) <= .25)
+    geometry = _geometry()
+    path = local_path.clearance_route((~obstacle, obstacle), geometry, .30, (4.2, 0.), .60, (0., 0.))
+    assert path is not None and path.reachable_prefix
+    assert any(f < 1. for f, r in path.topology if abs(r) >= .10)
+    assert min(abs(r) for f, r in path.topology if 1.55 <= f <= 1.95) >= .65
+    side_obstacle = obstacle & (right != 0.)
+    side_obstacle = np.roll(side_obstacle, 18, axis=1)
+    assert local_path.clearance_route((~side_obstacle, side_obstacle), geometry, .30,
+                                      (4.2, 0.), .60, (0., 0.)) is None
+
+
 def test_dwa_prefers_clearance_beyond_the_hard_footprint():
     route = ((0., 0.), (.65, 0.), (1., 0.))
     close = _run(route, grid=_grid(obstacles=[(.4, .55)]))
