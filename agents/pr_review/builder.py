@@ -525,6 +525,9 @@ def container_name_from_service_yaml(yaml_text: str) -> str:
     same fragment out of the image, so translating the whole fragment into
     `docker run` here would duplicate what compose already does.
     The name is used to tell the reviewer which container to expect.
+
+    Also accepts a whole compose file (`services: {name: {...}}`), which is
+    what agent-core ships instead of a fragment.
     """
     try:
         import yaml
@@ -535,6 +538,8 @@ def container_name_from_service_yaml(yaml_text: str) -> str:
 
     if not isinstance(doc, dict) or not doc:
         return ""
+    if isinstance(doc.get("services"), dict) and doc["services"]:
+        doc = doc["services"]
     key = next(iter(doc))
     svc = doc[key]
     if not isinstance(svc, dict):
@@ -543,15 +548,15 @@ def container_name_from_service_yaml(yaml_text: str) -> str:
 
 
 def service_yaml_path(target: BuildTarget, driver_path: str | None) -> str | None:
-    """Where a target's `deploy/service.yml` lives in the checkout, if it has one.
+    """Where the compose service a target runs as is declared in the checkout.
 
-    Drivers, perception and actucore all ship one and are deployed the same way
-    (Agent Core extracts it from the image and merges it into the host compose
-    file).
+    Drivers, perception and actucore ship a `deploy/service.yml` fragment and
+    are deployed the same way (Agent Core extracts it from the image and merges
+    it into the host compose file).
 
-    Core has none: it is the agent itself, updated in place through the web
-    console via `POST /api/system/update`, which pulls the image and hands over
-    to a restart-helper container. A `docker run` for core would be wrong.
+    Core ships no fragment — it is the agent itself — but its compose template
+    names the container, and run-pr-image.sh swaps a core image into that
+    container in place, so the comment can offer the same command for it.
     """
     if target == BuildTarget.DRIVER and driver_path:
         return f"{driver_path}/deploy/service.yml"
@@ -559,6 +564,8 @@ def service_yaml_path(target: BuildTarget, driver_path: str | None) -> str | Non
         return "perception/deploy/service.yml"
     if target == BuildTarget.ACTUCORE:
         return "actucore/deploy/service.yml"
+    if target == BuildTarget.CORE:
+        return "agent-core/deploy/docker-compose.yml"
     return None
 
 
