@@ -381,14 +381,20 @@ class ShortTermFusion:
 
     def _initialize(self, stamp, pose):
         self.warmup.append((stamp, deepcopy(pose)))
-        # Use the shortest measured window spanning half a second and at least
-        # three poses. A low frame rate must not force a stationary IMU to wait forever.
+        window_expired = stamp-self.warmup[0][0] > 1_500_000_000
         while self.warmup and stamp-self.warmup[0][0] > 1_500_000_000:
-            self.warmup.popleft()
-        while len(self.warmup) > 3 and stamp-self.warmup[1][0] >= 500_000_000:
             self.warmup.popleft()
         if len(self.warmup) < 3 or stamp-self.warmup[0][0] < 500_000_000:
             return False
+        # Keep the shortest window that still covers three visual poses and
+        # enough measured IMU samples. A slow sensor needs a longer window.
+        min_samples = 20
+        entries = [s for s in self.samples if self.warmup[0][0] <= s[0] <= stamp]
+        if len(entries) >= min_samples:
+            oldest_needed = entries[-min_samples][0]
+            while (len(self.warmup) > 3 and stamp-self.warmup[1][0] >= 500_000_000 and
+                   self.warmup[1][0] <= oldest_needed):
+                self.warmup.popleft()
         first_stamp, first_pose = self.warmup[0]
         positions = np.array([p['position'] for _, p in self.warmup])
         first_rotation = pose_values(first_pose)[1]
@@ -401,11 +407,11 @@ class ShortTermFusion:
             return False
         if (not self.samples or self.samples[0][0] > first_stamp or self.samples[-1][0] < stamp):
             return False
-        entries = [s for s in self.samples if first_stamp <= s[0] <= stamp]
-        if len(entries) < 20:
-            # Both boundaries have arrived. This window cannot initialize the filter.
-            self.visual_fallback_stamp = stamp
+        if len(entries) < min_samples:
+            if window_expired:
+                self.visual_fallback_stamp = stamp
             return False
+        entries = [s for s in entries if s[0] >= first_stamp]
         if self.imu_coverage and not self._imu_covers(first_stamp, stamp):
             return False
         # Include the measured samples bracketing both interpolation boundaries.

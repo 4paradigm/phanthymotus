@@ -362,6 +362,20 @@ def test_two_hz_measured_visuals_can_initialize_and_remain_tracking():
     assert len(tracking) >= 2
 
 
+def test_warmup_keeps_enough_samples_at_a_slow_imu_cadence():
+    fusion = ShortTermFusion('run', 'optical', 'capture-clock', K)
+    color, depth = images()
+    for i in range(27):
+        stamp = 1_000_000_000 + i*60_000_000
+        fusion.observe_imu(source(stamp), stamp)
+        if i % 2 == 0:
+            sample = fusion.observe_frame(stamp, color, depth, pose(), stamp)
+            if i <= 20:
+                assert fusion.visual_fallback_stamp is None
+    assert fusion.status(stamp) == 'tracking'
+    assert sample['pose'] is not None
+
+
 def test_slow_warmup_cannot_initialize_across_an_unmeasured_imu_gap():
     fusion = ShortTermFusion('run', 'optical', 'capture-clock', K)
     t0 = 1_000_000_000
