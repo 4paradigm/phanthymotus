@@ -1,59 +1,14 @@
 #!/usr/bin/env python3
 """
-plugins/doc_parse_runtime.py — read .xlsx / .docx / .csv into tables, text and images.
+plugins/table_db_parse.py — read and write .xlsx / .csv tables (standard library only).
 
-**Standard library only.** Nothing here imports a third-party package, downloads
-a model, or touches ROS, so it runs on both JetPack lines (cp38 jp5.11, cp310
-jp6.1) and on a bare x86 box with no setup. openpyxl and python-docx would each
-add a wheel that nothing else in this image needs, and neither is available on
-the robot today.
+Supports:
+* .csv (UTF-8 / UTF-8-BOM / GB18030)
+* .xlsx (values, inline/shared strings, dates, WPS DISPIMG cell images,
+  floating drawing images, Excel 365 place-in-cell images)
+* Export back to .csv (UTF-8-BOM) and .xlsx (including embedded image BLOBs).
 
-What this module knows about the formats
-----------------------------------------
-
-An .xlsx and a .docx are both zip archives of XML, which is why a parser this
-small is possible at all. What is *not* simple is where the pictures live:
-
-* **xlsx, WPS "embedded cell picture"** — the cell holds a formula
-  `=DISPIMG("ID_xxx",1)` and the image is registered in `xl/cellimages.xml`
-  under that id. The picture is not anchored anywhere, so the only link between
-  a row and its photo is this formula.
-* **xlsx, ordinary floating picture** — `xl/drawings/drawingN.xml` anchors an
-  image to a cell (`<from><row>`, `<from><col>`), and the anchor is often on the
-  row *below* the photo's top edge. That is still the right row: an anchor whose
-  top edge is in row 3 belongs to row 3.
-* **docx table picture** — `word/document.xml` cell text lives in `<w:t>`; the
-  picture is `<a:blip r:embed="rIdN">`, and `word/_rels/document.xml.rels` maps
-  rIdN to `word/media/imageN.png`.
-
-All three are the shapes the Q5 exam-roster import had to handle by hand; they
-are reproduced here so a card can do it for any skill, and the tests build real
-archives with each shape.
-
-One attribute-spelling trap, found by running this against real files
----------------------------------------------------------------------
-
-WordprocessingML qualifies almost every attribute (`w:val`, `w:styleId`), while
-SpreadsheetML leaves most of them bare (`r="A1"`, `t="n"`). Reading only the
-bare spelling returned `None` for every heading level in a Word document and for
-every style id in a sheet — no exception, just wrong answers. Every attribute
-read goes through `_attr()` for that reason.
-
-What this module deliberately does not do
------------------------------------------
-
-* **No merged-cell expansion.** A header merged across four columns stores its
-  text in the top-left cell only, so the three cells to its right read as empty.
-  Expanding merges for *data* cells is wrong (a merged seat column would repeat
-  one person's seat down the sheet), and expanding them only for header rows
-  needs a heuristic that has not been justified by a real file yet. It is
-  reported as a limitation instead of guessed at.
-* **No PDF, no .doc/.xls, no scanned pages.** Those are the plugin's answers to
-  produce, not this module's; see `doc_parse.py`.
-* **No cell formatting beyond dates.** A percentage stored as `0.15` reads as
-  `0.15`, not `15%`, because a number format is presentation and the caller is
-  usually about to feed the value to something else. Dates *are* converted,
-  because `46000` is unusable as a birth date.
+No third-party dependencies, no ROS, no models.
 """
 
 from __future__ import annotations
@@ -69,25 +24,18 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape as _xml_escape
 
 # ── reasons ──────────────────────────────────────────────────────────────────
-# The same vocabulary as plugins/image_input.py and plugins/barcode.py: a caller
-# (usually a model) is told *why* in a token it can branch on, and *what to do*
-# in `detail`.
 
 REASON_UNSUPPORTED = "unsupported_format"
-REASON_LEGACY = "legacy_format"
 REASON_UNREADABLE = "unreadable"
 REASON_TOO_LARGE = "too_large"
 REASON_EMPTY = "empty"
 REASON_NO_DOC = "unknown_document"
 REASON_NO_TABLE = "unknown_table"
 
-SUPPORTED_SUFFIXES = (".xlsx", ".xlsm", ".docx", ".docm", ".csv", ".tsv")
-# Old binary Office formats (and password-protected OOXML, which is the same
-# container): both need "save as" rather than an attempt to read them.
-LEGACY_SUFFIXES = (".doc", ".xls", ".ppt", ".wps", ".et", ".dps")
-PLANNED_SUFFIXES = (".pdf", ".pptx", ".key", ".odt", ".ods", ".odp")
+SUPPORTED_SUFFIXES = (".xlsx", ".csv")
 
 _OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
@@ -1174,179 +1122,6 @@ def read_xlsx(data: bytes, limits: Limits) -> Document:
     return Document(kind="xlsx", tables=tables, notes=notes)
 
 
-# ── docx ─────────────────────────────────────────────────────────────────────
-
-def _docx_heading_styles(zf: zipfile.ZipFile, names) -> Dict[str, int]:
-    """styleId -> heading level.
-
-    Read from the file rather than assumed to be `Heading1`: a Chinese Word
-    writes `w:pStyle w:val="1"` with the style *name* `标题 1`, so matching on
-    the id alone would find headings in an English file and none in a Chinese
-    one. The name is the stable half.
-    """
-    if "word/styles.xml" not in names:
-        return {}
-    out: Dict[str, int] = {}
-    root = _parse_xml(zf.read("word/styles.xml"), "word/styles.xml")
-    for style in _iter_named(root, "style"):
-        style_id = _attr(style, "styleId")
-        if not style_id:
-            continue
-        name_element = _child(style, "name")
-        label = _attr(name_element, "val") if name_element is not None else ""
-        match = re.match(r"(?i)^\s*(?:heading|标题|標題)\s*([1-9])", label)
-        if match:
-            out[style_id] = int(match.group(1))
-    return out
-
-
-def _docx_heading_level(paragraph, styles: Dict[str, int]) -> int:
-    properties = _child(paragraph, "pPr")
-    if properties is None:
-        return 0
-    style = _child(properties, "pStyle")
-    if style is not None:
-        level = styles.get(_attr(style, "val"))
-        if level:
-            return level
-    outline = _child(properties, "outlineLvl")
-    if outline is not None:
-        try:
-            return int(_attr(outline, "val") or 0) + 1
-        except (TypeError, ValueError):
-            return 0
-    return 0
-
-
-def _docx_paragraph_text(paragraph, max_chars: int) -> str:
-    """Text of one paragraph, with tabs and line breaks kept.
-
-    `<w:tab/>` and `<w:br/>` carry meaning in a 讲解稿 (indentation, stanza
-    breaks) and cost nothing to keep, while dropping them silently reflows the
-    document. Field instructions (`<w:instrText>`) are invisible in Word and are
-    dropped here as well, and deleted revisions (`<w:delText>`) are ignored so a
-    tracked change does not return the old text twice.
-    """
-    parts: List[str] = []
-
-    def walk(node) -> None:
-        for child in node:
-            name = _local(child.tag)
-            if name == "t":
-                parts.append(child.text or "")
-            elif name in ("delText", "instrText", "softHyphen", "sym"):
-                continue
-            elif name == "tab":
-                parts.append("\t")
-            elif name in ("br", "cr"):
-                parts.append("\n")
-            elif name == "noBreakHyphen":
-                parts.append("-")
-            else:
-                walk(child)
-
-    walk(paragraph)
-    text = "".join(parts).replace("\r", "")
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text[:max_chars] if max_chars > 0 else text
-
-
-def _docx_style_id(paragraph) -> str:
-    properties = _child(paragraph, "pPr")
-    style = _child(properties, "pStyle") if properties is not None else None
-    return _attr(style, "val") if style is not None else ""
-
-
-def _blips(element, base: str, rels: Dict[str, str]) -> List[str]:
-    out: List[str] = []
-    for candidate in _iter_named(element, "blip"):
-        media = _resolve(base, rels.get(_embed(candidate), ""))
-        if media and media not in out:
-            out.append(media)
-    return out
-
-
-def _docx_table(table_element, rels: Dict[str, str], name: str,
-                limits: Limits) -> Table:
-    max_chars = max(0, min(limits.max_text_chars, MAX_TEXT_CHARS))
-    max_cols = max(1, limits.max_columns)
-    rows: List[Dict[int, Cell]] = []
-    sheet_rows: List[int] = []
-    truncated = False
-    for row_element in _children(table_element, "tr"):
-        row: Dict[int, Cell] = {}
-        for column, cell_element in enumerate(_children(row_element, "tc"), 1):
-            if column > max_cols:
-                truncated = True
-                break
-            text = _docx_paragraph_text(cell_element, max_chars)
-            text = text.replace("\n", " ").strip()
-            media = _first_blip(cell_element, "word", rels)
-            if text or media:
-                row[column] = Cell(text=text, media=media)
-        if row:
-            rows.append(row)
-            sheet_rows.append(len(rows))
-        if len(rows) >= max(1, limits.max_rows):
-            truncated = True
-            break
-    return Table(name=name, rows=rows, sheet_rows=sheet_rows, truncated=truncated)
-
-
-def read_docx(data: bytes, limits: Limits) -> Document:
-    zf = _open_zip(data)
-    names = set(zf.namelist())
-    part = "word/document.xml"
-    if part not in names:
-        raise ParseError(REASON_UNREADABLE,
-                         "不是 Word 文档：缺少 word/document.xml。"
-                         "如果这是加密的 .docx，请取消密码后另存一份")
-    rels = _rels(zf, part)
-    styles = _docx_heading_styles(zf, names)
-    root = _parse_xml(zf.read(part), part)
-    body = _child(root, "body")
-    if body is None:
-        body = root
-
-    notes: List[str] = []
-    tables: List[Table] = []
-    paragraphs: List[Paragraph] = []
-
-    for element in body:
-        local = _local(element.tag)
-        if len(paragraphs) >= max(1, limits.max_paragraphs):
-            notes.append("文档正文超过 %d 段，后面的内容没有读" % limits.max_paragraphs)
-            break
-        if local == "p":
-            text = _docx_paragraph_text(element, limits.max_text_chars)
-            images = _blips(element, "word", rels)
-            if not text and not images:
-                continue
-            paragraphs.append(Paragraph(
-                text=text,
-                heading=_docx_heading_level(element, styles),
-                style=_docx_style_id(element),
-                media=images,
-            ))
-        elif local == "tbl":
-            if len(tables) >= max(1, limits.max_tables):
-                notes.append("文档表格数量超过上限，后面的表格没有读")
-                break
-            name = "table%d" % (len(tables) + 1)
-            table = _docx_table(element, rels, name, limits)
-            if not table.rows:
-                continue
-            tables.append(table)
-            # A marker, not the table's content: `text` says where the table
-            # was and `rows` reads it. Keeps the reading order of a 讲解稿 that
-            # interleaves prose and tables without duplicating the table.
-            paragraphs.append(Paragraph(table=name))
-
-    if not any(item.text or item.media for item in paragraphs) and not tables:
-        raise ParseError(REASON_EMPTY, "文档里没有可读的正文或表格")
-    return Document(kind="docx", tables=tables, paragraphs=paragraphs, notes=notes)
-
-
 # ── csv ──────────────────────────────────────────────────────────────────────
 
 def _decode(data: bytes) -> str:
@@ -1481,56 +1256,240 @@ open_bounded_zip = _open_zip
 
 
 def sniff_kind(data: bytes, filename: str) -> str:
-    """What a byte string looks like, by OLE magic, zip content, or extension."""
+    """Identify .xlsx or .csv by content / extension."""
     if data[:8] == _OLE_MAGIC:
-        return "legacy"
+        return "unsupported"
     if data[:2] == b"PK":
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
                 names = set(zf.namelist())
         except zipfile.BadZipFile:
             return "unreadable"
-        if "word/document.xml" in names:
-            return "docx"
         if "xl/workbook.xml" in names:
             return "xlsx"
+        if "word/document.xml" in names:
+            return "unsupported"
         return "unreadable"
     suffix = posixpath.splitext((filename or "").lower())[1]
-    if suffix in (".csv", ".tsv"):
+    if suffix == ".csv":
         return "csv"
     return "unknown"
 
 
 def parse_document(data: bytes, filename: str,
                    limits: Optional[Limits] = None) -> Document:
-    """Read one document. Raises ParseError with a caller-facing reason."""
+    """Read one .xlsx or .csv table file. Raises ParseError on failure."""
     limits = limits or Limits()
     suffix = posixpath.splitext((filename or "").lower())[1]
+    if suffix and suffix not in SUPPORTED_SUFFIXES:
+        raise ParseError(
+            REASON_UNSUPPORTED,
+            "不支持的文件格式 %r，仅支持 .csv 和 .xlsx" % suffix,
+        )
     kind = sniff_kind(data, filename)
 
-    if kind == "docx":
-        return read_docx(data, limits)
     if kind == "xlsx":
         return read_xlsx(data, limits)
     if kind == "csv":
         return read_csv(data, limits)
-    if kind == "legacy":
-        raise ParseError(
-            REASON_LEGACY,
-            "这是旧版 Office 格式（.doc / .xls）或者加了密码的文件，本卡读不了。"
-            "请用 Word / Excel / WPS 打开后「另存为」 .docx / .xlsx 再发一次",
-        )
-    if suffix in PLANNED_SUFFIXES:
+    if kind == "unsupported":
         raise ParseError(
             REASON_UNSUPPORTED,
-            "暂不支持 %s。v0.1 只做 xlsx / docx / csv；PDF 文字和 pptx 计划在 v0.2。"
-            "扫描版 PDF 请用 ocr 卡" % (suffix or "这种格式"),
+            "不支持的文件格式，仅支持 .csv 和 .xlsx",
         )
     if suffix in SUPPORTED_SUFFIXES:
         raise ParseError(REASON_UNREADABLE,
-                         "扩展名是 %s，但内容不像该格式，文件可能已损坏" % suffix)
+                         "扩展名是 %s，但内容无法按该格式解析，文件可能已损坏" % suffix)
     raise ParseError(
         REASON_UNSUPPORTED,
-        "不支持的格式 %r。支持 .xlsx / .xlsm / .docx / .docm / .csv / .tsv；"
-        "旧格式 .doc / .xls 请先另存为新格式" % (suffix or "（无扩展名）"),
+        "不支持的文件格式 %r，仅支持 .csv 和 .xlsx" % (suffix or "（无扩展名）"),
     )
+
+
+# ── export writers (.csv / .xlsx) ────────────────────────────────────────────
+
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+_IMAGE_MIME_BY_EXT = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "webp": "image/webp",
+}
+
+
+def _xml_text(value: str) -> str:
+    return _xml_escape(_XML_ILLEGAL.sub("", value))
+
+
+def write_csv(headers: List[str], rows: List[List[Any]]) -> bytes:
+    """Serialize headers + rows into UTF-8-BOM CSV bytes."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow(["" if val is None else str(val) for val in row])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def write_xlsx(sheet_name: str, headers: List[str], rows: List[List[Any]],
+               images: Optional[Dict[Tuple[int, int], Tuple[bytes, str]]] = None) -> bytes:
+    """Serialize headers + rows (+ optional embedded cell images) into a valid .xlsx.
+
+    `images` maps `(row_1based, col_1based)` (where row 1 is the header row and
+    data rows start at 2) to `(image_bytes, ext)` where `ext` is e.g. `"png"` or `"jpeg"`.
+    """
+    clean_sheet = re.sub(r"[:\\/?*\[\]]", "_", (sheet_name or "Sheet1")).strip()[:31] or "Sheet1"
+    images = images or {}
+
+    row_xml: List[str] = []
+    # Row 1: header
+    header_cells = []
+    for col_idx, name in enumerate(headers, 1):
+        ref = "%s1" % column_letter(col_idx)
+        header_cells.append('<c r="%s" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                            % (ref, _xml_text(str(name))))
+    row_xml.append('<row r="1">%s</row>' % "".join(header_cells))
+
+    # Data rows (starting at row 2)
+    for r_offset, row in enumerate(rows, 2):
+        cells = []
+        for col_idx, val in enumerate(row, 1):
+            if val is None:
+                continue
+            ref = "%s%d" % (column_letter(col_idx), r_offset)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
+                cells.append('<c r="%s" t="n"><v>%s</v></c>' % (ref, val))
+            else:
+                cells.append('<c r="%s" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                             % (ref, _xml_text(str(val))))
+        if cells:
+            row_xml.append('<row r="%d">%s</row>' % (r_offset, "".join(cells)))
+
+    drawing_tag = '<drawing r:id="rId1"/>' if images else ""
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheetData>%s</sheetData>%s</worksheet>'
+    ) % ("".join(row_xml), drawing_tag)
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="%s" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    ) % _xml_text(clean_sheet)
+
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+    wb_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        '</Relationships>'
+    )
+
+    used_exts = set()
+    anchors = []
+    drawing_rels = []
+    media_files: List[Tuple[str, bytes]] = []
+    for idx, ((row_num, col_num), (img_bytes, raw_ext)) in enumerate(sorted(images.items()), 1):
+        ext = (raw_ext or "png").lstrip(".").lower()
+        if ext not in _IMAGE_MIME_BY_EXT:
+            ext = "png"
+        used_exts.add(ext)
+        media_name = "image%d.%s" % (idx, ext)
+        media_files.append(("xl/media/" + media_name, img_bytes))
+        rid = "rId%d" % idx
+        drawing_rels.append(
+            '<Relationship Id="%s" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            'Target="../media/%s"/>' % (rid, media_name)
+        )
+        c0 = max(0, col_num - 1)
+        r0 = max(0, row_num - 1)
+        anchors.append(
+            '<xdr:twoCellAnchor>'
+            '<xdr:from><xdr:col>%d</xdr:col><xdr:colOff>0</xdr:colOff>'
+            '<xdr:row>%d</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+            '<xdr:to><xdr:col>%d</xdr:col><xdr:colOff>0</xdr:colOff>'
+            '<xdr:row>%d</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>'
+            '<xdr:pic>'
+            '<xdr:nvPicPr><xdr:cNvPr id="%d" name="%s"/><xdr:cNvPicPr/></xdr:nvPicPr>'
+            '<xdr:blipFill><a:blip r:embed="%s"/>'
+            '<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>'
+            '<xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+            '</xdr:pic><xdr:clientData/>'
+            '</xdr:twoCellAnchor>' % (c0, r0, c0 + 1, r0 + 1, idx + 1, media_name, rid)
+        )
+
+    ext_defaults = "".join(
+        '<Default Extension="%s" ContentType="%s"/>' % (ext, _IMAGE_MIME_BY_EXT[ext])
+        for ext in sorted(used_exts)
+    )
+    drawing_override = (
+        '<Override PartName="/xl/drawings/drawing1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+        if images else ""
+    )
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '%s'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '%s'
+        '</Types>'
+    ) % (ext_defaults, drawing_override)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        if images:
+            sheet_rels = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" '
+                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+                'Target="../drawings/drawing1.xml"/>'
+                '</Relationships>'
+            )
+            drawing_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" '
+                'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                '%s</xdr:wsDr>'
+            ) % "".join(anchors)
+            drawing_rels_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '%s</Relationships>'
+            ) % "".join(drawing_rels)
+            zf.writestr("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels)
+            zf.writestr("xl/drawings/drawing1.xml", drawing_xml)
+            zf.writestr("xl/drawings/_rels/drawing1.xml.rels", drawing_rels_xml)
+            for media_path, img_bytes in media_files:
+                zf.writestr(media_path, img_bytes)
+    return buf.getvalue()

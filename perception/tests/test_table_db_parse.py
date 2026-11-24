@@ -37,6 +37,8 @@ from plugins.table_db_parse import (
     resolve_layout,
     sniff_kind,
     table_records,
+    write_csv,
+    write_xlsx,
 )
 
 
@@ -285,101 +287,31 @@ def test_xlsx_column_budget_marks_the_sheet_truncated():
     assert sorted(document.tables[0].rows[0]) == [1, 2, 3]
 
 
-# ── docx ─────────────────────────────────────────────────────────────────────
+# ── export writers (.csv / .xlsx round-trip) ─────────────────────────────────
 
-def test_docx_body_text_keeps_order_and_heading_levels():
-    data = build_docx([
-        paragraph("展厅讲解稿", style="Heading1"),
-        paragraph("欢迎来到范式展厅。"),
-        paragraph("第一展区", style="Heading2"),
-        paragraph("这里是一段讲解词。"),
-    ], styles=[("Heading1", "heading 1"), ("Heading2", "heading 2")])
-
-    document = parse_document(data, "guide.docx")
-
-    assert [item.heading for item in document.paragraphs] == [1, 0, 2, 0]
-    assert document.paragraphs[0].text == "展厅讲解稿"
-    assert document.tables == []
+def test_write_csv_and_read_back_round_trip():
+    raw = write_csv(["col1", "col2"], [["a", 1], ["b,c", None]])
+    doc = parse_document(raw, "out.csv")
+    layout, records = _read(doc.tables[0])
+    assert layout.columns() == ["col1", "col2"]
+    assert records[0]["col1"] == "a" and records[0]["col2"] == "1"
+    assert records[1]["col1"] == "b,c" and "col2" not in records[1]
 
 
-def test_docx_heading_found_by_style_name_not_style_id():
-    """Chinese Word writes styleId "1" with the name "标题 1"; matching the id
-    alone would report every heading in an English file and none in a Chinese
-    one."""
-    data = build_docx([paragraph("第一展区", style="1")],
-                      styles=[("1", "标题 1")])
-
-    assert parse_document(data, "cn.docx").paragraphs[0].heading == 1
-
-
-def test_docx_table_text_and_picture():
-    data = build_docx([
-        paragraph("名单", style="Heading1"),
-        table([
-            ["姓名", "身份证号", "照片"],
-            ["王五", "110101199003031236", {"image": "image1.png"}],
-            ["赵六", "", ""],
-        ]),
-    ], styles=[("Heading1", "heading 1")])
-
-    document = parse_document(data, "roster.docx")
-    layout, records = _read(document.tables[0])
-
-    assert layout.columns() == ["姓名", "身份证号", "照片"]
-    assert records[0]["姓名"] == "王五"
-    assert records[0]["image"] == "word/media/image1.png"
-    assert records[1] == {"_row": 3, "姓名": "赵六"}
-    # The table's position in the body is kept as a marker paragraph.
-    assert [item.table for item in document.paragraphs] == ["", "table1"]
-
-
-def test_docx_picture_outside_a_table_belongs_to_its_paragraph():
-    data = build_docx([
-        paragraph("签名"),
-        paragraph(image="image1.png"),
-        paragraph("以上。"),
-    ])
-
-    document = parse_document(data, "note.docx")
-
-    assert len(document.paragraphs) == 3
-    assert document.paragraphs[1].text == ""
-    assert document.paragraphs[1].media == ["word/media/image1.png"]
-    assert document.media_paths() == ["word/media/image1.png"]
-
-
-def test_docx_tabs_and_breaks_survive():
-    # The fixture writes plain runs; a tab/break paragraph is hand-built here
-    # because those two elements are the reason the reader walks the tree
-    # instead of joining every <w:t>.
-    document = parse_document(_docx_with_runs(
-        '<w:r><w:t>甲</w:t><w:tab/><w:t>乙</w:t></w:r>'
-        '<w:r><w:br/><w:t>丙</w:t></w:r>'), "runs.docx")
-
-    assert document.paragraphs[0].text == "甲\t乙\n丙"
-
-
-def _docx_with_runs(runs: str) -> bytes:
-    import io
-    import zipfile
-
-    from ooxml_fixtures import _HEADER, _REL, _W, _PKG_REL, _CT
-
-    parts = {
-        "[Content_Types].xml": _HEADER + '<Types xmlns="%s"></Types>' % _CT,
-        "_rels/.rels": (_HEADER + '<Relationships xmlns="%s"><Relationship '
-                        'Id="rId1" Type="%s/officeDocument" '
-                        'Target="word/document.xml"/></Relationships>'
-                        % (_PKG_REL, _REL)),
-        "word/document.xml": (_HEADER + '<w:document xmlns:w="%s" '
-                              'xmlns:r="%s"><w:body><w:p>%s</w:p></w:body>'
-                              "</w:document>" % (_W, _REL, runs)),
-    }
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        for name, content in parts.items():
-            archive.writestr(name, content)
-    return buffer.getvalue()
+def test_write_xlsx_with_embedded_images_round_trip():
+    raw = write_xlsx(
+        "sheet_a",
+        ["col1", "col2", "img"],
+        [["row1", 42, None], ["row2", 3.5, None]],
+        images={(2, 3): (PNG_BYTES, "png")},
+    )
+    doc = parse_document(raw, "out.xlsx")
+    layout, records = _read(doc.tables[0])
+    assert layout.columns() == ["col1", "col2", "img"]
+    assert records[0]["col1"] == "row1" and records[0]["col2"] == "42"
+    assert records[0]["image"] == "xl/media/image1.png"
+    assert records[1]["col1"] == "row2" and records[1]["col2"] == "3.5"
+    assert "image" not in records[1]
 
 
 # ── csv ───────────────────────────────────────────────────────────────────────
@@ -429,28 +361,27 @@ def test_csv_single_column_without_header_keeps_every_name():
 # ── refusals and shapes ──────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("filename,reason", [
-    ("old.xls", "legacy_format"),
-    ("old.doc", "legacy_format"),
+    ("old.xls", "unsupported_format"),
+    ("old.doc", "unsupported_format"),
+    ("doc.docx", "unsupported_format"),
+    ("data.tsv", "unsupported_format"),
     ("scan.pdf", "unsupported_format"),
     ("slides.pptx", "unsupported_format"),
     ("archive.zip", "unsupported_format"),
 ])
 def test_unsupported_formats_name_the_reason(filename, reason):
-    payload = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64 \
-        if filename.endswith((".xls", ".doc")) else b"not that kind of file"
+    if filename.endswith((".xls", ".doc")):
+        payload = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64
+    elif filename.endswith(".docx"):
+        payload = build_docx([paragraph("x")])
+    else:
+        payload = b"not that kind of file"
 
     with pytest.raises(ParseError) as caught:
         parse_document(payload, filename)
 
     assert caught.value.reason == reason
-    assert caught.value.detail
-
-
-def test_legacy_format_tells_the_caller_to_save_as_a_new_format():
-    with pytest.raises(ParseError) as caught:
-        parse_document(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, "a.xls")
-
-    assert "另存为" in caught.value.detail
+    assert ".csv" in caught.value.detail and ".xlsx" in caught.value.detail
 
 
 def test_a_broken_zip_says_the_file_is_damaged():
@@ -460,8 +391,8 @@ def test_a_broken_zip_says_the_file_is_damaged():
     assert caught.value.reason == "unreadable"
 
 
-def test_a_zip_that_is_neither_word_nor_excel_is_refused():
-    assert sniff_kind(build_docx([paragraph("x")]), "x.docx") == "docx"
+def test_a_zip_that_is_not_xlsx_is_refused():
+    assert sniff_kind(build_docx([paragraph("x")]), "x.docx") == "unsupported"
     with pytest.raises(ParseError) as caught:
         parse_document(_zip_without_office_parts(), "thing.xlsx")
 
@@ -549,14 +480,16 @@ def test_empty_cells_and_blank_rows_are_omitted_but_row_numbers_are_real():
 
 
 def test_emf_picture_is_reported_by_the_reader_as_media():
-    """The runtime hands back the archive path even for a format the extractor
-    will skip; deciding what is decodable is the plugin's job."""
-    data = build_docx([table([["姓名", {"image": "stamp.emf"}]])],
-                      media={"stamp.emf": EMF_BYTES})
+    """The runtime hands back the archive path even for an EMF image."""
+    data = build_xlsx(
+        rows=[[xs("col1"), xs("col2")], [xs("v1"), xs("")]],
+        anchors=[(1, 1, "stamp.emf", "twoCell")],
+        media={"stamp.emf": EMF_BYTES},
+    )
 
-    sheet = parse_document(data, "stamp.docx").tables[0]
+    sheet = parse_document(data, "stamp.xlsx").tables[0]
 
-    assert sheet.rows[0][2].media == "word/media/stamp.emf"
+    assert sheet.rows[1][2].media == "xl/media/stamp.emf"
 
 
 # ── numbers as Excel shows them ──────────────────────────────────────────────

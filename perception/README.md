@@ -4600,51 +4600,26 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 
 ## `table_db` 卡片
 
-给所有 skill 共用的**表格数据库**。skill 指定自己的库（`db`，建议用 skill slug）和表名，就能：
-- 把飞书发来的 xlsx / csv（兼容 Word 里的表格，单元格可以有图片）一次导入；
-- 在运行中增删改查、分组计数。
+基于 SQLite 的**数据表存储卡片**（单库多表，表为最大一级，无数据库层级）。所有对外 action 严格遵循 SQLite 标准原语与命名，不耦合其它业务卡片：
 
-编号 `_id` 和计数由卡片保证，不再让模型读写 JSON 文件。卡片只负责存取，不判断业务含义，也不调用其他卡片。
+| action | SQLite 对应 | 必填参数 | 可选参数 | 说明 |
+|---|---|---|---|---|
+| `tables` | `.tables` / `.schema` | — | — | 查看所有数据表及列结构（`TEXT`/`INTEGER`/`REAL`/`BLOB`）与行数 |
+| `create_table` | `CREATE TABLE` | `table`, `columns` | — | 新建数据表 |
+| `drop_table` | `DROP TABLE` | `table` | — | 删除数据表并回收关联 BLOB |
+| `insert` | `INSERT INTO` | `table`, `values` | `file` | 插入一行或多行；BLOB 列传文件路径（SQLite `readfile` 语义）或 `'$file'` |
+| `select` | `SELECT` | `table` | `columns`, `where`, `group_by`, `order_by`, `limit`, `offset` | 查询、分页、排序、`COUNT(*)` 与 `GROUP BY`；BLOB 列返回 `{type, name, mime, size, url}` |
+| `update` | `UPDATE` | `table`, `where` | `set`, `file` | 按条件更新记录；BLOB 列可传文件路径、`'$file'` 或 `null` 清空，自动回收旧 BLOB |
+| `delete` | `DELETE FROM` | `table`, `where` | — | 按条件删除记录并回收关联 BLOB |
+| `import` | `.import` | `table`, `path` | `mode`, `header_row` | 导入 `.csv` 或 `.xlsx`（含 WPS `DISPIMG` / 浮动图 / Excel 365 单元格图片） |
+| `export` | 导出表格 | `table` | `format`, `where`, `columns`, `order_by` | 导出为 `.xlsx`（自动嵌入图片 BLOB）或 `.csv`，返回 `path` 与下载 `url` |
 
-> 模型要看得到这张卡，必须在画布上把决策卡的「连接执行器」连到它（与其它卡相同）。
+**设计要点**
+- 列类型遵循 SQLite 标准：`TEXT`、`INTEGER`、`REAL`、`BLOB`，行主键为 SQLite `rowid`。
+- 文件仅以 SQLite `BLOB` 存储，替换/清空/删行/删表后自动回收未引用的 `_files`/`_blobs`。
+- 防注入：用户表名、列名仅存元数据表，物理 SQL 使用生成标识符与参数绑定。
+- 存放位置：`/models/table_db/table_db.db`（宿主挂载目录，重启/升级不丢数据）。各项上限见 `config.yaml` 中 `plugins.table_db`。
 
-| 动作 | 参数（除 `list` 外都要 `table`，`db` 可选） | 返回 |
-|---|---|---|
-| `list` | （不填） | 先汇总（库数、库名、每库表名），再给 库 → 表 → 列、行数、文件数（画布上默认选中，先点它） |
-| `create` | `columns: [{"name","type":"text|file"}]` | 列定义 |
-| `import` | `path`（飞书文件填 `files[].path`）、`mode`（create/append）、`header_row`、`dry_run` | 识别出的列、`imported`、`files`、空行、前 3 条样例 |
-| `append` | `records`（≤500 条，只写文字列） | `ids` |
-| `query` | `where`、`offset`、`limit`（≤200） | `total`、`has_more`、`records` |
-| `update` | `_id`、`set` | 修改后的记录 |
-| `delete` | `_id` | 软删除 |
-| `stats` | `where`、`group_by` | `total`、`groups` |
-| `attach_file` | `_id`、`column`、`file` | 文件信息 |
-| `get_file` | `_id`、`column`（可选） | `url`（浏览器/视觉卡 `*_by_url` 可用）和 `path`（作为 `image_path`） |
-| `export_files` | `column`、`name_column`、`profile_columns`、`where` | 目录（文件 + manifest.json），交给 `face_recognition.register_by_corpus` |
-| `drop_table` | `confirm`（再填一遍表名） | 删除整张表及其文件 |
-| `drop_db` | `db`、`confirm`（再填一遍库名） | 删除整个库（所有表和文件） |
-
-画布卡片是一张表单：一个 action 下拉框（带中文标题）、各个参数格子和一个「▶ 执行」按钮。
-对象和数组参数可以填 JSON 文本，必填项由卡片检查；漏填时返回 `bad_request` 并带 `missing`。
-导入支持三种图片放法：WPS `DISPIMG`、浮动图片、Excel 365「放在单元格中」。
-只有 `create` 和 `import`（mode=create）会用新的 `db` 名字新建库，其它动作库不存在时报 `unknown_db`。
-
-**存储方式**
-- 列只有两种：`text`（文字），以及 `file`（图片、PDF、音频等非文字内容）。
-- `file` 以 BLOB 存在同一个 SQLite 文件里，相同内容只存一份；记录中显示为 `{file_id, name, mime, size}`。
-- 记录和文件在同一个事务里提交或回滚，所以一个库就是一个文件，复制即备份。
-
-**失败返回**：统一为 `{"ok":false,"reason","detail","row"?,"column"?,"written":0}`，写入整批回滚。
-
-**错误码**
-`bad_request`、`unknown_table`、`table_exists`、`unknown_column`、`not_found`、`invalid_header`、
-`invalid_value`、`legacy_format`、`unsupported_format`、`unreadable`、`empty`、`too_large`、
-`request_conflict`、`busy`、`internal_error`。
-
-**防注入**：用户给的表名、列名只作为数据存在元数据表里，物理表名和列名由卡片生成，所有值都通过参数绑定传入。
-
-**存放位置**：数据在 `/models/table_db/<db>.db`，`/models` 是宿主机目录，所以重启或重新部署都不会丢。各项上限在 `config.yaml` 的 `plugins.table_db` 下配置。
-
-```Bash
+```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_table_db*.py -q
 ```
