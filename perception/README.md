@@ -668,8 +668,30 @@ first, because two live publishers on one audio topic play both voices at once.
 
 ### `xiaoyou-zh-en`, the bilingual Xiaoyou voice
 
-The Jetson build enables Xiaoyou by default with `ENABLE_XIAOYOU_TTS=1`.
-Its speech frontend runs in a private environment at `/opt/xiaoyou-tts`.
+The standard Jetson image includes Xiaoyou's frontend by default with
+`ENABLE_XIAOYOU_TTS=1`. The TTS card selects its engine after deployment, so
+the image includes the pinned native frontend needed for that selection.
+Building and checking these dependencies once makes engine switching work
+offline with the Python ABI and package versions exercised by image CI.
+Installing them when the operator selects an engine would add package
+resolution and native-extension installation to the running service. The
+current runtime download contract covers verified model archives.
+
+This default increases image size. The published
+`release.261123.9e1f35a-jetson-jp5.11` and
+`release.261123.9e1f35a-jetson-jp6.1` manifests contain the following frontend
+installation layers.
+
+| Platform | Compressed frontend layer | Share of compressed image |
+|---|---:|---:|
+| JP5.11 | 90,238,397 bytes (86.1 MiB) | 1.32% |
+| JP6.1 | 160,244,150 bytes (152.8 MiB) | 1.94% |
+
+These are registry transfer sizes for the frontend layer. Extracted filesystem
+usage is a separate measurement. Model and dictionary archives are downloaded
+on first engine selection into the mounted model cache.
+
+The speech frontend runs in a private environment at `/opt/xiaoyou-tts`.
 JP5.1.1 uses the image's Python 3.8, the versions pinned in
 `plugins/xiaoyou_tts/requirements.jp511.txt`, and a pinned 12.8 MB English
 pipeline (spaCy `en_core_web_sm` 3.7.1). JP6.1 uses the image's Python 3.10

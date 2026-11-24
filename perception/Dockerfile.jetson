@@ -694,7 +694,11 @@ ENV PYTHONUNBUFFERED=1
 # exactly the "garbage characters" that make `docker logs` unreadable.
 ENV RCUTILS_COLORIZED_OUTPUT=0
 
-# Xiaoyou keeps its frontend dependencies in a private environment for each JetPack ABI.
+# The standard image supports choosing Xiaoyou from the TTS card after deployment.
+# Build its native Python frontend once so offline engine switches use the same
+# pinned ABI and dependencies exercised in image CI. Model weights stay on-demand.
+# Measured compressed frontend layers in release.261123.9e1f35a are 86.1 MiB on
+# JP5.11 and 152.8 MiB on JP6.1. Builds dedicated to other engines can set this to 0.
 ARG ENABLE_XIAOYOU_TTS=1
 RUN if [ "${ENABLE_XIAOYOU_TTS}" = "1" ]; then \
       set -eu; \

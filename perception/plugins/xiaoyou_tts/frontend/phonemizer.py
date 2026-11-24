@@ -1735,6 +1735,9 @@ class FrontendWorker:
 
 
 def run(connection, model_dir):
+    from utils import logsafe
+    logsafe.install()
+
     # Thinc supports a NumPy-only frontend if Torch is unavailable. Keep this
     # import policy inside the dedicated process.
     sys.modules['torch'] = None
