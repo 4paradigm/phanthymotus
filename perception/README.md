@@ -4257,14 +4257,8 @@ That key is what `ZXING_WHEEL_511` names.
 
 ### ArUco / AprilTag are deliberately not here
 
-Their output is a 6-DoF pose, not text, and producing it needs the marker's
-printed size plus camera intrinsics. That is a different card with a different
-config and a different output port; `info` says so in `markers` rather than
-leaving the question open. `cv2.aruco`'s presence in the JetPack base OpenCV is
-also unverified, and the only clean way to add it would be replacing OpenCV —
-`opencv-contrib-python` from pip would shadow the base `cv2` the whole vision
-stack and rapidocr are built against (see the `pip uninstall opencv-python` step
-in `Dockerfile.jetson`).
+ArUco poses use the separate [ArUco Processor](#aruco-定位-aruco). The barcode
+card decodes text and does not estimate ArUco or AprilTag poses.
 
 ### Verifying
 
@@ -4324,6 +4318,59 @@ at the form rather than the schema (`web/js/sidebar.js`):
 * **The config panel is English.** The LLM-facing `inputSchema` is not bound by
   this — it is read by a model, not shown in the form.
 
+
+## ArUco 定位 (`aruco`)
+
+Connect the camera's `image/jpeg` output to this card. The camera card must
+publish a calibrated `motus.camera/1` declaration for that stream and
+resolution. If its intrinsics are missing or invalid, startup raises an error
+identifying the stream. Report the camera card and stream to its developer
+so the driver can supply the calibration.
+An invalid rewire leaves a running card on its previously calibrated topic.
+If calibration is lost on the active topic, pose output stops until a valid
+start. Frame dimensions must match that calibration and fit within 36 megapixels.
+
+Connect the right-hand `data/json` port to a downstream `data/json` input,
+such as `decision_core`. The port is visible before the card starts. Wiring a
+camera resolves the instance's `poses` topic, and starting the canvas passes
+the calibration to ArUco and the resolved topic to the downstream card.
+
+The default marker side is **10 cm (0.10 m)**. If your print differs, measure an
+outer edge of the black square, excluding the white margin, and enter its
+length in meters under **Marker side (m)**. The card uses this length for every
+marker in the frame. A wrong length scales the reported translation.
+
+Choose the dictionary used to print your markers. An ID names a pattern
+within a dictionary. The patterns in each dictionary are deliberately
+separated to reduce the chance of confusing one ID with another. For a new set,
+the first number describes the grid of data cells and the last gives the number
+of available IDs. With the same printed size, a finer grid needs more image
+detail. [OpenCV dictionary selection guide](https://docs.opencv.org/4.x/d5/dae/tutorial_aruco_detection.html)
+
+| Dictionary | When to choose it for new markers |
+| --- | --- |
+| `DICT_4X4_50` (default) | Up to 50 IDs. The coarse grid helps when a marker occupies few pixels, such as a small tag or one seen from farther away. |
+| `DICT_5X5_50` | Up to 50 IDs. For workbench or room-scale use when the camera resolves five cells per side and you want more separation between patterns than 4×4 provides. |
+| `DICT_6X6_250` | Up to 250 IDs. Useful for a large inventory or many distinct stations where the tag image resolves the 6×6 grid. |
+| `DICT_7X7_50` | Up to 50 IDs. Use large or close-up tags when distinguishing similar-looking observations matters and the camera resolves the finer cells. |
+
+Each frame publishes one `poses` JSON message with `pose_status: calibrated`.
+The `markers` array includes all successfully localized markers in the
+selected dictionary, sorted by ID. Each entry contains XYZ translation in
+meters, a Rodrigues rotation vector in radians and reprojection RMS in pixels.
+The transform maps marker coordinates into the camera optical frame
+(+X right, +Y down, +Z forward). A blank frame produces an empty array.
+A single planar marker's rotation can be ambiguous near a frontal view.
+
+**Publish Monitor overlay** is on by default. It draws each marker's ID,
+outline and XYZ axes (red, green and blue) in a JPEG. Turn it off and restart
+the card to publish only the same JSON poses, skipping annotation and JPEG
+encoding.
+
+The card uses the Perception image's OpenCV. Verify `cv2.aruco` in the
+actual JetPack image before deployment. If it is missing, the card reports
+the dependency error while other processors continue to load. Keep the
+system OpenCV used by the existing vision processors when preparing the image.
 
 ## Camera Parameters (`camera_info`)
 
