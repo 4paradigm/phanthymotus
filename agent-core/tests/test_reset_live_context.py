@@ -1,4 +1,4 @@
-"""Exercise both canvas history controls while compression is suspended."""
+"""Exercise history clearing while work from the previous conversation is pending."""
 import asyncio
 import importlib
 import os
@@ -22,6 +22,18 @@ llm = importlib.import_module('event.llm')
 
 
 class ResetLiveContextTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        db_path = patch.object(config, 'DB_PATH', os.path.join(directory.name, 'test.db'))
+        db_path.start()
+        self.addCleanup(db_path.stop)
+        self.addCleanup(config._get_conn().close)
+        config._seed_defaults()
+        self.addCleanup(setattr, chat_history, 'last_clear_time', chat_history.last_clear_time)
+        collector.clear_context()
+        self.addCleanup(collector.clear_context)
+
     async def check_reset(self, reset, paused_function):
         agent = llm.Event()
         old = [{'role': 'user', 'content': 'old secret'}]

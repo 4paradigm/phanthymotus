@@ -1,16 +1,19 @@
 """Per-(channel_id, chat_id) recap stays isolated from other chats and other
 channels — it must not depend on the shared global turn history in event/llm.py."""
 
+import asyncio
 import json
 import os
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
 
+import chat_history
 import collector  # noqa: E402
 import config  # noqa: E402
 from channel.manager import ChannelManager  # noqa: E402
@@ -96,6 +99,46 @@ class ChatHistoryIsolationTest(unittest.TestCase):
         self.assertIn('帮我查电量', trigger['text'])
         self.assertIn('电量 80%', trigger['text'])
         self.assertNotIn('不相关的话', trigger['text'])
+
+
+class InFlightReplyTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        db = patch.object(config, 'DB_PATH', os.path.join(directory.name, 'test.db'))
+        db.start()
+        self.addCleanup(db.stop)
+        self.addCleanup(config._get_conn().close)
+        self.addCleanup(setattr, chat_history, 'last_clear_time', chat_history.last_clear_time)
+
+    async def test_reply_sent_across_clear_does_not_restore_channel_history(self):
+        manager = ChannelManager()
+        manager._set_last_context('channel', 'chat', 'user', message_id='msg')
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def delayed_send(message):
+            started.set()
+            await resume.wait()
+
+        adapter = Mock(send_message=AsyncMock(side_effect=delayed_send))
+        manager._adapters['channel'] = adapter
+        pending = asyncio.create_task(manager.send_to_channel(
+            'channel', text='old reply', source_message_id='msg'))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            chat_history.clear_all()
+        finally:
+            resume.set()
+            result = await pending
+
+        self.assertIn('Reply sent to channel', result)
+        adapter.send_message.assert_awaited_once()
+        self.assertEqual(adapter.send_message.await_args.args[0].text, 'old reply')
+        self.assertEqual(manager.get_chat_history('channel', 'chat'), [])
+        manager._set_last_context('channel', 'chat', 'user', message_id='new-msg')
+        await manager.send_to_channel('channel', text='new reply', source_message_id='new-msg')
+        self.assertEqual([item['text'] for item in manager.get_chat_history('channel', 'chat')],
+                         ['new reply'])
 
 
 if __name__ == '__main__':

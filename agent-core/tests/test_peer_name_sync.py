@@ -61,7 +61,6 @@ class TestStatePushCarriesDisplayName(unittest.IsolatedAsyncioTestCase):
         from peer import dds_state
         import config
 
-        config.main = {'peer_settings': {'display_name': 'TestBot'}}
         captured = []
 
         async def _post(eps, path, payload, **kw):
@@ -70,7 +69,8 @@ class TestStatePushCarriesDisplayName(unittest.IsolatedAsyncioTestCase):
 
         fake_bridge = mock.Mock(get_dds_topics=lambda: {'/test'})
         db = os.path.join(tempfile.mkdtemp(), 'peers.db')
-        with mock.patch.object(config, 'DB_PATH', db), \
+        with mock.patch.object(config, 'main', {'peer_settings': {'display_name': 'TestBot'}}), \
+             mock.patch.object(config, 'DB_PATH', db), \
              mock.patch.dict(sys.modules, {'ros2_bridge': fake_bridge}), \
              mock.patch('peer.store.list_peers', return_value=[
                  {'peer_id': 'b' * 32, 'endpoints': ['https://x:15678']}]), \
