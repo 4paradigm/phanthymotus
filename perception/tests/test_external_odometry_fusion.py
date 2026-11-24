@@ -911,3 +911,62 @@ def test_planar_pose_ignores_unobserved_chassis_channels_before_taking_differenc
                               quaternion=[0., np.sin(pitch/2), 0., np.cos(pitch/2)])
         engine.motion(*decode_motion(sample, 1))
     np.testing.assert_allclose(engine.current.transform, pose_at(.1), atol=1e-9)
+
+
+def test_planar_output_uses_only_capture_matched_body_gravity():
+    from plugins.external_odometry_fusion import pose_matrix
+    engine = ExternalOdometry(body_frame='body')
+    for idx in range(5):
+        t = idx / 10
+        p = packet(t, x=t)
+        p['motion_model'] = 'planar'
+        s = p['stamp_ns']
+        gravity = dict(frame_id='body', stamp_ns=s, up=[0., .6, .8])
+        if idx == 2:
+            gravity['variance_bound_rad2'] = .9
+        if idx == 3:
+            gravity['frame_id'] = 'camera'
+        if idx == 4:
+            gravity['stamp_ns'] -= NS
+        p['vendor'] = dict(body_gravity=gravity)
+        engine.motion(*decode_motion(p, 1))
+        if idx == 0:
+            continue
+        yaw = .35 * idx
+        visual = pose_at(t)
+        visual[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
+        visual[2, 3] = .08 * idx
+        engine.vision(s, 'native', visual)
+        output = engine.output()
+        M = pose_matrix(output['pose'])
+        assert M[:3, 3] == pytest.approx(engine.current.transform[:3, 3])
+        expected = engine.current.transform
+        assert np.arctan2(M[1,0], M[0,0]) == pytest.approx(np.arctan2(expected[1,0], expected[0,0]))
+        if idx == 2:
+            assert abs(expected[2,3]) > .05
+            assert abs(np.arctan2(expected[1,0], expected[0,0])) > .01
+        assert M[2,:3] == pytest.approx([0., .6, .8] if idx < 3 else [0., 0., 1.])
+        covariance = np.reshape(output['pose']['covariance'], (6, 6))
+        assert np.linalg.eigvalsh(covariance).min() >= -1e-9
+        if idx == 2:
+            assert np.linalg.eigvalsh(covariance[3:,3:])[-1] >= .9
+
+
+def test_gravity_variance_preserves_heading_uncertainty_without_copying_it_into_tilt():
+    engine = ExternalOdometry(learning=False)
+    initial = packet(0, x=0.)
+    initial['motion_model'] = 'planar'
+    engine.motion(*decode_motion(initial, 1))
+    engine.vision(NS, 'vision', pose_at(0.), np.array([.1, .1, .1, .1, .1, 2.]))
+    sample = dict(packet(.1, x=.1), motion_model='planar')
+    pitch = np.pi/3
+    bound = .01
+    sample['vendor'] = dict(body_gravity=dict(frame_id='body', stamp_ns=sample['stamp_ns'],
+        up=[-np.sin(pitch), 0., np.cos(pitch)], variance_bound_rad2=bound))
+    engine.motion(*decode_motion(sample, 1))
+    heading_var = engine.current.covariance[5, 5]
+    assert heading_var > 1.
+    forward = np.array([np.cos(pitch), 0., -np.sin(pitch)])
+    expected = np.diag([0., bound, heading_var]) + np.outer(forward, forward) * bound / np.cos(pitch)**2
+    covariance = np.reshape(engine.output()['pose']['covariance'], (6, 6))
+    np.testing.assert_allclose(covariance[3:, 3:], expected, atol=1e-10)

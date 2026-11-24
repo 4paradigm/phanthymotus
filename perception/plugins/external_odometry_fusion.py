@@ -191,6 +191,7 @@ class Motion:
     process_covariance: np.ndarray | None = None
     body_from_sensor: np.ndarray | None = None
     body_angular_velocity: np.ndarray | None = None
+    body_gravity: tuple | None = None
 
     def order_key(self):
         vector = self.pose if self.pose is not None else self.twist
@@ -199,7 +200,8 @@ class Motion:
                 self.mask.tobytes(), repr(self.origin), self.covariance.tobytes(), repr(self.model),
                 covariance is not None, covariance.tobytes() if covariance is not None else b'',
                 self.body_from_sensor.tobytes() if self.body_from_sensor is not None else b'',
-                self.body_angular_velocity.tobytes() if self.body_angular_velocity is not None else b'')
+                self.body_angular_velocity.tobytes() if self.body_angular_velocity is not None else b'',
+                self.body_gravity or ())
 
 
 def decode_motion(packet, receipt_ns):
@@ -284,9 +286,24 @@ def decode_motion(packet, receipt_ns):
     if measured_body:
         model = _MEASURED_PLANAR if planar else _MEASURED_SPATIAL
         origin += (quality['segment_id'],)
+    gravity = None
+    observation = vendor.get('body_gravity')
+    if model == _PLANAR_POSE and isinstance(observation, dict):
+        capture = observation.get('stamp_ns')
+        frame = observation.get('frame_id')
+        if (type(capture) is int and capture > 0 and isinstance(frame, str) and frame and
+                abs(capture + offset - stamp) <= 50_000_000):
+            try:
+                up = _vector(observation.get('up'), (3,))
+                norm = np.linalg.norm(up)
+                bound = observation.get('variance_bound_rad2', 0.)
+                if abs(norm-1.) < .01 and type(bound) in (float, int) and np.isfinite(bound) and bound >= 0.:
+                    gravity = (frame, capture+offset, tuple(up/norm), float(bound))
+            except (TypeError, ValueError, OverflowError):
+                pass  # Invalid optional IMU data cannot interrupt chassis odometry.
     return stamp, Motion(pose, twist, mask, origin, reset, covariance, model,
                          process_covariance, np.eye(4) if mount is None else mount,
-                         body_angular_velocity)
+                         body_angular_velocity, gravity)
 
 
 def _continuous_chassis(left, right, interval_ns):
@@ -953,6 +970,20 @@ class ExternalOdometry:
     def segment_id(self, state):
         return self.segment if state.chassis_break_ns is None else f'{self.segment}_{state.chassis_break_ns}'
 
+    def _gravity_at(self, state):
+        if state.motion_model != _PLANAR_POSE:
+            return None
+        # A fresh motion packet supersedes its predecessor, including loss of IMU.
+        motion = self.raw_motion.get(state.stamp)
+        if motion is None:
+            stamp = max((s for s in self.raw_motion if s <= state.stamp), default=None)
+            motion = self.raw_motion.get(stamp)
+        if motion is not None and not motion.reset and motion.body_gravity is not None:
+            frame, capture, up, bound = motion.body_gravity
+            if frame == self.body_frame and abs(state.stamp-capture) <= 50_000_000:
+                return capture, up, bound
+        return None
+
     def output(self, state=None):
         if state is None:
             state = self.current
@@ -968,8 +999,41 @@ class ExternalOdometry:
         if self._slewing_output:
             unapplied = _world_pose_offset(pose, state.transform)
             covariance += np.outer(unapplied, unapplied)
+        gravity = self._gravity_at(state)
+        rotation = pose[:3, :3]
+        if gravity is not None:
+            capture, up, variance_bound = gravity
+            # Preserve the projected forward heading, independent of IMU yaw.
+            level = np.hypot(up[1], up[2])
+            horizontal = np.hypot(*rotation[:2, 0])
+            if level > 1e-6 and horizontal > 1e-6:
+                forward = rotation[:, 0]
+                heading = np.arctan2(forward[1], forward[0])
+                lateral = np.array([0., up[2]/level, -up[1]/level])
+                rotation = _yaw_rotation(heading) @ np.stack((np.cross(lateral, up), lateral, up))
+                # Retain translation and heading uncertainty in fixed-world axes.
+                # Retain the prior angular bound when the IMU has no covariance.
+                jac = np.eye(6)
+                jac[3:, 3:] = 0.
+                jac[5, 3:] = [-forward[0]*forward[2]/horizontal**2,
+                              -forward[1]*forward[2]/horizontal**2, 1.]
+                if variance_bound > 0. and capture == state.stamp:
+                    # At fixed heading only roll has a sec(pitch) sensitivity.
+                    pitch_var = variance_bound
+                    roll_var = variance_bound / level**2
+                else:
+                    # Without a bound at this exact epoch, retain the prior estimate.
+                    prior_var = np.linalg.eigvalsh(covariance[3:, 3:])[-1]
+                    roll_var = pitch_var = max(prior_var, max(_DEFAULT_VARIANCE[3:]), variance_bound / level**2)
+                covariance = jac @ covariance @ jac.T
+                # Roll uncertainty rotates about the body forward axis; pitch
+                # about the horizontal lateral axis of the retained heading.
+                tilt_axes = np.column_stack((rotation[:, 0], [-np.sin(heading), np.cos(heading), 0.]))
+                covariance[3:, 3:] += (tilt_axes * [roll_var, pitch_var]) @ tilt_axes.T
+            else:
+                gravity = None
         segment = self.segment_id(state)
-        fused = dict(position=pose[:3, 3].tolist(), quaternion=quaternion(pose[:3, :3]),
+        fused = dict(position=pose[:3, 3].tolist(), quaternion=quaternion(rotation),
                      frame_id=segment+'_odom', child_frame_id=self.body_frame,
                      covariance=covariance.ravel().tolist())
         twist = ([float(value) if observed else None for value, observed in zip(state.twist, state.mask)]
@@ -981,4 +1045,5 @@ class ExternalOdometry:
                                                 segment_id=segment, pose_source='external_fusion',
                                                 pose_reference='body'),
                                 external_fusion=dict(update=state.last_update, observed=state.mask.tolist(),
-                                                     learning=state.learner.info())))
+                                                     learning=state.learner.info(),
+                                                     **({'body_gravity_stamp_ns': gravity[0]} if gravity else {}))))
