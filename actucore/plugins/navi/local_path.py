@@ -1235,8 +1235,9 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     # occupied squares and the complete oriented footprint to a stop.
     allowed = clearance > half_width - RESOLUTION
     allowed[start] = True
-    desired = half_width + 2.5 * RESOLUTION
-    cost = 3. * np.square(np.maximum(0., desired - clearance) / (2.5 * RESOLUTION))
+    preferred_extra = 4 * RESOLUTION
+    desired = half_width + preferred_extra
+    cost = 3. * np.square(np.maximum(0., desired - clearance) / preferred_extra)
     if previous:
         distance = np.full_like(clearance, np.inf)
         for f, r in previous:

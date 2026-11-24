@@ -406,7 +406,8 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral):
 
 
 def _obstacle_score(check):
-    return 1.5 * max(0., .25 - check.min_clearance_m) / .25
+    # Only rank sweeps that already passed the hard footprint checks.
+    return 1.5 * max(0., .30 - check.min_clearance_m) / .30
 
 
 def score_candidate(command, trace, check, reference, previous, *, half_width, limits,

@@ -513,6 +513,32 @@ def test_guidance_switches_sides_when_a_new_obstacle_blocks_the_prior_path():
     assert abs(rerouted.points[-1][1]) <= local_path.RESOLUTION
 
 
+def test_soft_clearance_starts_a_wide_detour_earlier():
+    f, r = local_path.FORWARD, local_path.RIGHT
+    obstacle = (f >= 1.) & (f <= 1.5) & (abs(r) <= .25)
+    path = local_path.clearance_route((~obstacle, obstacle), _geometry(), .3025, (2.85, 0.), .60, (0., 0.))
+    assert abs(path.topology[3][1]) >= local_path.RESOLUTION
+    passing = [abs(right) for forward, right in path.topology if 1. <= forward < 1.4]
+    assert min(passing) >= .69
+
+
+def test_dwa_prefers_clearance_beyond_the_hard_footprint():
+    route = ((0., 0.), (.65, 0.), (1., 0.))
+    close = _run(route, grid=_grid(obstacles=[(.4, .55)]))
+    wider = _run(route, grid=_grid(obstacles=[(.4, .6)]))
+    assert close.check.accepted and wider.check.accepted
+    assert close.components.obstacle > wider.components.obstacle == 0.
+
+
+def test_soft_clearance_preserves_a_feasible_narrow_opening():
+    walls = np.isclose(abs(local_path.RIGHT), .40)
+    grid = ~walls, walls
+    path = local_path.clearance_route(grid, _geometry(), .3025, (2.85, 0.), .60, (0., 0.))
+    assert path is not None and all(right == 0. for _, right in path.topology)
+    choice = _run(((0., 0.), (.65, 0.), (1., 0.)), grid=grid)
+    assert choice.command[0] > 0. and choice.components.obstacle > 0.
+
+
 def test_unused_prediction_can_be_checked_by_a_later_reference_after_budget_exhaustion():
     budget = dwa.CandidateBudget(8)
     options = dict(candidate_budget=budget, max_candidates=8, yaw_limits=(0., 0.))

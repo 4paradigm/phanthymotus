@@ -923,7 +923,7 @@ def test_clearance_route_keeps_every_original_turn_node_as_its_topology(monkeypa
     plan = local_path.clearance_route((~occupied, occupied), geometry, .22, (1.8, 0.), .50, (0., 0.))
     allowed, path = seen[-1]
     raw = tuple((local_path.FORWARD[node], local_path.RIGHT[node]) for node in path)
-    assert len(raw) == 29 and len(plan.points) < len(raw)
+    assert len(plan.points) < len(raw)
     assert not allowed[local_path.START[0] + 4, local_path.START[1] - 2]
     assert plan.topology == raw
     tier, ref = policy._dwa_route_reference(plan, 2, (1.8, 0.), .50, .05)
