@@ -71,8 +71,10 @@ class ChatHistoryIsolationTest(unittest.TestCase):
 
     def test_build_trigger_injects_scoped_chat_history_block(self):
         self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '帮我查电量',
-                                           user_label='Alice')
-        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'assistant', '电量 80%')
+                                           user_label='Alice', user_id='u1',
+                                           user_role='viewer', sender_type='user')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'assistant', '电量 80%',
+                                           user_id='u1', user_role='viewer', sender_type='user')
         self.manager._record_chat_exchange('feishu_r1', 'oc_b', 'user', '不相关的话',
                                            user_label='Bob')
 
@@ -84,7 +86,8 @@ class ChatHistoryIsolationTest(unittest.TestCase):
                 'source': 'dds:/channel/request/feishu_r1',
                 'text': json.dumps({
                     'channel_id': 'feishu_r1', 'chat_id': 'oc_a',
-                    'sender_type': 'user', 'message_id': 'om_new',
+                    'sender_type': 'user', 'user_id': 'u1', 'user_role': 'viewer',
+                    'message_id': 'om_new',
                     'text': '我刚才说的怎么样了',
                 }, ensure_ascii=False),
                 'ts': 1,
