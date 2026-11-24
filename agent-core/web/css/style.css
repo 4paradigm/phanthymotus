@@ -5686,6 +5686,12 @@ html, body {
 .task-actions button.danger { color: var(--red); }
 .task-actions button.danger:hover { border-color: var(--red); }
 
+.task-section-title {
+  font-size: 0.8rem; font-weight: 600; margin: 18px 0 8px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.task-section-title small { font-weight: 400; font-size: 0.72rem; color: var(--text-dim); }
+
 /* Task edit form */
 .task-edit-form label {
   display: block; font-size: 0.72rem; color: var(--text-dim);
