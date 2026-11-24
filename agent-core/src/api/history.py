@@ -44,6 +44,7 @@ def batch_delete(body: BatchDeleteBody):
 
 
 @router.delete('/sessions')
-def clear_all():
-    chat_history.clear_all()
+async def clear_all():
+    import event
+    event.llm.clear_chat_history()
     return {'ok': True}

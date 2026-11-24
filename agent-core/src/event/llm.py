@@ -22,6 +22,7 @@ import typing
 import log
 import config
 import client
+import chat_history
 import event
 import event_bus
 import collector
@@ -1613,6 +1614,7 @@ def get_recent_context_rich(max_turns: int = 20, max_chars: int = 6000) -> str:
 
 class Event:
     def __init__(self):
+        self._turn_cancel = None
         self._turns: list[list[dict]] = []  # 每轮对话的消息列表
         self._context_pressure = None  # (prompt_tokens, context_tokens)：本机模型答的上一轮
         self._sys_tools:   dict       = {}
@@ -1621,6 +1623,20 @@ class Event:
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
         self._subagent_mgr = None             # SubagentManager instance
         self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
+
+    def clear_chat_history(self):
+        """Called on the agent event loop so storage and live history reset together."""
+        chat_history.clear_all()
+        collector.clear_context()
+        if self._turn_cancel is not None:
+            self._turn_cancel.set()
+        self._turns = []
+        self._current_turn = []
+        self._session_id = None
+        self._summary = None
+        self._context_pressure = None
+        _pending_narration_feedback.clear()
+        _remember_report('')
 
     async def __aenter__(self):
         global _event_instance
@@ -1925,7 +1941,8 @@ class Event:
             self._chat_only_active = bool(ev.get('_chat_only_channel'))
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
-            cancel_ev = asyncio.Event()
+            current_turn = self._current_turn
+            cancel_ev = self._turn_cancel = asyncio.Event()
             collector.set_cancel_event(cancel_ev)
             # 更窄的信号：高优先级 steering 到达时，打断"正在飞的 LLM 请求"或者
             # "还没发出去、卡在排队里的 tool_call"，但不结束这个 turn（跟 cancel_ev
@@ -1943,7 +1960,7 @@ class Event:
                 await self._one_turn(ev, cancel_event=cancel_ev, reconsider_event=reconsider_ev)
             except TurnCancelled:
                 print(f'[decision] turn cancelled by user message')
-                self._current_turn.append({
+                current_turn.append({
                     'role': 'assistant',
                     'content': '[turn interrupted by user message]',
                 })
@@ -1960,13 +1977,14 @@ class Event:
                     import hooks
                     asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
-                self._current_turn.append({
+                current_turn.append({
                     'role': 'assistant',
                     'content': f'[错误] {type(e).__name__}: {e}',
                 })
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
                 _cancel_ctx.reset(_cancel_token)
+                self._turn_cancel = None
                 collector.set_cancel_event(None)
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
@@ -2083,21 +2101,23 @@ class Event:
         if len(self._turns) <= max_kept:
             return  # 不够分割，跳过
 
-        # 分割：压缩旧的，保留最近的
-        old_turns = self._turns[:-max_kept]
-        recent_turns = self._turns[-max_kept:]
+        if await self._compress_history(max_kept, summary_budget) and pressured:
+            self._context_pressure = None
 
-        print(f'[decision] compressing history: {len(old_turns)} old turns, keeping {max_kept} recent')
+    async def _compress_history(self, keep: int, budget: int) -> bool:
+        generation = chat_history.last_clear_time
+        old_turns, recent_turns = self._turns[:-keep], self._turns[-keep:]
         summary = await _compress_turns(old_turns)
-        # Rolling summary: 合并旧摘要（固定预算重写，而非无限拼接）
+        if generation != chat_history.last_clear_time:
+            return False
         if self._summary:
-            summary = await _rewrite_summary(self._summary, summary, summary_budget)
-
+            summary = await _rewrite_summary(self._summary, summary, budget)
+            if generation != chat_history.last_clear_time:
+                return False
         self._summary = summary
         self._turns = recent_turns
-        if pressured:
-            self._context_pressure = None   # 下一轮的 usage 会重新报，别拿旧数再压一次
         print(f'[decision] compressed: kept {len(recent_turns)} recent turns, summary={len(summary)} chars')
+        return True
 
     async def _report_progress(self) -> None:
         """生成一句进度汇报并播出去。**唯一的触发点是沉默计时到点。**
@@ -2151,6 +2171,7 @@ class Event:
 
         # 上下文
         global _last_progress_ts, _reported_turn_msgs
+        generation = chat_history.last_clear_time
         phase = 'new'
         live = self._current_turn if turn_alive else None
         if live:
@@ -2224,6 +2245,8 @@ class Event:
             _narration_inflight = False
 
         # SKIP 逃生口：传感器轮询那种确实没进展的时段，连说三遍"我还在查看"比沉默更糟。
+        if generation != chat_history.last_clear_time:
+            return
         if not report or report.upper().startswith('SKIP'):
             _restart_countdown()
             return
@@ -2237,6 +2260,8 @@ class Event:
         report = _trim_narration(report)
 
         results = await hooks.fire('on_notify', {'text': report}, barrier_aware=True)
+        if generation != chat_history.last_clear_time:
+            return
         if not _notify_fire_spoke(results):
             # 竞态：gate 判定时嘴还空着，真要说的时候被占了。LLM 的钱已经花了，退避。
             print(f'[decision] narration: all bindings skipped (busy) → "{report}"')
@@ -2277,6 +2302,7 @@ class Event:
                         reconsider_event: asyncio.Event | None = None):
         import time as _time
         from uuid import uuid4
+        turn_messages = self._current_turn
         _turn_t0 = _time.perf_counter()
         bot_restricted = _bot_channel_restricted(trigger_event)
         viewer_restricted = _viewer_channel_restricted(trigger_event)
@@ -2425,7 +2451,6 @@ class Event:
         absolute_max = max_rounds * 5  # 绝对上限防死循环
         response    = None
         decisions   = []
-        turn_messages = self._current_turn  # alias for brevity
         _turn_usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'cached_tokens': 0}
 
         round_idx = 0
@@ -2571,14 +2596,9 @@ class Event:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
                     if len(self._turns) > 2 and not bot_restricted:
-                        old = self._turns[:-2]
-                        summary = await _compress_turns(old)
-                        if self._summary:
-                            llm_cfg = config.main.get('event', {}).get('llm', {})
-                            budget = llm_cfg.get('summary_max_chars', 5000)
-                            summary = await _rewrite_summary(self._summary, summary, budget)
-                        self._summary = summary
-                        self._turns = self._turns[-2:]
+                        budget = llm_cfg.get('summary_max_chars', 5000)
+                        if not await self._compress_history(2, budget):
+                            return
                         # 重建 history 并重试（复用冻结的 system）
                         history = self._build_history()
                         current_history = history + _sanitize(_scrub(turn_messages))
@@ -2593,6 +2613,7 @@ class Event:
                         response = await client.call(
                             message_list = messages,
                             tool_list    = all_tool_list,
+                            cancel_event = cancel_event,
                             trace_id     = _trace_id,
                             caller_info  = {'agent_type': 'main_agent'},
                         )
@@ -2600,6 +2621,8 @@ class Event:
                         raise
                 else:
                     raise
+            if turn_messages is not self._current_turn:
+                return
             turn_messages.append(response)
             self._flush_current_turn(trigger_event)
             _flush_spans()

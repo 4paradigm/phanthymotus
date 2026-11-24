@@ -16,6 +16,7 @@ import re
 import time
 
 import config
+import chat_history
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError
 from channel import acl, chat_only
 
@@ -940,6 +941,7 @@ class ChannelManager:
                 return 'Error: nothing sent.\n' + '\n'.join(file_errors)
 
         chat_id = ctx['chat_id']
+        history_epoch = chat_history.last_clear_time
         try:
             await adapter.send_message(OutboundMessage(
                 chat_id=chat_id,
@@ -960,7 +962,7 @@ class ChannelManager:
             result = f'Reply sent to {channel_id} ({"; ".join(parts) or "empty"})'
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
-            if not mention_open_id:
+            if not mention_open_id and history_epoch == chat_history.last_clear_time:
                 # Bot-to-bot mentions aren't this chat's own human-facing conversation —
                 # keep the recap scoped to the human/channel side of the exchange.
                 self._record_chat_exchange(channel_id, chat_id, 'assistant', text)

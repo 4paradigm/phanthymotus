@@ -16,6 +16,8 @@ Agent Loop 从此队列出，保证单一消费者串行处理。
 import asyncio
 import time
 
+import chat_history
+
 _queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
 _recent: list[dict]   = []    # 最近 N 条事件，用于 L2 环境快照
 
@@ -28,13 +30,24 @@ async def enqueue(source: str, text: str, payload: dict | None = None) -> None:
         'ts':      time.time(),
     }
     await _queue.put(event)
+    if event['ts'] < chat_history.last_clear_time:
+        return
     _recent.append(event)
     if len(_recent) > 100:
         _recent.pop(0)
 
 
 async def dequeue() -> dict:
-    return await _queue.get()
+    while True:
+        event = await _queue.get()
+        if event['ts'] >= chat_history.last_clear_time:
+            return event
+
+
+def clear_context():
+    _recent.clear()
+    while not _queue.empty():
+        _queue.get_nowait()
 
 
 def recent(n: int = 10) -> list[dict]:

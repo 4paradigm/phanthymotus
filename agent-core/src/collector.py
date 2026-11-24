@@ -20,6 +20,7 @@ from collections import deque
 
 import config
 import event_bus
+import chat_history
 
 
 # ── P>0 管道 ─────────────────────────────────────────────────────────────────
@@ -247,6 +248,18 @@ def _pending_has_same_asr_text(asr_text: str) -> bool:
 
 # ── 公开接口 ──────────────────────────────────────────────────────────────────
 
+def clear_context():
+    """Forget old raw inputs and triggers that could feed the next conversation."""
+    _source_ring.clear()
+    _priority_pending.clear()
+    _bg_buffer.clear()
+    _bg_last_accepted.clear()
+    for queue in (_output, _steering_queue):
+        while not queue.empty():
+            queue.get_nowait()
+    event_bus.clear_context()
+
+
 def set_busy(busy: bool):
     """由 agent loop 调用：标记当前是否正在执行 turn。"""
     global _busy
@@ -326,7 +339,10 @@ async def next_trigger() -> dict:
     """阻塞等待下一批 P>0 事件（main agent 消费端）。"""
     # Fallback: 每次等待前再检查一次 pending 队列，防止遗漏
     _flush_all_pending()
-    return await _output.get()
+    while True:
+        trigger = await _output.get()
+        if trigger.get('ts', time.time()) >= chat_history.last_clear_time:
+            return trigger
 
 
 def get_source_detail(source: str, limit: int = 20) -> list[dict]:
@@ -739,8 +755,8 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
     message = '\n\n'.join(parts)
 
     # 检查是否有活跃的 bg subagent
-    active = _manager_instance.list_active()
-    bg_agents = [a for a in active if a.goal.startswith('[bg]')]
+    bg_agents = [a for a in _manager_instance.list_active()
+                 if a.goal.startswith('[bg]') and a.created_at >= chat_history.last_clear_time]
 
     if bg_agents:
         _manager_instance.send_message(bg_agents[0].id, message)

@@ -5,8 +5,10 @@ import re
 import time
 import uuid
 
-from config import _get_conn
+from config import _get_conn, main as config_store
 
+
+last_clear_time = config_store.get('chat_history_cleared_at', 0.0)
 
 KIND_MAIN = 'main'
 KIND_SUBAGENT = 'subagent'
@@ -205,6 +207,8 @@ def clear_all():
     overlooked: guessing by timestamp would delete another session's
     conclusions.
     """
+    global last_clear_time
+    cleared_at = time.time()
     with _get_conn() as conn:
         conn.execute('DELETE FROM chat_messages')
         conn.execute('DELETE FROM chat_sessions')
@@ -218,7 +222,11 @@ def clear_all():
             conn.execute('DELETE FROM subagent_conclusions')
         except Exception:
             pass
+        conn.execute("DELETE FROM config WHERE key = 'channel_chat_history'")
+        conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                     ('chat_history_cleared_at', json.dumps(cleared_at)))
         conn.commit()
+    last_clear_time = cleared_at
 
 
 # ── FTS5 全文搜索 ─────────────────────────────────────────────────────────────

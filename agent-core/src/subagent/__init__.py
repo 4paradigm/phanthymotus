@@ -1,3 +1,5 @@
+import chat_history
+
 from .manager import SubagentManager
 from .protocol import SubagentSpec, SubagentResult, SubagentStatus
 
@@ -16,7 +18,8 @@ def _get_active_subagents() -> list[SubagentStatus]:
     """Get active subagent statuses (used by prompt.py for L2 dynamic)."""
     if _manager_instance is None:
         return []
-    return _manager_instance.list_active()
+    return [s for s in _manager_instance.list_active()
+            if s.created_at >= chat_history.last_clear_time]
 
 
 def _get_active_digests(max_turns: int = 3, since: dict | None = None) -> list[dict]:
@@ -40,7 +43,7 @@ def _get_active_digests(max_turns: int = 3, since: dict | None = None) -> list[d
         return []
     out = []
     for agent in getattr(_manager_instance, '_agents', {}).values():
-        if agent.status != 'running':
+        if agent.status != 'running' or agent.created_at < chat_history.last_clear_time:
             continue
         try:
             turns = list(agent.context.turns)

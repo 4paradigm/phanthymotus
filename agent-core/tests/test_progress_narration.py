@@ -160,10 +160,12 @@ class _Fixture(unittest.TestCase):
         if turns is None:
             turns = [[{'role': 'tool', 'content': 'BASEFINDING'}]]
         st = 'running' if running else 'completed'
-        _S = type('S', (), {'id': 'ab12', 'status': st,
+        created_at = time.time()
+        _S = type('S', (), {'id': 'ab12', 'status': st, 'created_at': created_at,
                             'rounds_completed': rounds, 'goal': '长任务'})
         _Ctx = type('Ctx', (), {'turns': list(turns or [])})
         _Agent = type('Agent', (), {
+            'created_at': created_at,
             'id': 'ab12', 'status': st, 'rounds_completed': rounds,
             'spec': type('Spec', (), {'goal': '长任务'})(),
             'context': _Ctx()})

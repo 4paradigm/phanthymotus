@@ -11,6 +11,7 @@ Responsibilities:
 
 from __future__ import annotations
 import asyncio
+import chat_history
 import time
 
 import config
@@ -433,6 +434,8 @@ class SubagentManager:
         - BG subagent fail/timeout → 仍触发 main agent
         - 用户任务 subagent → 结论存 DB + 精简通知触发 main agent
         """
+        if agent.created_at < chat_history.last_clear_time:
+            return
         is_bg = agent.spec.goal.startswith('[bg]')
 
         # 所有 subagent 完成时结论存 DB

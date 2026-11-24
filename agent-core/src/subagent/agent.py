@@ -16,6 +16,7 @@ import time
 import typing
 from uuid import uuid4
 
+import chat_history
 import mcp_client
 from .protocol import (
     SubagentSpec, SubagentResult, SubagentStatus,
@@ -94,10 +95,9 @@ class Subagent:
 
     def persist_turn(self, messages: list[dict]) -> None:
         """Append one finished round to this agent's chat-history session."""
-        if not messages:
+        if not messages or self.created_at < chat_history.last_clear_time:
             return
         try:
-            import chat_history
             if not self.history_session_id:
                 kind = (chat_history.KIND_BG_SUBAGENT
                         if self.spec.goal.startswith('[bg]')
@@ -748,7 +748,7 @@ class Subagent:
         if name == 'subagent_report':
             progress = args.get('progress', '')
             urgent = args.get('urgent', False)
-            if not progress.strip():
+            if not progress.strip() or self.created_at < chat_history.last_clear_time:
                 return 'ok'
             self._progress_reports.append(progress)
             print(f'[subagent:{self.id}] progress{"(urgent)" if urgent else ""}: {progress[:100]}')
