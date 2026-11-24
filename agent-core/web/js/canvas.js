@@ -998,7 +998,7 @@ async function _removeCard(id) {
   // until perception exits — publishing to a topic no card accounts for.
   // `stop` is idempotent, so doing this to a card that was never started is fine.
   const tool = _allMcps.find(m => m.id === removed.mcpId)?.tools?.find(t => t.name === removed.toolName);
-  if (tool?.type !== 'sensor' || tool.multiInstance) {
+  if (tool?.type !== 'sensor') {
     _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
   }
   removed.el.remove();
@@ -1081,12 +1081,8 @@ async function _clearCanvas() {
       }
     }
 
-    // The server stops the removed instances as part of the layout write.
-    // Browser-owned sources live in this tab and have to be stopped here —
-    // including when a reload above has already taken their cards off screen.
+    // Clearing cards leaves sensor collection, including browser sources, running.
     for (const card of doomed) {
-      if (card.toolName === 'remote_camera') stopCameraStream();
-      if (card.toolName === 'remote_mic') stopMicStream();
       card.el.remove();
     }
     if (_cards === doomed) {

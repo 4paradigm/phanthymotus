@@ -64,7 +64,7 @@ test('cancel leaves the shared layout untouched and does not claim the edit lock
   assert.deepEqual(f.removed, []);
 });
 
-test('clear saves one empty layout, removes all cards and stops browser sources', async () => {
+test('clear saves one empty layout, removes all cards and preserves browser sources', async () => {
   const f = fixture();
   await f.api._clearCanvas();
   assert.equal(f.calls.length, 1);
@@ -74,7 +74,7 @@ test('clear saves one empty layout, removes all cards and stops browser sources'
     transform: { zoom: 1.2, tx: 10, ty: 20 }, session_id: 'this-tab',
   });
   assert.deepEqual(f.removed, ['sensor', 'remote_mic', 'remote_camera']);
-  assert.deepEqual(f.stopped, ['mic', 'camera']);
+  assert.deepEqual(f.stopped, []);
   assert.equal(f.ctx._cards.length, 0);
   assert.equal(f.ctx._connections.length, 0);
   assert.equal(f.ctx._execConnections.length, 0);
@@ -148,7 +148,7 @@ test('a project that starts during clear preparation prevents the layout write',
   assert.match(f.toasts.at(-1), /停止智能控制/);
 });
 
-test('a write that times out but did land is reported as cleared and stops browser sources', async () => {
+test('a write that times out but did land is reported as cleared and preserves browser sources', async () => {
   const f = fixture();
   f.ctx.fetch = async () => { throw new Error('aborted'); };
   // The server saved [] before its slow teardown; reloading reads that back.
@@ -158,7 +158,7 @@ test('a write that times out but did land is reported as cleared and stops brows
     f.ctx._layoutGen++;
   };
   await f.api._clearCanvas();
-  assert.deepEqual(f.stopped, ['mic', 'camera']);
+  assert.deepEqual(f.stopped, []);
   assert.equal(f.ctx._cards.length, 0);
   assert.equal(f.toasts.at(-1), '画布已清空');
 });
