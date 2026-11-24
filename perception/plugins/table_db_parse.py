@@ -1206,9 +1206,14 @@ class _BoundedZip(zipfile.ZipFile):
     length mismatch at the end of a member, but only after inflating it.
     """
 
-    def read(self, name, pwd=None):  # noqa: D401 - same contract as ZipFile.read
+    def read(self, name, pwd=None, max_bytes: Optional[int] = None):  # noqa: D401 - same contract as ZipFile.read
         info = name if isinstance(name, zipfile.ZipInfo) else self.getinfo(name)
-        limit = min(info.file_size, MAX_ZIP_MEMBER_BYTES)
+        cap = MAX_ZIP_MEMBER_BYTES if max_bytes is None else min(max_bytes, MAX_ZIP_MEMBER_BYTES)
+        if info.file_size > cap:
+            raise ParseError(REASON_TOO_LARGE,
+                             "文件里的 %s 大小 %d 字节超过上限 %d 字节"
+                             % (info.filename, info.file_size, cap))
+        limit = min(info.file_size, cap)
         with self.open(info, "r", pwd=pwd) as handle:
             data = handle.read(limit + 1)
         if len(data) > limit:
@@ -1324,13 +1329,28 @@ def _xml_text(value: str) -> str:
     return _xml_escape(_XML_ILLEGAL.sub("", value))
 
 
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return str(val)
+    text = str(val)
+    if text and (text[0] in _CSV_FORMULA_PREFIXES
+                 or text.lstrip(" \t\r\n").startswith(_CSV_FORMULA_PREFIXES)):
+        return "'" + text
+    return text
+
+
 def write_csv(headers: List[str], rows: List[List[Any]]) -> bytes:
-    """Serialize headers + rows into UTF-8-BOM CSV bytes."""
+    """Serialize headers + rows into UTF-8-BOM CSV bytes, escaping formula prefixes."""
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(headers)
+    writer.writerow([_csv_cell(h) for h in headers])
     for row in rows:
-        writer.writerow(["" if val is None else str(val) for val in row])
+        writer.writerow([_csv_cell(val) for val in row])
     return buf.getvalue().encode("utf-8-sig")
 
 

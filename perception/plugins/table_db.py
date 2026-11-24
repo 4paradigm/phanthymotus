@@ -829,7 +829,8 @@ class TableDbPlugin:
                         raise TableDbError("invalid_value",
                                            "第 %d 行「%s」包含图片，但该列不是 BLOB 列" % (number, name),
                                            row=number, column=name)
-                    value = _archive_file(archive, cell.media, number, name)
+                    value = _archive_file(archive, cell.media, number, name,
+                                          self._store.limits.max_file_bytes)
                     if cell.text:
                         warnings.append("第 %d 行「%s」同时含文字与图片，已保留图片" % (number, name))
                     item[name] = value
@@ -1237,15 +1238,27 @@ def _param_hint(action: str, key: str, raw: str) -> str:
     return "%s 格式错误，收到 %r" % (key, shown)
 
 
-def _archive_file(archive, media: str, row: int, column: str) -> FileValue:
+def _archive_file(archive, media: str, row: int, column: str,
+                  max_bytes: int) -> FileValue:
     if archive is None:
         raise TableDbError("invalid_value", "第 %d 行「%s」引用了图片，但文件不是 .xlsx 格式"
                            % (row, column), row=row, column=column)
     try:
-        data = archive.read(media)
+        info = archive.getinfo(media)
     except KeyError:
         raise TableDbError("unreadable", "第 %d 行「%s」的图片在 .xlsx 中找不到（%s）"
                            % (row, column, media), row=row, column=column)
+    if info.file_size > max_bytes:
+        raise TableDbError(
+            "too_large",
+            "第 %d 行「%s」的图片大小 %d 字节超过单文件上限 %d 字节"
+            % (row, column, info.file_size, max_bytes),
+            row=row, column=column,
+        )
+    try:
+        data = archive.read(info, max_bytes=max_bytes)
+    except TypeError:
+        data = archive.read(info)
     name = posixpath.basename(media)
     return FileValue(data=data, name=name, mime=_mime(data, name))
 

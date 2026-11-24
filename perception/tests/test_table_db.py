@@ -479,3 +479,62 @@ def test_zip_bomb_and_lying_header_are_refused(tmp_path, monkeypatch):
     zf = parse.open_bounded_zip(bytes(data))
     with pytest.raises((parse.ParseError, zipfile.BadZipFile)):
         zf.read("xl/worksheets/sheet1.xml")
+
+
+def test_csv_export_escapes_formula_injection_prefixes(tmp_path):
+    """Exported CSV neutralizes spreadsheet formula prefixes (=, +, -, @, tab)
+    on TEXT cells while preserving genuine numeric INTEGER/REAL values."""
+    import csv as _csv
+
+    card = _card(tmp_path)
+    _call(card, "create_table", table="f_test", columns="txt,n:INTEGER,r:REAL")
+    dangerous = [
+        "=HYPERLINK(\"http://evil\",\"click\")",
+        "+1+1",
+        "-2+3",
+        "@SUM(A1:A2)",
+        "\t=cmd|' /C calc'!A0",
+        " =1+2",
+    ]
+    _call(card, "insert", table="f_test", values=[
+        {"txt": val, "n": -42, "r": -1.5} for val in dangerous
+    ])
+
+    exp = _call(card, "export", table="f_test", format="csv")
+    assert exp["ok"] is True
+    st, raw, _, _ = _served(card, exp["url"])
+    assert st == 200
+    rows = list(_csv.reader(io.StringIO(raw.decode("utf-8-sig"))))
+    assert rows[0] == ["txt", "n", "r"]
+    for idx, orig in enumerate(dangerous, 1):
+        assert rows[idx][0] == "'" + orig
+        assert rows[idx][1] == "-42"
+        assert rows[idx][2] == "-1.5"
+
+
+def test_import_rejects_oversized_xlsx_media_before_inflating(tmp_path, monkeypatch):
+    """An embedded XLSX image exceeding max_file_bytes is rejected using its
+    ZipInfo.file_size header without opening or inflating the media entry."""
+    import plugins.table_db_parse as parse
+
+    big_png = PNG_BYTES + b"\x00" * 4096
+    xlsx = build_xlsx(
+        rows=[[xs("col1"), xs("img")], [xs("v1"), xs("")]],
+        anchors=[(1, 1, "big.png", "twoCell")],
+        media={"big.png": big_png},
+    )
+    opened_media = []
+    orig_open = parse._BoundedZip.open
+
+    def spy_open(self, name, *args, **kwargs):
+        member = name.filename if isinstance(name, zipfile.ZipInfo) else str(name)
+        if member.startswith("xl/media/"):
+            opened_media.append(member)
+        return orig_open(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(parse._BoundedZip, "open", spy_open)
+    card = _card(tmp_path, max_file_bytes=512)
+    reply = _call(card, "import", table="t_big", path=_write(tmp_path, "big.xlsx", xlsx))
+    assert reply["ok"] is False and reply["reason"] == "too_large" and reply["written"] == 0
+    assert opened_media == []
+    assert _call(card, "tables")["count"] == 0
