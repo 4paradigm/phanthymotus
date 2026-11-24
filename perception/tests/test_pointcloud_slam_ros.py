@@ -1035,10 +1035,12 @@ def test_native_odom_tf_matches_admitted_pose_and_capture(node):
     assert all(t.header.frame_id != pose.header.frame_id for t in static)
 
 
-def test_place_uses_recent_native_pose_and_follows_optimized_anchor(node):
+@pytest.mark.parametrize('reference,forward', [(None, None), ('body_axes', [1., 0., 0.])])
+def test_place_uses_recent_native_pose_and_follows_optimized_anchor(node, reference, forward):
     send(node)
     assert _wait_until(lambda: node.status()['forwarded_clouds'] == 1)
     segment = node._active
+    segment['pose_reference'] = reference
     stamp = NS(frame_id='map', stamp=NS(sec=1, nanosec=0))
     positions = [NS(position=NS(x=2., y=3., z=4.), orientation=NS(x=0., y=0., z=0., w=1.))]
     graph = NS(header=stamp, poses_id=[7], poses=positions, links=[])
@@ -1052,6 +1054,7 @@ def test_place_uses_recent_native_pose_and_follows_optimized_anchor(node):
     node._native_info(info, segment)
     place, = node.change_place('入口', remove=False)
     assert (place['node_id'], place['x'], place['y'], place['z']) == (7, 2., 3., 4.)
+    assert place.get('node_forward') == forward
     packet = bytes(published(node, '/pointcloud_slam/map')[0].messages[-1])
     _, _, _, flags, count = struct.unpack('<fffBI', packet[:17])
     assert not flags & 64 and len(packet) == 17 + 12 * count

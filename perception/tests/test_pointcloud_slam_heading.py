@@ -18,7 +18,8 @@ def test_optical_forward_and_body_forward_produce_same_map_heading(angle):
     # Axis convention only: optical +Z forward, +X right, +Y down.
     optical = body.copy()
     optical[:3, :3] = body[:3, :3] @ np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
-    for reference, pose, expected_flags in [('body', body, 23), ('camera_optical', optical, 15)]:
+    for reference, pose, expected_flags in [('body', body, 23), ('body_axes', body, 23),
+                                             ('camera_optical', optical, 15)]:
         packet = encode_mapping([[1, 2, 3]], pose, max_points=1, pose_reference=reference)
         _, _, yaw, flags, _ = struct.unpack('<fffBI', packet[:17])
         assert yaw == pytest.approx(-angle)

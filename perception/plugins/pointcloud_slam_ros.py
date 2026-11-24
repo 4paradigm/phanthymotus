@@ -1156,7 +1156,7 @@ class RtabmapNode(Node):
                     raise ValueError('current mapped pose unavailable: no localized map pose')
                 anchor = segment.get('place_anchor') if state == 'external' else None
                 place = dict(name=name, segment_id=segment['segment_id'])
-                axis = {'body': 0, 'camera_optical': 2}.get(segment.get('pose_reference'))
+                axis = {'body': 0, 'body_axes': 0, 'camera_optical': 2}.get(segment.get('pose_reference'))
                 forward = np.eye(3)[:, axis] if axis is not None else None
                 if anchor is not None:
                     node_id, map_pose, source = anchor

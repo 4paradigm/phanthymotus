@@ -488,11 +488,13 @@ class ExternalOdometryInput:
         self.learning_results[key] = result
         if len(self.learning_results) > 64:
             self.learning_results.popitem(last=False)
-        begin = key[0] if pending is None else min(key[0], pending)
-        # Retain delayed fits for ordinary measurement replay, but do not
-        # force a rewind to a capture that can no longer be published live.
-        if time.time_ns() - begin <= _OUTPUT_TIMEOUT_NS:
-            self.fuser.replay_learning(begin)
+        earliest = time.time_ns() - _OUTPUT_TIMEOUT_NS
+        if pending is not None:
+            # Earlier retries may have aged out while the executor was busy.
+            # Revisit the publishable suffix so a fresh window can still fit.
+            self.fuser.replay_learning(max(earliest, min(key[0], pending)))
+        elif key[0] >= earliest:
+            self.fuser.replay_learning(key[0])
 
     def _apply_ready(self, events):
         if not events and (self.learning_work is None or not self.learning_work[2].done()):

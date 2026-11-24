@@ -28,6 +28,7 @@ def _finish_learning(stream):
     (-.3, True, '/external', False),
     (.3, True, '/external', False),
     (.3, True, '/renamed_motion', False),
+    (-.3, True, '/external', True),
     (.3, True, '/external', True),
     (.3, False, '/external', False),
     (0., True, '/external', False),

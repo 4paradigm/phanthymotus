@@ -33,7 +33,7 @@ def encode_mapping(points, pose, *, max_points, pose_reference=None):
     axis = None
     if pose_reference == 'camera_optical':
         axis, flags = 2, flags | CAMERA_OPTICAL
-    elif pose_reference == 'body':
+    elif pose_reference in ('body', 'body_axes'):
         axis, flags = 0, flags | BODY
     if axis is None or np.linalg.norm(matrix[:2, axis]) < 1e-6:
         ros_yaw, flags = 0., flags | HEADING_UNAVAILABLE
