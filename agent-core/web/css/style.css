@@ -779,6 +779,34 @@ html, body {
 .tool-config-desc + .tool-config-label {
   margin-top: 14px;
 }
+/* x-options-action: the field and the button that fetches its choices. */
+.tool-config-options-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.tool-config-options-row > .tool-config-input {
+  flex: 1;
+  min-width: 0;
+}
+.tool-config-options-btn {
+  flex: none;
+  padding: 0 14px;
+  border: 1px solid var(--border-med);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.tool-config-options-btn:hover:not(:disabled) {
+  background: var(--accent-dim);
+}
+.tool-config-options-btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
 /* Per-field help. Sits under its input, quieter than the label, so the label
    can stay a short name and the explanation still has somewhere to live. */
 .tool-config-help {
