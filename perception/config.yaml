@@ -29,9 +29,10 @@ plugins:
     # Stable ROS topics: existing motus.hand/1 subscribers need no change.
     keypoint_topic: /actucore/handdrive/keypoints
     view_topic: /actucore/handdrive/view
+    # 骨架预览参数已定死在 plugin.py 常量，画布不可见；此处仅作记录。
     draw_view: true
-    line_width: 1
-    point_radius: 3
+    line_width: 5
+    point_radius: 8
     view_jpeg_quality: 90
   # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
   phanthy_music:

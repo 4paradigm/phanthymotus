@@ -72,3 +72,17 @@ def test_rtmpose_imports_from_perception_and_declares_left(monkeypatch):
     assert detection.landmarks[0].tolist() == pytest.approx([.1, .2, 0])
     monkeypatch.setattr(hand_runtime, 'hands_in_frame', lambda *a, **kw: [])
     assert model.detect(np.zeros((101, 101, 3))) == []
+
+
+def test_output_uses_control_hand_flex_format_not_data_json():
+    """The keypoint port must be a control-style stream, not a raw JSON blob."""
+    from plugins.hand_landmarks.plugin import HandLandmarksPlugin, FLEX_FORMAT
+    assert FLEX_FORMAT == "control/hand_flex"
+    p = HandLandmarksPlugin({'hand': 'Right'}, None)
+    outs = p._outputs()
+    kf = [o for o in outs if o['format'] == FLEX_FORMAT]
+    assert kf, f"no {FLEX_FORMAT} output: {outs}"
+    assert not any(o['format'] == 'data/json' for o in outs)
+    # control-style fields present in the wire payload
+    tool = p.get_tools()[0]
+    assert tool['topic_out'][1]['format'] == FLEX_FORMAT

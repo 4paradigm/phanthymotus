@@ -14,6 +14,21 @@ KEYPOINTS = '/actucore/handdrive/keypoints'
 VIEW = '/actucore/handdrive/view'
 
 
+# Fixed skeleton-preview rendering. The canvas hides these knobs (x-show-when
+# below) and the values are pinned here, so they cannot drift via config.yaml
+# or a config action. The preview is always on for exhibition demos.
+VIEW_ALWAYS_ON = True
+VIEW_LINE_WIDTH = 5
+VIEW_POINT_RADIUS = 8
+VIEW_JPEG_QUALITY = 90
+
+# Wire format exposed to the canvas. `control/hand_flex` renders as a
+# structured command stream (like navi's control/velocity), not a raw JSON
+# blob. Five values are the per-finger curls in FINGER_ORDER below.
+FLEX_FORMAT = "control/hand_flex"
+FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")
+
+
 class HandLandmarksPlugin:
     PREFIX = 'hand_landmarks'
 
@@ -30,31 +45,43 @@ class HandLandmarksPlugin:
         self.error = self.view_error = self.model_status = ''
         self.hand_present = False
         self.published = 0
+        self._seq = 0
         self.last_curl = {}
         self.image_topic = ''
 
     def _outputs(self):
         return [{'topic': self.cfg.get('view_topic', VIEW), 'format': 'image/jpeg'},
-                {'topic': self.cfg.get('keypoint_topic', KEYPOINTS), 'format': 'data/json'}]
+                {'topic': self.cfg.get('keypoint_topic', KEYPOINTS), 'format': FLEX_FORMAT}]
 
     def get_tools(self):
         def field(kind, default, scope='shared', **extra):
             return dict(type=kind, default=default, scope=scope, **extra)
 
+        # All configSchema properties except `hand` and `hand_confidence` are
+        # hidden from the canvas form via
+        # x-show-when against a value `hand` can never take ("__hidden__"):
+        # the canvas renders every property and offers no native hide flag.
+        # All values stay in config.yaml / code and config actions can still
+        # change them; only the canvas form is hidden. `hand` stays visible
+        # and is the control field for x-show-when.
+        _hidden = {'x-show-when': {'hand': '__hidden__'}}
         props = {
-            'backend': field('string', 'rtmpose', enum=['rtmpose', 'mediapipe', 'mock']),
+            'backend': field('string', 'rtmpose', enum=['rtmpose', 'mediapipe', 'mock'], **_hidden),
             'hand': field('string', 'Right', enum=['Right', 'Left', 'either']),
-            'model_dir': field('string', '/models/hand'), 'model_path': field('string', ''),
-            'model_family': field('string', '', enum=['', 'jp61', 'jp511']),
-            'mock_pose': field('string', 'open', enum=['open', 'fist', 'alternate']),
-            'hand_confidence': field('number', 0.3), 'slew_rate': field('number', 20.0),
-            'rate_hz': field('number', 10, 'instance'),
-            'keypoint_topic': field('string', KEYPOINTS, 'instance'),
-            'view_topic': field('string', VIEW, 'instance'),
-            'draw_view': field('boolean', True, 'instance'),
-            'line_width': field('integer', 1, 'instance'),
-            'point_radius': field('integer', 3, 'instance'),
-            'view_jpeg_quality': field('integer', 90, 'instance'),
+            'model_dir': field('string', '/models/hand', **_hidden),
+            'model_path': field('string', '', **_hidden),
+            'model_family': field('string', '', enum=['', 'jp61', 'jp511'], **_hidden),
+            'mock_pose': field('string', 'open', enum=['open', 'fist', 'alternate'], **_hidden),
+            'hand_confidence': field('number', 0.3),
+            'slew_rate': field('number', 20.0, **_hidden),
+            'rate_hz': field('number', 10, 'instance', **_hidden),
+            'keypoint_topic': field('string', KEYPOINTS, 'instance', **_hidden),
+            'view_topic': field('string', VIEW, 'instance', **_hidden),
+            # Skeleton-preview knobs are hidden and pinned to module constants.
+            'draw_view': field('boolean', VIEW_ALWAYS_ON, 'instance', **_hidden),
+            'line_width': field('integer', VIEW_LINE_WIDTH, 'instance', **_hidden),
+            'point_radius': field('integer', VIEW_POINT_RADIUS, 'instance', **_hidden),
+            'view_jpeg_quality': field('integer', VIEW_JPEG_QUALITY, 'instance', **_hidden),
         }
         return [{'name': self.PREFIX, 'type': 'processor', 'multiInstance': False,
                  'description': '识别单手 21 个关键点，输出五指弯曲量和绿色骨架预览。',
@@ -201,10 +228,20 @@ class HandLandmarksPlugin:
         now = time.monotonic()
         curl = self.limiter.update(raw, now - self.prev_time if self.prev_time else 0)
         self.prev_time = now
+        curls = {k: round(v, 4) for k, v in curl.items()}
+        self._seq += 1
+        # Payload keeps `schema: motus.hand/1` and the named `flexions` dict so
+        # existing downstream drivers need no change; the extra control-style
+        # fields (seq/values/ttl_ms/source/control_mode) make the canvas render
+        # it as a command stream under the `control/hand_flex` format.
         return detection, {'schema': 'motus.hand/1', 'stamp_ms': int(time.time() * 1000),
-                           'obs_stamp_ms': obs_ms, 'handedness': detection.handedness,
+                           'obs_stamp_ms': obs_ms, 'ttl_ms': 200,
+                           'seq': self._seq, 'source': 'mcp__perception__hand_landmarks',
+                           'control_mode': 'hand_flex',
+                           'values': [curls.get(k, 0.0) for k in FINGER_ORDER],
+                           'handedness': detection.handedness,
                            'handedness_source': detection.handedness_source, 'score': detection.score,
-                           'flexions': {k: round(v, 4) for k, v in curl.items()},
+                           'flexions': curls,
                            'landmarks': [[round(float(x), 5) for x in pt] for pt in detection.landmarks]}
 
     def _tick(self):
@@ -239,13 +276,13 @@ class HandLandmarksPlugin:
                 self.error = ''
             except Exception as exc:
                 self.error = str(exc)
-            if self.cfg.get('draw_view', True):
+            if VIEW_ALWAYS_ON:
                 try:
                     image = frame if detection is None else draw_hand(frame, detection.landmarks,
-                        line_width=int(self.cfg.get('line_width', 1)), point_radius=int(self.cfg.get('point_radius', 3)))
+                        line_width=VIEW_LINE_WIDTH, point_radius=VIEW_POINT_RADIUS)
                     msg = CompressedImage()
                     msg.format = 'jpeg'
-                    msg.data = encode_jpeg(image, int(self.cfg.get('view_jpeg_quality', 90)))
+                    msg.data = encode_jpeg(image, VIEW_JPEG_QUALITY)
                     self.view.publish(msg)
                     self.view_error = ''
                 except Exception as exc:
