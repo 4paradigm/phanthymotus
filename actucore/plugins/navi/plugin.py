@@ -1940,8 +1940,8 @@ class NaviPlugin:
                 vendor = payload.get("vendor")
                 vendor = vendor if isinstance(vendor, dict) else {}
                 stamp_source = vendor.get("stamp_source", timing.get("stamp_source", "robot"))
-                # A component timestamp, when provided, identifies the speed
-                # reading even if a producer republishes it in a newer envelope.
+                # A single-sample packet dates its speed with stamp_ms. When
+                # component times are present, only the speed time can date it.
                 samples = self._received_speed_samples
                 speed_ms = None
                 twist = odom_mod.planar_feedback(self._odom)
@@ -1951,7 +1951,7 @@ class NaviPlugin:
                         speed_ms = stamp
                     elif isinstance(stamps, dict):
                         speed_ms = stamps.get("speed")
-                    self._odom["component_speed_ms"] = (stamps.get("speed") if isinstance(stamps, dict) else None)
+                    self._odom["component_speed_ms"] = speed_ms
                     self._odom["received_speed_ms"] = speed_ms if type(speed_ms) is int and twist is not None else None
                 if type(speed_ms) is not int or not 0 < speed_ms <= now or twist is None:
                     samples.clear()

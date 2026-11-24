@@ -1684,6 +1684,37 @@ def test_repeated_speed_sample_with_independently_updated_pose(change, compact, 
     assert plugin._continuous_feedback_update(old, new, 350, stationary=True) == stationary
 
 
+@pytest.mark.parametrize("stamp, speed_stamps, published", [
+    (1100, {}, True),
+    (1100, {"sample_timestamps_ms": {"speed": 1100}}, True),
+    (1000, {}, False),
+    (995, {}, False),
+    (1101, {}, False),
+    (1100, {"sample_timestamps_ms": {"speed": 1000}}, False),
+    (1100, {"sample_timestamps_ms": {"pose": 1100}}, False),
+])
+def test_route_tracks_received_odometry_with_existing_sample_stamp(monkeypatch, stamp, speed_stamps, published):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 600
+
+    def receive_odometry(stamp_ms, vendor):
+        payload = dict(schema="motus.odom/1", frame="body", stamp_ms=stamp_ms, pose=None,
+                       twist=[.1, 0., None, None, None, 0.],
+                       vendor={"stamp_source": "received", **vendor})
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+        odom = plugin.NaviPlugin._observation_snapshot(card, with_capture_timing=True)[2]
+        objects, depth, _, receipt = snapshot[0]
+        snapshot[0] = objects, depth, odom, receipt
+
+    receive_odometry(1000, {})
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    assert len(packets) == 1 and packets[0]["values"][0] > 0
+    advance_snapshot(snapshot, clock, 1100)
+    receive_odometry(stamp, speed_stamps)
+    card._dispatch_command()
+    assert any(p["values"][0] > 0 for p in packets[1:]) == published
+
+
 @pytest.mark.parametrize("change", [
     "clear", "obstacle", "obstacle_new_odom", "missing_target", "same_speed", "partial_speed",
     "lost_speed", "cancel", "late", "obstacle_failed_stop", "obstacle_duplicate_speed",
