@@ -15,6 +15,21 @@ import scheduler
 router = APIRouter(prefix='/tasks', tags=['tasks'])
 
 
+# ── 静态定时任务（config.main['scheduler']）────────────────────────────────────
+# 写在 `/{task_id}` 前面：路由按注册顺序匹配。
+
+@router.get('/scheduler')
+async def list_static_schedules():
+    """List static scheduler entries — they outlive history resets and restarts."""
+    return {'jobs': scheduler.list_static()}
+
+
+@router.delete('/scheduler/{name}')
+async def delete_static_schedule(name: str):
+    """Remove a static scheduler entry from config and stop its running timer."""
+    return {'ok': scheduler.remove_static(name)}
+
+
 @router.get('')
 async def list_tasks():
     """List all active tasks."""

@@ -94,6 +94,9 @@ class SubagentManager:
         self._store = SubagentStore()
         self._scheduler_task: asyncio.Task | None = None
         self._timeout_tasks: dict[str, asyncio.Task] = {}
+        # discard_all() 丢掉的 agent：它们的 task 被取消后还会走一遍收尾代码，
+        # 收尾里的 checkpoint / 落结论 / 唤醒主代理必须对它们全部失效。
+        self._discarded: set[str] = set()
         self._cfg = _get_config()
 
     async def start(self) -> None:
@@ -170,6 +173,48 @@ class SubagentManager:
         # Kick scheduler
         self._queue._notify.set()
         return agent.id
+
+    async def discard_all(self, reason: str = '') -> int:
+        """丢掉所有非终态子代理 —— 排队的、在跑的、挂起的，不留痕迹。
+
+        给「清空历史对话」用。`cancel()` 做不到：它让在跑的 agent 走正常收尾，收尾
+        会把结论写进 `subagent_conclusions`、把对话写回 chat_history，再用
+        `subagent:<id>` 事件唤醒主代理 —— 等于把刚清掉的旧任务原样送回来。而挂起的
+        agent 留在 `subagents` 表里，下次启动 `_restore()` 会把它重新排队、接着做原来
+        的目标。所以这里硬取消 task、删掉表里的行，并让收尾路径对它们静默。
+        """
+        ids = set(self._agents)
+        try:
+            ids.update(rec['id'] for rec in self._store.load_active())
+        except Exception as e:
+            print(f'[subagent] discard_all: load_active failed: {e}')
+        if not ids:
+            return 0
+        self._discarded.update(ids)
+
+        tasks = []
+        for aid in ids:
+            self._queue.remove(aid)
+            agent = self._agents.get(aid)
+            if agent:
+                agent.cancel(reason or 'discarded')
+            task = self._running.get(aid)
+            if task and not task.done():
+                task.cancel()
+                tasks.append(task)
+            watchdog = self._timeout_tasks.pop(aid, None)
+            if watchdog:
+                watchdog.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=5.0)
+
+        for aid in ids:
+            self._agents.pop(aid, None)
+            self._completed.pop(aid, None)
+            self._running.pop(aid, None)
+            self._store.delete(aid)
+        print(f'[subagent] discarded {len(ids)} agent(s): {reason}')
+        return len(ids)
 
     async def spawn_and_wait(self, spec: SubagentSpec, timeout: float = 120) -> SubagentResult:
         """Spawn a subagent and wait for its result (synchronous from caller's perspective)."""
@@ -392,6 +437,9 @@ class SubagentManager:
 
     def _finalize(self, agent: Subagent):
         """Handle terminal state: store result, notify, cleanup, save history."""
+        if agent.id in self._discarded:
+            self._agents.pop(agent.id, None)
+            return
         result = agent.result
         if result:
             # Store in completed ring (keep last 50)
@@ -529,6 +577,8 @@ class SubagentManager:
 
     def _checkpoint(self, agent: Subagent):
         """Persist agent state to SQLite."""
+        if agent.id in self._discarded:
+            return
         self._store.save_checkpoint(
             agent_id=agent.id,
             spec=agent.spec,
