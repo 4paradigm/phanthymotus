@@ -997,10 +997,7 @@ async function _removeCard(id) {
   // leave it, so its ROS node, subscription and any CUDA context would live
   // until perception exits — publishing to a topic no card accounts for.
   // `stop` is idempotent, so doing this to a card that was never started is fine.
-  const tool = _allMcps.find(m => m.id === removed.mcpId)?.tools?.find(t => t.name === removed.toolName);
-  if (tool?.type !== 'sensor') {
-    _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
-  }
+  _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
   removed.el.remove();
   _cards.splice(idx, 1);
   // Trigger stop for connections where this card was the source
@@ -1071,9 +1068,7 @@ async function _clearCanvas() {
     } else {
       // A 403 has already reloaded the server's layout in _writeLayout.
       if (!_isEditor) { _showToast('编辑权已被其他会话获取，画布未清空'); return; }
-      // The server persists the layout first and only then stops each removed
-      // instance, so a slow teardown outlasts the timeout after the clear has
-      // in fact happened. Ask the server instead of reporting a failure.
+      // A lost response does not mean the empty layout was not saved.
       await _reloadLayout();
       if (_cards.length) {
         _showToast('未能确认画布是否清空，请检查网络后重试');
@@ -1081,7 +1076,7 @@ async function _clearCanvas() {
       }
     }
 
-    // Clearing cards leaves sensor collection, including browser sources, running.
+    // Only remove the cards; services and browser sources keep running.
     for (const card of doomed) {
       card.el.remove();
     }

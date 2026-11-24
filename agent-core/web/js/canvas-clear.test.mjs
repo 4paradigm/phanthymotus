@@ -151,7 +151,7 @@ test('a project that starts during clear preparation prevents the layout write',
 test('a write that times out but did land is reported as cleared and preserves browser sources', async () => {
   const f = fixture();
   f.ctx.fetch = async () => { throw new Error('aborted'); };
-  // The server saved [] before its slow teardown; reloading reads that back.
+  // The server saved [] before the response was lost; reloading reads that back.
   f.ctx._reloadLayout = async () => {
     for (const c of f.ctx._cards) c.el.remove();
     f.ctx._cards = []; f.ctx._connections = []; f.ctx._execConnections = [];
