@@ -6,7 +6,7 @@
 
 1. 停止画布项目，移除旧的 ActuCore `handdrive` / `hand_landmarks` 实例。避免新旧实例同时发布同一话题。
 2. 部署含此改动的 **Perception** 镜像；保留 L20 Lite 驱动服务。以前保存的画布节点绑定的是 ActuCore 的 MCP 服务，即便工具名相同也要重新添加。
-3. 添加 Perception 的 `hand_landmarks`。将相机 `image/jpeg` 接到它的输入，将它的 `data/json` 接到 `hand_visual_follow`。骨架 `image/jpeg` 仅供预览。
+3. 添加 Perception 的 `hand_landmarks`。将相机 `image/jpeg` 接到它的输入，将它的 `control/hand_flex`（五指弯曲量指令流）接到 `hand_visual_follow` 的输入。另一个 `image/jpeg` 输出是绿色骨架预览，仅供查看、不参与控制。
 4. 设置 `hand` 与驱动卡的 `bound_side` 一致；左手机械手用 `Left` 和 `left`。RTMPose 整图推理不测左右手，输出明确标记为 `handedness_source=configured`。
 
 默认保留 `/actucore/handdrive/keypoints` 和 `/actucore/handdrive/view` 两个 ROS 话题名，前缀仅为兼容旧订阅方。JSON 协议仍是 `motus.hand/1`：`landmarks`、`flexions`、`score`、`handedness`、`handedness_source`、`stamp_ms`、`obs_stamp_ms`。旧版可选的 `control/joint` 不再发布；若已有项目直接依赖该端口，不能用本卡直接替换。

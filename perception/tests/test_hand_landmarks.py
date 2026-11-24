@@ -86,3 +86,21 @@ def test_output_uses_control_hand_flex_format_not_data_json():
     # control-style fields present in the wire payload
     tool = p.get_tools()[0]
     assert tool['topic_out'][1]['format'] == FLEX_FORMAT
+
+
+def test_documented_canvas_port_contract_matches_topic_out():
+    """The migration doc must name the same format the card advertises.
+
+    A format change that leaves the doc behind makes the documented canvas
+    wiring impossible (the operator connects a port that does not exist).
+    """
+    from pathlib import Path
+    from plugins.hand_landmarks.plugin import HandLandmarksPlugin, FLEX_FORMAT
+
+    doc = (Path(__file__).resolve().parents[1] / 'docs' / 'hand-landmarks.md').read_text()
+    assert FLEX_FORMAT in doc, "migration doc must name the flexion port format"
+    assert 'data/json' not in doc, "doc still advertises a port the card no longer has"
+    p = HandLandmarksPlugin({'hand': 'Right'}, None)
+    outs = p.get_tools()[0]['topic_out']
+    assert any(o['format'] == FLEX_FORMAT for o in outs)
+    assert not any(o['format'] == 'data/json' for o in outs)
