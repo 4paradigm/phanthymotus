@@ -355,12 +355,55 @@ def test_the_fallback_corridor_uses_dashed_guides_without_a_dimension_bar():
 
 
 @needs_cv2
-def test_a_planned_route_is_drawn_with_dashes(monkeypatch):
-    monkeypatch.setattr(V, "route_lines", lambda *args, **kwargs: [
-        ((220, 150), (220, 350), False),
-    ])
-    column = (_render(clearance=1.0)[150:350, 220] == V._CORRIDOR).all(axis=1)
-    assert column.any() and not column.all()
+def test_a_planned_route_is_drawn_with_two_white_corridor_edges():
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    config = P.Config(half_width_m=.25)
+    keep = config.half_width_m + config.clearance_margin_m
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    route = Detour(None, ((.8, 0.), (1.05, 0.), (1.3, .2), (1.8, .2)), geometry)
+    frame = _render(depth_m=depth, ground=ground, detour=route, clearance=None, config=config)
+    route_color = (frame == (255, 255, 255)).all(axis=2)
+    # The horizontal focal length is twice the vertical focal length times
+    # the floor height, so each row projects twice the half-width in pixels.
+    rows = np.arange(400, 430)
+    half_span = np.rint(2 * keep * (rows - 240)).astype(int)
+    assert route_color[rows, 320 - half_span].all()
+    assert route_color[rows, 320 + half_span].all()
+    assert not route_color[rows, 320].any()
+    turn_span = round(2 * keep * (363 - 240))
+    assert route_color[363, 369 - turn_span] and route_color[363, 369 + turn_span]
+
+
+@needs_cv2
+@pytest.mark.parametrize("project_detour", [True, False], ids=["no-ground", "new-depth"])
+def test_unprojectable_route_stays_centered_in_the_main_view(project_detour):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = None if project_detour else np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    route = Detour(None, ((0., 0.), (.25, 0.), (.8, .3), (1.2, .24)), geometry)
+    config = P.Config(half_width_m=.25)
+    keep = config.half_width_m + config.clearance_margin_m
+    frame = _render(depth_m=depth, ground=ground, detour=route, clearance=1.,
+                    project_detour=project_detour, config=config)
+    baseline = _render(depth_m=depth, ground=ground, clearance=1.)
+
+    white = (frame == (255, 255, 255)).all(axis=2)
+    # The schematic uses the same half-width and perspective scale on both sides.
+    rows = np.arange(410, 435)
+    half_span = np.rint(640 * .5 * keep * (rows / 480 - .6) / .31).astype(int)
+    assert white[rows, 320 - half_span].all()
+    assert white[rows, 320 + half_span].all()
+    assert not white[rows, 320].any()
+    assert np.array_equal(frame[:145, 500:], baseline[:145, 500:])
 
 
 @needs_cv2
@@ -451,22 +494,14 @@ def test_route_monitor_draws_selected_and_executing_routes_without_ground():
     executing = _render(ground=None, clearance=None, detour=candidate, executing=active)
     assert not np.array_equal(preview, baseline)
     assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
-    assert (executing == V._EXECUTING_ROUTE).all(axis=2).any()
+    green = (executing == V._EXECUTING_ROUTE).all(axis=2)
+    assert green[350:440, 230:320].any()
+    assert np.array_equal(executing[:145, 500:], baseline[:145, 500:])
 
 
 @needs_cv2
-def test_target_guidance_is_a_dashed_line_in_the_main_image():
-    frame = _render(ground=None, clearance=None, route_target=(2., 0.))
+def test_target_box_has_no_dashed_line_to_the_robot():
+    frame = _render(ground=None, clearance=None, box=(.25, .25, .75, .5))
     target = (frame == V._TARGET).all(axis=2)
-    assert not target[:145, 500:].any()
-    centre = target[290:420, 320]
-    assert centre.any() and not centre.all()
-
-
-@pytest.mark.parametrize("bearing, column", [(-1.2, 12), (1.2, 627)])
-@needs_cv2
-def test_offscreen_target_has_a_dashed_arrow_at_the_correct_edge(bearing, column):
-    frame = _render(ground=None, clearance=None, target_bearing=bearing)
-    target = (frame == V._TARGET).all(axis=2)
-    assert target[268:287, column].any()
-    assert not target[:145, 500:].any()
+    assert target[240, 320]
+    assert not target[260:430, 300:340].any()

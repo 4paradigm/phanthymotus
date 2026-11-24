@@ -37,10 +37,10 @@ def test_payload_without_requested_target_cannot_make_memory_motion_renewable(mo
             _, fresh_depth, fresh_odom, _ = snapshot[0]
             snapshot[0] = (absent_target_payload(kind, stamp), fresh_depth, fresh_odom, stamp)
             card._dispatch_command()
-        assert packets[-1]["values"] == [0.] * 6
-    nonzero = [packet for packet in packets if any(packet["values"])]
-    assert len(nonzero) == 1 and nonzero[0]["values"] == message["values"]
-    assert nonzero[0]["stamp_ms"] + nonzero[0]["ttl_ms"] <= message["stamp_ms"] + message["ttl_ms"]
+        assert card._scheduled_command is None
+    packet, = packets
+    assert packet["values"] == message["values"]
+    assert packet["stamp_ms"] + packet["ttl_ms"] <= message["stamp_ms"] + message["ttl_ms"]
 
 
 @pytest.mark.parametrize("kind", ["empty", "unrelated"])
@@ -63,8 +63,7 @@ def test_targetless_payload_preserves_sent_motion_only_until_its_fixed_deadline(
         assert card._scheduled_command.forward_check.motion_guard.deadline_ms == deadline
     advance_snapshot(snapshot, clock, deadline)
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
-    assert len([packet for packet in packets if any(packet["values"])]) == 1
+    assert [packet["values"] for packet in packets] == [message["values"]]
     assert card._scheduled_command is None
     assert len(calls) == card._state.dwa_totals["select_calls"]
 
@@ -85,7 +84,7 @@ def test_targetless_timer_tick_does_not_insert_zero_before_legal_coasting_replan
     assert all(packet["values"][0] > 0. for packet in packets)
 
 
-@pytest.mark.parametrize("event,stop_reason", [
+@pytest.mark.parametrize("event,rejection", [
     ("clear", None),
     ("obstacle", "footprint_collision"),
     ("stranger", None),
@@ -96,7 +95,7 @@ def test_targetless_timer_tick_does_not_insert_zero_before_legal_coasting_replan
     ("front_requirement", None),
     ("source_regression", "target_missing"),
 ])
-def test_timer_during_coasting_selection_keeps_only_a_still_valid_sent_command(monkeypatch, event, stop_reason):
+def test_timer_during_coasting_selection_keeps_only_a_still_valid_sent_command(monkeypatch, event, rejection):
     from plugins.navi import policy
 
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False, live_target=True)
@@ -136,7 +135,7 @@ def test_timer_during_coasting_selection_keeps_only_a_still_valid_sent_command(m
                 snapshot[0] = dict(payload, timestamp=.9), latest_depth, latest_odom, receipt
             card._dispatch_command()
             during.append(dict(card._dwa_publication))
-            if stop_reason is None:
+            if rejection is None:
                 assert card._scheduled_command is original
                 assert original.expires_ms == original.forward_check.motion_guard.deadline_ms == 1250
         return select(*args, **kwargs)
@@ -153,13 +152,14 @@ def test_timer_during_coasting_selection_keeps_only_a_still_valid_sent_command(m
         else:
             # The replacement was planned against the coasting goal.
             assert packets[-1]["values"] == next_message["values"]
-    elif stop_reason is None:
+    elif rejection is None:
         assert card._last_decision.dwa_acceptance is not None
         assert card._stage_command(next_message, card._output_epoch)
         assert len(packets) == 2 and all(packet["values"][0] > 0. for packet in packets)
     else:
-        assert packets[-1]["values"] == [0.] * 6
-        assert during[0]["reason"] == stop_reason
+        assert [packet["values"] for packet in packets] == [message["values"]]
+        assert card._scheduled_command is None
+        assert (during[0]["event"], during[0]["reason"]) == ("veto", rejection)
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
@@ -176,7 +176,7 @@ def test_unpublished_observed_command_cannot_coast_after_tracker_consumes_a_miss
         card._publish_command(message)
     else:
         card._stage_command(message, card._output_epoch)
-    assert all(packet["values"] == [0.] * 6 for packet in packets)
+    assert not packets
     assert card._state.dwa_totals.get("published_packets", 0) == 0
     assert card._dwa_publication["reason"] == "superseded"
 
@@ -245,16 +245,15 @@ def test_repeated_matching_source_keeps_its_original_target_deadline(monkeypatch
         _, depth, odom, _ = snapshot[0]
         snapshot[0] = (original_payload, depth, odom, stamp)
         card._dispatch_command()
-    nonzero = [packet for packet in packets if any(packet["values"])]
-    assert len(nonzero) == 1
-    assert all(packet["values"] == message["values"] for packet in nonzero)
-    assert all(packet["stamp_ms"] + packet["ttl_ms"] <= target_deadline for packet in nonzero)
+    packet, = packets
+    assert packet["values"] == message["values"]
+    assert packet["stamp_ms"] + packet["ttl_ms"] <= target_deadline
     assert card._scheduled_command is None
     advance_snapshot(snapshot, clock, target_deadline)
     _, depth, odom, _ = snapshot[0]
     snapshot[0] = (original_payload, depth, odom, target_deadline)
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
+    assert packets == [packet]
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["body", "camera"])
@@ -334,10 +333,10 @@ def test_a_different_person_cannot_renew_the_original_target_command(monkeypatch
                    config=card._config, ego=(.1, 0., 0.), ego_measured=True, dt=(stamp - 1000) / 1000)
         assert not probe.track.accepted_detection and probe.track.measured_range_m is None
         card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
-    nonzero = [packet for packet in packets if any(packet["values"])]
-    assert len(nonzero) == 1
-    assert nonzero[0]["stamp_ms"] + nonzero[0]["ttl_ms"] <= message["stamp_ms"] + message["ttl_ms"]
+    packet, = packets
+    assert packet["values"] == message["values"]
+    assert packet["stamp_ms"] + packet["ttl_ms"] <= message["stamp_ms"] + message["ttl_ms"]
+    assert card._scheduled_command is None
 
 
 @pytest.mark.parametrize("retain_original", [True, False], ids=["original-present", "original-lost"])
@@ -410,7 +409,9 @@ def test_coasting_person_uses_remembered_front_within_original_deadline(monkeypa
         card._publish_command(message)
     else:
         card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
+        assert card._scheduled_command is None
+    assert [packet["values"] for packet in packets] == [message["values"]]
+    assert card._dwa_publication["reason"] == "publish_expired"
 
 
 def test_coasting_person_timer_leaves_new_feedback_and_hits_for_planner(monkeypatch):
@@ -475,10 +476,12 @@ def test_sent_memory_command_rechecks_physics_during_target_reappearance(monkeyp
         replacement = card.next_command()
         assert card._stage_command(replacement, epoch)
         assert len(packets) == 2 and all(any(packet["values"]) for packet in packets)
-    elif event in ("cancel", "expiry"):
+    elif event == "cancel":
         assert packets[-1]["values"] == [0.] * 6
-        if event == "expiry":
-            assert card._dwa_publication["reason"] == "publish_expired"
+    elif event == "expiry":
+        assert [packet["values"] for packet in packets] == [message["values"]]
+        assert card._scheduled_command is None
+        assert card._dwa_publication["reason"] == "publish_expired"
     else:
         assert len(packets) == 1 and card._scheduled_command.expires_ms == deadline
 
@@ -554,7 +557,11 @@ def test_publication_follows_confirmed_target_generation(monkeypatch, life):
     assert (tracker.track is original) == (life != "replaced")
     assert tracker.track.observed == (life != "pending")
     card._publish_command(message)
-    assert packets[-1]["values"] == (message["values"] if life == "reconfirmed" else [0.] * 6)
+    if life == "reconfirmed":
+        assert [packet["values"] for packet in packets] == [message["values"]]
+    else:
+        assert not packets
+        assert card._dwa_publication["reason"] == "superseded"
 
 
 @pytest.mark.parametrize("method", ["sample", "turn"])
@@ -672,7 +679,9 @@ def test_memory_first_send_checks_new_same_generation_range(monkeypatch, body, d
                 card._publish_command(message)
             else:
                 card._dispatch_command()
-            assert packets[-1]["values"] == [0.] * 6
+                assert card._scheduled_command is None
+            assert packets == [packet]
+            assert card._dwa_publication["reason"] == "publish_expired"
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
@@ -835,7 +844,7 @@ def test_fixed_window_first_send_with_receipt_only_detector(monkeypatch, body, u
         if not body:
             advance_snapshot(snapshot, clock, initial.motion_guard.deadline_ms)
             card._dispatch_command()
-            assert packets[-1]["values"] == [0.] * 6
+            assert packets == [packet] and card._scheduled_command is None
     else:
         assert card._dwa_publication["reason"] == "target_missing"
 
@@ -1069,12 +1078,14 @@ def test_visible_person_without_front_fix(monkeypatch, scene, can_advance, vx_ma
         assert 0. < packets[-1]["values"][0] <= vx_max
         assert packets[-1]["values"][1:5] == [0.] * 4
         assert bool(packets[-1]["values"][5]) == (scene == "detour")
-    else:
-        assert packets[-1]["values"] == [0.] * 6
-    if update == "moved_person":
+    elif update == "moved_person":
+        assert not packets
+        assert card._dwa_publication["reason"] == "stale_observation"
         next_message = card.next_command()
         assert next_message["values"][5] < 0.
         assert card._last_decision.distance_m is None
+    else:
+        assert packets[-1]["values"] == [0.] * 6
 
 
 @pytest.mark.parametrize("update", ["match", "same", "unrelated", "blocked", "future_receipt"])
@@ -1101,8 +1112,15 @@ def test_slow_duplicate_plan_uses_independent_new_target_and_physical_check(monk
     monkeypatch.setattr(policy, "step", slow_step)
     message = card.next_command()
     card._publish_command(message)
-    assert (packets[-1]["values"][0] > 0.) == (update == "match")
     if update == "match":
-        assert packets[-1]["obs_stamp_ms"] == 1470
+        packet, = packets
+        assert packet["values"][0] > 0. and packet["obs_stamp_ms"] == 1470
         assert card._wire_dwa_origin.forward_check.target_source == 1.47
+    elif update == "blocked":
+        packet, = packets
+        assert packet["values"] == [0.] * 6
+        assert card._dwa_publication["reason"] == "footprint_collision"
+    else:
+        assert not packets
+        assert card._dwa_publication["reason"] == "publish_expired"
     assert not card._state.tracker.track.accepted_detection

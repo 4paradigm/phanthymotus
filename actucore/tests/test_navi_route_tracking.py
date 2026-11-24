@@ -78,8 +78,8 @@ def test_unregistered_or_interrupted_route_cannot_move_the_wire(monkeypatch, cha
     card._dispatch_command()
     clock[0] = 1500
     card._dispatch_command()
-    assert len(packets) >= 2
-    assert all(not any(packet["values"]) for packet in packets[1:])
+    assert len(packets) == 1
+    assert card._scheduled_command is None
 
 
 def test_expired_new_plan_leaves_current_route_with_controller(monkeypatch):
@@ -98,6 +98,58 @@ def test_expired_new_plan_leaves_current_route_with_controller(monkeypatch):
     stop = card._command_message([0.] * 6, clock[0] / 1000, clock[0])
     assert card._stage_command(stop, card._output_epoch)
     assert not any(packets[-1]["values"])
+
+
+@pytest.mark.parametrize("reason", ["publish_expired", "stale_observation", "no_feedback", "superseded"])
+def test_rejected_replacement_does_not_zero_the_active_route(monkeypatch, reason):
+    card, packets, _, _ = route_card(monkeypatch, advance=False)
+    current = card._scheduled_command
+    proposal = card.next_command()
+    assert any(proposal["values"])
+    monkeypatch.setattr(card, "_recheck_dwa_inputs", lambda *args: (reason, None))
+    assert card._stage_command(proposal, card._output_epoch)
+    assert card._scheduled_command is current
+    assert len(packets) == 1
+
+
+def test_route_expiry_does_not_emit_a_zero_or_renew_the_packet(monkeypatch):
+    card, packets, clock, _ = route_card(monkeypatch, advance=False)
+    clock[0] = card._scheduled_command.expires_ms
+    card._dispatch_command()
+    card._dispatch_command()
+    assert len(packets) == 1 and packets[0]["values"][0] > 0
+    assert card._scheduled_command is None
+
+
+def test_no_planner_result_leaves_the_valid_route_with_the_controller(monkeypatch):
+    card, packets, _, _ = route_card(monkeypatch, advance=False)
+    current = card._scheduled_command
+    monkeypatch.setattr(policy, "step", lambda **_: policy.Decision(None, policy.BLIND))
+    message = card.next_command()
+    assert card._stage_command(message, card._output_epoch)
+    assert len(packets) == 1 and card._scheduled_command is current
+
+
+def test_confirmed_measured_track_replaces_an_old_detour_goal(monkeypatch):
+    card, packets, _, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    _, depth, odom, _ = snapshot[0]
+    pose = PlanarPose(1000, ("odom",), .2, .1, .1)
+    depth.update(obstacle_capture_pose=pose)
+    odom.update(motion_pose=pose, obstacle_pose=pose)
+    state = card._state
+    track = state.tracker.track
+    old = state.goal_anchor
+    old.generation = track.generation - 1
+    old.target_missing = True
+
+    message = card.next_command()
+    assert state.goal_anchor is not old
+    assert state.tracker.track is track and track.measured_range_m is not None
+    assert card._last_decision.dwa_acceptance.target_observed
+    assert card._stage_command(message, card._output_epoch)
+    assert len(packets) == 1 and packets[0]["values"][0] > 0
+    assert card._scheduled_command.repeat_until is not None
 
 
 def test_expiry_during_new_plan_wire_check_does_not_evict_live_route(monkeypatch):
@@ -232,4 +284,5 @@ def test_route_uses_speed_measurement_age_through_write(monkeypatch, now, delay,
     else:
         clock[0] = 1500
         card._dispatch_command()
-        assert not any(packets[-1]["values"])
+        assert len(packets) == 1
+        assert card._scheduled_command is None

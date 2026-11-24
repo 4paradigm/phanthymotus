@@ -1812,6 +1812,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if pose is not None:
             state.dwa_association = track.snapshot(stamp), pose
     anchor = state.goal_anchor
+    if (config.local_controller == "dwa" and anchor is not None and anchor.generation is not None
+            and isinstance(track, Track) and track.observed
+            and track.accepted_detection and track.measured_range_m is not None
+            and track.navigation_range_known and track.generation != anchor.generation):
+        # A newly confirmed range starts a route for this generation. Keeping
+        # the detached goal makes the publisher treat it as a coasting route.
+        _reset_detour_route(state)
+        state.goal_anchor = anchor = None
     visual_only = bool(track is not None and track.observed and getattr(track, "front_required", False)
                        and track.front_fix is None)
     recovering = state.reacquire_generation is not None
@@ -4291,12 +4299,10 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 feedback = planar_feedback(odom)
                 approach_clear = False
                 approach_yaw = 0.
-                if (approach and scan is not None and not scan.active
-                        and (feedback is not None or state.motion_source == "command")):
+                if approach and scan is not None and not scan.active and feedback is not None:
                     approach_geometry = (config.scan_geometry if "scan_grid" in planning_depth
                                          else config.local_geometry)
-                    motion = feedback if feedback is not None else state.command_tail
-                    velocities = (motion, state.commanded)
+                    velocities = (feedback, state.commanded)
                     safe_speed = min(ahead - stationary_line,
                                      target_distance - config.stop_distance_m) / horizon_s
                     if (approach_geometry is not None and depth.get("map") is not None
@@ -4305,7 +4311,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                                     for vx, vy, _ in velocities)):
                         grid = state.local_plan.grid_for(planning_depth, approach_geometry)
                         yaw = _clamp(wz, _scan_yaw_rate(config, 1. if wz < 0. else -1.))
-                        if (feedback is not None and yaw and abs(yaw) >= config.floor_wz_moving
+                        if (yaw and abs(yaw) >= config.floor_wz_moving
                                 and (grid[0].any() or grid[1].any()) and local_path.motion_sweep_clear(
                                     grid, approach_geometry, config.half_width_m, horizon_s, (*velocities, (approach, 0., yaw)))):
                             approach_yaw, approach_clear = yaw, True

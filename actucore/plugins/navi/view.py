@@ -34,7 +34,7 @@ import math
 
 import numpy as np
 
-from .local_path import camera_square, intrinsics_for, optical_ground_plane
+from .local_path import intrinsics_for, optical_ground_plane
 
 # **The dashboard's own depth ramp, not a second one.**
 #
@@ -236,7 +236,7 @@ def _target_guidance(geometry, start, target, stop_distance_m):
 
 def route_lines(depth_m, ground, geometry, points, target, keep, width, height, *,
                 stop_distance_m, pending=False):
-    """Project route boundaries and dashed guidance to the stopping point."""
+    """Project the route centerline, or its boundaries when keep is positive."""
     if geometry is None or depth_m is None or ground is None or not (points or target):
         return []
     plane = optical_ground_plane(depth_m, geometry, ground)
@@ -258,7 +258,7 @@ def route_lines(depth_m, ground, geometry, points, target, keep, width, height, 
     lines = []
     for centre, dashed in sections:
         forward = centre[:, 0]
-        for side in (-keep, keep):
+        for side in ((-keep, keep) if keep else (0.,)):
             right = centre[:, 1] + side
             floor = (offset + normal @ origin - normal[0] * forward + normal[1] * right) / normal[2]
             optical = (np.column_stack((forward, -right, floor)) - origin) @ rotation
@@ -305,34 +305,25 @@ def _line(frame, start, end, colour, thickness: int = 2):
     cv2.line(frame, start, end, colour, thickness, cv2.LINE_AA)
 
 
-def _draw_route_inset(frame, detour, executing):
+def _route_stroke(frame, polylines, colour):
     import cv2
 
-    routes = [(route.points, colour) for route, colour in
-              ((detour, _CORRIDOR), (executing, _EXECUTING_ROUTE))
-              if route is not None and len(route.points) > 1]
-    height, width = frame.shape[:2]
-    size = min(132, width // 3, height // 3)
-    if not routes or size < 40:
-        return
+    cv2.polylines(frame, polylines, False, _CASING, 6, cv2.LINE_AA)
+    cv2.polylines(frame, polylines, False, colour, 3, cv2.LINE_AA)
 
-    points = np.array([(0., 0.)] + [point for route, _ in routes for point in route])
-    lower, upper = points.min(axis=0), points.max(axis=0)
-    midpoint = (upper + lower) / 2
-    scale = (size - 32) / max(.3, float((upper - lower).max()))
-    left, top = width - size - 8, 8
 
-    def pixel(point):
-        forward, right = (point - midpoint) * scale
-        return round(left + size / 2 + right), round(top + size / 2 + 6 - forward)
-
-    cv2.rectangle(frame, (left, top), (left + size, top + size), _CASING, -1)
-    _text(frame, "Top view", (left + 7, top + 15), _CORRIDOR, .38)
-    for route, colour in routes:
-        pixels = [pixel(point) for point in route]
-        for start, end in zip(pixels, pixels[1:]):
-            _line(frame, start, end, colour, thickness=3)
-    cv2.circle(frame, pixel((0., 0.)), 3, _TARGET, -1, cv2.LINE_AA)
+def _schematic_route(route, width, height, *, keep=0.):
+    """Draw the robot-relative route in the corridor area without a floor pose."""
+    if route is None or len(route.points) < 2:
+        return []
+    forward, right = np.asarray(route.points).T
+    scale = 1. / (1. + np.maximum(forward, 0.))
+    rows = height * (.60 + .31 * scale)
+    paths = []
+    for side in ((-keep, keep) if keep else (0.,)):
+        columns = width * (.5 + .5 * (right + side) * scale)
+        paths.append(np.rint(np.column_stack((columns, rows))).astype(np.int32))
+    return paths
 
 
 def _arrow(frame, origin, dx, dy, colour, label: str):
@@ -345,11 +336,11 @@ def _arrow(frame, origin, dx, dy, colour, label: str):
         _text(frame, label, (end[0] + 6, end[1] + 4), colour, 0.45)
 
 
-def _dashed_line(frame, a, b, colour, phase=0.):
+def _dashed_line(frame, a, b, colour):
     length = math.dist(a, b)
     if not length:
-        return phase
-    offset = -phase
+        return
+    offset = 0.
     while offset < length:
         start, end = max(0., offset), min(length, offset + 8.)
         if start < end:
@@ -357,45 +348,11 @@ def _dashed_line(frame, a, b, colour, phase=0.):
                       for t in (start, end)]
             _line(frame, *points, colour, thickness=2)
         offset += 15.
-    return (phase + length) % 15.
-
-
-def _draw_target_direction(frame, bearing, box, config):
-    height, width = frame.shape[:2]
-    start = (width // 2, height - 46)
-    if box:
-        end = (round(width * (box[0] + box[2]) / 2), round(height * box[3]))
-        _dashed_line(frame, start, end, _TARGET)
-        return
-    if bearing is None or not math.isfinite(bearing):
-        return
-
-    intrinsics = getattr(config, "depth_intrinsics", None)
-    if abs(bearing) >= math.pi / 2:
-        column = width if bearing > 0. else -1
-    elif intrinsics is None:
-        column = _column_of(bearing, config.half_fov_rad, width)
-    else:
-        fx, cx = intrinsics.for_width(width)
-        column = round(cx + fx * math.tan(bearing))
-    offscreen = not 0 <= column < width
-    if offscreen:
-        column = width - 13 if bearing > 0. else 12
-    end = (column, round(height * .58))
-    _dashed_line(frame, start, end, _TARGET)
-
-    if offscreen:
-        direction = math.atan2(end[1] - start[1], end[0] - start[0])
-        for wing in (-.55, .55):
-            angle = direction + wing
-            corner = (round(end[0] - 13 * math.cos(angle)), round(end[1] - 13 * math.sin(angle)))
-            _line(frame, corner, end, _TARGET)
 
 
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
            measured=None, rgb_jpeg=None, blend: float = 0.5,
-           ground=None, detour=None, executing=None, depth_vertical=None, route_target=None,
-           target_bearing=None,
+           ground=None, detour=None, executing=None, project_detour=True,
            width: int = 640, height: int = 480):
     """One frame. Every input may be absent — the overlay still draws.
 
@@ -428,22 +385,14 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                                interpolation=cv2.INTER_NEAREST)
 
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
-    geometry = (detour.geometry if detour is not None else
-                camera_square(config.depth_intrinsics, depth_vertical, config.half_width_m))
-    lines = route_lines(depth_m, ground, geometry, detour.points if detour is not None else (),
-                        None, keep, width, height,
-                        stop_distance_m=config.stop_distance_m,
-                        pending=detour is not None and detour.command is None)
-    phase, previous_end = 0., None
-    for a, b, dashed in lines:
+    lines = (route_lines(depth_m, ground, detour.geometry, detour.points, None, keep,
+                         width, height, stop_distance_m=config.stop_distance_m)
+             if detour is not None and project_detour else ())
+    projected = []
+    for a, b, _ in lines:
         visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
         if visible:
-            if dashed:  # Guidance already contains gaps in ground coordinates.
-                _line(frame, a, b, _CORRIDOR, thickness=2)
-            else:
-                phase = _dashed_line(frame, a, b, _CORRIDOR, phase if a == previous_end else 0.)
-            previous_end = b
-
+            projected.append(np.asarray((a, b), dtype=np.int32))
     execution_visible = False
     if executing is not None:
         for a, b, _ in route_lines(depth_m, ground, executing.geometry, executing.points, None,
@@ -452,8 +401,13 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
             if visible:
                 _line(frame, a, b, _EXECUTING_ROUTE, thickness=3)
                 execution_visible = True
-    if (detour is not None and previous_end is None) or (executing is not None and not execution_visible):
-        _draw_route_inset(frame, detour, executing)
+        if not execution_visible:
+            executing_path = _schematic_route(executing, width, height)
+            if executing_path:
+                _route_stroke(frame, executing_path, _EXECUTING_ROUTE)
+    schematic = _schematic_route(detour, width, height, keep=keep) if not projected else []
+    if projected or schematic:
+        _route_stroke(frame, projected or schematic, _CORRIDOR)
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #
@@ -463,7 +417,7 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     edges = corridor_edges(clearance, config, width)
     if edges:
         colour = _WARN if clearance <= config.obstacle_stop_m else _CORRIDOR
-        if not lines:
+        if detour is None:
             for far, near in zip(edges, corridor_edges(clearance * .5, config, width)):
                 visible, a, b = cv2.clipLine((0, 0, width, height),
                                             (far, int(height * .62)), (near, height - 1))
@@ -471,12 +425,11 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                     _dashed_line(frame, a, b, colour)
         _text(frame, f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
               (8, 24), colour, 0.55)
-    if edges or lines:
-        _text(frame, f"path {2 * keep:.2f}m wide", (8, 46), _CORRIDOR, 0.5)
+    if edges or projected or schematic:
+        label = f"path {2 * keep:.2f}m wide" + (" (schematic)" if schematic else "")
+        _text(frame, label, (8, 46), _CORRIDOR, 0.5)
 
     # ── the target ───────────────────────────────────────────────────────────
-    bearing = route_target[1] if route_target is not None else target_bearing
-    _draw_target_direction(frame, bearing, box, config)
     if box:
         x1, y1, x2, y2 = (int(box[0] * width), int(box[1] * height),
                           int(box[2] * width), int(box[3] * height))

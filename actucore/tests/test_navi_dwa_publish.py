@@ -165,7 +165,13 @@ def test_first_write_recovers_only_with_valid_replacement(monkeypatch, missing, 
     replacement = snapshot[0] if recovers else partial
     monkeypatch.setattr(card, "_observation_snapshot", lambda **_: next(reads, replacement))
     card._publish_command(message)
-    assert packets[-1]["values"] == (message["values"] if recovers else [0.] * 6)
+    if recovers:
+        packet, = packets
+        assert packet["values"] == message["values"]
+    else:
+        assert not packets
+        assert card._dwa_publication["event"] == "veto"
+        assert card._dwa_publication["reason"] == ("stale_observation" if missing == "depth" else "no_feedback")
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
@@ -204,9 +210,8 @@ def test_changed_or_expired_candidate_cannot_reach_the_wire(monkeypatch, body, c
     if body:
         card._publish_command(message)
     else:
-        card._wire_moving = True  # A prior command must be stopped on veto.
         card._stage_command(message, card._output_epoch)
-    assert packets and all(not any(packet["values"]) for packet in packets)
+    assert not packets
     assert card._state.dwa_trace["accepted_twist"] is None
     assert card._state.dwa_trace["proposed_twist"] is not None
     assert card._state.dwa_trace["select_calls"] > 0
@@ -244,14 +249,14 @@ def test_postcheck_veto_reports_which_publication_contract_failed(monkeypatch, c
         # gate. The real sampled twist still violates this explicit limit.
         origin = replace(origin, constraints=card._dwa_constraints())
     card._publish_command(message, dwa_origin=origin)
-    packet, = packets
-    assert packet["values"] == [0.] * 6
+    assert not packets
     publication = card._info()["dwa"]["publication"]
+    assert publication["event"] == "veto"
     assert publication["reason"] == "postcheck_veto"
     assert publication["veto_stage"] == stage and publication["veto_detail"] == detail
     assert card._state.dwa_trace["veto_stage"] == stage
     assert card._state.dwa_trace["veto_detail"] == detail
-    assert card._state.dwa_totals["stop_reasons"]["postcheck_veto"] == 1
+    assert card._state.dwa_totals.get("stop_packets", 0) == 0
 
 
 def test_planning_expiry_clears_acceptance_but_retains_real_attempts(monkeypatch):
@@ -270,14 +275,15 @@ def test_planning_expiry_clears_acceptance_but_retains_real_attempts(monkeypatch
     monkeypatch.setattr(dwa, "select", delayed_select)
     message = card.next_command()
     card._publish_command(message)
-    assert packets[-1]["values"] == [0.] * 6
+    assert not packets
     assert not state.dwa_selected
     assert card._last_decision.dwa_acceptance is None
     assert state.dwa_trace["accepted_twist"] is None
     assert state.dwa_trace["proposed_twist"] is not None
     assert state.dwa_trace["veto_reason"] == "publish_expired"
     assert state.dwa_trace["fallback_reason"] == "publication_veto"
-    assert card._dwa_publication["wire_values"] == packets[-1]["values"]
+    assert card._dwa_publication["event"] == "veto"
+    assert "wire_values" not in card._dwa_publication
     assert card._dwa_publication["decision_id"] == state.decision_id
     assert state.dwa_totals["attempted_ticks"] == 1
     assert state.dwa_totals["accepted_ticks"] == 0
@@ -286,8 +292,10 @@ def test_planning_expiry_clears_acceptance_but_retains_real_attempts(monkeypatch
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
 def test_publish_error_never_counts_a_dwa_success(monkeypatch, body):
     card, _, _, _, message = selected_card(monkeypatch, body=body)
+    attempts = []
 
-    def fail(_):
+    def fail(payload):
+        attempts.append(json.loads(payload.data)["values"])
         raise RuntimeError("transport failed")
 
     card._publisher = SimpleNamespace(publish=fail)
@@ -297,6 +305,7 @@ def test_publish_error_never_counts_a_dwa_success(monkeypatch, body):
     else:
         card._stage_command(message, card._output_epoch)
         assert card._scheduled_command is None
+    assert attempts == [message["values"]]
     assert card._published == 0
     assert not card._wire_moving
     assert card._state.dwa_totals.get("published_packets", 0) == 0
@@ -313,7 +322,7 @@ def test_expiry_reports_the_sent_decision_while_the_planner_selects_another(monk
     card._state.dwa_trace = {"decision_id": original.decision_id + 1}
     clock[0] = packets[0]["stamp_ms"] + packets[0]["ttl_ms"]
     card._dispatch_command()
-    assert len(packets) == 2 and not any(packets[-1]["values"])
+    assert len(packets) == 1 and card._scheduled_command is None
     assert card._info()["dwa"]["publication"]["decision_id"] == original.decision_id
     assert card._state.dwa_trace == {"decision_id": original.decision_id + 1}
 
@@ -338,7 +347,7 @@ def test_card_postselection_limits_cannot_modify_a_real_candidate(monkeypatch, c
     assert message["values"] == [0.] * 6
     assert card._last_decision.dwa_acceptance is None
     card._publish_command(message)
-    assert packets[-1]["values"] == [0.] * 6
+    assert not packets
     assert not state.dwa_selected
     assert state.dwa_trace["veto_reason"] == "postcheck_veto"
     assert state.dwa_trace["veto_detail"] == (
@@ -472,7 +481,7 @@ def test_real_tick_keeps_publish_error_through_cleanup(monkeypatch):
     assert card._state.dwa_totals.get("published_decisions", 0) == 0
 
 
-def test_expired_old_work_keeps_its_stop_reason_and_logs_one_veto(monkeypatch, caplog):
+def test_expired_old_work_logs_one_veto_without_writing_a_stop(monkeypatch, caplog):
     card, packets, clock, _, message = selected_card(monkeypatch, body=False)
     original = card._last_decision.dwa_acceptance
     assert card._stage_command(message, card._output_epoch)
@@ -482,9 +491,9 @@ def test_expired_old_work_keeps_its_stop_reason_and_logs_one_veto(monkeypatch, c
     clock[0] = message["stamp_ms"] + message["ttl_ms"]
     with caplog.at_level(logging.INFO, logger=plugin.__name__):
         card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
+    assert len(packets) == 1 and card._scheduled_command is None
     assert card._state.dwa_trace == next_trace
-    assert card._state.dwa_totals["stop_reasons"] == {"publish_expired": 1}
+    assert card._state.dwa_totals.get("stop_packets", 0) == 0
     publication = card._info()["dwa"]["publication"]
     assert publication["decision_id"] == original.decision_id
     assert publication["reason"] == "publish_expired"
@@ -505,7 +514,7 @@ def test_remembered_goal_guard_cannot_renew_the_original_command_window(monkeypa
         assert len(packets) == 1
     clock[0] = message["stamp_ms"] + message["ttl_ms"]
     card._dispatch_command()
-    assert len(packets) == 2 and packets[-1]["values"] == [0.] * 6
+    assert len(packets) == 1 and card._scheduled_command is None
 
 
 @pytest.mark.parametrize("body", [True, False])
@@ -611,7 +620,7 @@ def test_fresh_feedback_at_a_local_endpoint_does_not_extend_the_sent_window(monk
     assert len(packets) == 1
     advance_snapshot(snapshot, clock, deadline)
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
+    assert len(packets) == 1 and card._scheduled_command is None
 
 
 def test_fresh_obstacle_uses_the_translated_body_corridor(monkeypatch):
@@ -692,10 +701,7 @@ def test_failed_stop_is_attempted_once_per_dispatch_and_later_recovers(monkeypat
 
     card._publisher = SimpleNamespace(publish=fail_four_stops)
     clock[0] = message["stamp_ms"] + message["ttl_ms"]
-    if body:
-        card._halt(True)
-    else:
-        card._dispatch_command()
+    card._halt(True)
     assert len(attempts) == 1, "A failed zero must not recursively send another zero"
     epoch = card._output_epoch
     assert card._wire_moving and card._wire_dwa_origin is original
@@ -715,7 +721,7 @@ def test_failed_stop_is_attempted_once_per_dispatch_and_later_recovers(monkeypat
     assert not card._wire_moving and card._wire_dwa_origin is None
     assert card._output_epoch == epoch
     assert card._scheduled_command is None
-    assert card._state.dwa_totals["stop_reasons"] == {"superseded" if body else "publish_expired": 1}
+    assert card._state.dwa_totals["stop_reasons"] == {"superseded": 1}
 
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
 def test_new_obstacle_rechecks_shared_motion(monkeypatch, body):
@@ -741,7 +747,7 @@ def test_duplicate_dispatch_does_not_extend_deadline(monkeypatch):
         assert card._scheduled_command.expires_ms == deadline
     clock[0] = deadline
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
+    assert len(packets) == 1 and card._scheduled_command is None
 
 @pytest.mark.parametrize("change", ["anchor", "front", "near"])
 def test_motion_proof_checks_target_and_memory_revisions(monkeypatch, change):
@@ -774,7 +780,8 @@ def test_unchanged_first_send_reuses_the_selected_motion_check(monkeypatch):
     assert card._wire_dwa_origin.forward_check.motion_guard.check is selected.check
     clock[0] = message["stamp_ms"] + message["ttl_ms"]
     card._publish_command(message)
-    assert packets[-1]["values"] == [0.] * 6
+    assert len(packets) == 1
+    assert card._dwa_publication["reason"] == "publish_expired"
 
 
 @pytest.mark.parametrize("scheduled", [False, True], ids=["direct", "scheduled"])
@@ -911,7 +918,7 @@ def test_unregistered_pose_frame_invalidates_dwa_origin(monkeypatch, body):
         card._publish_command(message)
     else:
         card._stage_command(message, card._output_epoch)
-    assert packets[-1]["values"] == [0.] * 6
+    assert not packets
     assert card._info()["dwa"]["publication"]["reason"] == "geometry_mismatch"
 
 
@@ -943,16 +950,17 @@ def test_empty_near_projection_preserves_dwa_only_in_its_registered_frame(monkey
     else:
         card._publish_command(message)
 
-    packet, = packets
     if memory_frame == "odom":
         # The retained cell is 1.9 m behind this grid origin. A valid empty
         # projection must not erase the real selector's complete-stop proof.
+        packet, = packets
         assert packet["values"] == message["values"]
         assert card._state.dwa_totals["published_decisions"] == 1
     else:
         # An unavailable projection is different: the old obstacle has no
         # registration to this robot pose and must still prevent publication.
-        assert packet["values"] == [0.] * 6
+        assert not packets
+        assert card._dwa_publication["reason"] == "postcheck_veto"
         assert card._state.dwa_totals.get("published_decisions", 0) == 0
     assert scan.near_obstacles.cells == retained
 
@@ -1018,10 +1026,11 @@ def test_first_absolute_pose_keeps_only_a_continuous_fresh_dwa_proof(monkeypatch
     if event == "continuous":
         packet, = packets
         assert packet["values"] == message["values"]
+    elif event == "expired":
+        assert not packets
+        assert card._dwa_publication["reason"] == "publish_expired"
     else:
         assert all(packet["values"] == [0.] * 6 for packet in packets)
-        if event == "expired":
-            assert card._dwa_publication["reason"] == "publish_expired"
     assert bool(card._state.dwa_totals.get("published_decisions", 0)) is (event == "continuous")
     assert scan.near_obstacles.cells == retained
 
@@ -1259,7 +1268,7 @@ def test_planning_expiry_keeps_measured_dwa_progress(monkeypatch):
     assert state.idle_for_s == 0. and not state.failed_reason
 
 @pytest.mark.parametrize("body", [True, False])
-def test_direct_tracking_expired_during_planning_reports_zero_with_its_decision(monkeypatch, body):
+def test_direct_tracking_expired_during_planning_records_the_unpublished_decision(monkeypatch, body):
     card, packets, clock = direct_tracking_card(monkeypatch, body)
     choose = policy.step
 
@@ -1275,12 +1284,13 @@ def test_direct_tracking_expired_during_planning_reports_zero_with_its_decision(
         card._publish_command(message)
     else:
         card._stage_command(message, card._output_epoch)
-    assert packets[-1]["values"] == [0.] * 6
+    assert not packets
     publication, trace = card._dwa_publication, card._state.dwa_trace
     assert publication["decision_id"] == trace["decision_id"]
     assert publication["reason"] == "publish_expired"
     assert trace["fallback_reason"] == "publication_veto"
-    assert trace["final_twist"][0] > 0. and trace["wire_values"] == packets[-1]["values"]
+    assert trace["final_twist"][0] > 0.
+    assert "wire_values" not in publication and "wire_values" not in trace
 
 
 def test_direct_tracking_reads_original_feedback_clocks_without_local_scan(monkeypatch):
@@ -1438,7 +1448,7 @@ def test_sent_dwa_command_runs_to_its_wire_deadline_without_rechecking(monkeypat
     assert len(packets) == 1
     clock[0] = deadline
     card._dispatch_command()
-    assert packets[-1]["values"] == [0.] * 6
+    assert len(packets) == 1 and card._scheduled_command is None
 
 
 def test_admitted_drive_outlives_its_packet_ttl_until_the_declared_watchdog(monkeypatch):
@@ -1458,7 +1468,7 @@ def test_admitted_drive_outlives_its_packet_ttl_until_the_declared_watchdog(monk
         assert len(packets) == 1
     clock[0] = 1500
     card._dispatch_command()
-    assert len(packets) == 2 and not any(packets[-1]["values"])
+    assert len(packets) == 1 and card._scheduled_command is None
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
@@ -1492,8 +1502,11 @@ def test_first_send_rechecks_new_evidence_when_publication_outlasts_proof(monkey
         card._publish_command(message)
     else:
         card._stage_command(message, card._output_epoch)
-    packet, = packets
-    if update in ("fresh", "same_target"):
+    if update == "no_new_input":
+        assert not packets
+        assert card._dwa_publication["reason"] == "publish_expired"
+    elif update in ("fresh", "same_target"):
+        packet, = packets
         assert packet["values"] == message["values"]
         assert packet["stamp_ms"] == finish
         assert packet["obs_stamp_ms"] == (finish if update == "fresh" else message["obs_stamp_ms"])
@@ -1505,6 +1518,7 @@ def test_first_send_rechecks_new_evidence_when_publication_outlasts_proof(monkey
             card._dispatch_command()
             assert len(packets) == 1
     else:
+        packet, = packets
         assert packet["values"] == [0.] * 6
 
 
@@ -1633,7 +1647,7 @@ def test_pose_reset_during_publication_cannot_shift_the_checked_scene(monkeypatc
         card._publish_command(message)
     else:
         card._stage_command(message, card._output_epoch)
-    assert packets[-1]["values"] == [0.] * 6
+    assert not packets
     assert card._dwa_publication["reason"] == "geometry_mismatch"
 
 
@@ -1715,6 +1729,45 @@ def test_route_tracks_received_odometry_with_existing_sample_stamp(monkeypatch, 
     assert any(p["values"][0] > 0 for p in packets[1:]) == published
 
 
+@pytest.mark.parametrize("new_vx,elapsed_ms,written", [
+    (.02, 37, True), (.025, 37, False), (.02, 120, False),
+], ids=["unchanged", "speed-changed", "outside-swept-margin"])
+def test_route_repeat_accepts_unchanged_speed_only_feedback_during_sweep(monkeypatch, new_vx, elapsed_ms, written):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+
+    def receive_speed(stamp, vx=.02):
+        clock[0] = stamp
+        payload = dict(schema="motus.odom/1", frame="body", stamp_ms=stamp,
+                       twist=[vx, 0., None, None, None, -.004],
+                       vendor={"stamp_source": "received"})
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+        odom = plugin.NaviPlugin._observation_snapshot(card, with_capture_timing=True)[2]
+        assert odom.get("motion_pose") is None
+        objects, depth, _, receipt = snapshot[0]
+        snapshot[0] = objects, depth, odom, receipt
+
+    receive_speed(1000)
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    cutoff = card._scheduled_command.expires_ms
+    advance_snapshot(snapshot, clock, 1100)
+    receive_speed(1100)
+    recheck = card._recheck_dwa_motion
+
+    def speed_arrives_during_sweep(*args, **kwargs):
+        result = recheck(*args, **kwargs)
+        receive_speed(clock[0] + elapsed_ms, new_vx)
+        return result
+
+    monkeypatch.setattr(card, "_recheck_dwa_motion", speed_arrives_during_sweep)
+    card._dispatch_command()
+    assert len(packets) == (2 if written else 1)
+    if written:
+        assert packets[-1]["values"][0] > 0.
+        assert packets[-1]["stamp_ms"] == 1100 + elapsed_ms
+        assert packets[-1]["stamp_ms"] + packets[-1]["ttl_ms"] <= cutoff
+
+
 @pytest.mark.parametrize("change", [
     "clear", "obstacle", "obstacle_new_odom", "missing_target", "same_speed", "partial_speed",
     "lost_speed", "cancel", "late", "obstacle_failed_stop", "obstacle_duplicate_speed",
@@ -1779,11 +1832,11 @@ def test_bounded_watchdog_repeat_requires_new_clear_sweep(monkeypatch, change):
         assert len(attempts) == len(packets) == 2 and not any(packets[-1]["values"])
         return
     card._dispatch_command()
-    if change in ("same_speed", "partial_speed", "lost_speed"):
+    if change in ("same_speed", "partial_speed", "lost_speed", "late"):
         assert len(packets) == 1 and card._wire_moving
         clock[0] = 1500
         card._dispatch_command()
-        assert len(packets) == 2 and not any(packets[-1]["values"])
+        assert len(packets) == 1 and card._scheduled_command is None
     elif change in ("clear", "new_depth_clear", "second_depth_clear"):
         assert len(packets) == 2 and packets[-1]["values"] == message["values"]
         if change.startswith("second_depth"):
@@ -1792,7 +1845,7 @@ def test_bounded_watchdog_repeat_requires_new_clear_sweep(monkeypatch, change):
         assert len(packets) == 2
         clock[0] += 500
         card._dispatch_command()
-        assert len(packets) == 3 and not any(packets[-1]["values"])
+        assert len(packets) == 2 and card._scheduled_command is None
     else:
         assert len(packets) == 2 and not any(packets[-1]["values"])
         if change.startswith("second_depth"):
@@ -2341,15 +2394,17 @@ def test_timer_checks_replacement_route_before_taking_the_wire(monkeypatch, chan
     if change == "cancelled":
         card._cancel_scheduled_motion(block=True)
     card._dispatch_command()
-    assert len(packets) == 2
-    if change == "clear":
+    if change == "expired":
+        assert len(packets) == 1 and card._scheduled_command is None
+    elif change == "clear":
+        assert len(packets) == 2
         assert any(packets[-1]["values"])
         origin = card._wire_dwa_origin
         assert origin.acceptance is candidate
         assert origin.tracking_command is not None
         assert origin.forward_check.source_id == 1150
     else:
-        assert not any(packets[-1]["values"])
+        assert len(packets) == 2 and not any(packets[-1]["values"])
 
 
 @pytest.mark.parametrize("expire", [None, "during_check", "during_write"])
@@ -2385,14 +2440,14 @@ def test_route_handoff_waits_for_the_timer_if_only_moving_odometry_changed(monke
 
         monkeypatch.setattr(card, "_publish_command", expire_before_write)
     card._dispatch_command()
-    assert len(packets) == 2
     if expire is None:
+        assert len(packets) == 2
         packet = packets[-1]
         assert packet["values"][0] > 0.
         assert card._wire_dwa_origin.acceptance is candidate
         assert packet["stamp_ms"] < previous.expires_ms < packet["stamp_ms"] + packet["ttl_ms"]
     else:
-        assert not any(packets[-1]["values"])
+        assert len(packets) == 1 and card._scheduled_command is None
 
 
 @pytest.mark.parametrize("change,covered", [
@@ -2517,7 +2572,7 @@ def test_route_controller_keeps_checking_only_when_the_next_visit_is_too_late(
         assert len(packets) == 1 and card._wire_moving
     else:
         # The old packet's watchdog ends at 1500. No unchecked frame extends it.
-        assert clock[0] == 1500 and len(packets) == 2 and not any(packets[-1]["values"])
+        assert clock[0] == 1500 and len(packets) == 1 and card._scheduled_command is None
         assert card._dwa_publication["reason"] == "publish_expired"
 
 
@@ -2607,8 +2662,14 @@ def test_same_detector_exposure_keeps_original_range_when_depth_advances(monkeyp
         objects = dict(objects, objects=[dict(objects["objects"][0], confidence=.92)])
     snapshot[0] = objects, depth, odom, receipt
     card._dispatch_command()
-    assert len(packets) == 2
-    if change == "background":
+    if change in ("expired_range", "expired_matching_range", "driver_expired"):
+        assert len(packets) == 1
+        deadline = packets[0]["stamp_ms"] + card._config.watchdog_ms
+        clock[0] = deadline
+        card._dispatch_command()
+        assert len(packets) == 1 and card._scheduled_command is None
+    elif change == "background":
+        assert len(packets) == 2
         assert packets[-1]["values"][0] > 0.
         result = card._wire_dwa_origin.forward_check
         assert result.target_ms == original.target_ms and result.target_capture_ms == original.target_capture_ms
@@ -2617,8 +2678,8 @@ def test_same_detector_exposure_keeps_original_range_when_depth_advances(monkeyp
             original.target_ms + card._config.max_obs_age_ms,
             original.target_capture_ms + card._config.depth_age_limit_ms)
     else:
-        assert not any(packets[-1]["values"])
-        assert card._dwa_publication["reason"] in {"target_missing", "target_standoff", "footprint_collision", "publish_expired"}
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+        assert card._dwa_publication["reason"] in {"target_missing", "target_standoff", "footprint_collision"}
 
 
 @pytest.mark.parametrize("change", ["clear", "different_goal", "near_person"])
@@ -2726,7 +2787,10 @@ def test_direct_controller_checks_new_target_before_the_old_packet_expires(monke
     else:
         clock[0] = deadline
         card._dispatch_command()
-        assert len(packets) == 2 and not any(packets[-1]["values"])
+        if update in ("duplicate", "no_feedback", "below_moving_floor"):
+            assert len(packets) == 1 and card._scheduled_command is None
+        else:
+            assert len(packets) == 2 and not any(packets[-1]["values"])
 
 
 def test_first_send_retry_uses_original_association_to_refresh_the_target_clock(monkeypatch):

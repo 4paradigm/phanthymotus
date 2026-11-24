@@ -3467,17 +3467,22 @@ def test_close_obstacle_in_the_new_view_requires_another_turn_before_advancing(m
     assert not scan.active
 
 
-def test_local_blocked_approach_waits_for_active_observation_and_checks_the_forward_sweep(monkeypatch):
+@pytest.mark.parametrize("measured", [False, True])
+def test_local_blocked_approach_requires_measured_feedback_and_checks_the_forward_sweep(monkeypatch, measured):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .23)
     cfg = _cfg(local_planning=True, local_geometry=geometry, stop_distance_m=.6)
-    state = _state(motion_source="command")
+    state = _state(motion_source="measured" if measured else "command")
     scan = state.active_scan
     scan.phase, scan.directions = "evaluate", (1., -1.)
-    scan.receipt_only = scan.command_only = scan.attempted = scan.issued_yaw = True
+    scan.receipt_only = scan.attempted = scan.issued_yaw = True
+    scan.command_only = not measured
     scan.side_frame = 1000
+    if measured:
+        scan.poses.append((1000, scan.pose, 0.))
+    odom = {"vx": 0., "vy": 0., "wz": 0.} if measured else None
     occupied = np.zeros(local_path.SHAPE, dtype=bool)
     monkeypatch.setattr(P, "_local_translation", lambda *args: None)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.28, 1.))
@@ -3486,12 +3491,17 @@ def test_local_blocked_approach_waits_for_active_observation_and_checks_the_forw
     def tick(frame):
         depth = dict(_scene(2.), ground=occupied, frame_id=frame)
         return P._avoid(.60, 0., 0., depth, cfg, P.APPROACHING, "", state,
-                        target_distance=2., may_scan=True)
+                        target_distance=2., may_scan=True, odom=odom)
 
     assert tick(1000)[:3] == (0., 0., 0.)
     assert scan.active and scan.directions == (-1.,)
     scan.phase, scan.side_frame = "evaluate", 1100
-    assert tick(1100)[0] > 0.
+    decision = tick(1100)
+    if measured:
+        assert decision[0] > 0.
+    else:
+        assert decision[:3] == (0., 0., 0.)
+        assert decision[-1] == P.NO_LOCAL_ROUTE
     assert not scan.active
     occupied[local_path.START[0] + 5, local_path.START[1]] = True
     assert tick(1200)[:3] == (0., 0., 0.)
@@ -3760,7 +3770,8 @@ def test_memory_can_use_the_command_only_scan_without_a_motion_pose_history(monk
                             target_distance=3., target_bearing=0., may_scan=True,
                             odom={"obstacle_pose": pose})
     assert not state.active_scan.poses and state.active_scan.obstacles.cells
-    assert decision[:3] == (.15, 0., 0.)
+    assert decision[:3] == (0., 0., 0.)
+    assert decision[-1] == P.NO_LOCAL_ROUTE
 
 
 def test_checked_route_speed_fits_its_remaining_waypoint_horizon():
