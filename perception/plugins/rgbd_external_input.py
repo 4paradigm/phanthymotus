@@ -488,10 +488,14 @@ class ExternalOdometryInput:
         self.learning_results[key] = result
         if len(self.learning_results) > 64:
             self.learning_results.popitem(last=False)
-        self.fuser.replay_learning(key[0] if pending is None else min(key[0], pending))
+        begin = key[0] if pending is None else min(key[0], pending)
+        # Retain delayed fits for ordinary measurement replay, but do not
+        # force a rewind to a capture that can no longer be published live.
+        if time.time_ns() - begin <= _OUTPUT_TIMEOUT_NS:
+            self.fuser.replay_learning(begin)
 
     def _apply_ready(self, events):
-        if not events:
+        if not events and (self.learning_work is None or not self.learning_work[2].done()):
             return
         if self.mounts is not None:
             # First-seen captures also need the live evidence from before this
@@ -529,6 +533,9 @@ class ExternalOdometryInput:
             else:
                 current.append(event)
         with self.fuser.batch():
+            # A completed fit can rewind the mutable history. Include the
+            # waiting measurements in that replay before publishing.
+            self._complete_learning()
             if mounts_received:
                 # Revise accepted projections as well as captures still waiting
                 # for evidence, against the complete mount batch.
@@ -558,7 +565,6 @@ class ExternalOdometryInput:
     def _work(self):
         while not self.closed:
             try:
-                self._complete_learning()
                 self._apply_ready(self._take_ready())
                 if not self.reported_stale:
                     info = self.info()

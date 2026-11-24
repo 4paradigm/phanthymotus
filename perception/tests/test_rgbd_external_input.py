@@ -724,6 +724,43 @@ def test_external_pose_publishes_while_parameter_solve_is_pending(sessions, monk
         card.shutdown()
 
 
+@pytest.mark.parametrize('age_ns', [400_000_000, 1_600_000_000])
+def test_completed_learning_rebuilds_with_fresh_motion(sessions, monkeypatch, age_ns):
+    _, now, _ = sessions
+    now[0] = 1_300_000_000
+    stream = fusion_input()
+    rebuilds = []
+    try:
+        stream._receive('/external', NS(data=json.dumps(packet(0., 0.))))
+        stream.visual(1_100_000_000, 'native',
+                      dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.]))
+        stream._receive('/external', NS(data=json.dumps(packet(.2, .2))))
+        stream._apply_ready(stream._take_ready())
+        completed = NS(result=lambda: None, done=lambda: True)
+        key = (1_100_000_000,)
+        result = object()
+        stream.learning_work = (key, result, completed)
+
+        rebuild = stream.fuser._rebuild
+        def record_rebuild(stamp):
+            rebuilds.append(stamp)
+            rebuild(stamp)
+        monkeypatch.setattr(stream.fuser, '_rebuild', record_rebuild)
+        now[0] = key[0] + age_ns
+        newest = now[0] - 10_000_000
+        for stamp in (newest - 50_000_000, newest):
+            stream._receive('/external', NS(data=json.dumps(packet((stamp-1e9)/1e9, .2))))
+        stream._apply_ready(stream._take_ready())
+        assert stream.learning_work is None
+        assert stream.learning_results[key] is result
+        expected_start = key[0] if age_ns < 1_500_000_000 else 1_200_000_001
+        assert rebuilds == [expected_start]
+        assert stream.info()['stamp_ns'] == newest
+        assert stream.info()['status'] == 'tracking'
+    finally:
+        stream.close()
+
+
 def test_untyped_core_wire_classifies_external_odometry_from_payload(sessions, monkeypatch):
     _, wall_clock, _ = sessions
     wall_clock[0] = 1_260_000_000

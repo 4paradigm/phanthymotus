@@ -424,7 +424,7 @@ class ExternalOdometry:
         begin = max(stamp, self.base.stamp+1)
         next_visual = min((value for value in self.raw_vision if value >= begin), default=None)
         if next_visual is not None:
-            self._rebuild(next_visual)
+            self._changed(next_visual)
 
     def _pose_interval(self, t0, t1, left, right, end, overlap, knot=None):
         # A visual correction can replay these exact measured intervals many
