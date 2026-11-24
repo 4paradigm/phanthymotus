@@ -166,6 +166,63 @@ def test_stale_fusion_recovers_current_motion_before_replaying_history(sessions,
         stream.close()
 
 
+@pytest.mark.parametrize('first, fail_publication', [
+    (10_200_000_000, False), (10_900_000_000, False), (10_200_000_000, True),
+])
+def test_fusion_publishes_a_completed_checkpoint_before_slow_replay_finishes(
+        sessions, monkeypatch, first, fail_publication):
+    _, now, _ = sessions
+    stream = fusion_input()
+    try:
+        for stamp in (9_700_000_000, 9_800_000_000, 10_000_000_000):
+            now[0] = stamp
+            motion = packet((stamp - 1_000_000_000) / 1e9, stamp / 1e9)
+            stream._receive('/external', NS(data=json.dumps(motion)))
+            stream._apply_ready(stream._take_ready())
+        segment = stream.info()['segment_id']
+        now[0] = 11_200_000_000
+        late_visual = 9_900_000_000
+        stream.visual(late_visual, 'native', dict(position=[.2, 0., 0.], quaternion=[0., 0., 0., 1.]))
+        queued = sorted({first, 10_900_000_000, 11_100_000_000, 11_200_000_000})
+        for stamp in queued:
+            motion = packet((stamp - 1_000_000_000) / 1e9, stamp / 1e9)
+            stream._receive('/external', NS(data=json.dumps(motion)))
+        if fail_publication:
+            publish = stream.publisher.publish
+
+            def publish_after_failure(message):
+                if json.loads(message.data)['vendor']['motus_slam']['stamp_ns'] == first:
+                    raise RuntimeError('transient publish error')
+                publish(message)
+
+            monkeypatch.setattr(stream.publisher, 'publish', publish_after_failure)
+
+        during_replay = []
+        advance = stream.fuser._advance
+
+        def slow_advance(state, stamp, times):
+            if stamp == 10_900_000_000:
+                now[0] += 350_000_000
+            if stamp == 11_100_000_000:
+                during_replay.append(stream.info())
+            return advance(state, stamp, times)
+
+        monkeypatch.setattr(stream.fuser, '_advance', slow_advance)
+        stream._apply_ready(stream._take_ready())
+
+        assert during_replay[0]['stamp_ns'] == (queued[1] if fail_publication else first)
+        assert during_replay[0]['status'] == 'tracking'
+        assert during_replay[0]['segment_id'] == segment
+        assert late_visual in stream.fuser.raw_vision
+        assert stream.fuser.current.visual[0] == late_visual
+        assert stream.info()['stamp_ns'] == 11_200_000_000
+        stamps = [json.loads(msg)['vendor']['motus_slam']['stamp_ns'] for msg in stream.publisher.messages]
+        assert stamps == [9_800_000_000, 10_000_000_000, *queued[int(fail_publication):]]
+        assert stream.last_error == ('transient publish error' if fail_publication else None)
+    finally:
+        stream.close()
+
+
 def test_fusion_queue_keeps_recent_events_and_skips_expired_work(sessions, monkeypatch):
     _, now, _ = sessions
     now[0] = 1_900_000_000

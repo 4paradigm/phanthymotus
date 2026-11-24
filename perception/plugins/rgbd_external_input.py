@@ -47,7 +47,8 @@ class ExternalOdometryInput:
         self.body = (mount or {}).get('parent_frame', 'body')
         self.fixed_mount = calibration.get('body_from_camera')
         self.mounts = CaptureMounts(mount, self.camera, calibration.get('clock_id')) if mount else None
-        self.fuser = ExternalOdometry(learning=learning, body_frame=self.body, solve_learning=self._solve_learning)
+        self.fuser = ExternalOdometry(learning=learning, body_frame=self.body, solve_learning=self._solve_learning,
+                                      publish_replay=self._publish_replay_checkpoint)
         self.active = calibration.get('external_topic') is not None and (
             self.fixed_mount is not None or self.camera == self.body)
         self.motion_received = False
@@ -339,6 +340,20 @@ class ExternalOdometryInput:
         if age > _OUTPUT_TIMEOUT_NS and self.active and 'stamp_ns' not in self.status:
             self.status = dict(self.status, stamp_ns=stamp)
         return -_FUTURE_TOLERANCE_NS <= age <= _OUTPUT_TIMEOUT_NS
+
+    def _publish_replay_checkpoint(self, state):
+        if state.last_update is None:
+            return False
+        if (self.status.get('published_at') is None or
+                self.fuser.segment_id(state) != self.fuser.segment_id(self.fuser.current) or
+                state.stamp - time.time_ns() > _FUTURE_TOLERANCE_NS):
+            return True  # Let the normal publish pass handle this boundary.
+        try:
+            self._publish(state)
+        except (ValueError, TypeError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as error:
+            # A publisher failure must not interrupt checkpoint reconstruction.
+            self.last_error = str(error)
+        return self.status.get('stamp_ns') == state.stamp
 
     def _publish(self, state=None):
         if not self.active and not self.motion_received:

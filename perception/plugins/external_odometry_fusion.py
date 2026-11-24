@@ -335,14 +335,16 @@ class _State:
 class ExternalOdometry:
     """Replay raw samples in timestamp order and publish in one local body frame."""
 
-    def __init__(self, *, learning=True, body_frame='body', solve_learning=None):
+    def __init__(self, *, learning=True, body_frame='body', solve_learning=None, publish_replay=None):
         self.segment = 'rgbd_body_' + uuid.uuid4().hex[:12]
         self.body_frame = body_frame
         self.solve_learning = solve_learning
+        self.publish_replay = publish_replay
         self.raw_motion = {}
         self.raw_vision = {}
         self._pose_profiles = {}
         self._pose_intervals = OrderedDict()
+        self._pose_endpoints = OrderedDict()
         self._learned_steps = OrderedDict()
         self.checkpoints = {}
         self.base = _State(0, np.eye(4), np.eye(6), np.zeros((6, 12)), ExternalMotionLearner(enabled=learning))
@@ -435,14 +437,26 @@ class ExternalOdometry:
             self._pose_intervals.move_to_end(key)
             return cached[3], cached[4], cached[5]
         if knot is None:
+            # A visual checkpoint clips the interval without changing the
+            # measured endpoints or their angular-rate corroboration.
+            bounds = (t0, t1)
+            endpoints = self._pose_endpoints.get(bounds)
+            if endpoints is None or endpoints[0] is not left or endpoints[1] is not right:
+                duration = t1-t0
+                velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / (duration / 1e9)
+                fixed_attitude = ((left.mask & right.mask)[3:].all() and
+                                  _origin_attitude(left, right, duration) is not None)
+                endpoints = self._pose_endpoints[bounds] = (left, right, velocity, fixed_attitude)
+                if len(self._pose_endpoints) > _MAX_EVENTS:
+                    self._pose_endpoints.popitem(last=False)
+            self._pose_endpoints.move_to_end(bounds)
             start, origin = t0, left.pose
-            velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / ((t1-t0) / 1e9)
+            velocity, fixed_attitude = endpoints[2:]
         else:
             start, origin, velocity = knot
+            fixed_attitude = False
         covariance = _pose_increment_covariance(left, right, velocity, (end-start)/1e9,
                                                 overlap/(t1-t0), end == t1, origin)
-        fixed_attitude = (knot is None and (left.mask & right.mask)[3:].all() and
-                          _origin_attitude(left, right, t1-t0) is not None)
         self._pose_intervals[key] = (left, right, knot, velocity, covariance, fixed_attitude)
         self._pose_intervals.move_to_end(key)
         if len(self._pose_intervals) > _MAX_EVENTS:
@@ -749,11 +763,18 @@ class ExternalOdometry:
         self.checkpoints = {stamp: checkpoint for stamp, checkpoint in self.checkpoints.items()
                             if stamp <= before}
         events = sorted(stamp for stamp in self.raw_motion.keys() | self.raw_vision.keys() if stamp > before)
+        frontier = self.current.stamp
+        publish = self.publish_replay if (begin <= frontier == self._output_stamp and
+                                         len(self.checkpoints) + len(events) < _MAX_EVENTS) else None
         for stamp in events:
             state = self._advance(state, stamp, times)
             if stamp in self.raw_vision:
                 state = self._correct(state, *self.raw_vision[stamp], times)
             self.checkpoints[stamp] = state
+            # All raw measurements are staged. A completed forward checkpoint
+            # already includes the rewind and needs no separate propagation.
+            if publish is not None and frontier < stamp < events[-1] and publish(state):
+                publish = None
         self.current = state
         all_times = sorted(self.checkpoints)
         time_index = bisect_right(all_times, state.stamp-_HISTORY_NS)-1
