@@ -1,49 +1,44 @@
 """Real OpenCV geometry and JPEGs, with ROS message/executor stubs."""
 
 import json
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
 
+from plugins import aruco_runtime
 from plugins.aruco import ArucoPlugin
-from plugins.aruco_runtime import Calibration, MarkerDetector
+from plugins.aruco_runtime import MarkerDetector, intrinsics
 from vision_stubs import _FakeCompressedImage, _FakeExecutor, _wait_until
 
 
 TOPIC = "/camera/color"
-JETPACK_IMAGE = Path("/etc/jetpack.env")
 WIDTH, HEIGHT = 640, 480
 K = [800.0, 0.0, 320.0, 0.0, 800.0, 240.0, 0.0, 0.0, 1.0]
 CAMERA = {"schema": "motus.camera/1", "topic": TOPIC, "id": "calibrated-camera",
-          "width": WIDTH, "height": HEIGHT, "K": K, "distortion_model": "pinhole", "D": [0] * 5}
+          "width": WIDTH, "height": HEIGHT, "K": K, "distortion_model": "plumb_bob", "D": [0] * 5}
+# What R1 declares: a measured field of view and no K. atan(320 / 800) matches K above.
+FOV_ONLY = {**CAMERA, "K": None, "D": None, "half_fov_rad": float(np.arctan(320 / 800))}
 SQUARE = np.array([[-0.05, 0.05, 0], [0.05, 0.05, 0],
                    [0.05, -0.05, 0], [-0.05, -0.05, 0]], dtype=np.float64)
+TILTED = np.array([2.7, -0.19, 0.28]), np.array([0.035, -0.022, 0.4])
 
 
-@pytest.fixture
-def detector():
-    try:
-        return MarkerDetector("DICT_4X4_50")
-    except RuntimeError as exc:
-        if JETPACK_IMAGE.is_file():
-            # The cloud runner uses the built image's OpenCV. A skipped
-            # detection here would let an unusable JetPack image pass CI.
-            version = getattr(cv2, "__version__", "unavailable")
-            pytest.fail(f"JetPack OpenCV {version} cannot run ArUco: {exc} ({exc.__cause__})",
-                        pytrace=False)
-        pytest.skip(str(exc))
+@pytest.fixture(autouse=True)
+def aruco_backend():
+    if aruco_runtime.unavailable_reason():
+        if Path("/etc/jetpack.env").is_file():
+            # A skip here would let an image without ArUco pass CI.
+            pytest.fail(aruco_runtime.unavailable_reason(), pytrace=False)
+        pytest.skip(aruco_runtime.unavailable_reason())
 
 
 def render_marker(rotation, translation, marker_id=23, dictionary_name="DICT_4X4_50"):
     """Perspective-project an actual dictionary marker at a known camera pose."""
     aruco = cv2.aruco
-    get_dictionary = getattr(aruco, "getPredefinedDictionary", None) or aruco.Dictionary_get
-    dictionary = get_dictionary(getattr(aruco, dictionary_name))
+    dictionary = aruco.getPredefinedDictionary(getattr(aruco, dictionary_name))
     if hasattr(aruco, "generateImageMarker"):
         marker = aruco.generateImageMarker(dictionary, marker_id, 240)
     else:
@@ -51,506 +46,188 @@ def render_marker(rotation, translation, marker_id=23, dictionary_name="DICT_4X4
     source = np.array([[0, 0], [239, 0], [239, 239], [0, 239]], dtype=np.float32)
     points, _ = cv2.projectPoints(SQUARE, rotation, translation, np.array(K).reshape(3, 3), None)
     transform = cv2.getPerspectiveTransform(source, points.reshape(4, 2).astype(np.float32))
-    gray = cv2.warpPerspective(marker, transform, (WIDTH, HEIGHT),
-                               flags=cv2.INTER_NEAREST, borderValue=255)
+    gray = cv2.warpPerspective(marker, transform, (WIDTH, HEIGHT), flags=cv2.INTER_NEAREST, borderValue=255)
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
-@pytest.mark.parametrize(("rotation", "translation"), [
-    ([np.pi, 0, 0], [0, 0, 0.4]),
-    ([2.7, -0.19, 0.28], [0.035, -0.022, 0.4]),
-])
-def test_metric_pose_for_frontal_and_tilted_jpegs(detector, rotation, translation):
-    rotation = np.asarray(rotation, dtype=np.float64)
-    translation = np.asarray(translation, dtype=np.float64)
-    frame = render_marker(rotation, translation)
-    ok, encoded = cv2.imencode(".jpg", frame)
+def _frame(image, sec=100):
+    ok, encoded = cv2.imencode(".jpg", image)
     assert ok
-    jpeg = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-    calibration = Calibration.from_declaration(CAMERA)
-    [pose] = detector.estimate(jpeg, calibration, 0.1)
-    assert pose["id"] == 23
-    assert np.linalg.norm(np.asarray(pose["translation_m"]) - translation) < 0.006
-    actual, _ = cv2.Rodrigues(np.asarray(pose["rotation_rvec_rad"]))
-    expected, _ = cv2.Rodrigues(rotation)
-    assert np.linalg.norm(actual - expected) < 0.23
-    assert pose["reprojection_rms_px"] < 1.5
-    # OpenCV draws the X and Y axes with red and green in BGR images.
-    assert ((jpeg[:, :, 2] > 240) & (jpeg[:, :, 1] < 30)).any()
-    assert ((jpeg[:, :, 1] > 240) & (jpeg[:, :, 2] < 30)).any()
-
-
-@pytest.mark.parametrize("change", [
-    {"K": [float("nan")] * 9},
-    {"K": [-800.0, *K[1:]]},
-    {"distortion_model": "unknown", "D": [0.1, 0, 0, 0, 0]},
-    {"distortion_model": "plumb_bob", "D": [0.1]},
-    {"distortion_model": "pinhole", "D": [0.1, 0, 0, 0, 0]},
-])
-def test_rejects_unusable_calibration(change):
-    with pytest.raises(ValueError):
-        Calibration.from_declaration({**CAMERA, **change})
-
-
-def test_bundle_advertises_tool_and_explains_missing_backend(monkeypatch):
-    from main import PerceptionBundle
-
-    monkeypatch.delattr(cv2, "aruco", raising=False)
-    executor = _FakeExecutor()
-    bundle = PerceptionBundle({"plugins": {"aruco": {"enabled": True},
-                                          "echo_cancellation": {"enabled": False},
-                                          "audio_mixer": {"enabled": False}}}, executor)
-    try:
-        [tool] = bundle.get_all_tools()
-        assert tool["name"] == "aruco" and tool["type"] == "processor"
-        fields = tool["configSchema"]["properties"]
-        assert "calibration" not in fields
-        assert fields["publish_overlay"]["type"] == "boolean" and fields["publish_overlay"]["default"] is True
-        assert fields["marker_size_m"]["default"] == 0.10 and "10 cm" in tool["description"]
-        for dictionary in fields["dictionary"]["enum"]:
-            assert dictionary in fields["dictionary"]["description"]
-        assert [port["format"] for port in tool["topic_out"]] == ["data/json", "image/jpeg"]
-        unavailable = bundle.dispatch("aruco", {"action": "info"})
-        assert unavailable["state"] == "error"
-        assert "OpenCV ArUco" in unavailable["error"]
-        assert unavailable["topic_out"] == [{**port, "topic": ""} for port in tool["topic_out"]]
-        assert not executor.nodes
-    finally:
-        bundle.shutdown()
-
-
-@pytest.mark.parametrize("publish_overlay", [True, False])
-def test_output_ports_are_available_before_start(detector, publish_overlay):
-    executor = _FakeExecutor()
-    plugin = ArucoPlugin({}, executor)
-    instance = {"instance_id": "aruco-card"}
-    wired = {**instance, "input_topic": TOPIC}
-    try:
-        plugin.dispatch("aruco", {**instance, "action": "config", "publish_overlay": publish_overlay})
-        unbound = plugin.dispatch("aruco", {**instance, "action": "info", "input_topic": ""})
-        assert unbound["state"] == "idle"
-        ports = plugin.get_tools()[0]["topic_out"]
-        assert unbound["topic_out"] == [{**port, "topic": ""} for port in ports]
-
-        preview = plugin.dispatch("aruco", {**wired, "action": "info"})
-        assert preview["state"] == "idle"
-        assert not executor.nodes
-        poses, overlay = preview["topic_out"]
-        assert poses["format"] == "data/json" and poses["topic"].endswith("/poses")
-        assert overlay["format"] == "image/jpeg"
-        if publish_overlay:
-            assert overlay["topic"].endswith("/overlay")
-        else:
-            assert overlay["topic"] == ""
-
-        started = plugin.dispatch("aruco", {**wired, "action": "start", "camera_info": [CAMERA]})
-        assert started["state"] == "running"
-        assert started["topic_out"] == preview["topic_out"]
-        [node] = executor.nodes
-        assert [pub.topic for pub in node.publishers] == [p["topic"] for p in preview["topic_out"] if p["topic"]]
-        plugin.dispatch("aruco", {**instance, "action": "stop"})
-        assert plugin.dispatch("aruco", {**wired, "action": "info"}) == preview
-    finally:
-        plugin.shutdown()
-
-
-def test_output_preview_uses_the_wired_camera_and_card_id(detector):
-    plugin = ArucoPlugin({}, _FakeExecutor())
-    try:
-        args = {"action": "info", "input_topic": TOPIC, "instance_id": "first"}
-        first = plugin.dispatch("aruco", args)["topic_out"][0]["topic"]
-        second = plugin.dispatch("aruco", {**args, "instance_id": "second"})["topic_out"][0]["topic"]
-        rewired = plugin.dispatch("aruco", {**args, "input_topic": "/other/color"})["topic_out"][0]["topic"]
-        assert first.startswith(f"{TOPIC}/aruco/") and second.startswith(f"{TOPIC}/aruco/")
-        assert first != second
-        assert rewired == first.replace(TOPIC, "/other/color", 1)
-        assert plugin.dispatch("aruco", {**args, "input_topic": "not-absolute"})["topic_out"][0]["topic"] == ""
-    finally:
-        plugin.shutdown()
-
-
-def _frame(image, sec):
-    if isinstance(image, np.ndarray):
-        ok, encoded = cv2.imencode(".jpg", image)
-        assert ok
-        image = encoded.tobytes()
-    frame = _FakeCompressedImage(image)
+    frame = _FakeCompressedImage(encoded.tobytes())
     frame.header.stamp = SimpleNamespace(sec=sec, nanosec=42)
     frame.header.frame_id = "camera_optical_frame"
     return frame
 
 
-def test_processor_publishes_matching_json_and_jpeg_then_clears_detection(detector):
+def _assert_pose(marker, rotation, translation):
+    np.testing.assert_allclose(marker["translation_m"], translation, atol=0.006)
+    assert marker["distance_m"] == pytest.approx(np.linalg.norm(translation), abs=0.006)
+    actual, _ = cv2.Rodrigues(np.asarray(marker["rotation_rvec_rad"]))
+    expected, _ = cv2.Rodrigues(rotation)
+    assert np.linalg.norm(actual - expected) < 0.23
+
+
+@pytest.mark.parametrize(("rotation", "translation"), [([np.pi, 0, 0], [0, 0, 0.4]), TILTED])
+def test_metric_pose_for_frontal_and_tilted_markers(rotation, translation):
+    rotation, translation = np.asarray(rotation, float), np.asarray(translation, float)
+    image = render_marker(rotation, translation)
+    matrix, distortion, status = intrinsics(CAMERA, WIDTH, HEIGHT)
+    [marker] = MarkerDetector("DICT_4X4_50").detect(image, 0.1, matrix, distortion, draw=True)
+    assert status == "calibrated" and marker["id"] == 23
+    _assert_pose(marker, rotation, translation)
+    # OpenCV draws the X and Y axes red and green.
+    assert ((image[:, :, 2] > 240) & (image[:, :, 1] < 30)).any()
+
+
+def test_intrinsics_use_k_then_field_of_view_then_nothing():
+    calibrated, _, status = intrinsics(CAMERA, WIDTH, HEIGHT)
+    assert status == "calibrated"
+    approximate, distortion, status = intrinsics(FOV_ONLY, WIDTH, HEIGHT)
+    assert status == "approximate" and distortion is None
+    assert approximate[0, 0] == pytest.approx(800)
+    assert intrinsics(None, WIDTH, HEIGHT) == (None, None, "uncalibrated")
+    assert intrinsics({"width": WIDTH, "height": HEIGHT}, WIDTH, HEIGHT)[2] == "uncalibrated"
+    # A K declared at another resolution is rescaled to the frame.
+    half, _, _ = intrinsics(CAMERA, WIDTH // 2, HEIGHT // 2)
+    np.testing.assert_allclose(half, calibrated / [[2], [2], [1]])
+
+
+@pytest.mark.parametrize(("camera_info", "status"), [
+    ({TOPIC: CAMERA}, "calibrated"), ([FOV_ONLY], "approximate"), (None, "uncalibrated")])
+def test_card_runs_with_whatever_the_camera_declares(camera_info, status):
     executor = _FakeExecutor()
     plugin = ArucoPlugin({"rate_hz": 30}, executor)
-    args = {"action": "start", "instance_id": "aruco-a", "input_topic": TOPIC,
-            "camera_info": {TOPIC: CAMERA}}
     try:
-        assert plugin.dispatch("aruco", args)["state"] == "running"
-        assert plugin.dispatch("aruco", args)["state"] == "running"
-        [node] = executor.nodes
-        [pose_pub, overlay_pub] = node.publishers
-        result = plugin.dispatch("aruco", {"action": "info", "instance_id": "aruco-a"})
-        assert [port["topic"] for port in result["topic_out"]] == [pose_pub.topic, overlay_pub.topic]
-        deliver = node.subscriptions[0].callback
-        frame = _frame(render_marker(np.array([2.7, -0.19, 0.28]), np.array([0.035, -0.022, 0.4])), 100)
-        deliver(frame)
-        assert _wait_until(lambda: len(overlay_pub.raw_messages) == 1)
-        first = json.loads(pose_pub.messages[0])
-        assert first["markers"][0]["id"] == 23
-        assert first["pose_status"] == "calibrated"
-        assert first["coordinate_frame"] == "camera_optical"
-        assert first["camera_id"] == CAMERA["id"]
-        assert first["frame_id"] == frame.header.frame_id
-        assert first["stamp"] == {"sec": 100, "nanosec": 42}
-        overlay = overlay_pub.raw_messages[0]
-        assert overlay.format == "jpeg" and overlay.header == frame.header
-        view = cv2.imdecode(np.frombuffer(overlay.data, dtype=np.uint8), cv2.IMREAD_COLOR)
-        assert view.shape == (HEIGHT, WIDTH, 3)
-        assert ((view[:, :, 1] > 140) & (view[:, :, 2] < 130)).any()
-
-        deliver(_frame(np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8), 101))
-        assert _wait_until(lambda: len(overlay_pub.messages) == 2)
-        blank = json.loads(pose_pub.messages[1])
-        assert blank["markers"] == [] and "error" not in blank
-        plain = cv2.imdecode(np.frombuffer(overlay_pub.messages[1], dtype=np.uint8), cv2.IMREAD_COLOR)
-        assert plain.min() == 255
-
-        deliver(_frame(b"not a JPEG", 102))
-        assert _wait_until(lambda: len(pose_pub.messages) == 3)
-        assert "decode" in json.loads(pose_pub.messages[2])["error"]
-        deliver(_frame(np.full((240, 320, 3), 255, dtype=np.uint8), 103))
-        assert _wait_until(lambda: len(pose_pub.messages) == 4)
-        assert "dimensions" in json.loads(pose_pub.messages[3])["error"]
-        assert len(overlay_pub.messages) == 2
-
-        assert plugin.dispatch("aruco", {"action": "stop", "instance_id": "aruco-a"})["state"] == "idle"
-        deliver(frame)
-        assert not executor.nodes and node.destroyed and not node.worker.is_alive()
-        assert len(pose_pub.messages) == 4
-    finally:
-        plugin.shutdown()
-
-
-@pytest.mark.parametrize("camera_info", [
-    None,
-    {"/other": CAMERA},
-    {TOPIC: {**CAMERA, "schema": "other.camera/1"}},
-    {TOPIC: {**CAMERA, "topic": "/another/color"}},
-    {TOPIC: {**CAMERA, "format": "image/depth-zlib"}},
-    {TOPIC: {k: v for k, v in CAMERA.items() if k != "id"}},
-    {TOPIC: {**CAMERA, "id": ""}},
-    {TOPIC: {**CAMERA, "id": "   "}},
-    {TOPIC: {**CAMERA, "id": 17}},
-    {TOPIC: {**CAMERA, "K": None}},
-    {TOPIC: {**CAMERA, "K": []}},
-    {TOPIC: {**CAMERA, "distortion_model": "unknown"}},
-])
-def test_start_requires_intrinsics_from_the_wired_camera(camera_info):
-    executor = _FakeExecutor()
-    # A previously saved manual calibration must not mask a broken camera declaration.
-    plugin = ArucoPlugin({"calibration": CAMERA}, executor)
-    try:
-        plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "calibration": CAMERA})
-        with pytest.raises(ValueError) as error:
-            plugin.dispatch("aruco", {"action": "start", "instance_id": "a",
-                                      "input_topic": TOPIC, "camera_info": camera_info})
-        assert TOPIC in str(error.value) and "相机卡片开发者" in str(error.value)
-        assert not executor.nodes
-    finally:
-        plugin.shutdown()
-
-
-def test_failed_rewire_preserves_the_original_calibrated_camera(detector):
-    executor = _FakeExecutor()
-    plugin = ArucoPlugin({}, executor)
-    args = {"action": "start", "instance_id": "a", "input_topic": TOPIC, "camera_info": [CAMERA]}
-    try:
-        info = plugin.dispatch("aruco", args)
-        [original] = executor.nodes
-        with pytest.raises(ValueError, match="相机卡片开发者"):
-            plugin.dispatch("aruco", {**args, "input_topic": "/different/camera", "camera_info": {}})
-        assert plugin.dispatch("aruco", {"action": "info", "instance_id": "a"}) == info
-        assert executor.nodes == [original] and original.worker.is_alive()
-    finally:
-        plugin.shutdown()
-
-
-def test_frame_dimensions_are_checked_before_pixel_decode(detector, monkeypatch):
-    from plugins import aruco
-
-    executor = _FakeExecutor()
-    plugin = ArucoPlugin({}, executor)
-    args = {"action": "start", "input_topic": TOPIC, "camera_info": [CAMERA]}
-    wrong_size = _frame(np.zeros((240, 320), np.uint8), 1)
-    matching = _frame(np.zeros((HEIGHT, WIDTH), np.uint8), 2)
-    try:
-        assert plugin.dispatch("aruco", args)["state"] == "running"
+        started = plugin.dispatch("aruco", {"action": "start", "instance_id": "a", "input_topic": TOPIC,
+                                            "camera_info": camera_info})
+        assert started["state"] == "running"
         [node] = executor.nodes
         poses, overlay = node.publishers
-
-        def unexpected_decode(*_args):
-            pytest.fail("Pixels decoded before checking JPEG dimensions")
-
-        monkeypatch.setattr(cv2, "imdecode", unexpected_decode)
-        node._process(wrong_size)
-        assert "dimensions" in json.loads(poses.messages[-1])["error"]
-        monkeypatch.setattr(aruco, "MAX_FRAME_PIXELS", WIDTH * HEIGHT - 1)
-        node._process(matching)
-        assert "pixel limit" in json.loads(poses.messages[-1])["error"]
-        assert not overlay.messages
+        assert [poses.topic, overlay.topic] == [f"{TOPIC}/aruco", f"{TOPIC}/aruco/overlay"]
+        node.subscriptions[0].callback(_frame(render_marker(*TILTED)))
+        assert _wait_until(lambda: bool(overlay.raw_messages))
+        result = json.loads(poses.messages[0])
+        assert result["pose_status"] == status and result["stamp"] == {"sec": 100, "nanosec": 42}
+        [marker] = result["markers"]
+        assert marker["id"] == 23 and len(marker["center_px"]) == 2
+        if status == "uncalibrated":
+            assert "translation_m" not in marker
+        else:
+            _assert_pose(marker, *TILTED)
+        assert plugin.dispatch("aruco", {"action": "info", "instance_id": "a"})["pose_status"] == status
     finally:
         plugin.shutdown()
+    assert not executor.nodes and node.destroyed and not node.worker.is_alive()
 
 
-@pytest.mark.parametrize("camera_info", [{TOPIC: CAMERA}, [CAMERA]])
-def test_saved_override_cannot_replace_camera_geometry(detector, camera_info):
+def test_publishes_once_when_markers_leave_then_stays_quiet():
     executor = _FakeExecutor()
-    plugin = ArucoPlugin({}, executor)
+    plugin = ArucoPlugin({"rate_hz": 30, "publish_overlay": False}, executor)
     try:
-        plugin.dispatch("aruco", {"action": "config", "instance_id": "a",
-                                  "calibration": {**CAMERA, "id": "old-file", "K": [400, 0, 320, 0, 400, 240, 0, 0, 1]}})
-        info = plugin.dispatch("aruco", {"action": "start", "instance_id": "a",
-                                         "input_topic": TOPIC, "camera_info": camera_info})
-        assert info["pose_status"] == "calibrated"
+        plugin.dispatch("aruco", {"action": "start", "input_topic": TOPIC, "camera_info": [CAMERA]})
         [node] = executor.nodes
-        assert node.camera_id == CAMERA["id"]
-        np.testing.assert_array_equal(node.calibration.matrix, np.array(K).reshape(3, 3))
-    finally:
-        plugin.shutdown()
+        [poses] = node.publishers
+        deliver = node.subscriptions[0].callback
+        blank = np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8)
+        for image, expected in ((render_marker(*TILTED), 1), (blank, 2)):
+            deliver(_frame(image))
+            assert _wait_until(lambda: len(poses.messages) == expected)
+        assert json.loads(poses.messages[1])["markers"] == []
+        deliver(_frame(blank))
+        assert _wait_until(lambda: node.frames.pop(timeout=0) is None)
+        assert len(poses.messages) == 2
 
-
-def test_overlay_is_per_instance_and_invalid_restart_stops_only_that_instance(detector):
-    executor = _FakeExecutor()
-    plugin = ArucoPlugin({}, executor)
-    start = {"action": "start", "input_topic": TOPIC, "camera_info": {TOPIC: CAMERA}}
-    try:
-        with pytest.raises(ValueError, match="publish_overlay"):
-            plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "publish_overlay": "false"})
-        with pytest.raises(ValueError, match="marker_size_m"):
-            plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "marker_size_m": -1})
-        plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "publish_overlay": False})
-        a = plugin.dispatch("aruco", {**start, "instance_id": "a"})
-        b = plugin.dispatch("aruco", {**start, "instance_id": "b"})
-        assert a["topic_out"][1]["topic"] == "" and b["topic_out"][1]["topic"].endswith("/overlay")
-        assert a["topic_out"][0]["topic"] != b["topic_out"][0]["topic"]
-        first, second = executor.nodes
-        with pytest.raises(ValueError, match="相机卡片开发者"):
-            plugin.dispatch("aruco", {**start, "instance_id": "a", "camera_info": {}})
-        assert first.destroyed and not first.worker.is_alive()
-        assert executor.nodes == [second] and second.worker.is_alive()
-    finally:
-        plugin.shutdown()
-
-
-@pytest.mark.parametrize("blocked_stage", ["teardown", "launch"])
-def test_stop_cancels_a_replacement_in_flight(detector, monkeypatch, blocked_stage):
-    executor = _FakeExecutor()
-    plugin = ArucoPlugin({}, executor)
-    start = {"action": "start", "instance_id": "a", "input_topic": TOPIC, "camera_info": [CAMERA]}
-    entered, release = Event(), Event()
-    try:
-        assert plugin.dispatch("aruco", start)["state"] == "running"
-        [old] = executor.nodes
-        plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "publish_overlay": False})
-        if blocked_stage == "teardown":
-            original = plugin._dispose
-        else:
-            original = type(old).start_worker
-
-        def pause(node):
-            entered.set()
-            assert release.wait(5)
-            original(node)
-
-        if blocked_stage == "teardown":
-            monkeypatch.setattr(plugin, "_dispose", pause)
-        else:
-            monkeypatch.setattr(type(old), "start_worker", pause)
-
-        with ThreadPoolExecutor(max_workers=2) as requests:
-            replacing = requests.submit(plugin.dispatch, "aruco", start)
-            try:
-                assert entered.wait(2)
-                info = requests.submit(plugin.dispatch, "aruco", {"action": "info", "instance_id": "a"})
-                assert info.result(timeout=2)["state"] == "starting"
-                stopping = requests.submit(plugin.dispatch, "aruco", {"action": "stop", "instance_id": "a"})
-                assert stopping.result(timeout=2)["state"] == "idle"
-            finally:
-                release.set()
-            assert replacing.result(timeout=2)["state"] == "idle"
-        assert not executor.nodes and old.destroyed
-        assert plugin.dispatch("aruco", start)["state"] == "running"
-        assert len(executor.nodes) == 1
-    finally:
-        release.set()
-        plugin.shutdown()
-
-
-def test_failed_registration_releases_ros_handles_and_allows_retry(detector, monkeypatch):
-    executor = _FakeExecutor()
-    plugin = ArucoPlugin({}, executor)
-    start = {"action": "start", "instance_id": "a", "input_topic": TOPIC, "camera_info": [CAMERA]}
-    allocated = []
-
-    def broken_add(node):
-        allocated.append(node)
-        executor.nodes.append(node)
-        raise RuntimeError("registration failed")
-
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(executor, "add_node", broken_add)
-            assert plugin.dispatch("aruco", start) == {"state": "error", "error": "registration failed"}
-        assert allocated[0].destroyed and not executor.nodes
-        assert plugin.dispatch("aruco", {"action": "info", "instance_id": "a"})["state"] == "idle"
-        assert plugin.dispatch("aruco", start)["state"] == "running"
+        deliver(_FakeCompressedImage(b"not a JPEG"))
+        assert _wait_until(lambda: "decode" in plugin.dispatch("aruco", {"action": "info",
+                                                                           "input_topic": TOPIC})["last_error"])
     finally:
         plugin.shutdown()
 
 
 @pytest.mark.parametrize(("dictionary", "second_id"), [
-    ("DICT_4X4_50", 23), ("DICT_5X5_50", 49), ("DICT_6X6_250", 203), ("DICT_7X7_50", 49),
-])
-def test_two_marker_poses_are_identical_with_or_without_overlay(detector, monkeypatch, dictionary, second_id):
+    ("DICT_4X4_50", 23), ("DICT_5X5_50", 23), ("DICT_6X6_250", 123), ("DICT_7X7_50", 23)])
+def test_two_markers_in_each_dictionary(dictionary, second_id):
     rotations = (np.array([2.8, -0.13, 0.1]), np.array([2.7, -0.19, 0.28]))
     translations = (np.array([-0.08, -0.012, 0.4]), np.array([0.10, 0.02, 0.60]))
-    left = render_marker(rotations[0], translations[0], 7, dictionary)
-    right = render_marker(rotations[1], translations[1], second_id, dictionary)
-    frame = _frame(np.minimum(left, right), 123)
+    image = np.minimum(render_marker(rotations[0], translations[0], 7, dictionary),
+                       render_marker(rotations[1], translations[1], second_id, dictionary))
+    matrix, distortion, _ = intrinsics(CAMERA, WIDTH, HEIGHT)
+    markers = MarkerDetector(dictionary).detect(image, 0.1, matrix, distortion)
+    assert [m["id"] for m in markers] == [7, second_id]
+    for marker, rotation, translation in zip(markers, rotations, translations):
+        _assert_pose(marker, rotation, translation)
+
+
+def test_ports_before_start_and_overlay_off():
+    plugin = ArucoPlugin({}, _FakeExecutor())
+    ports = plugin.get_tools()[0]["topic_out"]
+    assert plugin.dispatch("aruco", {"action": "info"})["topic_out"] == [{**p, "topic": ""} for p in ports]
+    plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "publish_overlay": False})
+    preview = plugin.dispatch("aruco", {"action": "info", "instance_id": "a", "input_topic": TOPIC})
+    assert preview["state"] == "idle"
+    assert [p["topic"] for p in preview["topic_out"]] == [f"{TOPIC}/aruco", ""]
+
+
+def test_restart_applies_new_settings_and_camera_but_not_a_repeat():
     executor = _FakeExecutor()
     plugin = ArucoPlugin({}, executor)
-    config = {"action": "config", "instance_id": "test", "dictionary": dictionary}
-    start = {"action": "start", "instance_id": "test", "input_topic": TOPIC, "camera_info": [CAMERA]}
-
-    def forbid_overlay(*_args, **_kwargs):
-        raise AssertionError("Overlay work ran in JSON-only mode")
-
+    start = {"action": "start", "instance_id": "a", "input_topic": TOPIC, "camera_info": [CAMERA]}
     try:
-        plugin.dispatch("aruco", config)
-        enabled = plugin.dispatch("aruco", start)
-        assert enabled["publish_overlay"] is True
-        [node] = executor.nodes
-        poses, overlay = node.publishers
-        node.subscriptions[0].callback(frame)
-        assert _wait_until(lambda: bool(overlay.raw_messages))
-        reference = json.loads(poses.messages[0])
-        assert reference["dictionary"] == dictionary
-        assert [marker["id"] for marker in reference["markers"]] == [7, second_id]
-        for marker, rotation, translation in zip(reference["markers"], rotations, translations):
-            np.testing.assert_allclose(marker["translation_m"], translation, atol=0.006)
-            actual, _ = cv2.Rodrigues(np.asarray(marker["rotation_rvec_rad"]))
-            expected, _ = cv2.Rodrigues(rotation)
-            assert np.linalg.norm(actual - expected) < 0.23
-            assert marker["reprojection_rms_px"] < 1.5
-
-        plugin.dispatch("aruco", {**config, "publish_overlay": False})
-        disabled = plugin.dispatch("aruco", start)
-        assert disabled["publish_overlay"] is False
-        assert disabled["topic_out"][0] == enabled["topic_out"][0]
-        assert disabled["topic_out"][1]["topic"] == ""
-        assert node.destroyed and not node.worker.is_alive()
-        [json_node] = executor.nodes
-        [json_only] = json_node.publishers
-        with monkeypatch.context() as patch:
-            for op in ("drawFrameAxes", "polylines", "putText", "imencode"):
-                patch.setattr(cv2, op, forbid_overlay)
-            json_node.subscriptions[0].callback(frame)
-            assert _wait_until(lambda: bool(json_only.messages))
-            assert json.loads(json_only.messages[0]) == reference
-
-        plugin.dispatch("aruco", {**config, "publish_overlay": True})
-        restored = plugin.dispatch("aruco", start)
-        assert restored["topic_out"] == enabled["topic_out"]
-        assert len(executor.nodes[0].publishers) == 2
-    finally:
-        plugin.shutdown()
-
-
-def test_worker_reports_processing_error_recovers_and_restarts(detector, caplog, monkeypatch):
-    executor = _FakeExecutor()
-    plugin = ArucoPlugin({"rate_hz": 30}, executor)
-    args = {"action": "start", "instance_id": "a", "input_topic": TOPIC,
-            "camera_info": {TOPIC: CAMERA}}
-    info_args = {"action": "info", "instance_id": "a"}
-    image = np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8)
-    try:
-        assert plugin.dispatch("aruco", args)["state"] == "running"
-        [node] = executor.nodes
-        deliver = node.subscriptions[0].callback
-        pose_pub = node.publishers[0]
-
-        def broken_detector(*_args):
-            raise RuntimeError("detector unavailable")
-
-        with monkeypatch.context() as patch:
-            patch.setattr(node.detector, "estimate", broken_detector)
-            for index in (1, 2):
-                deliver(_frame(image, index))
-                assert _wait_until(lambda: len(pose_pub.messages) == index)
-                failed = json.loads(pose_pub.messages[-1])
-                assert failed["markers"] == []
-                assert "detector unavailable" in failed["error"]
-                assert failed["stamp"]["sec"] == index
-            info = plugin.dispatch("aruco", info_args)
-            assert info["state"] == "error" and "detector unavailable" in info["error"]
-            assert sum("detector unavailable" in record.message for record in caplog.records) == 1
-
-        deliver(_frame(image, 3))
-        assert _wait_until(lambda: plugin.dispatch("aruco", info_args)["state"] == "running")
-        assert "error" not in json.loads(pose_pub.messages[-1])
-
-        node.close()
-        assert "worker stopped" in plugin.dispatch("aruco", info_args)["error"]
-        assert plugin.dispatch("aruco", args)["state"] == "running"
-        [replacement] = executor.nodes
-        assert node.destroyed and replacement is not node and replacement.worker.is_alive()
-    finally:
-        plugin.shutdown()
-
-
-def test_same_topic_restart_applies_marker_size_and_calibration_changes(detector):
-    executor = _FakeExecutor()
-    plugin = ArucoPlugin({"rate_hz": 30}, executor)
-    args = {"action": "start", "instance_id": "a", "input_topic": TOPIC,
-            "camera_info": {TOPIC: CAMERA}}
-    image = render_marker(np.array([np.pi, 0, 0]), np.array([0.0, 0.0, 0.4]))
-
-    def depth(node, sec):
-        node.subscriptions[0].callback(_frame(image, sec))
-        assert _wait_until(lambda: bool(node.publishers[0].messages))
-        [marker] = json.loads(node.publishers[0].messages[0])["markers"]
-        return marker["translation_m"][2]
-
-    try:
-        without_calibration = {**args, "camera_info": {TOPIC: {**CAMERA, "K": []}}}
-        with pytest.raises(ValueError, match="相机卡片开发者"):
-            plugin.dispatch("aruco", without_calibration)
-        assert plugin.dispatch("aruco", args)["pose_status"] == "calibrated"
+        plugin.dispatch("aruco", start)
         [first] = executor.nodes
-        assert depth(first, 1) == pytest.approx(0.4, abs=0.006)
+        plugin.dispatch("aruco", start)
+        assert executor.nodes == [first]
 
-        plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "marker_size_m": 0.2})
-        assert plugin.dispatch("aruco", args)["state"] == "running"
+        plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "marker_size_m": 0.05})
+        plugin.dispatch("aruco", {"action": "config", "instance_id": "a", "rate_hz": 2})
+        plugin.dispatch("aruco", start)
         [second] = executor.nodes
-        assert first.destroyed and not first.worker.is_alive()
-        assert second.outputs == first.outputs
-        assert depth(second, 2) == pytest.approx(0.8, abs=0.012)
+        assert first.destroyed and second.options["marker_size_m"] == 0.05 and second.options["rate_hz"] == 2
 
-        changed = {**CAMERA, "K": [400.0, 0, 320.0, 0, 400.0, 240.0, 0, 0, 1]}
-        restart = {**args, "camera_info": {TOPIC: changed}}
-        assert plugin.dispatch("aruco", restart)["state"] == "running"
+        plugin.dispatch("aruco", {**start, "camera_info": [FOV_ONLY]})
         [third] = executor.nodes
-        assert second.destroyed and not second.worker.is_alive()
-        assert depth(third, 3) == pytest.approx(0.4, abs=0.006)
-        assert plugin.dispatch("aruco", restart)["state"] == "running"
-        assert executor.nodes == [third]
-        with pytest.raises(ValueError, match="相机卡片开发者"):
-            plugin.dispatch("aruco", without_calibration)
-        assert third.destroyed and not third.worker.is_alive() and not executor.nodes
-        assert plugin.dispatch("aruco", restart)["state"] == "running"
-        [recovered] = executor.nodes
-        assert recovered.outputs == third.outputs
-        assert depth(recovered, 4) == pytest.approx(0.4, abs=0.006)
+        assert second.destroyed and third.declaration == FOV_ONLY
     finally:
         plugin.shutdown()
+
+
+def test_config_rejects_bad_values():
+    plugin = ArucoPlugin({}, _FakeExecutor())
+    for bad in ({"dictionary": "DICT_ARUCO_ORIGINAL"}, {"marker_size_m": -1}, {"rate_hz": 100}):
+        with pytest.raises(ValueError):
+            plugin.dispatch("aruco", {"action": "config", **bad})
+
+
+def test_stop_during_start_discards_the_new_node(monkeypatch):
+    import plugins.aruco as module
+
+    executor = _FakeExecutor()
+    plugin = ArucoPlugin({}, executor)
+    real_node = module._ArucoNode
+
+    def node_then_stop(*args):
+        node = real_node(*args)
+        plugin.dispatch("aruco", {"action": "stop"})
+        return node
+
+    monkeypatch.setattr(module, "_ArucoNode", node_then_stop)
+    result = plugin.dispatch("aruco", {"action": "start", "instance_id": "a", "input_topic": TOPIC})
+    assert result == {"state": "idle"} and not executor.nodes
+
+
+def test_bundle_loads_the_card_and_reports_a_missing_backend(monkeypatch):
+    from main import PerceptionBundle
+
+    monkeypatch.setattr(aruco_runtime, "unavailable_reason", lambda: "no ArUco here")
+    monkeypatch.setattr("plugins.aruco.unavailable_reason", lambda: "no ArUco here")
+    bundle = PerceptionBundle({"plugins": {"aruco": {"enabled": True},
+                                          "echo_cancellation": {"enabled": False},
+                                          "audio_mixer": {"enabled": False}}}, _FakeExecutor())
+    try:
+        [tool] = bundle.get_all_tools()
+        assert tool["name"] == "aruco" and tool["type"] == "processor"
+        info = bundle.dispatch("aruco", {"action": "info"})
+        assert info["state"] == "error" and info["error"] == "no ArUco here"
+        assert bundle.dispatch("aruco", {"action": "start", "input_topic": TOPIC})["state"] == "error"
+    finally:
+        bundle.shutdown()

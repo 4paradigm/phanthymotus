@@ -4321,56 +4321,32 @@ at the form rather than the schema (`web/js/sidebar.js`):
 
 ## ArUco 定位 (`aruco`)
 
-Connect the camera's `image/jpeg` output to this card. The camera card must
-publish a calibrated `motus.camera/1` declaration for that stream and
-resolution. If its intrinsics are missing or invalid, startup raises an error
-identifying the stream. Report the camera card and stream to its developer
-so the driver can supply the calibration.
-An invalid rewire leaves a running card on its previously calibrated topic.
-If calibration is lost on the active topic, pose output stops until a valid
-start. Frame dimensions must match that calibration and fit within 36 megapixels.
+Wire a camera's `image/jpeg` output into the card. Every processed frame that
+shows a marker publishes one JSON message on `<camera>/aruco`, and one empty
+message when the markers leave view. Each marker carries its `id` and pixel
+`center_px`, and, when a focal length is known, `translation_m` (camera
+optical frame: +X right, +Y down, +Z forward), `rotation_rvec_rad` and
+`distance_m`. `<camera>/aruco/overlay` is a JPEG with the outlines and axes,
+unless **Publish overlay** is off.
 
-Connect the right-hand `data/json` port to a downstream `data/json` input,
-such as `decision_core`. The port is visible before the card starts. Wiring a
-camera resolves the instance's `poses` topic, and starting the canvas passes
-the calibration to ArUco and the resolved topic to the downstream card.
+The focal length comes from the camera card's `motus.camera/1` declaration
+(see [Camera Parameters](#camera-parameters-camera_info)), and `pose_status`
+says which case applies:
 
-The default marker side is **10 cm (0.10 m)**. If your print differs, measure an
-outer edge of the black square, excluding the white margin, and enter its
-length in meters under **Marker side (m)**. The card uses this length for every
-marker in the frame. A wrong length scales the reported translation.
+| `pose_status` | The camera declares | Pose |
+| --- | --- | --- |
+| `calibrated` | `K` (and `D`, when it has distortion) | Metric, rescaled to the frame size |
+| `approximate` | only `half_fov_rad`, as R1 does | Metric, pinhole, no distortion |
+| `uncalibrated` | nothing, as G1, Go2 and the browser camera do | IDs and pixel centres only |
 
-Choose the dictionary used to print your markers. An ID names a pattern
-within a dictionary. The patterns in each dictionary are deliberately
-separated to reduce the chance of confusing one ID with another. For a new set,
-the first number describes the grid of data cells and the last gives the number
-of available IDs. With the same printed size, a finer grid needs more image
-detail. [OpenCV dictionary selection guide](https://docs.opencv.org/4.x/d5/dae/tutorial_aruco_detection.html)
+**Marker side (m)** is the outer edge of the black square, without the white
+margin. One card instance assumes one printed size, and a wrong value scales
+every distance by the same factor. Pick the **dictionary** the markers were
+printed from: `DICT_4X4_50` (default) suits small or distant markers,
+`DICT_6X6_250` gives 250 IDs.
 
-| Dictionary | When to choose it for new markers |
-| --- | --- |
-| `DICT_4X4_50` (default) | Up to 50 IDs. The coarse grid helps when a marker occupies few pixels, such as a small tag or one seen from farther away. |
-| `DICT_5X5_50` | Up to 50 IDs. For workbench or room-scale use when the camera resolves five cells per side and you want more separation between patterns than 4×4 provides. |
-| `DICT_6X6_250` | Up to 250 IDs. Useful for a large inventory or many distinct stations where the tag image resolves the 6×6 grid. |
-| `DICT_7X7_50` | Up to 50 IDs. Use large or close-up tags when distinguishing similar-looking observations matters and the camera resolves the finer cells. |
-
-Each frame publishes one `poses` JSON message with `pose_status: calibrated`.
-The `markers` array includes all successfully localized markers in the
-selected dictionary, sorted by ID. Each entry contains XYZ translation in
-meters, a Rodrigues rotation vector in radians and reprojection RMS in pixels.
-The transform maps marker coordinates into the camera optical frame
-(+X right, +Y down, +Z forward). A blank frame produces an empty array.
-A single planar marker's rotation can be ambiguous near a frontal view.
-
-**Publish Monitor overlay** is on by default. It draws each marker's ID,
-outline and XYZ axes (red, green and blue) in a JPEG. Turn it off and restart
-the card to publish only the same JSON poses, skipping annotation and JPEG
-encoding.
-
-The card uses the Perception image's OpenCV. Verify `cv2.aruco` in the
-actual JetPack image before deployment. If it is missing, the card reports
-the dependency error while other processors continue to load. Keep the
-system OpenCV used by the existing vision processors when preparing the image.
+OpenCV ships `cv2.aruco` in both JetPack images; the tests fail inside an
+image that lacks it, rather than skip.
 
 ## Camera Parameters (`camera_info`)
 

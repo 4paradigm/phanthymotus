@@ -1,151 +1,125 @@
-"""ArUco detection, calibrated pose estimation and rendering with OpenCV."""
+"""ArUco detection and pose estimation with OpenCV."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import functools
 
 import numpy as np
+
+from plugins.camera_info import camera_matrix
 
 
 DICTIONARIES = ("DICT_4X4_50", "DICT_5X5_50", "DICT_6X6_250", "DICT_7X7_50")
 DEFAULT_DICTIONARY = DICTIONARIES[0]
-MAX_REPROJECTION_PX = 3.0
+# OpenCV's distortion vector lengths.
+_DISTORTION_SIZES = (4, 5, 8, 12, 14)
 
 
-@dataclass(frozen=True)
-class Calibration:
-    width: int
-    height: int
-    matrix: np.ndarray
-    distortion: np.ndarray | None
+@functools.lru_cache(maxsize=1)
+def unavailable_reason() -> str:
+    """Empty when this image's OpenCV has ArUco, otherwise why not."""
+    try:
+        import cv2
+        cv2.aruco.getPredefinedDictionary
+    except (ImportError, AttributeError, OSError) as exc:
+        return f"This Perception image's OpenCV has no ArUco module: {exc}"
+    return ""
 
-    def matches(self, other):
-        return (other is not None and self.width == other.width and self.height == other.height
-                and np.array_equal(self.matrix, other.matrix)
-                and np.array_equal(self.distortion, other.distortion))
 
-    @classmethod
-    def from_declaration(cls, value):
-        if not isinstance(value, dict):
-            raise ValueError("Expected camera calibration metadata for this image stream.")
-        width, height = value.get("width"), value.get("height")
-        if any(type(n) is not int or n <= 0 for n in (width, height)):
-            raise ValueError("Calibration needs positive integer width and height.")
-        try:
-            matrix = np.asarray(value.get("K"), dtype=np.float64).reshape(3, 3)
-            coeffs = value.get("D")
-            distortion = np.asarray([] if coeffs is None else coeffs, dtype=np.float64)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("Calibration requires numeric K (nine values) and D.") from exc
-        if (not np.isfinite(matrix).all() or min(matrix[0, 0], matrix[1, 1]) <= 0
-                or matrix[0, 1] != 0 or matrix[1, 0] != 0
-                or not np.array_equal(matrix[2], [0, 0, 1])):
-            raise ValueError("Calibration K must be a finite pinhole matrix with positive focal lengths.")
-        if distortion.ndim != 1 or not np.isfinite(distortion).all():
-            raise ValueError("Calibration D must be a finite list of distortion coefficients.")
-        model = value.get("distortion_model")
-        if model in ("pinhole", "none") and not np.any(distortion):
-            return cls(width, height, matrix, None)
-        if ((model == "plumb_bob" and distortion.size in (4, 5))
-                or (model == "rational_polynomial" and distortion.size == 8)):
-            return cls(width, height, matrix, distortion)
-        raise ValueError("Calibration needs a pinhole, plumb_bob, or rational_polynomial model with matching D.")
+def intrinsics(declaration, width, height):
+    """`(K, D, pose_status)` for a `width` x `height` frame.
+
+    `calibrated` when the camera declares K, `approximate` when K is derived
+    from its declared field of view (pinhole, no distortion), and
+    `uncalibrated` with no K when it declares neither — markers are still
+    detected then, only without a metric pose. A K declared at another
+    resolution is rescaled to the frame.
+    """
+    if not declaration:
+        return None, None, "uncalibrated"
+    try:
+        matrix, declared_w, declared_h = camera_matrix(declaration)
+    except ValueError:
+        return None, None, "uncalibrated"
+    matrix = matrix.astype(np.float64)
+    matrix[0] *= width / declared_w
+    matrix[1] *= height / declared_h
+    if declaration.get("K") in (None, "", []):
+        return matrix, None, "approximate"
+    coeffs = declaration.get("D")
+    distortion = None
+    if isinstance(coeffs, (list, tuple)) and len(coeffs) in _DISTORTION_SIZES:
+        distortion = np.asarray(coeffs, dtype=np.float64)
+        if not np.isfinite(distortion).all() or not distortion.any():
+            distortion = None
+    return matrix, distortion, "calibrated"
 
 
 class MarkerDetector:
-    def __init__(self, dictionary, *, draw_overlay=True):
-        try:
-            import cv2
+    def __init__(self, dictionary):
+        import cv2
 
-            aruco = cv2.aruco
-            get_dictionary = getattr(aruco, "getPredefinedDictionary", None) or aruco.Dictionary_get
-            marker_dictionary = get_dictionary(getattr(aruco, dictionary))
-            if hasattr(aruco, "ArucoDetector"):
-                self._detect = aruco.ArucoDetector(marker_dictionary, aruco.DetectorParameters()).detectMarkers
-            else:
-                parameters = aruco.DetectorParameters_create()
-                self._detect = lambda gray: aruco.detectMarkers(gray, marker_dictionary, parameters=parameters)
-            # Check the rest of the native API before accepting a camera stream.
-            required = ["solvePnP", "solvePnPGeneric", "projectPoints", "Rodrigues"]
-            if draw_overlay:
-                required.append("drawFrameAxes")
-            if (not all(callable(getattr(cv2, name, None)) for name in required)
-                    or not hasattr(cv2, "SOLVEPNP_IPPE_SQUARE")):
-                raise AttributeError("calibrated pose API is unavailable")
-        except (AttributeError, ImportError, OSError) as exc:
-            raise RuntimeError("This Perception image lacks OpenCV ArUco or the calibrated pose API. "
-                               "Use a compatible Perception image.") from exc
+        aruco = cv2.aruco
+        marker_dictionary = aruco.getPredefinedDictionary(getattr(aruco, dictionary))
+        if hasattr(aruco, "ArucoDetector"):  # OpenCV >= 4.7
+            self._detect = aruco.ArucoDetector(marker_dictionary, aruco.DetectorParameters()).detectMarkers
+        else:  # older OpenCV (JetPack 5)
+            parameters = aruco.DetectorParameters_create()
+            self._detect = lambda gray: aruco.detectMarkers(gray, marker_dictionary, parameters=parameters)
         self.cv = cv2
-        self.draw_overlay = draw_overlay
 
-    def _detect_markers(self, image):
+    def detect(self, image, marker_size_m, matrix, distortion, *, draw=False):
+        """Markers in `image` sorted by ID, with a pose when `matrix` is given."""
         cv = self.cv
-        gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
-        corners, ids, _ = self._detect(gray)
+        corners, ids, _ = self._detect(cv.cvtColor(image, cv.COLOR_BGR2GRAY))
         if ids is None:
-            return
-        for marker_id, quad in zip(ids.reshape(-1), corners):
-            pixels = np.asarray(quad, dtype=np.float64).reshape(4, 2)
-            if np.isfinite(pixels).all():
-                yield int(marker_id), pixels
-
-    def _draw_marker(self, image, marker_id, pixels):
-        cv = self.cv
-        outline = np.rint(pixels).astype(np.int32)
-        color = (0, 200, 255)
-        cv.polylines(image, [outline], True, color, 1)
-        cv.putText(image, str(marker_id), tuple(outline[0]), cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-    def estimate(self, image, calibration, marker_size_m):
-        """Return each accepted marker's pose and optionally draw it on the source image."""
-        cv = self.cv
-        if image.shape[:2] != (calibration.height, calibration.width):
-            raise ValueError("Decoded frame dimensions differ from camera calibration.")
+            return []
         half = marker_size_m / 2
-        # OpenCV IPPE_SQUARE order matches the detected, marker-oriented corners.
+        # The corner order SOLVEPNP_IPPE_SQUARE expects, which is the detector's.
         square = np.array([[-half, half, 0], [half, half, 0],
                            [half, -half, 0], [-half, -half, 0]], dtype=np.float64)
         markers = []
-        for marker_id, pixels in self._detect_markers(image):
-            pose = self._solve(square, pixels, calibration)
-            if pose is None:
-                continue
-            rms, rotation, translation = pose
-            if self.draw_overlay:
-                cv.drawFrameAxes(image, calibration.matrix, calibration.distortion, rotation, translation, half)
-                self._draw_marker(image, marker_id, pixels)
-            markers.append({"id": marker_id, "translation_m": translation.reshape(3).tolist(),
-                            "rotation_rvec_rad": rotation.reshape(3).tolist(), "reprojection_rms_px": rms})
-        return sorted(markers, key=lambda marker: marker["id"])
+        for marker_id, quad in zip(ids.reshape(-1), corners):
+            pixels = quad.reshape(4, 2).astype(np.float64)
+            marker = {"id": int(marker_id), "center_px": [round(float(v), 1) for v in pixels.mean(axis=0)]}
+            pose = self._pose(square, pixels, matrix, distortion) if matrix is not None else None
+            if pose is not None:
+                rvec, tvec = pose
+                marker.update(translation_m=[round(float(v), 4) for v in tvec.reshape(3)],
+                              rotation_rvec_rad=[round(float(v), 4) for v in rvec.reshape(3)],
+                              distance_m=round(float(np.linalg.norm(tvec)), 4))
+                if draw:
+                    cv.drawFrameAxes(image, matrix, distortion, rvec, tvec, half)
+            if draw:
+                outline = np.rint(pixels).astype(np.int32)
+                cv.polylines(image, [outline], True, (0, 200, 255), 1)
+                cv.putText(image, str(marker["id"]), tuple(int(v) for v in outline[0]),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
+            markers.append(marker)
+        return sorted(markers, key=lambda m: m["id"])
 
-    def _solve(self, square, pixels, calibration):
+    def _pose(self, square, pixels, matrix, distortion):
+        """`(rvec, tvec)` with the marker in front of the camera and facing it, or None.
+
+        IPPE first. OpenCV 4.6's IPPE fails on a marker seen exactly head-on
+        (both candidates are the identity, 141 px off), so fall back to the
+        iterative solver, which handles that case.
+        """
         cv = self.cv
-        matrix, distortion = calibration.matrix, calibration.distortion
         candidates = []
         try:
-            _, rotations, translations, *_ = cv.solvePnPGeneric(
-                square, pixels, matrix, distortion, flags=cv.SOLVEPNP_IPPE_SQUARE)
-            candidates.extend(zip(rotations, translations))
+            _, rvecs, tvecs, _ = cv.solvePnPGeneric(square, pixels, matrix, distortion,
+                                                    flags=cv.SOLVEPNP_IPPE_SQUARE)
+            candidates += zip(rvecs, tvecs)
         except cv.error:
             pass
-        # IPPE can return degenerate candidates for a square viewed head-on.
         try:
-            ok, rotation, translation = cv.solvePnP(
-                square, pixels, matrix, distortion, flags=cv.SOLVEPNP_ITERATIVE)
+            ok, rvec, tvec = cv.solvePnP(square, pixels, matrix, distortion, flags=cv.SOLVEPNP_ITERATIVE)
             if ok:
-                candidates.append((rotation, translation))
+                candidates.append((rvec, tvec))
         except cv.error:
             pass
-        best = None
-        for rotation, translation in candidates:
-            if not (np.isfinite(rotation).all() and np.isfinite(translation).all()):
-                continue
-            axes, _ = cv.Rodrigues(rotation)
-            if np.any((square @ axes.T + translation.reshape(3))[:, 2] <= 0):
-                continue
-            projected, _ = cv.projectPoints(square, rotation, translation, matrix, distortion)
-            residual = projected.reshape(4, 2) - pixels
-            rms = float(np.sqrt(np.mean(np.sum(residual ** 2, axis=1))))
-            if rms <= MAX_REPROJECTION_PX and (best is None or rms < best[0]):
-                best = rms, rotation, translation
-        return best
+        for rvec, tvec in candidates:
+            if np.isfinite(tvec).all() and tvec[2, 0] > 0 and cv.Rodrigues(rvec)[0][2, 2] < 0:
+                return rvec, tvec
+        return None
