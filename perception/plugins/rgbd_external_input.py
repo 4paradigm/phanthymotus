@@ -475,7 +475,7 @@ class ExternalOdometryInput:
                                            min(pending, learner.last_solve_ns))
         return None
 
-    def _complete_learning(self):
+    def _complete_learning(self, *, replay=True):
         if self.learning_work is None or not self.learning_work[2].done():
             return
         key, result, future = self.learning_work
@@ -488,6 +488,8 @@ class ExternalOdometryInput:
         self.learning_results[key] = result
         if len(self.learning_results) > 64:
             self.learning_results.popitem(last=False)
+        if not replay:
+            return
         earliest = time.time_ns() - _OUTPUT_TIMEOUT_NS
         if pending is not None:
             # Earlier retries may have aged out while the executor was busy.
@@ -528,16 +530,37 @@ class ExternalOdometryInput:
                 mount_fault = True
         current, delayed = [], []
         now = time.time_ns()
+        earliest = now - _OUTPUT_TIMEOUT_NS
+        frontier = self.fuser.current.stamp
+        published_stamp = self.status.get('stamp_ns')
+        recovery_stamp = 0
+        # A newer checkpoint with no fresh publication means computation
+        # missed the deadline. A gap in incoming data alone does not do this.
+        if self.status.get('published_at') is not None and published_stamp < min(earliest, frontier):
+            recovery_stamp = max((stamp for kind, source, stamp, motion in observations
+                if kind == 'motion' and source == self.selected and
+                stamp >= earliest and stamp > frontier and motion.pose is not None and
+                not motion.reset and motion.mask[[0, 1, 5]].all()), default=0)
+        dropped_replay = 0
         for event in observations:
             stamp = event[1] if event[0] == 'visual' else event[2]
-            if type(stamp) is int and now-stamp > _OUTPUT_TIMEOUT_NS:
+            if recovery_stamp and type(stamp) is int and (
+                    (event[0] == 'visual' and stamp <= recovery_stamp) or
+                    (event[0] == 'motion' and not event[3].reset and (stamp <= frontier or stamp < earliest))):
+                # Restore measured motion without reopening the already-applied
+                # history. Explicit source boundaries still go through below.
+                dropped_replay += 1
+            elif type(stamp) is int and stamp < earliest:
                 delayed.append((stamp, event))
             else:
                 current.append(event)
+        if dropped_replay:
+            with self.event_lock:
+                self.dropped += dropped_replay
         with self.fuser.batch():
             # A completed fit can rewind the mutable history. Include the
             # waiting measurements in that replay before publishing.
-            self._complete_learning()
+            self._complete_learning(replay=not recovery_stamp)
             if mounts_received:
                 # Revise accepted projections as well as captures still waiting
                 # for evidence, against the complete mount batch.

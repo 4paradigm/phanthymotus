@@ -433,7 +433,7 @@ class ExternalOdometry:
         cached = self._pose_intervals.get(key)
         if cached is not None and cached[0] is left and cached[1] is right and cached[2] is knot:
             self._pose_intervals.move_to_end(key)
-            return cached[3], cached[4]
+            return cached[3], cached[4], cached[5]
         if knot is None:
             start, origin = t0, left.pose
             velocity = se3_log(np.linalg.inv(left.pose) @ right.pose) / ((t1-t0) / 1e9)
@@ -441,11 +441,13 @@ class ExternalOdometry:
             start, origin, velocity = knot
         covariance = _pose_increment_covariance(left, right, velocity, (end-start)/1e9,
                                                 overlap/(t1-t0), end == t1, origin)
-        self._pose_intervals[key] = (left, right, knot, velocity, covariance)
+        fixed_attitude = (knot is None and (left.mask & right.mask)[3:].all() and
+                          _origin_attitude(left, right, t1-t0) is not None)
+        self._pose_intervals[key] = (left, right, knot, velocity, covariance, fixed_attitude)
         self._pose_intervals.move_to_end(key)
         if len(self._pose_intervals) > _MAX_EVENTS:
             self._pose_intervals.popitem(last=False)
-        return velocity, covariance
+        return velocity, covariance, fixed_attitude
 
     def _pose_start(self, times, index):
         while index >= 0:
@@ -511,7 +513,7 @@ class ExternalOdometry:
                 # tangent before applying any learned scales or clipping.
                 noise_end = t1 if knot is not None else clipped_end
                 seconds_to_knot = (noise_end - clipped_end) / 1e9
-                velocity, increment_covariance = self._pose_interval(
+                velocity, increment_covariance, _ = self._pose_interval(
                     p0, p1, pose_left, pose_right, noise_end, overlap, knot)
                 mask = pose_left.mask & pose_right.mask
                 covariance = pose_left.covariance
@@ -536,9 +538,9 @@ class ExternalOdometry:
                 fixed_attitude = mask[3:].all()
                 covariance = left.covariance
             elif left.pose is not None and right.pose is not None:
-                velocity, increment_covariance = self._pose_interval(t0, t1, left, right, clipped_end, overlap)
+                velocity, increment_covariance, fixed_attitude = self._pose_interval(
+                    t0, t1, left, right, clipped_end, overlap)
                 mask = left.mask & right.mask
-                fixed_attitude = mask[3:].all() and _origin_attitude(left, right, t1-t0) is not None
                 covariance = left.covariance
             elif left.twist is not None and right.twist is not None:
                 mask = left.mask & right.mask
@@ -552,8 +554,9 @@ class ExternalOdometry:
 
     def _learned_step(self, learner, velocity, dt, observed, fixed_attitude, measured_chassis):
         # Delayed visual measurements often replay the same measured motion.
-        # The prior can move without changing its body increment or adjoint.
-        key = (learner.parameters.tobytes(), velocity.tobytes(), dt, observed.tobytes(), fixed_attitude, measured_chassis)
+        # Its increment, noise scaling and parameter sensitivity depend only on this step.
+        key = (learner.parameters.tobytes(), velocity.tobytes(), dt, observed.tobytes(),
+               fixed_attitude, measured_chassis, learner.enabled)
         step = self._learned_steps.get(key)
         if step is None:
             calibrated = observed
@@ -567,9 +570,14 @@ class ExternalOdometry:
                 # Independently corroborated angular increments already measure
                 # body motion. A visual fit cannot add angular drift to them.
                 twist[3:] = velocity[3:]
-            delta = se3_exp(twist * dt)
-            differential = se3_right_jacobian(twist * dt) if learner.enabled else None
-            step = (twist, delta, _adjoint(np.linalg.inv(delta)), differential, calibrated)
+            integrated = twist * dt
+            delta = se3_exp(integrated)
+            sensitivity_increment = None
+            if learner.enabled:
+                sensitivity_increment = (
+                    se3_right_jacobian(integrated) @ learner.velocity_parameter_jacobian(velocity, calibrated) * dt)
+            scales = np.exp(np.where(calibrated, learner.parameters[:6], 0.)) * observed
+            step = (twist, delta, _adjoint(np.linalg.inv(delta)), sensitivity_increment, np.outer(scales, scales))
             self._learned_steps[key] = step
             if len(self._learned_steps) > _MAX_EVENTS:
                 self._learned_steps.popitem(last=False)
@@ -594,20 +602,19 @@ class ExternalOdometry:
         corroborated_span = 0.
         pieces = self._intervals(motion_times, state.stamp, stamp)
         for velocity, dt, observed, covariance, increment, seconds_to_knot, fixed_attitude in pieces:
-            twist, delta, adjoint, differential, calibrated = self._learned_step(
+            twist, delta, adjoint, sensitivity_increment, noise_scale = self._learned_step(
                 learner, velocity, dt, observed, fixed_attitude, model in _MEASURED_MODELS)
             transform = transform @ delta
             if fixed_attitude:
                 corroborated_span += dt
-            scales = np.exp(np.where(calibrated, learner.parameters[:6], 0.)) * observed
             if increment is None:
                 # Preserve the stream's variance-per-second propagation while
                 # retaining its full spatial covariance and learned unit scale.
-                process_noise = covariance * np.outer(scales, scales) * dt
+                process_noise = covariance * noise_scale * dt
             else:
                 # The increment already covers dt. Apply the learned velocity
                 # scales and retain the default uncertainty on unobserved axes.
-                process_noise = increment * np.outer(scales, scales)
+                process_noise = increment * noise_scale
                 if seconds_to_knot:
                     # Later propagation uses this calibrated screw. Transport
                     # the knot's share back to the current clip in its tangent.
@@ -616,8 +623,7 @@ class ExternalOdometry:
             process_noise = process_noise + np.diag(np.where(observed, 0., .25 * dt))
             noise = adjoint @ noise @ adjoint.T + process_noise
             if learner.enabled:
-                sensitivity = (adjoint @ sensitivity +
-                               differential @ learner.velocity_parameter_jacobian(velocity, calibrated)*dt)
+                sensitivity = adjoint @ sensitivity + sensitivity_increment
             mask |= observed
         attitude_since = state.corroborated_attitude_since
         if stamp > state.stamp:

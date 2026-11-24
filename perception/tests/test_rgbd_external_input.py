@@ -114,6 +114,58 @@ def test_fusion_rejects_stale_measurements_even_during_publication(sessions):
         stream.close()
 
 
+def test_stale_fusion_recovers_current_motion_before_replaying_history(sessions, monkeypatch):
+    _, now, _ = sessions
+    stream = fusion_input()
+    try:
+        now[0] = 1_120_000_000
+        for sec in (0., .1):
+            stream._receive('/external', NS(data=json.dumps(packet(sec, 0.))))
+        stream._apply_ready(stream._take_ready())
+        previous_segment = stream.info()['segment_id']
+        rebuild = stream.fuser._rebuild
+        now[0] = 1_320_000_000
+        stream._receive('/external', NS(data=json.dumps(packet(.3, 0.))))
+
+        def missed_deadline(begin):
+            rebuild(begin)
+            now[0] += 1_600_000_000
+
+        with monkeypatch.context() as context:
+            context.setattr(stream.fuser, '_rebuild', missed_deadline)
+            stream._apply_ready(stream._take_ready())
+        assert stream.fuser.current.stamp == 1_300_000_000
+        assert stream.info()['stamp_ns'] == 1_100_000_000
+        now[0] = 4_000_000_000
+        captured = 1_060_000_000
+        queued_visual = 3_750_000_000
+        old_pose = dict(position=[0., 0., 0.], quaternion=[0., 0., 0., 1.])
+        stream.visual(captured, 'native', old_pose)
+        stream.visual(queued_visual, 'native', old_pose)
+        for sec in (2.9, 2.95):
+            stream._receive('/external', NS(data=json.dumps(packet(sec, 0.))))
+        def expensive_history(begin):
+            if begin <= captured:
+                now[0] += 1_600_000_000
+            rebuild(begin)
+
+        with monkeypatch.context() as context:
+            context.setattr(stream.fuser, '_rebuild', expensive_history)
+            stream._apply_ready(stream._take_ready())
+        info = stream.info()
+        assert info['status'] == 'tracking'
+        assert info['stamp_ns'] == 3_950_000_000
+        assert info['segment_id'] == previous_segment
+        assert captured not in stream.fuser.raw_vision
+        assert queued_visual not in stream.fuser.raw_vision
+
+        stream.visual(captured, 'native', old_pose)
+        stream._apply_ready(stream._take_ready())
+        assert captured in stream.fuser.raw_vision
+    finally:
+        stream.close()
+
+
 def test_fusion_queue_keeps_recent_events_and_skips_expired_work(sessions, monkeypatch):
     _, now, _ = sessions
     now[0] = 1_900_000_000

@@ -1,6 +1,7 @@
 """Calibrate body-frame external odometry increments against native visual motion."""
 from collections import deque
 from copy import copy
+import math
 from time import perf_counter_ns
 
 import numpy as np
@@ -13,14 +14,36 @@ _MAX_INTERVALS, _HUBER = 64, 2.5
 
 
 def _skew(v):
-    x, y, z = np.moveaxis(v, -1, 0)
-    zero = np.zeros_like(x)
-    return np.stack((zero, -z, y, z, zero, -x, -y, x, zero), axis=-1).reshape(v.shape[:-1] + (3, 3))
+    result = np.zeros(v.shape[:-1] + (3, 3), dtype=v.dtype)
+    result[..., 0, 1], result[..., 1, 0] = -v[..., 2], v[..., 2]
+    result[..., 0, 2], result[..., 2, 0] = v[..., 1], -v[..., 1]
+    result[..., 1, 2], result[..., 2, 1] = -v[..., 0], v[..., 0]
+    return result
 
 
 def se3_exp(increment):
     """Body displacement from a twist integral in [linear, angular] order."""
-    v, w = np.split(np.asarray(increment, dtype=float), 2, axis=-1)
+    vector = np.asarray(increment, dtype=float)
+    v, w = vector[..., :3], vector[..., 3:]
+    if vector.ndim == 1:
+        squared = float(w @ w)
+        angle = math.sqrt(squared)
+        if angle < 1e-3:
+            sin_ratio = 1. - squared / 6. + squared**2 / 120.
+            cos_ratio = .5 - squared / 24. + squared**2 / 720.
+            jacobian_ratio = 1. / 6. - squared / 120.
+        else:
+            sine = math.sin(angle)
+            sin_ratio = sine / angle
+            cos_ratio = 2. * (math.sin(.5 * angle) / angle)**2
+            jacobian_ratio = (angle - sine) / angle**3
+        skew = _skew(w)
+        second = skew @ skew
+        result = np.eye(4)
+        result[:3, :3] += sin_ratio * skew + cos_ratio * second
+        result[:3, 3] = v + cos_ratio * (skew @ v) + jacobian_ratio * (skew @ (skew @ v))
+        return result
+
     angle = np.linalg.norm(w, axis=-1)
     small = angle < 1e-3
     safe = np.where(small, 1., angle)
@@ -32,9 +55,9 @@ def se3_exp(increment):
     second = skew @ skew
     result = np.broadcast_to(np.eye(4), w.shape[:-1] + (4, 4)).copy()
     result[..., :3, :3] = np.eye(3) + sin_ratio[..., None, None] * skew + cos_ratio[..., None, None] * second
-    first_cross = np.cross(w, v)
+    first_cross = (skew @ v[..., None])[..., 0]
     result[..., :3, 3] = (v + cos_ratio[..., None] * first_cross +
-                          jacobian_ratio[..., None] * np.cross(w, first_cross))
+                          jacobian_ratio[..., None] * (skew @ first_cross[..., None])[..., 0])
     return result
 
 
@@ -75,9 +98,10 @@ def se3_log(transform):
     """Principal SE(3) logarithm with the inverse rotational translation Jacobian."""
     transform = np.asarray(transform, dtype=float)
     rotation, translation = transform[..., :3, :3], transform[..., :3, 3]
-    axis = np.stack((rotation[..., 2, 1] - rotation[..., 1, 2],
-                     rotation[..., 0, 2] - rotation[..., 2, 0],
-                     rotation[..., 1, 0] - rotation[..., 0, 1]), axis=-1) * .5
+    axis = np.empty(translation.shape)
+    axis[..., 0] = .5 * (rotation[..., 2, 1] - rotation[..., 1, 2])
+    axis[..., 1] = .5 * (rotation[..., 0, 2] - rotation[..., 2, 0])
+    axis[..., 2] = .5 * (rotation[..., 1, 0] - rotation[..., 0, 1])
     sine = np.linalg.norm(axis, axis=-1)
     cosine = (np.trace(rotation, axis1=-2, axis2=-1) - 1.) * .5
     angle = np.arctan2(sine, cosine)
@@ -94,8 +118,9 @@ def se3_log(transform):
     safe_angle = np.where(small, 1., angle)
     ratio = np.where(small, 1. / 12. + angle**2 / 720.,
                      (1. - .5 * safe_angle / np.tan(.5 * safe_angle)) / safe_angle**2)
-    first_cross = np.cross(w, translation)
-    v = translation - .5 * first_cross + ratio[..., None] * np.cross(w, first_cross)
+    skew = _skew(w)
+    first_cross = (skew @ translation[..., None])[..., 0]
+    v = translation - .5 * first_cross + ratio[..., None] * (skew @ first_cross[..., None])[..., 0]
     return np.concatenate((v, w), axis=-1)
 
 

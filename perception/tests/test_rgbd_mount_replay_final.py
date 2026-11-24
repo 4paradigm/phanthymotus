@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from plugins import rgbd_external_input
+from plugins.external_motion_learning import ExternalMotionLearner
 from test_external_odometry_fusion import packet
 from test_rgbd_mount_replay import (
     CAPTURE, START, flush, motion, mount, native_pose, samples,
@@ -24,10 +25,19 @@ def finish_learning(stream):
 
 
 @pytest.mark.parametrize('amendment', ['retract_old_endpoint', 'restore_earlier_endpoint'])
-def test_async_learning_revisits_eligible_solves_shifted_by_mount_replay(streams, monkeypatch, amendment):
+def test_async_learning_revisits_eligible_solves_shifted_by_mount_replay(streams, monkeypatch, amendment, request):
     create, now, _ = streams
     ordered, late = create(learning=True), create(learning=True)
     monkeypatch.setattr(rgbd_external_input.threading, 'Thread', Thread)
+    release_fit = Event()
+    request.addfinalizer(release_fit.set)
+    fit = ExternalMotionLearner.fit
+
+    def fit_after_amendment(learner):
+        release_fit.wait()
+        return fit(learner)
+
+    monkeypatch.setattr(ExternalMotionLearner, 'fit', fit_after_amendment)
     retract = amendment == 'retract_old_endpoint'
     changed = START+(750_000_000 if retract else 500_000_000)
     count = 7 if retract else 5
@@ -59,6 +69,7 @@ def test_async_learning_revisits_eligible_solves_shifted_by_mount_replay(streams
         return rebuild(stamp)
 
     monkeypatch.setattr(late.fuser, '_rebuild', record_rebuild)
+    release_fit.set()
     for stream in (ordered, late):
         finish_learning(stream)
     assert min(replay_starts) == START+(1_000_000_000 if retract else 750_000_000)

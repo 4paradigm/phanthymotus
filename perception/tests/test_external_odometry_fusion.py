@@ -76,6 +76,42 @@ def attitude_packet(t, position, yaw, angular, *, frame='odometry', child='body'
     return item
 
 
+def test_replay_reuses_attitude_check_and_propagation_for_unchanged_endpoints(monkeypatch):
+    from plugins import external_odometry_fusion as fusion
+
+    checks = []
+    jacobians = []
+    corroborate = fusion._origin_attitude
+    parameter_jacobian = fusion.ExternalMotionLearner.velocity_parameter_jacobian
+
+    def observe(left, right, interval_ns):
+        checks.append(right)
+        return corroborate(left, right, interval_ns)
+
+    def observe_jacobian(learner, velocity, calibrated):
+        jacobians.append(velocity)
+        return parameter_jacobian(learner, velocity, calibrated)
+
+    monkeypatch.setattr(fusion, '_origin_attitude', observe)
+    monkeypatch.setattr(fusion.ExternalMotionLearner, 'velocity_parameter_jacobian', observe_jacobian)
+    engine = ExternalOdometry()
+    start, left = decode_motion(attitude_packet(0., 0., 0., .6), 1)
+    end, first = decode_motion(attitude_packet(.1, .1, .06, .6), 1)
+    _, second = decode_motion(attitude_packet(.1, .2, .8, .6), 1)
+    first, second = sorted((first, second), key=lambda motion: motion.order_key())
+    engine.motion(start, left)
+    engine.motion(end, first)
+    engine.vision(start, 'native', pose_at(0.))
+    assert len(checks) == 1
+    assert len(jacobians) == 1
+    assert engine.motion(end, second)
+    assert len(checks) == 2 and checks[-1] is second
+    assert len(jacobians) == 2
+    piece, = engine._intervals([start, end], start, end)
+    assert piece[-1] == (corroborate(left, second, end-start) is not None)
+    assert len(checks) == 2
+
+
 def test_origin_change_preserves_attitude_only_with_measured_body_rate():
     engine = ExternalOdometry(learning=False)
     for item in (attitude_packet(0., 10., 0., .6),
