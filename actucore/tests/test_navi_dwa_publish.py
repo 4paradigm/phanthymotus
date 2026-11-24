@@ -502,6 +502,39 @@ def test_expired_old_work_logs_one_veto_without_writing_a_stop(monkeypatch, capl
     assert len([event for event in events if event["event"] == "veto"]) == 1
 
 
+def test_dwa_logs_sample_steady_output_and_report_transitions(monkeypatch, caplog):
+    card, packets, _, _ = observation_card(monkeypatch)
+    state = card._state
+    state.active_scan.current_frame = 0
+    state.decision_id = 0
+
+    def step(**_):
+        state.decision_id += 1
+        stopping = state.decision_id == 102
+        state.dwa_trace = dict(decision_id=state.decision_id, controller_used="legacy",
+                               branch="direct", select_calls=0)
+        return policy.Decision([0. if stopping else .2, 0., 0., 0., 0., 0.], policy.APPROACHING)
+
+    monkeypatch.setattr(policy, "step", step)
+    with caplog.at_level(logging.INFO, logger=plugin.__name__):
+        for _ in range(104):
+            card._publish_command(card.next_command())
+
+    decisions, publications = [], []
+    for record in caplog.records:
+        if record.msg == "navi dwa decision: %s":
+            decisions.append(json.loads(record.args[0])["decision_id"])
+        elif record.msg == "navi dwa publication: %s":
+            event = json.loads(record.args[0])
+            publications.append((event["decision_id"], event["event"]))
+    assert decisions == [1, 100, 102, 103]
+    assert publications == [(1, "published"), (100, "published"), (102, "stopped"), (103, "published")]
+    assert len(packets) == 104
+    assert [pkt["seq"] for pkt in packets if not any(pkt["values"])] == [packets[101]["seq"]]
+    assert card._info()["dwa"]["publication"]["wire_seq"] == packets[-1]["seq"]
+    assert card._info()["dwa"]["totals"]["stop_packets"] == 1
+
+
 def test_remembered_goal_guard_cannot_renew_the_original_command_window(monkeypatch):
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=False)
     assert card._stage_command(message, card._output_epoch)

@@ -66,6 +66,7 @@ TOPIC_FORMAT = "control/velocity"
 
 # How often the descriptor is echoed back into the stream. See next_command.
 _DESCRIPTOR_EVERY = 50
+_DWA_LOG_EVERY = 100
 
 
 def _decision_log(trace):
@@ -482,6 +483,7 @@ class NaviPlugin:
         self._staged_dwa_command = None
         self._dwa_last_published = None
         self._dwa_publication = None
+        self._dwa_decision_log_state = None
         self._dwa_veto_detail = None
         self._wire_diagnostic = None
         self._wire_dwa_origin = None
@@ -3149,7 +3151,15 @@ class NaviPlugin:
             expired_route=expired_route,
             discarded_proposal=publication_veto in _DISCARD_WITHOUT_STOP and not expired_turn)
         if self._config.local_controller == "dwa":
-            log.info("navi dwa decision: %s", _decision_log(self._state.dwa_trace))
+            trace = self._state.dwa_trace
+            log_state = (epoch, action_id, decision.status, any(message["values"]),
+                         trace.get("controller_used"), trace.get("branch"),
+                         trace.get("fallback_reason"), trace.get("veto_reason"))
+            report = log_state != self._dwa_decision_log_state or self._state.decision_id % _DWA_LOG_EVERY == 0
+            self._dwa_decision_log_state = log_state
+            level = logging.INFO if report else logging.DEBUG
+            if log.isEnabledFor(level):
+                log.log(level, "navi dwa decision: %s", _decision_log(trace))
         return message
 
     def _command_message(self, values, now, obs_ms):
@@ -3422,7 +3432,11 @@ class NaviPlugin:
             if current:
                 trace.update(wire)
         self._dwa_publication = publication
-        log.info("navi dwa publication: %s", json.dumps(publication, ensure_ascii=False))
+        report = (event != "published" or previous is None or previous["event"] != "published"
+                  or previous["epoch"] != identity.epoch or self._published % _DWA_LOG_EVERY == 0)
+        level = logging.INFO if report else logging.DEBUG
+        if log.isEnabledFor(level):
+            log.log(level, "navi dwa publication: %s", json.dumps(publication, ensure_ascii=False))
 
     def _fresh_first_send(self, origin, snapshot, now_ms):
         """Can this unsent translation earn a new window from a full physical check?"""
