@@ -8,18 +8,8 @@
 
 import { ActivityRenderer } from './renderers/activity.js';
 import { TextRenderer }     from './renderers/text.js';
-import { VideoRenderer }    from './renderers/video.js';
-import { ImageRenderer }    from './renderers/image.js';
-import { AudioRenderer }    from './renderers/audio.js';
-import { LidarRenderer }    from './renderers/lidar.js';
-import { ControlRenderer }  from './renderers/control.js';
-import { SkeletonRenderer } from './renderers/skeleton.js';
-import { Pose2dRenderer }   from './renderers/pose2d.js';
-import { TactileRenderer }  from './renderers/tactile.js';
-import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
+import { RENDERERS }        from './renderers/registry.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
-
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 
 let _panel    = null;
 let _renderer = null;
@@ -88,7 +78,14 @@ function _armStaleTimer() {
   }, STALE_MS);
 }
 
-export function showTopicDetail(topicPath, format) {
+/**
+ * `mcpId` is the device that owns the topic. Renderers read per-device settings
+ * through it — the point cloud's axis mapping, the skeleton's URDF — so without
+ * it a rotated lidar drew rotated here while the monitor page drew it upright.
+ * 'dashboard' is the monitor page's own "unknown device" value, which every
+ * renderer already treats as "use the defaults".
+ */
+export function showTopicDetail(topicPath, format, mcpId) {
   _cleanup();
 
   _panel.classList.remove('hidden');
@@ -104,7 +101,7 @@ export function showTopicDetail(topicPath, format) {
   _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
-  _renderer.mount(body, 'detail');
+  _renderer.mount(body, mcpId || 'dashboard');
 
   _frames = 0;
   _status = document.createElement('div');

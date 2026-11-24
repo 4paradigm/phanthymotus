@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
 import { openDeployPanel } from './deploy-panel.js';
@@ -445,9 +445,7 @@ function _buildChip(mcp, tool) {
     _showDetail(mcp, tool);
   });
 
-  chip.addEventListener('pointerdown', () => { ensureEdit(); });
   chip.addEventListener('dragstart', (e) => {
-    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     chip.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -589,9 +587,7 @@ function _buildToolCard(mcp, tool) {
   }
 
   // Drag (for canvas drop)
-  card.addEventListener('pointerdown', () => { ensureEdit(); });
   card.addEventListener('dragstart', (e) => {
-    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     card.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -955,7 +951,6 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     alert('Stop agent before modifying');
     return;
   }
-  if (!(await ensureEdit())) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
@@ -1258,7 +1253,6 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     alert('Stop agent before modifying');
     return;
   }
-  if (!(await ensureEdit())) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');

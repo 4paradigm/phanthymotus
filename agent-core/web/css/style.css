@@ -1438,6 +1438,43 @@ html, body {
   margin: 0 4px;
 }
 
+.canvas-clear-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+/* Hover-capable pointers only: a tap leaves an emulated :hover behind on touch
+   screens, so the button stayed red after 取消 as if the clear were still armed. */
+@media (hover: hover) {
+  .canvas-clear-btn:hover:not(:disabled) {
+    background: var(--red-bg);
+    color: var(--red);
+  }
+}
+.canvas-clear-btn:disabled {
+  opacity: .45;
+  cursor: default;
+}
+@media (pointer: coarse) {
+  .canvas-clear-btn { min-height: 44px; }
+}
+/* Tablets: the clear button sits inline in the zoom bar, so its 44px would
+   stretch the bar around 24px zoom buttons. Give those the same floor. Phones
+   are excluded — there the clear button floats above the bar, and the zoom
+   buttons keep their own 32px from the max-width: 768px block. */
+@media (pointer: coarse) and (min-width: 769px) {
+  .canvas-ctrl-btn { width: 44px; height: 44px; }
+}
+
 /* ── Canvas Top Control (智能控制 button) ─────────────────────────────── */
 .canvas-top-control {
   position: absolute;
@@ -6824,6 +6861,18 @@ html, body {
     right: 12px;
     z-index: 50;
   }
+  /* Keep the clear action above the zoom controls, away from the editor bar. */
+  .canvas-clear-sep { display: none; }
+  .canvas-clear-btn {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 8px);
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
+  }
 
   /* Bottom-left, opposite the zoom controls — not top-left, which is the
      sidebar fab's slot. Pinned to exactly 12,12 with `z-index: 100`, it covered
@@ -7406,6 +7455,14 @@ html, body {
   gap: 6px;
   margin-top: 8px;
 }
+.channel-delete-confirm {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  font-size: 0.85rem;
+}
 .channel-add-form {
   background: var(--bg-card);
   border: 1px solid var(--accent);
@@ -7445,6 +7502,35 @@ html, body {
   display: flex;
   gap: 8px;
   margin-top: 12px;
+}
+.channel-qq-onboarding {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: center;
+  gap: 16px;
+  padding: 8px 0;
+  text-align: center;
+}
+.channel-qq-onboarding [role="status"] {
+  max-width: 32ch;
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.6;
+}
+.channel-qq-onboarding img:not([hidden]) {
+  display: block;
+  width: min(204px, 100%);
+  height: auto;
+  padding: 8px;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-sm);
+}
+.channel-qq-onboarding .channel-form-actions {
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 0;
 }
 /* Trusted Bots — one card per Bot instead of a table row, since a group
    chat_id + open_id pair is long enough that a 4-column grid forces every
