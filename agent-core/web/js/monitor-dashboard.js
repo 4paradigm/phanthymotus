@@ -5,22 +5,10 @@
  */
 
 import { ActivityRenderer } from './renderers/activity.js';
-import { TextRenderer }     from './renderers/text.js';
-import { VideoRenderer }    from './renderers/video.js';
-import { ImageRenderer }    from './renderers/image.js';
-import { AudioRenderer }    from './renderers/audio.js';
-import { LidarRenderer }    from './renderers/lidar.js';
-import { ControlRenderer }  from './renderers/control.js';
-import { PointCloudRenderer } from './renderers/pointcloud.js';
-import { MappingRenderer }   from './renderers/mapping.js';
-import { SkeletonRenderer } from './renderers/skeleton.js';
-import { Pose2dRenderer }   from './renderers/pose2d.js';
-import { TactileRenderer }  from './renderers/tactile.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
-import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
+import { RENDERERS }        from './renderers/registry.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, Pose2dRenderer, TactileRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 // Column count by viewport width. Desktop used to be a flat 5 whatever the
 // window was, which is only right near 1080p: at 1280 a column is 237px and a
@@ -358,7 +346,7 @@ function _createCard(topicPath, format, status, col, row, colSpan, rowSpan, save
 
   const body = el.querySelector('.monitor-card-body');
   const renderer = _createRenderer(format, defaultMode);
-  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard', topicPath);
 
   const ws = _connectWs(topicPath, format, renderer);
   const card = { el, renderer, ws, format, mode: defaultMode, col, row, colSpan, rowSpan };
@@ -471,7 +459,7 @@ function _refreshRenderer(topicPath) {
   card.renderer?.unmount?.();
   body.innerHTML = '';
   const renderer = _createRenderer(card.format, card.mode);
-  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
+  renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard', topicPath);
   card.renderer = renderer;
   // Re-wire WS. Optional: _connectWs returns null for a card whose topic is
   // not resolved yet, and a mode switch on such a card must not throw.
