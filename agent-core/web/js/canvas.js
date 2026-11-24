@@ -1227,7 +1227,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
           const desc = def.description || '';
-          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+          // The help sits under the input rather than in a 40-char placeholder that
+          // disappears once typed into; clamped to two lines, the full text is
+          // in the label's tooltip.
+          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}">`
+            + (desc ? `<div class="canvas-field-help">${_esc(desc)}</div>` : '');
         }
         return `
           <div class="canvas-field">
@@ -1402,7 +1406,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
         const desc = def.description || '';
-        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+        // The help sits under the input rather than in a 40-char placeholder that
+        // disappears once typed into; clamped to two lines, the full text is
+        // in the label's tooltip.
+        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}">`
+          + (desc ? `<div class="canvas-field-help">${_esc(desc)}</div>` : '');
       }
       return `
         <div class="canvas-field">
