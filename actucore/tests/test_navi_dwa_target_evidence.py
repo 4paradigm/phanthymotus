@@ -619,7 +619,7 @@ def test_association_uses_the_motion_at_the_detector_observation(monkeypatch, bo
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
-@pytest.mark.parametrize("distance,duplicate", [(4.60, False), (5., False), (4.40, True), (4.83, True), (5., True)],
+@pytest.mark.parametrize("distance,duplicate", [(4.60, False), (5.2, False), (4.40, True), (4.83, True), (5.2, True)],
                          ids=["arrived", "clear", "duplicate-inside", "duplicate-braking", "duplicate-clear"])
 def test_memory_first_send_checks_new_same_generation_range(monkeypatch, body, distance, duplicate):
     from plugins.navi import policy
@@ -636,7 +636,7 @@ def test_memory_first_send_checks_new_same_generation_range(monkeypatch, body, d
     message = card.next_command()
     guard = card._staged_dwa_command[1].forward_check
     generation = state.tracker.track.generation
-    assert guard.target_ms == 0 and not guard.renewable and message["values"][0] == pytest.approx(.15)
+    assert guard.target_ms == 0 and not guard.renewable and message["values"][0] == pytest.approx(config.vx_max)
     assert guard.planning_guard.measured_target is None
     advance_snapshot(snapshot, clock, 1010)
     _, depth, odom, _ = snapshot[0]
@@ -660,7 +660,7 @@ def test_memory_first_send_checks_new_same_generation_range(monkeypatch, body, d
     else:
         card._stage_command(message, card._output_epoch)
     packet, = packets
-    assert packet["values"] == (message["values"] if distance == 5. else [0.] * 6)
+    assert packet["values"] == (message["values"] if distance == 5.2 else [0.] * 6)
     if duplicate and distance == 4.40:
         assert duplicate_decision.dwa_acceptance is None
     if any(packet["values"]):
@@ -928,15 +928,16 @@ def test_missing_target_veto_hands_off_to_search(monkeypatch, recover):
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
-@pytest.mark.parametrize("vx", [0., .25], ids=["stationary", "still-translating"])
-def test_tick_checks_search_when_target_lost_before_first_send(monkeypatch, body, vx):
+@pytest.mark.parametrize("vx,blocked", [(0., False), (.25, False), (.25, True)],
+                         ids=["stationary", "still-translating", "blocked-transition"])
+def test_tick_checks_search_when_target_lost_before_first_send(monkeypatch, body, vx, blocked):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=body, live_target=True)
     plan = card.next_command
 
     def lose_target_after_plan():
         message = plan()
-        if card._last_decision.dwa_acceptance is not None:
-            advance_snapshot(snapshot, clock, 1010, vx=vx)
+        if card._last_decision.dwa_acceptance is not None and card._state.reacquire_generation is None:
+            advance_snapshot(snapshot, clock, 1010, vx=vx, obstacle=blocked)
             _, depth, odom, _ = snapshot[0]
             snapshot[0] = absent_target_payload("empty", 1010), depth, odom, 1010
         return message
@@ -946,11 +947,36 @@ def test_tick_checks_search_when_target_lost_before_first_send(monkeypatch, body
     assert not card._last_error
     packet, = packets
     assert packet["values"][:5] == [0.] * 5
-    if vx:
+    if blocked:
         assert packet["values"][5] == 0.
-        assert "停稳" in card._last_decision.reason
     else:
         assert packet["values"][5] != 0
+
+
+def test_active_route_hands_off_to_checked_search_without_a_zero(monkeypatch):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    assert len(packets) == 1 and packets[0]["values"][0] > 0.
+    advance_snapshot(snapshot, clock, 1050)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=1.05), depth, odom, 1050
+    plan = card.next_command
+
+    def lose_target_after_plan():
+        message = plan()
+        if card._state.reacquire_generation is None:
+            assert card._last_decision.dwa_acceptance is not None
+            advance_snapshot(snapshot, clock, 1060, vx=.25)
+            _, depth, odom, _ = snapshot[0]
+            snapshot[0] = absent_target_payload("empty", 1060), depth, odom, 1060
+        return message
+
+    monkeypatch.setattr(card, "next_command", lose_target_after_plan)
+    card._tick()
+    assert not card._last_error
+    assert len(packets) == 2
+    assert packets[1]["values"][:5] == [0.] * 5 and packets[1]["values"][5] != 0.
 
 
 @pytest.mark.parametrize("update", ["confirmed", "duplicate", "unrelated", "obstacle",
@@ -980,49 +1006,75 @@ def test_slow_plan_refreshes_only_with_new_original_target_and_clear_sweep(monke
         assert result is None or not result[2]
 
 
-@pytest.mark.parametrize("box_depth,can_advance,vx_max,update", [
-    (5., True, .30, None), (5., True, .12, None), (.4, False, .30, None), (0., False, .30, None),
-    (5., True, .30, "same_person"), (5., False, .30, "closer_surface"),
-    (5., False, .30, "missing_person"),
+@pytest.mark.parametrize("scene,can_advance,vx_max,update", [
+    ("clear", True, .30, None), ("clear", True, .12, None), ("hole", True, .30, None),
+    ("invalid", False, .30, None), ("blocked", False, .30, None),
+    ("detour", True, .30, None), ("anchored_hole", True, .30, None),
+    ("hole", True, .30, "same_person"), ("clear", True, .30, "new_hole"),
+    ("hole", False, .30, "closer_surface"), ("hole", False, .30, "obstacle"),
+    ("hole", False, .30, "missing_person"), ("hole", False, .30, "moved_person"),
 ])
-def test_visible_person_without_front_fix(monkeypatch, box_depth, can_advance, vx_max, update):
-    from plugins.navi import track as tracking
+def test_visible_person_without_front_fix(monkeypatch, scene, can_advance, vx_max, update):
+    from plugins.navi import policy, track as tracking
 
     card, packets, clock, snapshot = observation_card(monkeypatch, body=True)
     state, config = card._state, card._config
     calls = observe_selector(monkeypatch)
     config.vx_max = vx_max
     _, depth, odom, _ = snapshot[0]
-    depth["map"][48:145, 287:354] = box_depth
+    if scene == "invalid":
+        depth["map"][:] = 0.
+    if scene != "clear":
+        depth["map"][48:145, 287:354] = 0.
+    if scene == "blocked":
+        depth["map"][220:370, 302:338] = .25
+    elif scene == "detour":
+        depth["map"][220:370, 302:338] = .65
     state.goal_anchor = None
     config.depth_intrinsics = config.local_geometry.horizontal
     person = {"name": "person", "position": [0., -.6], "confidence": .95,
               "bbox_norm": [.45, .10, .55, .30]}
-    monkeypatch.setattr(tracking, "_front_point", lambda *args: None)
+    if scene == "clear":
+        monkeypatch.setattr(tracking, "_front_point", lambda *args: None)
     for stamp in (700, 800, 900):
         state.tracker.step(detections={"timestamp": stamp / 1000, "objects": [person]},
                            depth=dict(depth, frame_id=stamp, source_frame_id=stamp),
                            target=state.target, config=config, ego=(0., 0., 0.), ego_measured=True, dt=.1)
+    if scene == "anchored_hole":
+        state.goal_anchor = policy.DetourGoal(3., 1., generation=state.tracker.track.generation)
     snapshot[0] = {"timestamp": 1., "objects": [person]}, depth, odom, 1000
     message = card.next_command()
     assert state.tracker.track.front_fix is None and state.goal_anchor is None
     assert card._last_decision.distance_m is None
+    if any(message["values"]):
+        guard = card._last_decision.dwa_acceptance.motion_guard
+        assert guard.goal is None and guard.check.accepted and guard.trace.stopped
     if update:
         assert message["values"][0] > 0.
-        advance_snapshot(snapshot, clock, 1010)
+        stamp = 1050 if update == "moved_person" else 1010
+        advance_snapshot(snapshot, clock, stamp, obstacle=update == "obstacle")
         objects, depth, odom, _ = snapshot[0]
         if update == "closer_surface":
             depth["map"][48:145, 287:354] = .4
-        snapshot[0] = (dict(objects, timestamp=1.01, objects=[] if update == "missing_person" else [person]),
-                       depth, odom, 1010)
+        elif update == "new_hole":
+            depth["map"][48:145, 287:354] = 0.
+        elif update == "moved_person":
+            person = dict(person, position=[.20, -.6], bbox_norm=[.55, .10, .65, .30])
+            depth["map"][48:145, 352:416] = 0.
+        people = [] if update == "missing_person" else [person]
+        snapshot[0] = dict(objects, timestamp=stamp / 1000, objects=people), depth, odom, stamp
     card._publish_command(message)
     if can_advance:
-        assert calls[-1][0]["x_limit"][1] == pytest.approx(.6 * vx_max)
-        assert (.04, 0., 0.) in calls[-1][0]["candidate_commands"]
-        assert 0. < packets[-1]["values"][0] <= .6 * vx_max
-        assert packets[-1]["values"][1:] == [0.] * 5
+        assert calls[-1][0]["x_limit"][1] == pytest.approx(vx_max)
+        assert 0. < packets[-1]["values"][0] <= vx_max
+        assert packets[-1]["values"][1:5] == [0.] * 4
+        assert bool(packets[-1]["values"][5]) == (scene == "detour")
     else:
         assert packets[-1]["values"] == [0.] * 6
+    if update == "moved_person":
+        next_message = card.next_command()
+        assert next_message["values"][5] < 0.
+        assert card._last_decision.distance_m is None
 
 
 @pytest.mark.parametrize("update", ["match", "same", "unrelated", "blocked", "future_receipt"])

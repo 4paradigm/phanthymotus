@@ -191,7 +191,10 @@ def test_far_anchored_target_keeps_direct_control_when_the_corridor_clears(monke
     assert decision.distance_m == pytest.approx(5.)
     if blocking:
         assert state.dwa_trace["branch"] == "reachable_prefix" and state.dwa_selected
-        assert packet["values"][0] > 0 and packet["values"][5] > 0
+        assert packet["values"][0] > 0
+        route = decision.dwa_acceptance.route_points
+        assert packet["values"][5] * route[-1][1] < 0
+        assert decision.dwa_acceptance.motion_guard.check.accepted
     else:
         assert decision.status == policy.APPROACHING and not state.dwa_selected
         # Direct approach at this fixed range and bearing on main 881dfe4a.

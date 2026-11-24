@@ -58,6 +58,8 @@ def test_runtime_driver_declaration_updates_yaw_without_restarting(monkeypatch):
         assert card.dispatch("navi", {"action": "start", "control_interface": descriptor(1., .1),
                                       "input_topics": ["/camera/objects", "/camera/depth"]})["state"] == "running"
         original_state = card._state
+        assert card._config.motion_acceleration == pytest.approx((.30, .30, 1.))
+        assert card._config.motion_braking == pytest.approx((.30, .30, 1.))
         card._command_message([0.] * 6, 1., 1000)
         fast_ramp = descriptor(1., 3.)
         assert card.dispatch("navi", {"action": "config",
@@ -65,6 +67,8 @@ def test_runtime_driver_declaration_updates_yaw_without_restarting(monkeypatch):
         info = card.dispatch("navi", {"action": "info"})
         assert info["config"]["wz_max"] == pytest.approx(1.)
         assert info["downstream_limits"]["max_delta_per_step"][5] == 3.
+        assert card._config.motion_acceleration == pytest.approx((.30, .30, 30.))
+        assert card._config.motion_braking == pytest.approx((.30, .30, 30.))
         assert card._command_message([0.] * 6, 1., 1000)["control_interface"] == fast_ramp
         updated = descriptor(.52, 3.)
         assert card.dispatch("navi", {"action": "config", "control_interface": updated})["status"] == "configured"

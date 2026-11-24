@@ -84,7 +84,7 @@ def test_checked_prefix_reaches_real_dwa_and_publishes_its_exact_command(monkeyp
     twist = tuple(message["values"][i] for i in (0, 1, 5))
     assert twist == accepted[-1].command
     assert twist[0] > 0. and twist[1] == 0.
-    assert twist[0] <= .15, "A prefix must keep its local approach speed cap"
+    assert twist[0] <= config.vx_max
     if card._command_timer is None:
         card._publish_command(message)
     else:
@@ -869,6 +869,8 @@ def test_real_reference_reaches_serialized_wire(monkeypatch, branch, body):
             assert state.active_scan.begin((1.,))
     else:
         config, state, depth, odom = observation_case(body=body, attempted=branch == "prefix")
+    policy.adopt_limits(config, {"limits": {"upper": [.28, 0., 0., 0., 0., config.wz_max]}})
+    calls = observe_selector(monkeypatch)
     card, packets = card_for_case(monkeypatch, config, state, depth, odom)
     now = depth["control_ms"]
     monkeypatch.setattr(plugin.time, "time", lambda: now / 1000)
@@ -877,6 +879,7 @@ def test_real_reference_reaches_serialized_wire(monkeypatch, branch, body):
     assert len(packets) == 1
     choice = state.dwa_proposal.choice
     assert state.dwa_trace["branch"] == branch
+    assert calls[-1][0]["x_limit"] == (0., .28)
     assert choice.check.accepted and choice.trace.stopped
     assert choice.trace.velocities[-1] == pytest.approx((0., 0., 0.), abs=1e-12)
     vx, vy, wz = choice.command

@@ -174,8 +174,9 @@ class AssociationSnapshot:
 class TargetMatch:
     generation: int
     source: float | None
-    point: tuple[float, float]  # camera forward, left
-    range_m: float
+    point: tuple[float, float] | None  # camera forward, left, when a surface was measured
+    range_m: float | None
+    image_region: tuple | None = None
 
 
 def observation_source(detections):
@@ -547,7 +548,7 @@ def _correct(mean, cov, candidate, config):
 
 
 def match_observation(snapshot, detections, depth, *, ego_motion, elapsed_s, target, config,
-                      original_receipt=None):
+                      original_receipt=None, allow_missing_surface=False):
     """Gate a current measurement against a copied track, without consuming evidence.
 
     ego_motion is the displacement (forward, left, yaw) of the observation
@@ -592,7 +593,8 @@ def match_observation(snapshot, detections, depth, *, ego_motion, elapsed_s, tar
         has_fix = snapshot.has_front_fix and snapshot.front_age_s + elapsed_s <= front_limit / 1000
         point = _front_point(depth, box, config, reference, has_fix, True, corrected[:2], elapsed_s)
         if point is None:
-            return None
+            return (TargetMatch(snapshot.generation, source, None, None, _image_region(candidate["obj"]))
+                    if allow_missing_surface else None)
     return TargetMatch(snapshot.generation, source, tuple(point), polar_of(point)[0])
 
 

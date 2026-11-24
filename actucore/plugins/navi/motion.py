@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Tuple
 
 import numpy as np
@@ -313,8 +313,26 @@ def predict_motion(measured, previous, command, *, hold_s, latency_s, accelerati
                        body_travel, delay_travel, offset, mode, straight, tuple(interval_errors), tuple(delay_axes), heading_span)
 
 
+def _layers_in_sweep(evidence, bounds):
+    (lo_f, lo_r), (hi_f, hi_r) = bounds
+    close = []
+    for obstacle in evidence if isinstance(evidence, tuple) else (evidence,):
+        layer = local_path.occupied_squares(obstacle)
+        if layer is None or not len(layer.centers):
+            continue
+        extent = (local_path.RESOLUTION / 2 * (abs(math.cos(layer.yaw)) + abs(math.sin(layer.yaw)))
+                  + layer.alignment_error + 1e-9)
+        f, r = layer.centers.T
+        mask = ((lo_f - extent <= f) & (f <= hi_f + extent)
+                & (lo_r - extent <= r) & (r <= hi_r + extent))
+        if mask.any():
+            close.append(layer if mask.all() else replace(layer, centers=layer.centers[mask]))
+    return tuple(close)
+
+
 def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
-                    original_goal, stop_distance_m, terminal_boundary=None, prepared_layers=None):
+                    original_goal, stop_distance_m, terminal_boundary=None, prepared_layers=None,
+                    cull_obstacles=False):
     """Check the complete stop. supported_region is a pair of lower/upper (f,r) corners.
 
     first_hit is the earliest occupied/remembered contact sample. terminal_distance
@@ -349,6 +367,9 @@ def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
 
     bounds = ((-float(support(-1., 0.)), -float(support(0., -1.))),
               (float(support(1., 0.)), float(support(0., 1.))))
+    if cull_obstacles:
+        occupied = _layers_in_sweep(occupied, bounds)
+        remembered = _layers_in_sweep(remembered, bounds)
     if prepared_layers is not None:
         clearance, first_hit, reason = prepared_layers.clearance(
             poses, f, r, yaw, front, rear, width, sweep_padding)
@@ -400,6 +421,8 @@ def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
         if (reason is None and stop_distance_m > 0.
                 and minimum_target_distance(trace, original_goal) < stop_distance_m - 1e-10):
             reason = "target_standoff"
+    # Culled layers can contain the closest obstacle, but cannot overlap the sweep.
+    clearance = min(clearance, 0.) if cull_obstacles else clearance
     return MotionCheck(reason is None, reason, clearance, first_hit, bounds, terminal_distance)
 
 

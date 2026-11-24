@@ -789,6 +789,11 @@ def test_readonly_person_match_requires_a_continuous_front_return(near_patch):
     assert live.accepted_detection
     if near_patch:
         assert live.measured_range_m is None and match is None
+        bearing = T.match_observation(snapshot, observed, depth, ego_motion=STILL,
+                                      elapsed_s=.1, target="person", config=config,
+                                      allow_missing_surface=True)
+        assert bearing is not None and bearing.generation == snapshot.generation
+        assert bearing.point is None and bearing.range_m is None
     else:
         assert match.range_m == live.measured_range_m
         assert T.match_observation(snapshot, observed, dict(depth, source_frame_id=299),

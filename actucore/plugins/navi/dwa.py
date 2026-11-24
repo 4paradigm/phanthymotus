@@ -289,7 +289,8 @@ def _commands(previous, measured, preferred, limits, floors, extra, budget):
     def legal(cmd):
         return _legal_command(cmd, limits, floors)
 
-    xs = _axis_values(*xl, floors[0], previous[0], measured[0], *(p[0] for p in preferred))
+    # Keep a slow entry candidate when the declared upper limit widens the lattice.
+    xs = _axis_values(*xl, floors[0], xl[1] / 8, previous[0], measured[0], *(p[0] for p in preferred))
     ys = _axis_values(*yl, floors[1], previous[1], measured[1], *(p[1] for p in preferred))
     yaw_refs = (previous[2], measured[2], *(p[2] for p in preferred))
     standing_yaws = _axis_values(*wl, floors[2], *yaw_refs)
@@ -676,7 +677,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         (score, index, ordinal), _, cmd, _, _ = entry
         if cmd == previous and cmd[0] > 0. and (cmd[1] or cmd[2]):
             score -= score_band
-        return score, index, ordinal
+        return guidance and not any(cmd[:2]), score, index, ordinal
 
     if bounded:
         entries.sort(key=ranking_bound)
@@ -698,14 +699,16 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         obstacle = _obstacle_score(check)
         for components, progress, index in scores:
             components = replace(components, obstacle=obstacle)
-            key = (components.total, index, ordinal)
+            # Follow an admissible forward arc on the route before falling back
+            # to a stationary heading change.
+            key = (guidance and not any(cmd[:2]), components.total, index, ordinal)
             if (cmd == previous and cmd[0] > 0. and (cmd[1] or cmd[2]) and obstacle == 0.
-                    and (retained is None or key[0] < retained.score)):
-                retained = Choice(cmd, poses[:prediction.moving_count], key[0], progress,
+                    and (retained is None or components.total < retained.score)):
+                retained = Choice(cmd, poses[:prediction.moving_count], components.total, progress,
                                   check.min_clearance_m, prediction, check, components, index)
             if best_key is None or key < best_key:
                 best_key = key
-                best = Choice(cmd, poses[:prediction.moving_count], key[0], progress,
+                best = Choice(cmd, poses[:prediction.moving_count], components.total, progress,
                               check.min_clearance_m, prediction, check, components, index)
     if (retained is not None and best is not None and retained.reference_index == best.reference_index
             and math.dist(retained.trajectory[-1][:2], best.trajectory[-1][:2])

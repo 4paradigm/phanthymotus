@@ -4787,7 +4787,7 @@ def test_unvalidated_dynamic_mount_uses_measured_hits_without_world_memory(monke
     state = _state(motion_source="measured")
     scan = state.active_scan
     scan.receipt_only = True
-    wall = np.isclose(P.FORWARD, 1.25)
+    wall = np.isclose(P.FORWARD, .60)
     frame = np.full((8, 8), 3.)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (3., 1.))
     monkeypatch.setattr(P.local_path, "observe", lambda *args, **kwargs: (~wall, wall))

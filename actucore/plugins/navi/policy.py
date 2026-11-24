@@ -70,7 +70,7 @@ from .camera import half_fov as _resolve_half_fov
 from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, CAMERA_OCCUPANCY_MEMORY_RANGE_M, MAP_AGE_MS, ODOM_GAP_MS,
                           NearProjection, SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW,
                           TURN_SPEED_REDUCTION, confirmed_square_coverage, relative_pose_at)
-from .depth import approach_clearance, has_valid_returns
+from .depth import has_valid_returns
 from .track import AssociationSnapshot, ObservationFrame, Track, Tracker, observation_source, observation_transform, target_objects
 from . import local_path
 from . import dwa
@@ -146,6 +146,8 @@ class Config:
     local_controller: str = "dwa"  # "legacy" or "dwa"
     dwa_horizon_s: float = 1.2
     dwa_samples: int = 64
+    motion_acceleration: tuple = motion_model._DEFAULT_ACCELERATION
+    motion_braking: tuple = motion_model._DEFAULT_BRAKING
     odom_expected: bool = False
     local_geometry: Geometry | None = None
     scan_geometry: Geometry | None = None
@@ -755,6 +757,7 @@ class State:
     dwa_selected: bool = False
     dwa_proposal: DwaProposal | DwaTurn | None = None
     dwa_motion_guard: DwaMotionGuard | None = None
+    dwa_association: tuple[AssociationSnapshot, PlanarPose] | None = None
     dwa_admission_ms: int = 0
     dwa_odom: dict | None = None
     dwa_projection: local_path.DepthProjection | None = None
@@ -821,7 +824,7 @@ class DwaMotionInputs:
     deadline_ms: int
     prediction_horizon_s: float
     footprint: motion_model.FootprintSpec
-    goal: tuple
+    goal: tuple | None
     goal_error: float
     measured: tuple
     previous: tuple
@@ -1110,6 +1113,23 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             return value if math.isfinite(value) else None
         except (IndexError, TypeError, ValueError):
             return None
+
+    # The command sink limits velocity changes per accepted packet. Model
+    # its nominal ramp at the producer cadence declared by the sink.
+    deltas = limits.get("max_delta_per_step") or ()
+    hz = rate.get("expected_hz")
+    nominal_ramp = [None] * 3
+    if isinstance(deltas, (list, tuple)) and type(hz) in (int, float) and 0 < hz < math.inf:
+        for axis, index in enumerate((0, 1, 5)):
+            if index >= len(deltas) or signed_at(lower, index) == signed_at(upper, index) == 0.:
+                continue
+            step = deltas[index]
+            if type(step) in (int, float) and 0 < step < math.inf and math.isfinite(step * hz):
+                nominal_ramp[axis] = step * hz
+    config.motion_acceleration = tuple(rate or fallback for rate, fallback in
+                                       zip(nominal_ramp, motion_model._DEFAULT_ACCELERATION))
+    config.motion_braking = tuple(rate or fallback for rate, fallback in
+                                  zip(nominal_ramp, motion_model._DEFAULT_BRAKING))
 
     config.floor_vx_moving = at(moving_floors, 0)
     config.floor_vy_moving = at(moving_floors, 1)
@@ -1785,6 +1805,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
     track = state.tracker.step(detections=detections, depth=depth,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt)
+    if (config.local_controller == "dwa" and isinstance(track, Track) and track.observed
+            and track.accepted_detection and track.range_known and track.source is not None):
+        stamp = (depth or {}).get("control_ms")
+        pose = target_body_pose(stamp, odom, ego, depth.get("obstacle_capture_pose")) if stamp is not None else None
+        if pose is not None:
+            state.dwa_association = track.snapshot(stamp), pose
     anchor = state.goal_anchor
     visual_only = bool(track is not None and track.observed and getattr(track, "front_required", False)
                        and track.front_fix is None)
@@ -1801,8 +1827,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
             state.reacquire_generation = None
             state.missing_frames = 0
             state.searching_for_s = state.searched_rad = 0.
-    needs_probe = visual_only and anchor is None
+    needs_probe = visual_only and (anchor is None or config.local_controller == "dwa")
     if needs_probe:
+        if anchor is not None and depth is not None:
+            _reset_detour_route(state)
+            state.goal_anchor = anchor = None
         scan = state.active_scan
         scan.interrupt()
         history = (odom or {}).get("velocity_history")
@@ -1977,9 +2006,6 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 _reset_detour_route(state)
             if depth is None:
                 return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
-            if (detections is not None and state.tracker.track is not None
-                    and any(target_objects(detections, state.target, config))):
-                return Decision(_twist(0., 0., 0.), ALIGNING, "已看到目标，等待新观测确认")
             state.missing_frames = max(state.missing_frames, config.lost_frames)
             return _search_for_target(depth, config, state, dt, odom)
         if needs_probe:
@@ -2846,6 +2872,13 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
         motion = state.command_tail if command_only else scan.motion
         if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
                for vx, vy, wz in (motion, state.commanded)):
+            yaw = -direction * config.search_rate if requested_yaw is None else requested_yaw
+            if (has_sweep and config.local_controller == "dwa" and not command_only and yaw
+                    and state.missing_frames + 1 >= config.lost_frames
+                    and _check_dwa_turn(depth, config, state, geometry, None, "search", (0., 0., yaw))):
+                state.last_seen_side = direction
+                state.search_sweep_checked = True
+                return None
             return "原地搜索：等待平移或反向转动停稳"
         if has_sweep:
             horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
@@ -3309,22 +3342,24 @@ def _dwa_motion_inputs(depth, config, state, geometry, target, motion):
     return inputs, grid
 
 
-def _dwa_context(inputs, geometry, stop_distance, motion_frame):
+def _dwa_context(inputs, geometry, config, motion_frame):
     return dwa.MotionContext(
         inputs.measured, inputs.previous, inputs.prediction_horizon_s,
         (inputs.deadline_ms - inputs.checked_ms) / 1000, geometry, inputs.footprint,
         inputs.observed, inputs.remembered, local_path.SUPPORTED_REGION, inputs.goal,
-        stop_distance, frame=(motion_frame, inputs.pose), measured_target=inputs.measured_target)
+        config.stop_distance_m, acceleration=config.motion_acceleration, braking=config.motion_braking,
+        frame=(motion_frame, inputs.pose), measured_target=inputs.measured_target)
 
 
 def _check_dwa_turn(depth, config, state, geometry, target, branch, command):
-    if target is None or _dwa_unavailable_reason(depth, config, state, recovery=True):
+    if ((target is None and branch != "search")
+            or _dwa_unavailable_reason(depth, config, state, recovery=True)):
         return False
     scan = state.active_scan
     inputs, _ = _dwa_motion_inputs(depth, config, state, geometry, target, scan.motion)
     if inputs is None:
         return False
-    context = _dwa_context(inputs, geometry, config.stop_distance_m, scan.motion_frame)
+    context = _dwa_context(inputs, geometry, config, scan.motion_frame)
     outcomes = state.dwa_budget.for_context(context) if state.dwa_budget is not None else {}
     if command in outcomes:
         prediction, check = outcomes[command]
@@ -3340,8 +3375,7 @@ def _check_dwa_turn(depth, config, state, geometry, target, branch, command):
     if not check.accepted:
         state.dwa_trace["fallback_reason"] = check.reason
         return False
-    guard = DwaMotionGuard(**vars(inputs), trace=prediction, check=check,
-                           probe_region=state.tracker.track.image_region if branch == "visual_probe" else None)
+    guard = DwaMotionGuard(**vars(inputs), trace=prediction, check=check)
     state.dwa_proposal = DwaTurn(command, guard)
     state.dwa_motion_guard = guard
     state.dwa_selected = state.checked_prefix = state.avoidance_yaw_override = True
@@ -3350,9 +3384,13 @@ def _check_dwa_turn(depth, config, state, geometry, target, branch, command):
     return True
 
 
-def dwa_trace_visible(poses, shadow, view=None):
+def dwa_trace_visible(poses, shadow, view=None, *, pad_cell=False):
     if not shadow.any():
         return True
+    if pad_cell:
+        rows, cols = shadow.shape
+        padded = np.pad(shadow, 1)
+        shadow = np.logical_or.reduce([padded[r:r + rows, c:c + cols] for r in range(3) for c in range(3)])
     points = np.asarray(poses)[:, :2]
     if view is not None:
         points = view.source_points(points)
@@ -3384,40 +3422,46 @@ def _blocking_memory_view(scan, context, budget):
 
 def _visual_approach(depth, config, state, geometry, track, feedback, objects_ms, detections):
     hold = Decision(_twist(0., 0., 0.), ALIGNING, "已看到人，等待可验证的接近空间")
-    if (not depth or depth.get("map") is None or not track.front_box or geometry is None
-            or feedback is None or not objects_ms):
+    region = track.image_region
+    if (not depth or depth.get("map") is None or not region or geometry is None
+            or feedback is None or not objects_ms or _dwa_unavailable_reason(depth, config, state)):
         return hold
     if not track.accepted_detection and not (
             track.source is not None and track.source == observation_source(detections)
             and track.since_obs_s * 1000 < config.max_obs_age_ms
-            and any((tuple(obj.get("position") or ()), tuple(obj.get("bbox_norm") or ())) == track.image_region
+            and any((tuple(obj.get("position") or ()), tuple(obj.get("bbox_norm") or ())) == region
                     for obj in target_objects(detections, state.target, config))):
         return hold
-    near = approach_clearance(depth["map"], track.front_box)
-    if near is None or near <= config.stop_distance_m + local_path.RESOLUTION:
-        return hold
-    # A short local waypoint limits this approach; it is never a target range or an arrival fix.
-    distance = min(near, config.stop_distance_m + 2 * local_path.RESOLUTION)
-    bearing = track.bearing_rad / config.half_fov_rad
-    if abs(bearing) > config.align_tol:
-        limit = _scan_yaw_rate(config, math.copysign(1., bearing))
-        yaw = _lift(-config.k_yaw * bearing, config.floor_wz, limit) if limit >= config.floor_wz else 0.
-        point = local_path.target_in_grid(geometry, distance * math.cos(track.bearing_rad),
-                                         distance * math.sin(track.bearing_rad))
-        if yaw and _check_dwa_turn(depth, config, state, geometry, point, "visual_probe", (0., 0., yaw)):
-            return Decision(_twist(0., 0., yaw), ALIGNING, "已看到人，转向对准人体")
-        return hold
-    point = local_path.target_in_grid(geometry, distance, 0.)
-    # Keep a short-step candidate when the speed ceiling spreads the DWA samples apart.
-    speed_limit = .6 * config.vx_max
-    short_step = min(.04, speed_limit)
-    proposal = _dwa_detour(depth, config, state, Detour(None, ((0., 0.), point), geometry),
-                           distance, 0., branch="visual_probe", motion=feedback,
-                           speed_limit=speed_limit, candidate_commands=((short_step, 0., 0.),))
+    bearing = float(region[0][0]) * config.half_fov_rad if region[0] else 0.
+    lookahead = config.approach_check_distance_m
+    point = local_path.target_in_grid(geometry, lookahead * math.cos(bearing), lookahead * math.sin(bearing))
+    route = Detour(None, ((0., 0.), point), geometry)
+    side = math.copysign(1., bearing)
+    heading = -_clamp(bearing, _scan_yaw_rate(config, side))
+    seeds = tuple(_prefix_commands(config, config.vx_max, heading, (side, -side), False))
+    scan = state.active_scan
+    grid = scan.grid()
+    ahead = projected_forward_clearance(grid[1], geometry, config)
+    proposal = None
+    if ahead is not None and ahead < lookahead:
+        observation = dict(depth, projected_grid=grid, scan_revision=scan.poses[-1][0],
+                           body_half_width=config.half_width_m, allow_unknown=True,
+                           preview_occluded=True, finite_turn=True)
+        detours = (state.local_plan.route(
+            observation, geometry, _keepout_m(config), ahead, direction,
+            config.depth_age_limit_ms, config.watchdog_ms) for direction in (side, -side))
+        routes = tuple(ref for ref in detours if ref is not None)
+        if routes:
+            proposal = _dwa_detour(depth, config, state, routes[0], None, None, branch="visual_probe",
+                                   motion=feedback, candidate_commands=seeds, alternates=routes[1:], guidance=True)
+    if proposal is None:
+        proposal = _dwa_detour(depth, config, state, route, None, None, branch="visual_probe",
+                               motion=feedback, candidate_commands=seeds, guidance=True)
     if proposal is None:
         return hold
-    vx, vy, yaw, _, _ = _use_dwa(state, proposal, 0.)
-    return Decision(_twist(vx, vy, yaw), APPROACHING, "已看到人，沿已检查的短直线低速接近，等待人体测距")
+    turn = proposal.command[2]
+    vx, vy, yaw, _, _ = _use_dwa(state, proposal, math.copysign(1., -turn) if turn else 0.)
+    return Decision(_twist(vx, vy, yaw), APPROACHING, "沿目标图像方向接近，等待人体测距")
 
 
 def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
@@ -3444,13 +3488,15 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         return unavailable("geometry_mismatch")
     mode = "body" if config.scan_geometry is not None else "camera_approx"
     trace.update(eligible=True, geometry_mode=mode, observation_id=scan.current_frame)
-    if route is None or len(route.points) < 2 or target_distance is None or target_bearing is None:
+    visual = branch == "visual_probe"
+    if (route is None or len(route.points) < 2
+            or (not visual and (target_distance is None or target_bearing is None))):
         return unavailable("no_reference")
     limit = min(config.dwa_samples, dwa.MAX_SEARCH_CANDIDATES)
     if state.dwa_budget is None:
         state.dwa_budget = dwa.CandidateBudget(limit, predictions=state.dwa_predictions)
-    target = local_path.target_in_grid(geometry, target_distance * math.cos(target_bearing),
-                                       target_distance * math.sin(target_bearing))
+    target = (None if visual else local_path.target_in_grid(geometry, target_distance * math.cos(target_bearing),
+                                                            target_distance * math.sin(target_bearing)))
     (floor_x, limit_x), _ = _local_velocity_limits(config, 1.)
     floor_y, left_vy = _local_velocity_limits(config, -1.)[1]
     right_vy = _local_velocity_limits(config, 1.)[1][1]
@@ -3460,7 +3506,7 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     inputs, grid = _dwa_motion_inputs(depth, config, state, geometry, target, motion)
     if inputs is None:
         return unavailable(grid)
-    if shadow is None and scan.receipt_only and not config.use_lateral:
+    if shadow is None and scan.receipt_only and not config.use_lateral and not visual:
         shadow = scan.occlusion(geometry)
 
     # The shadow belongs to one exposure. Express a predicted path in its
@@ -3482,21 +3528,17 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
 
     diagnostics = {}
     trace["select_calls"] += 1
-    track, anchor = state.tracker.track, state.goal_anchor
-    live_route = (branch in ("route", "reachable_prefix") and track is not None and track.observed
-                  and track.navigation_range_known and (anchor is None or
-                  (not anchor.target_missing and anchor.generation == track.generation)))
     proposed = dwa.select(
         route=route.points, grid=grid, geometry=geometry, footprint=inputs.footprint,
         occupied=inputs.observed, remembered=inputs.remembered, supported_region=local_path.SUPPORTED_REGION,
         latency_s=(inputs.deadline_ms - inputs.checked_ms) / 1000,
         measured=inputs.measured, previous=inputs.previous, x_limit=(0., max(0., limit_x)),
-        y_limit=(0., 0.) if branch == "visual_probe" else (-right_vy, left_vy),
+        y_limit=(-right_vy, left_vy),
         yaw_limit=(-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.)),
         floors=(floor_x, floor_y, config.floor_wz, config.floor_wz_moving),
         target=target, stop_distance=config.stop_distance_m,
-        horizon=inputs.prediction_horizon_s, max_candidates=limit, allow_yaw=branch != "visual_probe",
-        straight_handoff_limit=config.vx_max if live_route else None,
+        acceleration=config.motion_acceleration, braking=config.motion_braking,
+        horizon=inputs.prediction_horizon_s, max_candidates=limit,
         candidate_commands=candidate_commands, validate_candidate=visible if shadow is not None else None,
         diagnostics=diagnostics, alternate_routes=tuple(ref.points for ref in alternates),
         candidate_budget=state.dwa_budget, motion_frame=(scan.motion_frame, inputs.pose), guidance=guidance,
@@ -3510,14 +3552,14 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     if proposed is None:
         if (scan.dwa_failures >= 2 and not scan.attempted and "memory_recheck" not in trace
                 and diagnostics["rejected"].get("remembered_obstacle")):
-            context = _dwa_context(inputs, geometry, config.stop_distance_m, scan.motion_frame)
+            context = _dwa_context(inputs, geometry, config, scan.motion_frame)
             view = _blocking_memory_view(scan, context, state.dwa_budget)
             if view is not None:
                 trace["memory_recheck"] = view
         return unavailable(diagnostics["reason"])
     guard = DwaMotionGuard(**vars(inputs), trace=proposed.trace, check=proposed.check,
                            visibility_required=shadow is not None,
-                           probe_region=state.tracker.track.image_region if branch == "visual_probe" else None)
+                           probe_region=state.tracker.track.image_region if visual else None)
     return DwaProposal(proposed, routes[proposed.reference_index], branch, guard)
 
 
@@ -3640,8 +3682,7 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                     guidance, visible, target, config.stop_distance_m, config.stop_tolerance_m)
                 if branch == "route":
                     proposal = _dwa_detour(depth, config, state, ref, target_distance, target_bearing,
-                                           branch=branch, speed_limit=max(floor_x, LOCAL_BLOCKED_APPROACH_MAX_MPS),
-                                           shadow=shadow, recovery=True, guidance=True)
+                                           branch=branch, shadow=shadow, recovery=True, guidance=True)
                     if proposal is not None:
                         state.dwa_guidance = DwaGuidance(
                             scan.motion_frame, state.goal_anchor,
@@ -3724,9 +3765,9 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             proposal = _dwa_detour(
                 depth, config, state, references[0], target_distance, target_bearing,
                 branch=branch, motion=rolling[1] if rolling is not None else scan.motion,
-                speed_limit=max(floor_x, LOCAL_BLOCKED_APPROACH_MAX_MPS), shadow=shadow,
+                shadow=shadow,
                 recovery=dwa_only, alternates=references[1:],
-                guidance=branch == "reachable_prefix" and not (config.use_lateral and config.vy_max))
+                guidance=branch != "prefix" and not (config.use_lateral and config.vy_max))
             if proposal is not None:
                 side = math.copysign(1., proposal.reference.points[-1][1])
                 return _use_dwa(state, proposal, side)
@@ -3802,8 +3843,7 @@ def _dwa_route_motion(depth, config, state, geometry, ahead, distance, bearing, 
     forward = distance * math.cos(bearing)
     if forward <= 0.:
         return None
-    floor = _local_velocity_limits(config, 1.)[0][0]
-    cap = min(config.vx_max, max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS))
+    (floor, cap), _ = _local_velocity_limits(config, 1.)
     if cap <= 0. or cap < floor:
         return None
     heading = -_clamp(bearing, config.wz_max)
@@ -3816,7 +3856,7 @@ def _dwa_route_motion(depth, config, state, geometry, ahead, distance, bearing, 
     else:
         references = _prefix_references(geometry, seeds, dwa_hold(config, state.dwa_admission_ms / 1000))
     proposal = _dwa_detour(depth, config, state, references[0], distance, bearing, branch="prefix",
-                           speed_limit=cap, candidate_commands=seeds, recovery=True, alternates=references[1:])
+                           candidate_commands=seeds, recovery=True, alternates=references[1:])
     if proposal is not None:
         side = math.copysign(1., -proposal.command[2]) if proposal.command[2] else state.escape_side
         return _use_dwa(state, proposal, side)
@@ -4375,7 +4415,6 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if dwa_lateral_routes:
         sides, routes = zip(*dwa_lateral_routes)
         proposal = _dwa_detour(depth, config, state, routes[0], target_distance, target_bearing,
-                               speed_limit=max(floor_x, LOCAL_BLOCKED_APPROACH_MAX_MPS),
                                alternates=routes[1:])
         if proposal is not None:
             side = sides[proposal.choice.reference_index]
@@ -4491,17 +4530,16 @@ def _checked_forward_prefix(scan, geometry, config, state, odom, motion, vx, hor
                             steer_only=False, shadow=None, depth=None,
                             target_distance=None, target_bearing=None):
     """Select from checked short motions, retaining the legacy fallback order."""
-    (floor, _), _ = _local_velocity_limits(config, 1.)
+    (floor, limit), _ = _local_velocity_limits(config, 1.)
     if config.local_controller == "dwa":
-        cap = min(config.vx_max, max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS))
-        commands = tuple(_prefix_commands(config, cap, yaw, sides, steer_only))
+        commands = tuple(_prefix_commands(config, limit, yaw, sides, steer_only))
     else:
         commands = ()
     if commands:
         references = _prefix_references(geometry, commands, horizon)
         proposed = _dwa_detour(
             depth, config, state, references[0], target_distance, target_bearing,
-            branch="prefix", motion=motion, speed_limit=cap,
+            branch="prefix", motion=motion,
             candidate_commands=commands, shadow=shadow, alternates=references[1:])
         if proposed is not None:
             side = math.copysign(1., -proposed.command[2]) if proposed.command[2] else state.escape_side
@@ -4557,7 +4595,7 @@ def _advance_after_scan(depth, config, state, odom, ahead, stop, target_distance
             reference = Detour(None, ((0., 0.), endpoint), geometry)
             proposed = _dwa_detour(
                 depth, config, state, reference, target_distance, target_bearing,
-                branch="advance", motion=motion, speed_limit=max(floor, LOCAL_BLOCKED_APPROACH_MAX_MPS))
+                branch="advance", motion=motion)
             if proposed is not None:
                 return _use_dwa(state, proposed, state.escape_side)
         if not scan.command_only:

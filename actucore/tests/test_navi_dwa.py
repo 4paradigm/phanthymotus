@@ -707,7 +707,7 @@ def test_bent_reference_seeds_its_standing_turn_and_slow_entry_arc():
     limits = ((0., .15), (-.4, .4), (-1., 1.))
     sampled, _ = dwa._commands(previous, previous, preferred, limits, (0., 0., .1, .04), (), 24)
     assert (0., 0., .31) in sampled
-    assert (.15 / 4, 0., .31) in sampled
+    assert (.15 / 8, 0., .31) in sampled
 
 
 def test_scoring_compacts_straight_grid_steps_but_keeps_turns_and_reversals():
