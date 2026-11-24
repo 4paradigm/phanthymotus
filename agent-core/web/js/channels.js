@@ -79,10 +79,6 @@ function _renderChannels(channels) {
           </button>
           <button class="btn-ghost btn-sm" data-channel-action="trusted-bots">
             Trusted Bots: ${(ch.trusted_bots || []).length}
-          </button>
-          <button class="btn-ghost btn-sm" data-channel-action="image-followup"
-                  title="@ 机器人后 60 秒内，可单独补发图片；文字请求立即处理。需要飞书群消息接收权限。">
-            图片补充：${ch.image_followup_enabled ? '已开启' : '已关闭'}
           </button>` : ''}
         ${ch.platform === 'qq' ? `
           <button class="btn-ghost btn-sm" data-channel-action="qq-group">
@@ -143,11 +139,6 @@ function _showAddForm() {
           <input type="checkbox" id="channel-form-bot-to-bot" /> Allow group Bot @ Bot
         </label>
       </div>
-      <div class="channel-form-row hidden" id="channel-form-image-followup-row">
-        <label title="需要在飞书后台开通接收群内所有用户消息的权限；只处理 @ 和同一用户的后续图片">
-          <input type="checkbox" id="channel-form-image-followup" /> 允许群聊补发图片（@ 后 60 秒内）
-        </label>
-      </div>
       <div class="channel-form-row">
         <label><input type="checkbox" id="channel-form-enabled" checked /> Enable immediately</label>
       </div>
@@ -177,7 +168,6 @@ function _showAddForm() {
     document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-bot-to-bot-row').classList.toggle('hidden', !isFeishu);
-    document.getElementById('channel-form-image-followup-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
       isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
     document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu || isLan);
@@ -216,8 +206,6 @@ async function _submitAdd(formEl) {
   const enabled = document.getElementById('channel-form-enabled').checked;
   const botToBotEnabled = platform === 'feishu'
     && document.getElementById('channel-form-bot-to-bot').checked;
-  const imageFollowupEnabled = platform === 'feishu'
-    && document.getElementById('channel-form-image-followup').checked;
 
   if (!id) { alert('ID is required'); return; }
 
@@ -252,7 +240,6 @@ async function _submitAdd(formEl) {
         config,
         enabled,
         bot_to_bot_enabled: botToBotEnabled,
-        image_followup_enabled: imageFollowupEnabled,
       }),
     });
     const json = await res.json();
@@ -284,7 +271,6 @@ function _handleChannelAction(e) {
     case 'qq-group': _setQQGroup(channel, btn); break;
     case 'bot-to-bot': _channelSetBotToBot(channel.id, !channel.bot_to_bot_enabled, btn); break;
     case 'trusted-bots': _showTrustedBots(channel, item); break;
-    case 'image-followup': _channelSetImageFollowup(channel, btn); break;
     case 'stop':       _channelStop(channel.id, btn); break;
     case 'restart':    _channelRestart(channel.id, btn); break;
     case 'delete':     _confirmChannelDelete(channel, item, btn); break;
@@ -303,26 +289,6 @@ async function _setQQGroup(channel, btn) {
     await _loadChannels();
   } catch {
     alert('QQ 群聊设置未能更新，请稍后重试。');
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function _channelSetImageFollowup(channel, btn) {
-  btn.disabled = true;
-  try {
-    const res = await fetch(`/api/channel/${encodeURIComponent(channel.id)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_followup_enabled: !channel.image_followup_enabled }),
-    });
-    if (!res.ok) {
-      const json = await res.json().catch(() => ({}));
-      throw new Error(json.detail || `Update failed (${res.status})`);
-    }
-    await _loadChannels();
-  } catch (e) {
-    alert('图片补充设置未能更新：' + e.message);
   } finally {
     btn.disabled = false;
   }

@@ -2,6 +2,7 @@
   "scopes": {
     "tenant": [
       "im:message.group_at_msg.include_bot:readonly",
+      "im:message.group_msg",
       "im:message.p2p_msg:readonly",
       "im:message:readonly",
       "im:message:send_as_bot",

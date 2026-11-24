@@ -7,7 +7,7 @@ channel/adapters/feishu.py — Feishu (Lark) adapter。
 便于统一处理错误码，也无需为每个调用开线程池。
 
 Requires: pip install lark-oapi
-Config: {app_id, app_secret, domain?, bot_to_bot_enabled?, image_followup_enabled?}
+Config: {app_id, app_secret, domain?, bot_to_bot_enabled?}
 
 Required Feishu permissions:
 - im:message                — 接收消息
@@ -630,7 +630,6 @@ class FeishuAdapter(ChannelAdapter):
                 return
 
             human_group = not is_bot and raw.get('chat_type') == 'group'
-            image_followup = human_group and self.config.get('image_followup_enabled', False)
             mentions_self = bool(self._bot_open_id) and any(
                 mention.get('open_id') == self._bot_open_id
                 for mention in raw.get('mentions', [])
@@ -647,14 +646,14 @@ class FeishuAdapter(ChannelAdapter):
                 if not all(key) or not raw['message_id']:
                     return
                 if not mentions_self:
-                    request = self._image_requests.get(key) if image_followup else None
+                    request = self._image_requests.get(key)
                     if not request or not request['text'] or not _has_image(raw):
                         return  # 全量群消息权限下，无关消息在下载附件之前过滤。
                     # 在下载之前取快照，避免下载期间新的 @ 改写本张图的上下文。
                     related_request = {
                         'message_id': request['message_id'], 'text': request['text'],
                     }
-                elif image_followup:
+                else:
                     # 先占住最新消息的位置，较早图文的慢下载不能覆盖后来的要求。
                     request_context = {
                         'message_id': raw['message_id'], 'text': '',

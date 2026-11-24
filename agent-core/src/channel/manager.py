@@ -133,8 +133,7 @@ def get_channel_config(channel_id: str) -> dict | None:
 def add_channel_config(channel_id: str, platform: str, cfg: dict,
                        enabled: bool = False, bot_to_bot_enabled: bool = False,
                        trusted_bots: list[dict] | None = None,
-                       chat_only: bool = False,
-                       image_followup_enabled: bool = False) -> dict:
+                       chat_only: bool = False) -> dict:
     configs = _get_channel_configs()
     # 检查 ID 唯一
     if any(c['id'] == channel_id for c in configs):
@@ -146,7 +145,6 @@ def add_channel_config(channel_id: str, platform: str, cfg: dict,
         'bot_to_bot_enabled': bot_to_bot_enabled if supports_bot_to_bot(platform) else False,
         'trusted_bots': normalize_trusted_bots(trusted_bots) if uses_trusted_bots(platform) else [],
         'chat_only': bool(chat_only),
-        'image_followup_enabled': bool(image_followup_enabled) if platform == 'feishu' else False,
         'config': cfg,
         'status': 'disconnected',
         'updated_at': time.time(),
@@ -167,11 +165,9 @@ def update_channel_config(channel_id: str, **updates) -> dict | None:
                 updates['trusted_bots'] = normalize_trusted_bots(updates['trusted_bots'])
             if not supports_bot_to_bot(target_platform):
                 updates['bot_to_bot_enabled'] = False
-            if target_platform != 'feishu':
-                updates['image_followup_enabled'] = False
             for k, v in updates.items():
                 if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled', 'trusted_bots',
-                         'chat_only', 'image_followup_enabled'):
+                         'chat_only'):
                     ch[k] = v
             ch['updated_at'] = time.time()
             _save_channel_configs(configs)
@@ -611,7 +607,6 @@ class ChannelManager:
 
         adapter_config = dict(ch_cfg.get('config', {}))
         adapter_config['bot_to_bot_enabled'] = ch_cfg.get('bot_to_bot_enabled', False)
-        adapter_config['image_followup_enabled'] = ch_cfg.get('image_followup_enabled', False)
         adapter = cls(
             channel_id=channel_id,
             platform=platform,
@@ -1042,7 +1037,6 @@ class ChannelManager:
                    if ch_cfg['platform'] == 'qq' else {}),
                 'enabled': ch_cfg.get('enabled', False),
                 'bot_to_bot_enabled': ch_cfg.get('bot_to_bot_enabled', False),
-                'image_followup_enabled': ch_cfg.get('image_followup_enabled', False),
                 'trusted_bots': ch_cfg.get('trusted_bots', []),
                 'chat_only': chat_only.enabled(ch_cfg),
                 'status': adapter.status() if adapter else 'disconnected',

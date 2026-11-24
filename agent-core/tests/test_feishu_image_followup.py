@@ -48,7 +48,7 @@ class FeishuImageFollowupTest(unittest.IsolatedAsyncioTestCase):
 
     def make_adapter(self, callback):
         adapter = FeishuAdapter('feishu_test', 'feishu', {
-            'image_followup_enabled': True, 'bot_to_bot_enabled': True,
+            'bot_to_bot_enabled': True,
         }, callback)
         adapter._bot_open_id = 'ou_self'
         adapter._download = mock.AsyncMock(return_value=Attachment(
@@ -106,19 +106,14 @@ class FeishuImageFollowupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.received), 1)
         self.adapter._download.assert_not_awaited()
 
-    async def test_feature_defaults_off_and_disabling_does_not_forward_all_group_messages(self):
-        self.adapter.config.pop('image_followup_enabled')
-        await self.adapter._process_event(_message('om_off'))
-        await self.adapter._process_event(_image('om_off_image'))
-        await self.adapter._process_event(_message('om_unmentioned', mention=False))
-        self.assertEqual(len(self.received), 1)
-
-        self.adapter.config['image_followup_enabled'] = True
-        await self.adapter._process_event(_message('om_on'))
+    async def test_legacy_disabled_setting_does_not_block_followups(self):
         self.adapter.config['image_followup_enabled'] = False
-        await self.adapter._process_event(_image('om_disabled_image'))
+        await self.adapter._process_event(_message('om_text'))
+        await self.adapter._process_event(_image())
+        await self.adapter._process_event(_message('om_unmentioned', mention=False))
         self.assertEqual(len(self.received), 2)
-        self.adapter._download.assert_not_awaited()
+        self.assertEqual(self.received[-1].related_request['message_id'], 'om_text')
+        self.adapter._download.assert_awaited_once()
 
     async def test_private_images_remain_standalone_inputs(self):
         await self.adapter._process_event(_image(chat_type='p2p'))
@@ -301,9 +296,7 @@ class FeishuImagePipelineTest(unittest.IsolatedAsyncioTestCase):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        self.adapter = FeishuAdapter('feishu_test', 'feishu', {
-            'image_followup_enabled': True,
-        }, self.manager._on_inbound_message)
+        self.adapter = FeishuAdapter('feishu_test', 'feishu', {}, self.manager._on_inbound_message)
         self.adapter._bot_open_id = 'ou_self'
         self.adapter._download = mock.AsyncMock(return_value=Attachment(
             kind=KIND_IMAGE, path='/work/resource/channel_files/photo.jpg', name='photo.jpg',
@@ -350,51 +343,47 @@ class FeishuImagePipelineTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['trusted_bot_id'], '')
 
 
-class FeishuImageSettingTest(unittest.IsolatedAsyncioTestCase):
+class FeishuImageDefaultTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         patch = mock.patch.object(config, 'main', {})
         patch.start()
         self.addCleanup(patch.stop)
 
-    async def test_setting_can_be_created_updated_and_reported_without_credentials(self):
+    async def test_new_channel_does_not_require_an_image_setting(self):
         from api import channel as api
 
         result = await api.add_channel(api.AddChannelReq(
-            id='feishu_test', platform='feishu', image_followup_enabled=True,
+            id='feishu_test', platform='feishu',
             config={'app_id': 'test-app', 'app_secret': 'test-secret'},
         ))
-        self.assertTrue(result['channel']['image_followup_enabled'])
+        self.assertNotIn('image_followup_enabled', result['channel'])
         status = ChannelManager().get_status()[0]
-        self.assertTrue(status['image_followup_enabled'])
+        self.assertNotIn('image_followup_enabled', status)
         self.assertNotIn('test-secret', json.dumps(status))
-        with mock.patch.object(api.manager, 'restart_adapter', new=mock.AsyncMock()) as restart:
-            await api.update_channel('feishu_test', api.UpdateChannelReq(image_followup_enabled=False))
-        restart.assert_awaited_once_with('feishu_test')
-        self.assertFalse(ChannelManager().get_status()[0]['image_followup_enabled'])
 
-    async def test_setting_is_rejected_for_other_platforms(self):
-        from api import channel as api
-        import fastapi
-
-        with self.assertRaises(fastapi.HTTPException) as error:
-            await api.add_channel(api.AddChannelReq(
-                id='other', platform='telegram', image_followup_enabled=True,
-            ))
-        self.assertEqual(error.exception.status_code, 400)
-
-    async def test_starting_the_adapter_applies_the_saved_setting(self):
+    async def test_existing_disabled_channel_accepts_followups_after_restart(self):
         from channel import manager as channels
 
         channel = channels.add_channel_config(
             'feishu_test', 'feishu', {'app_id': 'test-app'},
-            enabled=True, image_followup_enabled=True,
+            enabled=True,
         )
+        channel['image_followup_enabled'] = False
         manager = ChannelManager()
+        manager._on_inbound_message = mock.AsyncMock()
         with mock.patch.dict(channels._ADAPTER_CLASSES, {'feishu': FeishuAdapter}), \
                 mock.patch.object(FeishuAdapter, 'start', new=mock.AsyncMock()):
             await manager._start_adapter(channel, retries=1)
 
-        self.assertTrue(manager._adapters['feishu_test'].config['image_followup_enabled'])
+        adapter = manager._adapters['feishu_test']
+        adapter._bot_open_id = 'ou_self'
+        adapter._download = mock.AsyncMock(return_value=Attachment(
+            kind=KIND_IMAGE, path='/work/resource/channel_files/photo.jpg', name='photo.jpg',
+        ))
+        await adapter._process_event(_message('om_text'))
+        await adapter._process_event(_image())
+        self.assertEqual(manager._on_inbound_message.await_count, 2)
+        self.assertEqual(manager._on_inbound_message.await_args.args[0].related_request['message_id'], 'om_text')
 
 
 if __name__ == '__main__':

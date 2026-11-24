@@ -46,15 +46,12 @@ class AddChannelReq(BaseModel):
     bot_to_bot_enabled: bool = False
     trusted_bots: list[dict] = Field(default_factory=list)
     chat_only: bool = False  # Channel policy: may only reply to its own chat
-    image_followup_enabled: bool = False
 
 
 @router.post('/add')
 async def add_channel(req: AddChannelReq):
     if req.platform == 'qq':
         raise fastapi.HTTPException(400, 'Use the QQ QR setup')
-    if req.image_followup_enabled and req.platform != 'feishu':
-        raise fastapi.HTTPException(400, 'image_followup_enabled is only supported by Feishu')
     if req.bot_to_bot_enabled and not supports_bot_to_bot(req.platform):
         raise fastapi.HTTPException(
             400, f'bot_to_bot_enabled is not supported by platform "{req.platform}"')
@@ -74,7 +71,6 @@ async def add_channel(req: AddChannelReq):
             req.bot_to_bot_enabled,
             req.trusted_bots,
             req.chat_only,
-            req.image_followup_enabled,
         )
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
@@ -91,7 +87,6 @@ class UpdateChannelReq(BaseModel):
     bot_to_bot_enabled: bool | None = None
     trusted_bots: list[dict] | None = None
     chat_only: bool | None = None
-    image_followup_enabled: bool | None = None
 
 
 @router.put('/{channel_id}')
@@ -103,8 +98,6 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     if current is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     target_platform = updates.get('platform', current['platform'])
-    if updates.get('image_followup_enabled') and target_platform != 'feishu':
-        raise fastapi.HTTPException(400, 'image_followup_enabled is only supported by Feishu')
     if 'qq' in (current['platform'], target_platform):
         raise fastapi.HTTPException(400, 'Use the QQ settings endpoint')
     if updates.get('bot_to_bot_enabled') and not supports_bot_to_bot(target_platform):
