@@ -2863,15 +2863,23 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 
 async function _executeCard(el, mcpId, toolName, instanceId) {
   const btn = el.querySelector('.canvas-exec-btn');
-  btn.disabled = true;
-  btn.textContent = '执行中…';
+  if (btn.disabled) return;
+
+  const mcp = _allMcps.find(m => m.id === mcpId);
+  const tool = mcp?.tools?.find(t => (typeof t === 'string' ? t : t.name) === toolName);
+  const schema = tool?.inputSchema;
+  const props = schema?.properties || {};
+  const action = el.querySelector('.canvas-field-input[data-key="action"]')?.value.trim();
+  const params = schema?.['x-action-params']?.[action]?.params;
 
   const args = {};
   el.querySelectorAll('.canvas-field-input').forEach(input => {
     const key = input.dataset.key;
+    if (Array.isArray(params) && key !== 'action' && !params.includes(key)) return;
     const val = input.value.trim();
     if (val !== '') {
       if (input.type === 'number') args[key] = Number(val);
+      else if (props[key]?.type === 'string') args[key] = val;
       else if (val === 'true') args[key] = true;
       else if (val === 'false') args[key] = false;
       else args[key] = val;
@@ -2884,11 +2892,8 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
   // Auto-inject resolved topics from connected ports (based on schema, not DOM fields)
   const inPorts = [...el.querySelectorAll('.canvas-port.in')];
   const outPorts = [...el.querySelectorAll('.canvas-port.out')];
-  const _mcp = _allMcps.find(m => m.id === mcpId);
-  const _toolObj = _mcp?.tools?.find(t => (typeof t === 'string' ? t : t.name) === toolName);
-  const _schemaProps = (typeof _toolObj === 'object' ? _toolObj.inputSchema : null)?.properties || {};
   let inIdx = 0, outIdx = 0;
-  for (const key of Object.keys(_schemaProps)) {
+  for (const key of Object.keys(props)) {
     if (args[key]) continue;
     if (/input.*topic|topic.*in/i.test(key) && inPorts[inIdx]) {
       const t = inPorts[inIdx++].dataset.topic;
@@ -2899,6 +2904,14 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     }
   }
 
+  const confirmation = schema?.['x-action-lifecycle']?.actions?.[action]?.confirm;
+  if (typeof confirmation === 'string' && confirmation) {
+    const target = (params || []).map(key => args[key]).filter(value => value != null);
+    if (!confirm([confirmation, ...target].join('\n'))) return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '执行中…';
   _logActivity('mcp_call', `${toolName} @ ${mcpId}`);
 
   try {
@@ -2910,7 +2923,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     const json = await res.json();
 
     if (json.code === 200) {
-      const spec = _toolObj?.inputSchema?.['x-workbench'];
+      const spec = schema?.['x-workbench'];
       if (spec?.protocol === 'motus.workbench/1' && args.action === spec.entry) {
         const { openWorkbench } = await import('./workbench.js');
         await openWorkbench({mcp: mcpId, tool: toolName, instanceId: instanceId || el.dataset.cardId},

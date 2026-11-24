@@ -40,21 +40,3 @@ class MotionGate:
         diagnostics=tuple(name+' unknown' for name in ('sharpness','depth_fraction','covariance_available')
                           if getattr(quality,name,None) is None)
         return QualityDecision('accept','numeric pose format',diagnostics)
-
-
-
-class MapGate:
-    """Mapping admission is separate from pose validity and image heuristics."""
-    def __init__(self, observation_model=None, dynamic_mount=False):
-        self.observation_model,self.dynamic_mount=observation_model,dynamic_mount
-
-    def evaluate(self, pose, cloud, context, quality=None):
-        from .spatial_contract import validate_tracking_pose
-        import numpy as np
-        try:validate_tracking_pose(pose)
-        except (ValueError,TypeError) as error:return QualityDecision('pause',str(error))
-        points=np.asarray(cloud)
-        if points.ndim!=2 or points.shape[1]!=3 or not np.isfinite(points).all(axis=1).any():
-            return QualityDecision('drop','no usable finite cloud points')
-        return QualityDecision('accept','valid pose and usable cloud',
-                               ('optional quality unknown',) if quality is None else ())

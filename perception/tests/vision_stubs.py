@@ -68,6 +68,9 @@ class _FakeNode:
     def get_name(self):
         return self._name
 
+    def get_namespace(self):
+        return '/'
+
     def create_publisher(self, msg_type, topic, qos):
         publisher = _FakePublisher(topic)
         self.publishers.append(publisher)

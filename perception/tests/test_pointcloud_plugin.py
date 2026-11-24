@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import struct
+import threading
 import time
 import types
 import zlib
@@ -20,10 +22,11 @@ from vision_stubs import (
 )
 
 import plugins.pointcloud as pc  # noqa: E402
+from plugins.spatial_input import InputAdapterRegistry
 
-def _plugin(cfg=None):
+def _plugin(cfg=None, *, input_registry=None):
     executor = _FakeExecutor()
-    plugin = pc.PointCloudPerceptionPlugin(cfg or {}, "testns", executor)
+    plugin = pc.PointCloudPerceptionPlugin(cfg or {}, "testns", executor, input_registry=input_registry)
     return plugin, executor
 
 
@@ -897,6 +900,103 @@ def test_running_instance_rejects_input_rebinding():
     assert result['state'] == 'error'
     assert executor.nodes[0]._input_topic == '/first'
     plugin.dispatch('pointcloud', {'action': 'stop', 'instance_id': 'card'})
+
+
+@pytest.mark.parametrize('namespace,second_topic', [
+    ('/', '/cam/depth'), ('/', 'cam/depth'), ('/review', 'cam/depth'),
+])
+def test_same_source_cannot_have_two_pointcloud_publishers(monkeypatch, namespace, second_topic):
+    monkeypatch.setattr(pc._PointCloudNode, 'get_namespace', lambda self: namespace)
+    plugin, executor = _plugin()
+    first_topic = namespace.rstrip('/') + '/cam/depth'
+    first = {'instance_id': 'first', 'input_topic': first_topic}
+    second = {'instance_id': 'second', 'input_topic': second_topic}
+    try:
+        assert plugin.dispatch('start', first)['state'] == 'running'
+        assert plugin.dispatch('start', first)['state'] == 'running'
+        owner, = executor.nodes
+        result = plugin.dispatch('start', second)
+        assert result['state'] == 'error'
+        assert 'first' in result['message']
+        assert _FakeNode.instances == [owner]
+        assert executor.nodes == [owner]
+        assert owner._metric_cloud_topic == first_topic + '/pointcloud_metric'
+
+        plugin.dispatch('stop', {'instance_id': 'first'})
+        assert owner.destroyed
+        assert plugin.dispatch('start', second)['state'] == 'running'
+        assert len(executor.nodes) == 1
+    finally:
+        plugin.shutdown()
+
+
+def test_failed_pointcloud_start_releases_acquired_input(monkeypatch):
+    registry = InputAdapterRegistry(subscribe=lambda *_: lambda: None)
+    plugin, executor = _plugin(input_registry=registry)
+    original_subscribe = pc._PointCloudNode.create_subscription
+
+    def subscribe(node, msg_type, topic, callback, qos):
+        if topic == '/depth_metadata':
+            raise RuntimeError('metadata subscription failed')
+        return original_subscribe(node, msg_type, topic, callback, qos)
+
+    monkeypatch.setattr(pc._PointCloudNode, 'create_subscription', subscribe)
+    try:
+        result = plugin.dispatch('start', {'instance_id': 'first', 'input_topic': '/depth',
+            'camera_info': [metric_f32_declaration()],
+            'input_metadata': {'/depth': {'frame_metadata_topic': '/depth_metadata'}}})
+        assert result == {'state': 'error', 'message': 'metadata subscription failed'}
+        assert not registry.status()
+        assert not executor.nodes
+        assert plugin.dispatch('start', {'instance_id': 'second', 'input_topic': '/depth',
+            'camera_info': [metric_f32_declaration()]})['state'] == 'running'
+    finally:
+        plugin.shutdown()
+        registry.close()
+
+
+def test_stop_releases_input_acquired_by_in_flight_discovery():
+    attaching, release, stopping = threading.Event(), threading.Event(), threading.Event()
+
+    def subscribe(*_):
+        attaching.set()
+        assert release.wait(3)
+        return lambda: None
+
+    registry = InputAdapterRegistry(subscribe=subscribe)
+    plugin, executor = _plugin(input_registry=registry)
+    try:
+        assert plugin.dispatch('start', {'input_topic': '/depth'})['state'] == 'running'
+        node, = executor.nodes
+        node._topic_types['/depth'] = ['sensor_msgs/msg/Image']
+
+        class ObservedLock:
+            underlying = node._lifecycle_lock
+
+            def __enter__(self):
+                if node._stop_event.is_set():
+                    stopping.set()
+                return self.underlying.__enter__()
+
+            def __exit__(self, *args):
+                return self.underlying.__exit__(*args)
+
+        node._lifecycle_lock = ObservedLock()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            try:
+                poll = pool.submit(node._poll_input_subscription)
+                assert attaching.wait(2)
+                stop = pool.submit(plugin.dispatch, 'stop', {})
+                assert stopping.wait(2)
+            finally:
+                release.set()
+            poll.result(timeout=2)
+            assert stop.result(timeout=2)['state'] == 'idle'
+        assert not registry.status()
+        assert not executor.nodes
+    finally:
+        plugin.shutdown()
+        registry.close()
 
 
 def test_pinhole_for_falls_back_to_90deg_without_anything():

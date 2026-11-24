@@ -304,9 +304,6 @@ def test_removed_actions_are_neither_advertised_nor_dispatched(card, removed):
     schema = card.get_tools()[0]['inputSchema']
     assert removed not in schema['properties']['action']['enum']
     assert removed not in schema['x-action-params']
-    lifecycle = schema['x-action-lifecycle']['actions']
-    assert removed not in lifecycle
-    assert lifecycle['stop_mapping']['status_action'] == lifecycle['select_map']['status_action'] == 'info'
     assert call(card, removed) is None
 
 
@@ -1296,8 +1293,11 @@ def test_canvas_declares_separate_create_and_resume_actions(card):
     for action, field in [('start_mapping', 'map_name'), ('resume_mapping', 'map_id')]:
         assert action in schema['properties']['action']['enum']
         assert schema['x-action-params'][action]['params'] == [field]
-        assert schema['x-action-lifecycle']['actions'][action]['requires_project']
-    assert schema['properties']['map_id']['x-resource-options']['action'] == 'list_maps'
+
+
+def test_canvas_declares_delete_confirmation_for_all_map_versions(card):
+    schema = card.get_tools()[0]['inputSchema']
+    assert schema['x-action-lifecycle']['actions']['delete_map']['confirm'] == '删除地图及其全部版本？'
 
 
 @pytest.mark.parametrize('delete_old', [False, True])

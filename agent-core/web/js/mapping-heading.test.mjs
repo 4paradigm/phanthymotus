@@ -20,7 +20,6 @@ function renderer() {
   });
   r._points = { geometry: { attributes: { position: attribute(), color: attribute() }, setDrawRange() {} } };
   r._robotMesh = { visible: true, position: new Vector3(), rotation: new Vector3() };
-  r._markerLabel = { textContent: '' };
   return r;
 }
 function packet(flags) {
@@ -30,9 +29,8 @@ function packet(flags) {
   return buffer;
 }
 
-test('mapped camera heading renders without a text overlay', () => {
+test('mapped camera heading rotates the mesh and updates point geometry', () => {
   const r = renderer(); r.onData(packet(15));
-  assert.equal(r._markerLabel.textContent, '');
   assert.equal(r._robotMesh.visible, true);
   assert.ok(Math.abs(r._robotMesh.rotation.values[1] - .7) < 1e-6);
   assert.deepEqual([...r._positions], [1, 3, -2]);
@@ -41,13 +39,12 @@ test('mapped camera heading renders without a text overlay', () => {
     assert.equal(attribute.needsUpdate, true);
   }
 });
-test('body, unavailable, and legacy markers preserve visibility without text', () => {
+test('heading flags control marker visibility', () => {
   const r = renderer();
   r.onData(packet(23)); assert.equal(r._robotMesh.visible, true);
   r.onData(packet(39)); assert.equal(r._robotMesh.visible, false);
-  assert.equal(r._markerLabel.textContent, '');
   r.onData(packet(3)); assert.equal(r._robotMesh.visible, true);
-  r.onData(packet(19)); assert.equal(r._markerLabel.textContent, '');
+  r.onData(packet(19)); assert.equal(r._robotMesh.visible, true);
 });
 
 test('depth display packet and mapping packet share forward-left-up axes', () => {

@@ -170,7 +170,7 @@ def collect_connected_metadata(connections, resolved_info, topic_of_connection):
             continue
         if index < 0:
             continue
-        port = _port(info, index)
+        port = _port(info, index, source=True)
         topic = topic_of_connection(conn)
         if not topic or port.get('topic') != topic or not port.get('format'):
             continue

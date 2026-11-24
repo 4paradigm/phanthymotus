@@ -1,6 +1,6 @@
 """Capture-bracketed gyro rotation for native SLAM initialization."""
 from collections import deque
-from itertools import pairwise
+from itertools import islice
 import math
 import re
 import struct
@@ -66,7 +66,8 @@ class SlamRotationHint:
         self.history.append((stamp, orientation, self.generation))
 
     def payload(self, stamp):
-        for (before, a, generation), (after, b, next_generation) in pairwise(self.history):
+        adjacent = zip(self.history, islice(self.history, 1, None))
+        for (before, a, generation), (after, b, next_generation) in adjacent:
             if stamp < before:
                 break
             if before <= stamp <= after and generation == next_generation:

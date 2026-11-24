@@ -80,15 +80,14 @@ def test_malformed_mount_numeric_matrix_is_a_format_error():
     with pytest.raises(ValueError):observer.observe(packet(matrix=np.eye(3)),100)
 
 
-def test_motion_and_map_admission_do_not_enforce_rate_quality_or_receipt_labels():
-    from plugins.spatial_quality import MotionGate,MapGate,QualityReport
+def test_motion_admission_does_not_enforce_rate_quality_or_receipt_labels():
+    from plugins.spatial_quality import MotionGate,QualityReport
     from test_spatial_quality import sample as pose_sample
     previous,context=pose_sample(1_000_000_000)
     current,_=pose_sample(900_000_000,x=100.,receipt=True)
     decision=MotionGate({'reference':'camera_optical','max_speed_mps':.01}).evaluate(
         previous,current,context,QualityReport(native_lost=True))
     assert decision.action=='accept'
-    assert MapGate(dynamic_mount=True).evaluate(current,[[1.,2.,3.]],context).action=='accept'
 
 
 def test_connected_transport_roles_do_not_require_matching_kind_or_topic_labels():

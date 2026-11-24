@@ -11,6 +11,7 @@ import copy
 import hashlib
 import json
 import logging
+import posixpath
 import queue
 import threading
 import time
@@ -312,12 +313,13 @@ class _PointCloudNode(Node):
             return self._state("running")
 
     def stop(self) -> dict:
-        # Worker only — subscriptions are destroyed by dispose_node after the
-        # node leaves the executor (InvalidHandle race otherwise; see vop).
+        # Release shared input after any in-flight discovery has finished.
+        # Own subscriptions are destroyed by dispose_node after executor removal.
         self._stop_event.set()
-        for lease in self._input_leases:
-            lease.close()
         with self._lifecycle_lock:
+            leases, self._input_leases = self._input_leases, []
+            for lease in leases:
+                lease.close()
             timer, self._input_discovery_timer = self._input_discovery_timer, None
             if timer is not None:
                 self.destroy_timer(timer)
@@ -714,11 +716,16 @@ class PointCloudPerceptionPlugin:
                 'declared-K' if getattr(node, '_upstream_intrinsics', None) else
                 'declared-fov-approximate' if getattr(node, '_upstream_fov', None) else
                 '90-degree-fallback')
-            self._executor.add_node(node)
             try:
+                self._executor.add_node(node)
                 node.start()
             except Exception:
-                dispose_node(self._executor, node, label=f'pointcloud/{node_key}')
+                try:
+                    node.stop()
+                except Exception:
+                    log.exception('[pointcloud] cleanup after startup failure: %s', node_key)
+                finally:
+                    dispose_node(self._executor, node, label=f'pointcloud/{node_key}')
                 raise
             self._nodes[node_key] = node
         log.info("[pointcloud] depth node started: %s", input_topic)
@@ -726,17 +733,17 @@ class PointCloudPerceptionPlugin:
     def _retire_node(self, node_key: str) -> Optional[dict]:
         with self._nodes_lock:
             node = self._nodes.pop(node_key, None)
-        if node is None:
-            return None
-        with self._nodes_lock:
+            if node is None:
+                return None
             # 声明随节点走：留着会让重新接线的卡片拿一个已经不喂它的相机
             # 的光学参数回答 info()（同 visual_depth 的注释）。
             self._upstream_camera.pop(node_key, None)
             self._upstream_input_metadata.pop(node_key, None)
-        node.request_stop()
-        result = node.stop()
-        dispose_node(self._executor, node, label=f"pointcloud/{node_key}")
-        return result
+            node.request_stop()
+            try:
+                return node.stop()
+            finally:
+                dispose_node(self._executor, node, label=f"pointcloud/{node_key}")
 
     def shutdown(self) -> None:
         """Retire workers and subscriptions before ROS teardown."""
@@ -940,6 +947,14 @@ class PointCloudPerceptionPlugin:
             declaration = copy.deepcopy(declaration) if isinstance(declaration, dict) else {}
             with self._nodes_lock:
                 existing = self._nodes.get(node_key)
+                # Each source owns its derived topics. Resolve relative names
+                # against the namespace shared by the pointcloud nodes.
+                for key, node in self._nodes.items():
+                    namespace = node.get_namespace()
+                    if (key != node_key and posixpath.join(namespace, node._input_topic) ==
+                            posixpath.join(namespace, input_topic)):
+                        return {'state': 'error', 'message':
+                                f'pointcloud input {input_topic} is already used by instance {key}'}
                 if existing and (existing._input_topic != (input_topic or '') or
                                  declaration.get('frame_metadata_topic') !=
                                  self._upstream_input_metadata.get(node_key, {}).get('frame_metadata_topic')):
@@ -952,19 +967,17 @@ class PointCloudPerceptionPlugin:
                     return {'state': 'error', 'message': 'stop the pointcloud instance before changing its camera geometry'}
                 self._upstream_input_metadata[node_key] = declaration
                 self._upstream_camera[node_key] = declared
-                running = self._nodes.get(node_key)
-            if running is None:
-                try:
-                    self._start_node(node_key, input_topic, calibration)
-                except Exception as error:
-                    log.error("[pointcloud] unable to bind ROS input topic %s: %s",
-                              input_topic, error, exc_info=True)
-                    return {'state': 'error', 'message': str(error)}
-                with self._nodes_lock:
-                    running = self._nodes.get(node_key)
-                if running is None:
-                    return {"state": "idle", "input": input_topic}
-            return running.start()
+                if existing is None:
+                    try:
+                        self._start_node(node_key, input_topic, calibration)
+                    except Exception as error:
+                        self._upstream_input_metadata.pop(node_key, None)
+                        self._upstream_camera.pop(node_key, None)
+                        log.error("[pointcloud] unable to bind ROS input topic %s: %s",
+                                  input_topic, error, exc_info=True)
+                        return {'state': 'error', 'message': str(error)}
+                    existing = self._nodes[node_key]
+                return existing.start()
 
         elif action == "stop":
             with self._nodes_lock:

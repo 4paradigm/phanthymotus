@@ -105,11 +105,6 @@ class PointCloudSlamPlugin:
             if key in props and value is not None:
                 props[key]['default'] = json.dumps(value) if key == 'child_from_cloud' else value
         verbs = ['start', 'stop', 'info', 'config', *_ACTIONS]
-        actions = {key: {'requires_project': key in ('start_mapping', 'resume_mapping')} for key in _ACTIONS}
-        actions['delete_map']['confirm'] = '删除地图及其全部版本？'
-        for key in ('stop_mapping', 'select_map'):
-            actions[key].update(background=True, status_action='info',
-                pending_states=['working'], error_states=['error'], poll_interval_ms=500)
         schema = {'type': 'object', 'properties': {
             'action': {'type': 'string', 'enum': verbs,
                        'description': 'start_mapping 用 map_name 新建地图，resume_mapping 用 map_id 续建已有地图。select_map 和 delete_map 用 map_name 选择或删除已保存地图。',
@@ -122,11 +117,8 @@ class PointCloudSlamPlugin:
             'background': {'type': 'boolean'}, 'revision': {'type': 'integer'}}, 'required': ['action'],
             'x-action-params': {k: {'params': params} for k, params in _ACTIONS.items()},
             'x-slam-input-contract': 'motus.slam_input/1',
-            'x-map-manager': {'schema': 'motus.map-manager/1', 'actions': {
-                k: k for k in ('list_maps', 'select_map', 'rename_map', 'delete_map')}},
-            'x-action-lifecycle': {'schema': 'motus.action-lifecycle/1', 'config_actions': ['start'], 'actions': actions}}
-        schema['properties']['map_id']['x-resource-options'] = {
-            'action': 'list_maps', 'items': 'maps', 'value': 'id', 'label': 'name'}
+            'x-action-lifecycle': {'schema': 'motus.action-lifecycle/1', 'actions': {
+                'delete_map': {'confirm': '删除地图及其全部版本？'}}}}
         schema['properties']['tag_name']['description'] = '标点名称。tag_place 标记当前建图位置，untag_place 删除当前建图或所选地图上的同名标点。'
         return [{'name': self.PREFIX, 'type': 'processor', 'multiInstance': False,
                  'description': 'RTAB-Map point-cloud mapping with existing odometry',

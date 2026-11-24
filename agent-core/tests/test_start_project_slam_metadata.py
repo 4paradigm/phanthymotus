@@ -194,12 +194,14 @@ def test_missing_topic_keyed_odom_interface_remains_pending():
     assert result['odom_interfaces'] == {}
 
 
-def test_pointcloud_receives_only_connected_depth_provenance(rig):
+@pytest.mark.parametrize('source_port,saved_topic', [(0, '/bumi/depth'), (1, '/old/depth')])
+def test_pointcloud_receives_only_connected_depth_provenance(rig, source_port, saved_topic):
     layout = {'cards': [_card('other', 'other'), _card('depth', 'depth'),
                         _card('cloud', 'pointcloud')],
-              'connections': [_wire('depth', 0, 'cloud', '/bumi/depth',
+              'connections': [_wire('depth', source_port, 'cloud', saved_topic,
                                     'image/depth-zlib')]}
     assert run(layout) is not False
+    assert rig.starts['cloud']['input_topic'] == '/bumi/depth'
     assert rig.starts['cloud']['input_metadata'] == {
         '/bumi/depth': {'topic': '/bumi/depth', 'format': 'image/depth-zlib',
                         'source_id': 'measured-depth',
