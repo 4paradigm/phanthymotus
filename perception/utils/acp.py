@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
 import threading
 import urllib.request
 
@@ -25,8 +26,14 @@ log = logging.getLogger(__name__)
 
 # Loopback by default because /api/acp/complete is loopback-only (auth.py
 # rejects anything else, loudly, and tells the caller to use the peer inbox).
-AGENT_CORE_URL = os.environ.get('AGENT_CORE_URL', 'http://127.0.0.1:15678')
+# HTTPS: agent-core serves nothing else on 15678 — a plain-HTTP POST has the
+# connection dropped. Its certificate is self-signed with no SAN, so neither
+# the hostname nor the chain is checked (same as main.py's registration).
+AGENT_CORE_URL = os.environ.get('AGENT_CORE_URL', 'https://localhost:15678')
 TIMEOUT_S = 3
+_TLS = ssl.create_default_context()
+_TLS.check_hostname = False
+_TLS.verify_mode = ssl.CERT_NONE
 
 
 def _post(action_id: str, status: str, result: dict) -> None:
@@ -36,7 +43,7 @@ def _post(action_id: str, status: str, result: dict) -> None:
         f'{AGENT_CORE_URL.rstrip("/")}/api/acp/complete', body,
         headers={'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_S, context=_TLS) as response:
             response.read()
     except Exception as error:   # noqa: BLE001
         # Deliberately not re-raised: the caller is a playback thread, and a
