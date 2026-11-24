@@ -593,7 +593,7 @@ def test_speak_reads_in_the_language_it_asks_for(monkeypatch, prepared):
     assert _installed(plugin).readings == ["en"]
 
 
-def test_speak_without_a_language_reads_by_context(monkeypatch, prepared):
+def test_speak_without_a_language_reads_by_context(monkeypatch, prepared, completions):
     """There is no card setting: anything that does not ask for a reading —
     on_notify, the input topic, an LLM that leaves the argument out — is auto."""
     plugin, executor, state = _plugin(monkeypatch)
@@ -605,9 +605,13 @@ def test_speak_without_a_language_reads_by_context(monkeypatch, prepared):
     plugin.dispatch("tts", {"action": "speak", "text": "二", "reading_language": ""})
     # A reading_language left in a saved card config from before is ignored.
     plugin.dispatch("tts", {"action": "config", "reading_language": "zh"})
-    plugin.dispatch("tts", {"action": "speak", "text": "三"})
+    third = plugin.dispatch("tts", {"action": "speak", "text": "三"})
 
-    assert _wait_until(lambda: len(prepared) == 3)
+    action_id = third["action_id"]
+    assert _wait_until(lambda: any(c[0] == action_id for c in completions)), \
+        "third utterance did not complete"
+    _, _, frames, interrupted = _record(completions, action_id)
+    assert frames > 0 and not interrupted, "third utterance failed or was interrupted"
     assert [call[1] for call in prepared] == ["auto", "auto", "auto"]
     assert _installed(plugin).readings == ["", "", ""]
     assert state["loads"] == 1

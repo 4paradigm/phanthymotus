@@ -132,6 +132,8 @@ class OrtWorker:
         # key -> (module, func, kwargs), rebuilt on a restart for the same reason
         # sessions are: a caller holding a proxy should not have to notice.
         self._services = {}
+        self._service_refs = {}
+        self._service_ready = set()
         self._closed = False
         atexit.register(self.close)
 
@@ -140,6 +142,10 @@ class OrtWorker:
     def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.is_alive():
             return
+        if self._proc is not None or self._cmd_q is not None or self._res_q is not None:
+            # An idle child can die outside _request's timeout path too.
+            # Reap its IPC resources before replacing their last references.
+            self._terminate()
         import multiprocessing as mp
 
         # `spawn`, never the platform default. On Linux that is `fork`, which copies the
@@ -149,6 +155,11 @@ class OrtWorker:
         self._ctx = mp.get_context("spawn")
         self._cmd_q = self._ctx.Queue()
         self._res_q = self._ctx.Queue()
+        # A terminated child may disappear during a large JPEG transfer.
+        # Closing its last reader below intentionally makes the feeder see
+        # EPIPE; that is cancellation, not an error to print to container logs.
+        if hasattr(self._cmd_q, "_ignore_epipe"):
+            self._cmd_q._ignore_epipe = True
         self._proc = self._ctx.Process(
             target=_ort_worker_main,
             args=(self._cmd_q, self._res_q, log.getEffectiveLevel()),
@@ -186,30 +197,56 @@ class OrtWorker:
                 log.info("[ort] reloaded %s after the worker restarted", key)
             except Exception as exc:                              # noqa: BLE001
                 log.warning("[ort] could not reload %s: %s", key, exc)
-        stale_services, self._services = dict(self._services), {}
+        stale_services = dict(self._services)
+        self._service_ready.clear()
         for key, (module, func, kwargs) in stale_services.items():
             try:
                 self._request(("service", key, module, func, kwargs),
                               timeout=LOAD_TIMEOUT_S)
                 self._services[key] = (module, func, kwargs)
+                self._service_ready.add(key)
                 log.info("[ort] rebuilt service %s after the worker restarted", key)
             except Exception as exc:                              # noqa: BLE001
                 log.warning("[ort] could not rebuild service %s: %s", key, exc)
 
     def _terminate(self) -> None:
         proc, self._proc = self._proc, None
+        queues = (self._cmd_q, self._res_q)
         self._cmd_q = self._res_q = None
         self._meta = {}
-        if proc is None:
-            return
-        try:
-            proc.terminate()
-            proc.join(timeout=5)
-            if proc.is_alive():
-                proc.kill()
+        self._service_ready.clear()
+        for channel in queues:
+            if channel is not None:
+                cancel = getattr(channel, "cancel_join_thread", None)
+                close = getattr(channel, "close", None)
+                if cancel is not None:
+                    cancel()
+                if close is not None:
+                    close()
+        if proc is not None:
+            try:
+                proc.terminate()
                 proc.join(timeout=5)
-        except Exception:                                         # noqa: BLE001
-            pass
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=5)
+            except Exception:                                     # noqa: BLE001
+                pass
+        for channel in queues:
+            # Queue.close() only enqueues a sentinel. A feeder already blocked
+            # writing an 8 MiB frame cannot reach it, and cancel_join_thread()
+            # only suppresses the exit wait. Drop this process's reader copy
+            # after the child exits so the write gets EPIPE and releases the
+            # payload; then reap the feeder and close the remaining endpoint.
+            reader = getattr(channel, "_reader", None)
+            writer = getattr(channel, "_writer", None)
+            if reader is not None:
+                reader.close()
+            feeder = getattr(channel, "_thread", None)
+            if feeder is not None and feeder is not threading.current_thread():
+                feeder.join(timeout=1)
+            if writer is not None:
+                writer.close()
 
     def close(self) -> None:
         """Kill the child, releasing its CUDA context.
@@ -226,6 +263,7 @@ class OrtWorker:
             self._terminate()
             self._loaded = {}
             self._services = {}
+            self._service_refs = {}
 
     def has_cuda_session(self) -> bool:
         """Whether the child already holds a CUDA session — and so a CUDA context.
@@ -320,6 +358,10 @@ class OrtWorker:
         a name: a spawned child cannot be handed a closure, and a name means it imports
         the same implementation rather than a copy. This class still knows nothing about
         what it is hosting.
+
+        A service can request a worker-owned ONNX session with `_ort_session`
+        (model_path, providers and options). Its factory receives `session`
+        in the child, including when the worker rebuilds the service.
         """
         with self._lock:
             self._closed = False
@@ -327,22 +369,61 @@ class OrtWorker:
             reply = self._request(("service", key, module, func, kwargs),
                                   timeout=LOAD_TIMEOUT_S)
             self._services[key] = (module, func, kwargs)
+            self._service_ready.add(key)
             return ServiceProxy(self, key, reply)
 
-    def call(self, key: str, method: str, kwargs=None, timeout=None):
+    def acquire_service(self, key: str, module: str, func: str, **kwargs):
+        """Lease an identical service without replacing another consumer's model."""
         with self._lock:
+            spec = (module, func, kwargs)
+            if self._service_refs.get(key, 0):
+                if self._services.get(key) != spec:
+                    raise OrtWorkerError("shared service configuration conflict")
+                self._service_refs[key] += 1
+                return ServiceProxy(self, key, {})
+            proxy = self.service(key, module, func, **kwargs)
+            self._service_refs[key] = 1
+            return proxy
+
+    def release_service(self, key: str) -> None:
+        """Only the last lease releases the model; safe after worker.close()."""
+        with self._lock:
+            count = self._service_refs.get(key, 0)
+            if count > 1:
+                self._service_refs[key] = count - 1
+            elif count == 1:
+                del self._service_refs[key]
+                self.drop(key)
+
+    def call(self, key: str, method: str, kwargs=None, timeout=None):
+        started = time.monotonic()
+        budget = RUN_TIMEOUT_S if timeout is None else timeout
+        if not self._lock.acquire(timeout=budget):
+            raise OrtWorkerError("ORT worker is busy; call deadline expired")
+        try:
             if self._closed:
                 raise OrtWorkerError("the ORT worker is closed")
             if not self.alive:
                 log.warning("[ort] worker died; restarting and rebuilding its services")
                 self._ensure_started()
+            if key in self._services and key not in self._service_ready:
+                module, func, spec = self._services[key]
+                self._request(("service", key, module, func, spec),
+                              timeout=LOAD_TIMEOUT_S)
+                self._service_ready.add(key)
+            remaining = budget - (time.monotonic() - started)
+            if remaining <= 0:
+                raise OrtWorkerError("ORT service recovery exceeded call deadline")
             return self._request(("call", key, method, dict(kwargs or {})),
-                                 timeout=timeout or RUN_TIMEOUT_S)
+                                 timeout=remaining)
+        finally:
+            self._lock.release()
 
     def drop(self, key: str) -> None:
         """Release one service, keeping the child and everything else it holds."""
         with self._lock:
             self._services.pop(key, None)
+            self._service_ready.discard(key)
             if not self.alive:
                 return
             try:
@@ -526,6 +607,27 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
         return [{"name": e.name, "shape": list(e.shape), "type": e.type}
                 for e in entries]
 
+    def _create_session(model_path, providers, options):
+        opts = ort.SessionOptions()
+        if options.get("intra_op_num_threads") is not None:
+            opts.intra_op_num_threads = int(options["intra_op_num_threads"])
+        if options.get("log_severity_level") is not None:
+            opts.log_severity_level = int(options["log_severity_level"])
+        for config_key, config_value in (options.get("session_config") or {}).items():
+            opts.add_session_config_entry(str(config_key), str(config_value))
+        level = options.get("graph_optimization_level")
+        if level:
+            opts.graph_optimization_level = getattr(
+                ort.GraphOptimizationLevel, level)
+        # Positionally aligned with `providers`, e.g.
+        # [{"cudnn_conv_algo_search": "HEURISTIC"}, {}] — see
+        # kokoro_direct.py for why Kokoro's Japanese session needs this.
+        provider_options = options.get("provider_options")
+        if provider_options:
+            return ort.InferenceSession(model_path, opts, providers=providers,
+                                        provider_options=provider_options)
+        return ort.InferenceSession(model_path, opts, providers=providers)
+
     while True:
         try:
             command = cmd_q.get()
@@ -538,25 +640,8 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
         try:
             if verb == "load":
                 _, _, key, model_path, providers, options, postprocess = command
-                opts = ort.SessionOptions()
-                if options.get("intra_op_num_threads") is not None:
-                    opts.intra_op_num_threads = int(options["intra_op_num_threads"])
-                if options.get("log_severity_level") is not None:
-                    opts.log_severity_level = int(options["log_severity_level"])
-                level = options.get("graph_optimization_level")
-                if level:
-                    opts.graph_optimization_level = getattr(
-                        ort.GraphOptimizationLevel, level)
-                # Positionally aligned with `providers`, e.g.
-                # [{"cudnn_conv_algo_search": "HEURISTIC"}, {}] — see
-                # kokoro_direct.py for why Kokoro's Japanese session needs this.
-                provider_options = options.get("provider_options")
                 started = time.monotonic()
-                if provider_options:
-                    sess = ort.InferenceSession(model_path, opts, providers=providers,
-                                                provider_options=provider_options)
-                else:
-                    sess = ort.InferenceSession(model_path, opts, providers=providers)
+                sess = _create_session(model_path, providers, options)
                 post = None
                 if postprocess:
                     module = importlib.import_module(postprocess["module"])
@@ -577,7 +662,12 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
                 _, _, key, module_name, func_name, kwargs = command
                 module = importlib.import_module(module_name)
                 started = time.monotonic()
-                obj = getattr(module, func_name)(**kwargs)
+                factory = getattr(module, func_name)
+                session_spec = kwargs.pop("_ort_session", None)
+                if session_spec is None:
+                    obj = factory(**kwargs)
+                else:
+                    obj = factory(session=_create_session(**session_spec), **kwargs)
                 services[key] = obj
                 describe = getattr(obj, "describe", None)
                 wlog.info("built service %s from %s.%s in %.2fs",

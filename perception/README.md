@@ -3,10 +3,18 @@
 Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`,
 `echo_cancellation` echo handling), vision (`vop` object detection, `visual_depth`
 monocular depth, `ocr`, `face_recognition`, `pose` human keypoints + actions,
-`barcode` QR/条码扫码).
+`barcode` QR/条码扫码, `privacy_view` 人脸隐私遮挡).
 Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
+
+For the multi-instance `privacy_view` JPEG processor, see
+[Privacy View](PRIVACY_VIEW.md): opaque/pixelate/Gaussian modes, fail-closed
+fault behavior, source timestamp requirements, shared SCRFD ownership,
+Canvas/MCP ports, configuration and reproducible offline/live tests.
+
+See [Mosaic Smooth Demo](MOSAIC_SMOOTH_DEMO.md) for the independent, opt-in
+mosaic processor, its consent requirement and verified YuNet setup.
 
 ## Audio Requirements for ASR
 

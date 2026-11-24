@@ -21,6 +21,9 @@ and +5.1 ms per face; the numbers and the reasoning are in `face_service.py`.
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
+import threading
 
 import numpy as np
 
@@ -72,14 +75,28 @@ class FaceServiceProxy:
         ensure_face_model(weights_dir, bundle=bundle, progress_cb=progress_cb)
 
         self._worker = ort_worker.get_worker()
-        described = self._worker.service(
-            SERVICE_KEY, "plugins.face_service", "build",
-            model_dir=model_dir, model=model, providers=providers,
-            num_threads=num_threads, det_size=tuple(det_size),
-            det_thresh=det_thresh, nms_thresh=nms_thresh,
-            max_image_side=max_image_side, max_image_pixels=max_image_pixels,
-            warmup=warmup,
-        ).describe()
+        self._lease_lock = threading.RLock()
+        self._closed = False
+        spec = dict(
+            model_dir=weights_dir, model=model, providers=providers,
+            num_threads=max(1, int(num_threads)), det_size=tuple(int(v) for v in det_size),
+            det_thresh=float(det_thresh), nms_thresh=float(nms_thresh),
+            max_image_side=int(max_image_side), max_image_pixels=int(max_image_pixels),
+            warmup=bool(warmup),
+            detection_only=True,
+        )
+        # The key describes the actual engine, rather than whichever Card
+        # happened to load last. Recognition is enabled lazily in the child.
+        self._service_key = SERVICE_KEY + "." + hashlib.sha256(
+            json.dumps(spec, sort_keys=True).encode()).hexdigest()[:24]
+        self._worker.acquire_service(
+            self._service_key, "plugins.face_service", "build", **spec)
+        try:
+            described = self._worker.call(self._service_key, "describe", {})
+        except Exception:
+            self._worker.release_service(self._service_key)
+            self._closed = True
+            raise
         self._providers = list(described.get("providers") or providers)
         self._device = described.get("device", self._device)
         log.info("[face] service ready in the ORT worker: device=%s providers=%s",
@@ -106,7 +123,7 @@ class FaceServiceProxy:
         `faces` are `DetectedFace`s with `embedding` set for the ones that passed the
         gate and `None` for the rest.
         """
-        reply = self._worker.call(SERVICE_KEY, "recognise", {
+        reply = self._call("recognise", {
             "image_bytes": image_bytes, "max_faces": max_faces,
             "det_thresh": det_thresh, "min_face_px": min_face_px,
             "blur_min": blur_min, "want_aligned": want_aligned,
@@ -135,8 +152,21 @@ class FaceServiceProxy:
         """
         if not crops:
             return []
-        reply = self._worker.call(SERVICE_KEY, "embed_aligned", {"crops": list(crops)})
+        reply = self._call("embed_aligned", {"crops": list(crops)})
         return list(reply.get("embeddings") or [])
+
+    def _call(self, method, kwargs, timeout=None):
+        with self._lease_lock:
+            if self._closed:
+                raise RuntimeError("face service lease is closed")
+            return self._worker.call(self._service_key, method, kwargs, timeout=timeout)
+
+    def detect(self, image_bytes: bytes, frame_token: str,
+               det_thresh: float = 0.5, timeout: float = 2.0) -> dict:
+        """Detection only, keeping every face; an exception is never zero faces."""
+        return self._call("detect", {"image_bytes": image_bytes,
+                                    "frame_token": frame_token,
+                                    "det_thresh": det_thresh}, timeout=timeout)
 
     def close(self) -> None:
         """Drop the service, releasing its models and its share of the GPU pool.
@@ -144,7 +174,7 @@ class FaceServiceProxy:
         The child stays: Kokoro's Japanese session may be in it, and a face card
         stopping must not take Japanese down with it.
         """
-        try:
-            self._worker.drop(SERVICE_KEY)
-        except Exception as exc:                                  # noqa: BLE001
-            log.warning("[face] dropping the face service failed: %s", exc)
+        with self._lease_lock:
+            if not self._closed:
+                self._closed = True
+                self._worker.release_service(self._service_key)
