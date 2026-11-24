@@ -83,6 +83,7 @@ def driver(monkeypatch):
     never started, or started without an input, has no output topic to report.
     """
     starts, started_input = {}, {}
+    start_results, info_states = {}, {}
 
     async def _call(mcp_id, req, timeout_s=None):
         # **`timeout_s` 要收下并断言，不能只是吞掉。** 一个把出问题的那个参数
@@ -96,6 +97,11 @@ def driver(monkeypatch):
         if action == 'start':
             starts[card_id] = args
             started_input[card_id] = args.get('input_topic') or ''
+            if card_id in start_results:
+                result = start_results[card_id]
+                if isinstance(result, Exception):
+                    raise result
+                return result
             # A Unitree speaker refuses a start it cannot bind, and says so the
             # way those drivers do: a bare `error` key, no `state`, and the
             # JSON-RPC call itself succeeds.
@@ -104,6 +110,9 @@ def driver(monkeypatch):
             return {'code': 200, 'data': {'state': 'running'}}
         if action == 'info':
             data = {'state': 'running', 'topic_out': _topic_out(card_id, args, req.tool)}
+            states = info_states.get(card_id)
+            if states:
+                data.update(states.pop(0) if len(states) > 1 else states[0])
             topic_in = _topic_in(card_id)
             if topic_in is not None:
                 data['topic_in'] = topic_in
@@ -176,7 +185,8 @@ def driver(monkeypatch):
                       ('api.inspection', inspection), ('channel.manager', chan)):
         monkeypatch.setitem(sys.modules, name, mod)
 
-    return types.SimpleNamespace(starts=starts, events=events, registered=registered)
+    return types.SimpleNamespace(starts=starts, events=events, registered=registered,
+                                 start_results=start_results, info_states=info_states)
 
 
 def _start(layout):
@@ -470,3 +480,80 @@ def test_the_browser_snapshot_still_wins_over_the_registry(driver):
     layout['connections'][0]['fromTopic'] = '/drawn/on/the/canvas'
     assert _start(layout) is True
     assert driver.starts['card-dst'].get('input_topic') == '/drawn/on/the/canvas'
+
+
+def test_start_progress_distinguishes_same_tool_instances(driver):
+    cards = [_card('left', 'wrist_camera'), _card('right', 'wrist_camera')]
+    assert _start({'cards': cards, 'connections': []}) is True
+    begin = next(e['payload'] for e in driver.events if e['type'] == 'project_start_begin')
+    assert begin['cards'] == [
+        {'tool': 'wrist_camera', 'mcp_id': 'mcp-perception', 'card_id': 'left'},
+        {'tool': 'wrist_camera', 'mcp_id': 'mcp-perception', 'card_id': 'right'},
+    ]
+    items = [e['payload'] for e in driver.events if e['type'] == 'project_start_item']
+    assert [(p.get('card_id'), p['status']) for p in items] == [
+        ('left', 'starting'), ('left', 'ready'), ('right', 'starting'), ('right', 'ready')]
+
+
+@pytest.mark.parametrize('reply', [
+    {'code': 200, 'data': {'state': 'error', 'error': 'camera disconnected'}},
+    {'code': 503, 'message': 'driver offline'},
+    RuntimeError('connection lost'),
+])
+def test_start_failure_progress_identifies_the_failed_instance(driver, reply):
+    driver.start_results['left'] = reply
+    assert _start({'cards': [_card('left', 'wrist_camera'), _card('right', 'wrist_camera')],
+                   'connections': []}) is False
+    failed, = _errors(driver.events)
+    assert failed.get('card_id') == 'left'
+    done = next(e['payload'] for e in driver.events if e['type'] == 'project_start_done')
+    assert done['errors'] == ['wrist_camera (left)']
+
+
+def test_failure_summary_distinguishes_two_instances_of_one_tool(driver, capsys):
+    for cid in ('left', 'right'):
+        driver.start_results[cid] = {'code': 503, 'message': 'driver offline'}
+    assert _start({'cards': [_card('left', 'wrist_camera'), _card('right', 'wrist_camera')],
+                   'connections': []}) is False
+    done = next(e['payload'] for e in driver.events if e['type'] == 'project_start_done')
+    assert done['errors'] == ['wrist_camera (left)', 'wrist_camera (right)']
+    assert '2 cards failed (wrist_camera (left), wrist_camera (right))' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('terminal', ['running', 'error', 'idle', 'timeout'])
+def test_loading_progress_retains_instance_identity(driver, monkeypatch, terminal):
+    import itertools
+
+    for cid in ('left', 'right'):
+        driver.start_results[cid] = {'code': 200, 'data': {'state': 'loading'}}
+        driver.info_states[cid] = [
+            {'state': 'loading'}, {'state': 'loading', 'message': 'downloading'},
+            {'state': terminal if cid == 'left' else 'running'},
+        ]
+    if terminal == 'timeout':
+        monkeypatch.setattr(config_api, 'time', types.SimpleNamespace(
+            time=itertools.count(0, 1000).__next__))
+    original_sleep = asyncio.sleep
+
+    async def yield_immediately(_delay):
+        await original_sleep(0)
+
+    monkeypatch.setattr(asyncio, 'sleep', yield_immediately)
+
+    async def run():
+        config.main['canvas_layout'] = {
+            'cards': [_card('left', 'wrist_camera'), _card('right', 'wrist_camera')],
+            'connections': [],
+        }
+        assert await config_api._do_start_project_impl() is True
+        for _ in range(8):
+            await original_sleep(0)
+
+    asyncio.run(run())
+    items = [e['payload'] for e in driver.events if e['type'] == 'project_start_item']
+    assert all(p.get('card_id') in ('left', 'right') for p in items)
+    expected = {'running': 'ready', 'error': 'error', 'idle': 'cancelled', 'timeout': 'error'}
+    left = [p for p in items if p['card_id'] == 'left']
+    assert left[-1]['status'] == expected[terminal]
+    if terminal != 'timeout':
+        assert any(p['status'] == 'loading' and p.get('message') == 'downloading' for p in left)

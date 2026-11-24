@@ -285,6 +285,8 @@ export const MappingRenderer = {
     this._points?.material?.dispose();
     this._robotMesh?.geometry?.dispose();
     this._robotMesh?.material?.dispose();
+    // See PointCloudRenderer.unmount: release the context, not just buffers.
+    this._renderer?.forceContextLoss();
     this._renderer?.dispose();
     this._followBtn?.remove();
     this._el?.remove();

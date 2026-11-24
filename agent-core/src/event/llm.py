@@ -263,6 +263,47 @@ def _elide_arguments(args, value_chars: int = 40, max_chars: int = 400) -> str:
     return dumped
 
 
+# 说出口的话占的通道。和 benchmark_facts.SPEECH_CHANNELS 同一个判据：按驱动申报的
+# `x-resource`，不按工具名猜（嘴叫 tts / speaker / audio_play，各家不同）。
+_SPEECH_CHANNELS = frozenset({'mouth'})
+
+
+def _is_utterance(name: str) -> bool:
+    """这条调用的参数是不是**原话** —— 播报出去的、发到渠道里的文字。
+
+    原话的参数不能走 `_elide_arguments`。压出来的 `{"text": "我们现在到达具身智能
+    展位。前面介绍的AI更多生活在软件里，具…(略)"}` 留在历史里，在模型眼里就是一条
+    「我以前这么调用过 speak」的样例 —— 天轶导览里它照着生成了新的 speak，`…(略)`
+    是它自己写的，于是被 TTS 念了出来（深圳现场），北京日志里也有同样的新调用。
+    所以「最新一条没被压缩」不等于安全：坏的是之前的样例。
+
+    原话本身也是有用的上下文：模型要知道自己已经讲过什么，才不会重讲、也不会漏讲。
+    它的长度由「一段能念完的讲解」封顶，不是 canvas 配置那种无上限的参数。
+
+    没申报 `x-resource` 的播报工具认不出来，照旧被压 —— 和 barrier/on_notify 一样
+    只认申报，不猜。
+    """
+    if name == 'mcp__channel__channel_reply':
+        return True
+    if not name.startswith('mcp__'):
+        return False
+    entry = mcp_client.registry.get(name.split('__')[1]) or {}
+    meta = entry.get('tool_meta', {}).get(name) or {}
+    return bool((meta.get('resource') or frozenset()) & _SPEECH_CHANNELS)
+
+
+def _elide_call(tc: dict, value_chars: int, max_chars: int) -> dict:
+    """压一条 tool_call 的 arguments；原话（见 `_is_utterance`）原样返回。"""
+    fn = tc.get('function', {})
+    args = fn.get('arguments', '')
+    if _is_utterance(fn.get('name', '')):
+        return tc
+    elided = _elide_arguments(args, value_chars=value_chars, max_chars=max_chars)
+    if elided == args:
+        return tc
+    return {**tc, 'function': {**fn, 'arguments': elided}}
+
+
 def _scrub(message_list: list[dict]) -> list[dict]:
     """丢弃结构非法的 tool_call、非法的 arguments，以及失去归属的 tool 结果。
 
@@ -1310,11 +1351,7 @@ def _degrade_turn(turn: list[dict]) -> list[dict]:
                 msg = {**msg, 'content': '(多模态内容已省略)'}
         elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
             msg = {**msg, 'tool_calls': [
-                {**tc, 'function': {
-                    **tc['function'],
-                    'arguments': _elide_arguments(tc['function'].get('arguments', ''),
-                                                  value_chars=20, max_chars=80),
-                }}
+                _elide_call(tc, value_chars=20, max_chars=80)
                 for tc in msg['tool_calls']
             ]}
         degraded.append(msg)
@@ -1342,17 +1379,11 @@ def _compact_turn_messages(turn_messages: list[dict], keep_recent: int = 12) -> 
                 turn_messages[i] = {**msg, 'content': '(多模态内容已省略)'}
         elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
             # 保留 tool_calls 结构（API 需要），但截短 arguments —— 按结构压，
-            # 不能直接切片，切出来的半截 JSON 服务端不收。
-            new_calls = []
-            for tc in msg['tool_calls']:
-                args = tc.get('function', {}).get('arguments', '')
-                elided = _elide_arguments(args, value_chars=30, max_chars=100)
-                if elided != args:
-                    new_tc = {**tc, 'function': {**tc['function'], 'arguments': elided}}
-                else:
-                    new_tc = tc
-                new_calls.append(new_tc)
-            turn_messages[i] = {**msg, 'tool_calls': new_calls}
+            # 不能直接切片，切出来的半截 JSON 服务端不收。原话不压，见 `_is_utterance`。
+            turn_messages[i] = {**msg, 'tool_calls': [
+                _elide_call(tc, value_chars=30, max_chars=100)
+                for tc in msg['tool_calls']
+            ]}
 
 
 _REWRITE_SUMMARY_PROMPT = """将以下两段历史摘要合并为一段简洁摘要。
@@ -1622,6 +1653,9 @@ class Event:
             ('task_fail', event.task.task_fail),
             ('task_list', event.task.task_list),
             ('task_force_clear', event.task.task_force_clear),
+            ('schedule_create', event.task.schedule_create),
+            ('schedule_list', event.task.schedule_list),
+            ('schedule_cancel', event.task.schedule_cancel),
             ('raw_input_info', _raw_input_info),
             ('search_history', _search_history),
             ('memory_recall', _memory_recall),
@@ -1888,6 +1922,7 @@ class Event:
         """事件驱动：通过 collector 批量获取事件，每批跑一轮推理。"""
         while True:
             ev = await collector.next_trigger()
+            self._chat_only_active = bool(ev.get('_chat_only_channel'))
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
@@ -1913,14 +1948,15 @@ class Event:
                     'content': '[turn interrupted by user message]',
                 })
                 # 中止正在进行的 TTS 播放和动作
-                await self._interrupt_active_outputs()
+                if not self._chat_only_active:
+                    await self._interrupt_active_outputs()
                 await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
                 # Fire on_error hook (LED feedback etc.)
-                if not ev.get('_bot_channel_event'):
+                if not self._chat_only_active and not ev.get('_bot_channel_event'):
                     import hooks
                     asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
@@ -1935,12 +1971,13 @@ class Event:
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)
-                if not ev.get('_bot_channel_event'):
+                if not self._chat_only_active and not ev.get('_bot_channel_event'):
                     import hooks as _hooks_idle
                     asyncio.create_task(_hooks_idle.fire('on_idle'))
                 # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
                 if self._current_turn and not ev.get('_bot_channel_event'):
                     self._save_current_turn(ev)
+                self._chat_only_active = False
 
     def _flush_current_turn(self, trigger_event: dict | None = None):
         """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
@@ -2092,7 +2129,7 @@ class Event:
         if not work and not turn_alive:
             _narration_gate('no active work', stop=True)   # 活干完了，没什么好报的
             return
-        if _last_turn_restricted and not turn_alive:
+        if getattr(self, '_chat_only_active', False) or (_last_turn_restricted and not turn_alive):
             # 受限 turn 派出去的活，不该由我们代为出声
             _narration_gate('last turn was tool-restricted', stop=True)
             return
@@ -2243,7 +2280,11 @@ class Event:
         _turn_t0 = _time.perf_counter()
         bot_restricted = _bot_channel_restricted(trigger_event)
         viewer_restricted = _viewer_channel_restricted(trigger_event)
-        tool_restricted = bot_restricted or viewer_restricted
+        from channel import chat_only
+        chat_only_turn = bool(trigger_event.get('_chat_only_channel'))
+        if chat_only_turn:
+            reconsider_event = None
+        tool_restricted = chat_only_turn or bot_restricted or viewer_restricted
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
 
@@ -2252,7 +2293,8 @@ class Event:
 
         # 任务开始 → 开始计时。用 _start_countdown（"已在计时则不动"）而不是重新计：
         # 上一件事已经沉默了 20 秒的话，新任务不该把它再往后推一个完整间隔。
-        _on_task_started()
+        if not chat_only_turn:
+            _on_task_started()
         global _last_turn_restricted
         _last_turn_restricted = tool_restricted
 
@@ -2312,7 +2354,7 @@ class Event:
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
-        if not bot_restricted:
+        if not (chat_only_turn or bot_restricted):
             asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
@@ -2320,7 +2362,7 @@ class Event:
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
         # has_blocking_pendings 而不是 get_pending_actions：只有音乐在播时，没有任何
         # 东西需要打断，不该在每个用户 turn 上跑一遍清扫。
-        if (mcp_client.has_blocking_pendings() and not bot_restricted
+        if (mcp_client.has_blocking_pendings() and not (chat_only_turn or bot_restricted)
                 and not _trigger_is_self_originated(trigger_event)):
             # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
             # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
@@ -2353,7 +2395,11 @@ class Event:
         from event.desktop import search_configured
         if not search_configured():
             system_tools = [t for t in system_tools if t['schema']['name'] != 'WebSearch']
-        if tool_restricted:
+        if chat_only_turn:
+            system_tools = [self._sys_tools['finish']]
+            bound_schemas = [chat_only.REPLY_SCHEMA] if any(
+                s['name'] == chat_only.REPLY_TOOL for s in bound_schemas) else []
+        elif tool_restricted:
             system_tools = [
                 tool for tool in system_tools
                 if _restricted_channel_tool_allowed(tool['schema']['name'], bot_restricted=bot_restricted)
@@ -2639,7 +2685,9 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
+                if chat_only_turn:
+                    result = await chat_only.dispatch(name, args, trigger_event)
+                elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
@@ -2889,7 +2937,8 @@ class Event:
             # _turn_interacted 还是 False，哑火护栏会凭空多插一轮。
             if _notified_by_tool or _channel_replied:
                 _turn_interacted = True
-                _on_speaking_started()
+                if not chat_only_turn:
+                    _on_speaking_started()
 
             # ── finish 检测 ───────────────────────────────────────────────
             #
@@ -2921,7 +2970,7 @@ class Event:
                 frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
 
             # ── Steering: 检查是否有用户消息需要注入 ─────────────────────────
-            steered = await collector.drain_steering()
+            steered = [] if chat_only_turn else await collector.drain_steering()
             if steered:
                 deferred = [
                     sev for sev in steered
@@ -2973,7 +3022,7 @@ class Event:
             # 与其去枚举每一条"谁负责重新计时"（本次数出 4 条绕过监听的路径，说明枚举
             # 法不可靠），这里放一条不变式恢复：只要循环还在转，计时就不会凭空消失。
             # _start_countdown 的"已在计时则不动"保证它不会把正在跑的 deadline 往后推。
-            if not _mouth_busy():
+            if not chat_only_turn and not _mouth_busy():
                 _start_countdown()
 
             round_idx += 1

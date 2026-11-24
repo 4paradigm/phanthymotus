@@ -235,6 +235,11 @@ export const PointCloudRenderer = {
     this._controls?.dispose();
     this._points?.geometry?.dispose();
     this._points?.material?.dispose();
+    // dispose() frees the buffers but not the context, and browsers cap live
+    // WebGL contexts (iOS Safari at very few). Each detail-panel topic switch
+    // mounts a new renderer, so without this the browser starts evicting the
+    // oldest context — a monitor-page canvas goes blank with no error.
+    this._renderer?.forceContextLoss();
     this._renderer?.dispose();
     this._el?.remove();
     this._el = null;
