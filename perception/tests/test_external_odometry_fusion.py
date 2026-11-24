@@ -846,3 +846,68 @@ def test_explicit_estimate_overrides_legacy_chassis_declaration():
         pose_reference='body', pose_source='chassis_odometry', segment_id='one',
         stamp_source='measurement', stamp_ns=sample['stamp_ns'])}
     assert decode_motion(sample, 1)[1].model == ('pose',)
+
+
+@pytest.mark.parametrize('gauge_tilt', [0., 1.2])
+@pytest.mark.parametrize('delayed', [False, True])
+def test_planar_pose_fuses_only_footprint_and_preserves_visual_height_and_tilt(gauge_tilt, delayed):
+    from plugins.external_motion_learning import se3_exp
+    from plugins.external_odometry_fusion import pose_matrix
+    engine = ExternalOdometry()
+    gauge = se3_exp(np.array([0., 0., 0., gauge_tilt, 0., 0.]))
+    pitch = se3_exp(np.array([0., 0., 0., 0., np.deg2rad(-4.), 0.]))
+    roll = se3_exp(np.array([0., 0., 0., np.deg2rad(5.), 0., 0.]))
+    observation = pitch @ roll
+    observation[2, 3] = .08
+
+    def chassis(t, x, yaw):
+        sample = dict(packet(t, x), motion_model='planar')
+        sample['pose']['quaternion'] = [0., 0., np.sin(yaw/2), np.cos(yaw/2)]
+        engine.motion(*decode_motion(sample, 1))
+
+    chassis(0., 0., 0.)
+    engine.vision(NS, 'camera', gauge)
+    if delayed:
+        engine.vision(NS+100_000_000, 'camera', gauge @ observation)
+    chassis(.1, .10, .1)
+    if not delayed:
+        engine.vision(NS+100_000_000, 'camera', gauge @ observation)
+    fused = np.linalg.solve(gauge, pose_matrix(engine.output()['pose']))
+    yaw = np.arctan2(fused[1, 0], fused[0, 0])
+    assert 0 < fused[0, 3] < .10 and 0 < yaw < .1
+    assert fused[2, 3] == pytest.approx(.08)
+    expected = se3_exp(np.array([0., 0., 0., 0., 0., yaw])) @ observation
+    np.testing.assert_allclose(fused[:3, :3], expected[:3, :3], atol=1e-9)
+    # A later footprint translation and turn, without vision, must keep the last tilt and height.
+    chassis(.2, .20, .15)
+    carried = np.linalg.solve(gauge, pose_matrix(engine.output()['pose']))
+    turn = se3_exp(np.array([0., 0., 0., 0., 0., .05]))
+    assert carried[2, 3] == pytest.approx(.08)
+    np.testing.assert_allclose(carried[:3, :3], turn[:3, :3] @ fused[:3, :3], atol=1e-9)
+    assert np.linalg.eigvalsh(engine.current.covariance).min() >= -1e-12
+
+
+def test_planar_learning_uses_footprint_displacement_during_a_visual_bob():
+    from plugins.external_motion_learning import se3_exp
+    engine = ExternalOdometry()
+    for i in range(3):
+        stamp, motion = decode_motion(dict(packet(.1*i, .1*i), motion_model='planar'), 1)
+        engine.motion(stamp, motion)
+        observation = se3_exp(np.array([0., 0., 0., 0., -.2 if i else 0., 0.]))
+        observation[:3, 3] = [.1*i, 0., .08*i]
+        engine.vision(stamp, 'camera', observation)
+    # Training must compare the same two planar poses as the chassis path.
+    visual = engine.current.learner.window[-1][4]
+    assert visual[0, 3] == pytest.approx(.1)
+    assert visual[1, 3] == pytest.approx(0.)
+
+
+def test_planar_pose_ignores_unobserved_chassis_channels_before_taking_difference():
+    engine = ExternalOdometry(learning=False)
+    for step in (0, 1):
+        sample = dict(packet(.1*step, .1*step), motion_model='planar')
+        pitch = -.25*step
+        sample['pose'].update(position=[.1*step, 0., .1*step],
+                              quaternion=[0., np.sin(pitch/2), 0., np.cos(pitch/2)])
+        engine.motion(*decode_motion(sample, 1))
+    np.testing.assert_allclose(engine.current.transform, pose_at(.1), atol=1e-9)

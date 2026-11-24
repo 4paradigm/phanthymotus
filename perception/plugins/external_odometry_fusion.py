@@ -19,6 +19,7 @@ _HISTORY_NS = 10_000_000_000
 _MAX_EVENTS = 512
 _MAX_INTERVAL_NS = 1_500_000_000
 _ATTITUDE_INTERVAL_NS = 250_000_000
+_PLANAR_POSE = ('planar',)
 _MEASURED_PLANAR = ('measured_planar_chassis',)
 _MEASURED_SPATIAL = ('measured_spatial_body',)
 _MEASURED_MODELS = (_MEASURED_PLANAR, _MEASURED_SPATIAL)
@@ -61,6 +62,70 @@ def _adjoint(matrix):
     result[:3, :3] = result[3:, 3:] = rotation
     result[:3, 3:] = cross @ rotation
     return result
+
+
+def _yaw_rotation(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
+
+
+def _heading(rotation):
+    # When body X points straight up, use the horizontal projection of body Y.
+    axis = 0 if np.hypot(*rotation[:2, 0]) > 1e-6 else 1
+    x, y = rotation[:2, axis]
+    return np.arctan2(y, x) - axis * np.pi/2, axis
+
+
+def _footprint(pose, basis):
+    """Planar pose, and maps between body perturbations and planar perturbations."""
+    rotation = basis.T @ pose[:3, :3]
+    heading, axis = _heading(rotation)
+    x, y = rotation[:2, axis]
+    projection = np.zeros((3, 6))
+    projection[:2, :3] = rotation[:2]
+    projection[2, 3:] = np.cross(np.eye(3)[axis], rotation.T @ [-y, x, 0.]) / (x*x + y*y)
+    lift = np.zeros((6, 3))
+    lift[:3, :2] = rotation[:2].T
+    lift[3:, 2] = rotation[2]
+    return np.r_[basis[:, :2].T @ pose[:3, 3], heading], projection, lift
+
+
+def _move_footprint(pose, basis, change):
+    """Apply horizontal displacement and heading about the body's own origin."""
+    moved = pose.copy()
+    moved[:3, 3] += basis[:, :2] @ change[:2]
+    moved[:3, :3] = basis @ _yaw_rotation(change[2]) @ basis.T @ pose[:3, :3]
+    return moved
+
+
+def _planar_visual_update(state, target, variance):
+    # Work in the predicted heading axes so the planar correction keeps its usual
+    # forward/lateral bounds. The accepted visual pose supplies the other three DoF.
+    plane = state.planar_basis
+    heading, _ = _heading(plane.T @ state.transform[:3, :3])
+    basis = plane @ _yaw_rotation(heading)
+    predicted, prior_axes, _ = _footprint(state.transform, basis)
+    visual, visual_axes, visual_lift = _footprint(target, basis)
+    residual = visual - predicted
+    residual[2] = np.arctan2(np.sin(residual[2]), np.cos(residual[2]))
+    prior_var = np.diag(prior_axes @ state.covariance @ prior_axes.T)
+    visual_var = (visual_axes**2) @ variance
+    gain = np.clip(prior_var / (prior_var + visual_var), 0., .8)
+    correction = gain * residual
+    applied = np.clip(correction, -.05, .05)
+    transform = _move_footprint(target, basis, applied - residual)
+    _, _, lift = _footprint(transform, basis)
+    prior = (lift * (1.-gain)) @ prior_axes
+    measurement = np.eye(6) + (lift * gain - visual_lift) @ visual_axes
+    # Only the shared planar coordinates blend two uncertainties; height and tilt
+    # keep the visual measurement uncertainty. Retain prior/visual cross-axis terms.
+    prior_noise = prior @ state.noise @ prior.T
+    unapplied = lift @ (correction - applied)
+    prior_noise += np.outer(unapplied, unapplied)
+    noise = prior_noise + (measurement * variance) @ measurement.T
+    relative = measurement - np.eye(6)
+    carry = prior_noise + (relative * variance) @ relative.T
+    return transform, noise, prior @ state.sensitivity, carry
 
 
 def _world_pose_offset(reference, target):
@@ -210,6 +275,12 @@ def decode_motion(packet, receipt_ns):
         raise ValueError('no usable external pose or twist')
     origin = (record.get('frame_id'), record.get('child_frame_id')) if pose is not None else ()
     model = ('planar' if planar else 'pose',) if pose is not None else ('twist',) if twist is not None else None
+    if model == _PLANAR_POSE and not measured_body:
+        # Form the chassis increment from its observed footprint coordinates.
+        # Masking a 3-D screw after differencing would leak tilt/height into x and y.
+        heading, _ = _heading(pose[:3, :3])
+        pose[:3, :3] = _yaw_rotation(heading)
+        pose[2, 3] = 0.
     if measured_body:
         model = _MEASURED_PLANAR if planar else _MEASURED_SPATIAL
         origin += (quality['segment_id'],)
@@ -322,6 +393,7 @@ class _State:
     last_update: str | None = None
     motion_since_visual: bool = False
     motion_model: tuple | None = None
+    planar_basis: np.ndarray | None = None
     visual_carry: tuple | None = None
     corroborated_attitude_since: int | None = None
     last_chassis: tuple | None = None
@@ -607,6 +679,9 @@ class ExternalOdometry:
             bracket = self._pose_bracket(motion_times, stamp, stamp)
             if bracket is not None:
                 model = bracket[2].model
+        plane = None
+        if model == _PLANAR_POSE:
+            plane = state.planar_basis if state.planar_basis is not None else transform[:3, :3]
         learner = state.learner
         if state.motion_model is not None and model != state.motion_model:
             noise, sensitivity = state.covariance, np.zeros((6, 12))
@@ -618,7 +693,22 @@ class ExternalOdometry:
         for velocity, dt, observed, covariance, increment, seconds_to_knot, fixed_attitude in pieces:
             twist, delta, adjoint, sensitivity_increment, noise_scale = self._learned_step(
                 learner, velocity, dt, observed, fixed_attitude, model in _MEASURED_MODELS)
-            transform = transform @ delta
+            planar_step = plane is not None and not observed[[2, 3, 4]].any()
+            if planar_step:
+                coords, projection, old_lift = _footprint(transform, plane)
+                yaw = np.arctan2(delta[1, 0], delta[0, 0])
+                shift = _yaw_rotation(coords[2])[:2, :2] @ delta[:2, 3]
+                transform = _move_footprint(transform, plane, np.r_[shift, yaw])
+                _, _, lift = _footprint(transform, plane)
+                # The displacement rotates with heading but is independent of tilt.
+                step_jacobian = np.eye(3)
+                step_jacobian[:2, 2] = [-shift[1], shift[0]]
+                adjoint = np.eye(6) + (lift @ step_jacobian - old_lift) @ projection
+                axes = np.eye(4)
+                axes[:3, :3] = transform[:3, :3].T @ plane @ _yaw_rotation(coords[2] + yaw)
+                to_body = _adjoint(axes)
+            else:
+                transform = transform @ delta
             if fixed_attitude:
                 corroborated_span += dt
             if increment is None:
@@ -635,6 +725,10 @@ class ExternalOdometry:
                     transport = _adjoint(se3_exp(twist * seconds_to_knot))
                     process_noise = transport @ process_noise @ transport.T
             process_noise = process_noise + np.diag(np.where(observed, 0., .25 * dt))
+            if planar_step:
+                process_noise = to_body @ process_noise @ to_body.T
+                if sensitivity_increment is not None:
+                    sensitivity_increment = to_body @ sensitivity_increment
             noise = adjoint @ noise @ adjoint.T + process_noise
             if learner.enabled:
                 sensitivity = adjoint @ sensitivity + sensitivity_increment
@@ -652,7 +746,7 @@ class ExternalOdometry:
             last_chassis = (stamp, motion)
         interval_update = mask.any()
         return replace(state, stamp=stamp, transform=transform, noise=noise, sensitivity=sensitivity,
-                       learner=learner, motion_model=model, corroborated_attitude_since=attitude_since,
+                       learner=learner, motion_model=model, planar_basis=plane, corroborated_attitude_since=attitude_since,
                        last_chassis=last_chassis, chassis_break_ns=chassis_break,
                        mask=mask if interval_update else state.mask, twist=twist,
                        last_update='external' if interval_update else None,
@@ -674,7 +768,9 @@ class ExternalOdometry:
             alignments = dict(state.alignments, **{segment: transform @ np.linalg.inv(observed)})
             if len(alignments) > 8:
                 del alignments[next(iter(alignments))]
-            return replace(state, transform=transform, alignments=alignments,
+            # The first visual seed may choose a rotated world gauge. Its initial body axes define the local plane.
+            plane = observed[:3, :3] if seeded and state.planar_basis is not None else state.planar_basis
+            return replace(state, transform=transform, alignments=alignments, planar_basis=plane,
                            visual=visual, training=visual, mask=_FULL if seeded else state.mask,
                            noise=np.diag(variance) if seeded else state.noise,
                            last_update='vision' if seeded else state.last_update,
@@ -696,6 +792,51 @@ class ExternalOdometry:
                            visual=visual, training=visual, mask=_FULL, last_update='vision',
                            visual_carry=(carry_noise, carry_sensitivity))
         target = alignment @ observed
+        if state.planar_basis is not None:
+            transform, noise, sensitivity, carry_noise = _planar_visual_update(state, target, variance)
+        else:
+            transform, noise, sensitivity, carry_noise = self._spatial_visual_update(
+                state, target, variance, same_segment)
+        learner = state.learner
+        training = visual
+        previous = state.training[0]
+        if learner.enabled and same_segment and state.stamp-previous >= 100_000_000:
+            intervals = [(velocity, dt, observed, fixed_attitude)
+                         for velocity, dt, observed, _, _, _, fixed_attitude
+                         in self._intervals(motion_times, previous, state.stamp)]
+            if intervals and abs(sum(x[1] for x in intervals)-(state.stamp-previous)/1e9) < 1e-6:
+                learner = learner.checkpoint()
+                delta = np.linalg.inv(state.training[2]) @ observed
+                transport = _adjoint(np.linalg.inv(delta))
+                end_variance = variance
+                if state.planar_basis is not None:
+                    # Compare vision with the same horizontal motion used in propagation.
+                    # Keep the actual tilt change for the learner's missing-axis check.
+                    previous_body = alignment @ state.training[2]
+                    heading, _ = _heading(state.planar_basis.T @ previous_body[:3, :3])
+                    level = np.eye(4)
+                    level[:3, :3] = (_yaw_rotation(heading).T @ state.planar_basis.T
+                                      @ previous_body[:3, :3])
+                    delta = level @ delta @ level.T
+                    axes = _adjoint(level)
+                    transport = axes @ transport
+                    end_variance = np.square(axes) @ variance
+                start_variance = np.square(transport) @ state.training[3]
+                # Endpoint errors share visual history. With unknown cross-
+                # correlation, the sum of sigmas bounds each relative error;
+                # a weak endpoint must not become a precise training target.
+                sigma = np.sqrt(start_variance) + np.sqrt(end_variance)
+                learner.add(previous, state.stamp, intervals, delta, noise=sigma,
+                            solve=self.solve_learning)
+        elif learner.enabled and same_segment:
+            training = state.training
+        return replace(state, transform=transform, noise=noise, sensitivity=sensitivity,
+                       learner=learner, visual=visual, training=training, mask=_FULL, last_update='vision',
+                       visual_carry=(carry_noise, sensitivity),
+                       motion_since_visual=False)
+
+    @staticmethod
+    def _spatial_visual_update(state, target, variance, same_segment):
         predicted = state.transform
         residual = se3_log(np.linalg.inv(predicted) @ target)
         diag = np.diag(state.covariance)
@@ -729,30 +870,7 @@ class ExternalOdometry:
             unapplied = _adjoint(axes) @ _world_pose_offset(transform, nominal)
             noise = noise + np.outer(unapplied, unapplied)
             carry_noise = carry_noise + np.outer(unapplied, unapplied)
-        learner = state.learner
-        training = visual
-        previous = state.training[0]
-        if learner.enabled and same_segment and state.stamp-previous >= 100_000_000:
-            intervals = [(velocity, dt, observed, fixed_attitude)
-                         for velocity, dt, observed, _, _, _, fixed_attitude
-                         in self._intervals(motion_times, previous, state.stamp)]
-            if intervals and abs(sum(x[1] for x in intervals)-(state.stamp-previous)/1e9) < 1e-6:
-                learner = learner.checkpoint()
-                delta = np.linalg.inv(state.training[2]) @ observed
-                transport = _adjoint(np.linalg.inv(delta))
-                start_variance = np.square(transport) @ state.training[3]
-                # Endpoint errors share visual history. With unknown cross-
-                # correlation, the sum of sigmas bounds each relative error;
-                # a weak endpoint must not become a precise training target.
-                sigma = np.sqrt(start_variance) + np.sqrt(variance)
-                learner.add(previous, state.stamp, intervals, delta, noise=sigma,
-                            solve=self.solve_learning)
-        elif learner.enabled and same_segment:
-            training = state.training
-        return replace(state, transform=transform, noise=noise, sensitivity=sensitivity,
-                       learner=learner, visual=visual, training=training, mask=_FULL, last_update='vision',
-                       visual_carry=(carry_noise, sensitivity),
-                       motion_since_visual=False)
+        return transform, noise, sensitivity, carry_noise
 
     def _rebuild(self, begin):
         times = sorted(self.raw_motion)
