@@ -943,6 +943,19 @@ function _llmSourceInput(key, saved) {
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
+// Help under a field, only when there is a separate title to help — otherwise
+// the description is already serving as the label and repeating it is noise.
+// Both config dialogs use it: the tool-level one showed no help at all, so a
+// driver's explanation of a field (what to do before a choice appears, say)
+// never reached the one dialog a card without instance fields has.
+function _fieldHelp(def) {
+  if (!def.title || !def.description) return null;
+  const help = document.createElement('p');
+  help.className = 'tool-config-help';
+  help.textContent = def.description;
+  return help;
+}
+
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
   // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
   // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
@@ -1081,6 +1094,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
     fieldWrapper.appendChild(label);
     fieldWrapper.appendChild(input);
+    const help = _fieldHelp(def);
+    if (help) fieldWrapper.appendChild(help);
     bodyEl.appendChild(fieldWrapper);
   }
 
@@ -1445,14 +1460,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.value = vals[key] != null ? vals[key] : (def.default != null ? def.default : '');
     }
 
-    // Help text, only when there is a separate title to help — otherwise the
-    // description is already serving as the label and repeating it is noise.
-    let help = null;
-    if (def.title && def.description) {
-      help = document.createElement('p');
-      help.className = 'tool-config-help';
-      help.textContent = def.description;
-    }
+    const help = _fieldHelp(def);
 
     const host = isShared ? sharedHost : (def.advanced ? advancedHost() : bodyEl);
     host.appendChild(label);
