@@ -6,15 +6,15 @@ import xml.etree.ElementTree as ET
 import pytest
 
 
-@pytest.mark.parametrize('existing,expected', [(131072, 1048576), (4194304, 4194304)])
+@pytest.mark.parametrize('existing,expected', [(None, 1048576), (131072, 1048576), (4194304, 4194304)])
 def test_main_initializes_ros_with_buffered_profile_and_restores_on_failure(monkeypatch, tmp_path,
                                                                           existing, expected):
     import main
     profile = tmp_path/'local.xml'
+    receive_buffer = '' if existing is None else f'<receiveBufferSize>{existing}</receiveBufferSize>'
     original = ('<dds xmlns="http://www.eprosima.com"><profiles><transport_descriptors>'
                 '<transport_descriptor><transport_id>local</transport_id><type>UDPv4</type>'
-                f'<receiveBufferSize>{existing}</receiveBufferSize>'
-                '<interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>'
+                f'{receive_buffer}<interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>'
                 '</transport_descriptor></transport_descriptors><participant is_default_profile="true">'
                 '<rtps><useBuiltinTransports>false</useBuiltinTransports>'
                 '<userTransports><transport_id>local</transport_id></userTransports>'

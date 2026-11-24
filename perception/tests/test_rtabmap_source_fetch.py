@@ -3,6 +3,7 @@ import os
 import hashlib
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 
@@ -110,8 +111,6 @@ def run_core_fetch(tmp_path, *, interrupt_checkout=False, fail_checkout=False, r
     origin = tmp_path / 'origin.git'
     command('clone', '--bare', '-q', str(seed), str(origin))
     command('-C', str(origin), 'config', 'uploadpack.allowFilter', 'true')
-    config = tmp_path / 'gitconfig'
-    config.write_text(f'[url "{origin.as_uri()}"]\n    insteadOf = https://github.com/introlab/rtabmap.git\n')
     binary = tmp_path / 'bin'
     binary.mkdir()
     wrapper = binary / 'git'
@@ -135,11 +134,18 @@ os.execv(os.environ['REAL_GIT'], [os.environ['REAL_GIT'], *sys.argv[1:]])
     assert core_run is not None, 'core source must use the bounded sparse Git fetch'
     script = core_run.split('. /opt/ros/humble/install/setup.bash;')[0]
     script = re.sub(r'^--mount=\S+\s+', '', script)
+    # Older Git may check the configured transport before applying insteadOf
+    # during partial-clone fetches. Point the recipe directly at the fixture.
+    upstream = 'https://github.com/introlab/rtabmap.git'
+    assert script.count(upstream) == 1
+    script = script.replace(upstream, shlex.quote(origin.as_uri()))
     script = script.replace('/tmp/rtabmap-ws', str(tmp_path / 'workspace'))
     script = script.replace('/var/cache/rtabmap-source', str(tmp_path / 'source-cache'))
+    # Use the local server's v2 support for on-demand blob fetches on Git 2.25.
     env = dict(os.environ, PATH=str(binary)+os.pathsep+os.environ['PATH'], REAL_GIT=git,
-               TEST_ROOT=str(tmp_path), GIT_CONFIG_GLOBAL=str(config), GIT_CONFIG_NOSYSTEM='1',
-               GIT_ALLOW_PROTOCOL='file', RTABMAP_CORE_COMMIT=commit,
+               TEST_ROOT=str(tmp_path), GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
+               GIT_CONFIG_PARAMETERS="'protocol.version=2'", GIT_ALLOW_PROTOCOL='file',
+               RTABMAP_CORE_COMMIT=commit,
                INTERRUPT_CHECKOUT=str(int(interrupt_checkout)), FAIL_CHECKOUT=str(int(fail_checkout)))
     result = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True, timeout=15)
     if retry_offline:

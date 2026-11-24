@@ -518,7 +518,8 @@ def test_fallback_retains_native_timing_for_old_landmark_verification(fused):
 
 @pytest.mark.parametrize('speed,yaw_rate,imu_step_ms,probe_lost,expect_fallback', [
     (0.2, 0., 10, False, True), (0., 0.2, 10, False, True),
-    (0., 0., 100, False, True), (0.2, 0., 10, True, False),
+    (0., 0., 100, False, True), (0., 0., 50, False, False),
+    (0.2, 0., 10, True, False),
 ])
 def test_measured_visual_fallback_during_startup(fused, speed, yaw_rate, imu_step_ms, probe_lost, expect_fallback):
     from test_rgbd_fusion import pose

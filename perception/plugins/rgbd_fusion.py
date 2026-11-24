@@ -381,8 +381,9 @@ class ShortTermFusion:
 
     def _initialize(self, stamp, pose):
         self.warmup.append((stamp, deepcopy(pose)))
-        window_expired = stamp-self.warmup[0][0] > 1_500_000_000
-        while self.warmup and stamp-self.warmup[0][0] > 1_500_000_000:
+        max_window_ns = 1_500_000_000
+        window_expired = stamp-self.warmup[0][0] > max_window_ns
+        while self.warmup and stamp-self.warmup[0][0] > max_window_ns:
             self.warmup.popleft()
         if len(self.warmup) < 3 or stamp-self.warmup[0][0] < 500_000_000:
             return False
@@ -408,7 +409,11 @@ class ShortTermFusion:
         if (not self.samples or self.samples[0][0] > first_stamp or self.samples[-1][0] < stamp):
             return False
         if len(entries) < min_samples:
-            if window_expired:
+            # A single gap must not end warmup. If even the fastest measured
+            # interval cannot deliver enough samples in the allowed window,
+            # let an already tracking native visual estimate take over.
+            fastest_interval_ns = min((right[0]-left[0] for left, right in zip(entries, entries[1:])), default=0)
+            if window_expired or fastest_interval_ns * (min_samples-1) > max_window_ns:
                 self.visual_fallback_stamp = stamp
             return False
         entries = [s for s in entries if s[0] >= first_stamp]
