@@ -14,6 +14,14 @@ file_intake:
   retention_days: 7
 
 plugins:
+  # PiPER-only, read-only operation result verification. No camera/robot starts
+  # until explicitly configured and started; standalone config templates live
+  # in plugins/goal_verifier/deploy/.
+  piper_object_goal_verifier:
+    enabled: false
+    piper_id: configure-piper-installation-id
+    sources: {}
+
   # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
   phanthy_music:
     # 没有别的键了：曲库连接内置在卡片里，超时是实现细节，音量和自动续播是动作

@@ -1,0 +1,24 @@
+{
+  "piper_id": null,
+  "max_age_s": 2,
+  "session_ttl_s": 600,
+  "sources": {
+    "camera_input": {
+      "source_id": "camera_input",
+      "camera_id": null,
+      "frame_id": null,
+      "distortion": null,
+      "kind": "ros_normalized",
+      "topic": null,
+      "domain_id": null,
+      "allow_test_data": false,
+      "verified_persistent_tracks": false,
+      "accept_external_observations": false,
+      "stamp_semantics": null,
+      "capture_time_record": null,
+      "producer_record": null,
+      "external_observation_record": null
+    }
+  },
+  "calibrations": {}
+}
