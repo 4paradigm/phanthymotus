@@ -140,15 +140,18 @@ def test_none_layouts_are_tolerated(calls):
 @pytest.fixture
 def mixed_layout(monkeypatch):
     tools = [
-        {'name': 'imu', 'type': 'sensor', 'multiInstance': False},
+        {'name': 'imu', 'type': 'sensor', 'multiInstance': False,
+         'inputSchema': {'x-stop': {'keep_running': True}}},
         {'name': 'battery', 'type': 'sensor'},
+        # Kuavo 5-W releases card subscriptions without stopping the physical stream.
+        {'name': 'camera_head', 'type': 'sensor', 'multiInstance': False},
         {'name': 'ext_camera', 'type': 'sensor', 'multiInstance': True},
         {'name': 'tts', 'type': 'processor', 'multiInstance': True},
         {'name': 'loco', 'type': 'actuator', 'multiInstance': False},
         'legacy',
     ]
     cards = [{'id': name, 'mcpId': 'mcp-1', 'toolName': name}
-             for name in ('imu', 'battery', 'ext_camera', 'tts', 'loco', 'legacy', 'unknown')]
+             for name in ('imu', 'battery', 'camera_head', 'ext_camera', 'tts', 'loco', 'legacy', 'unknown')]
     monkeypatch.setattr(config_api.config, 'main', {
         'services': {'mcp': [{'id': 'mcp-1', 'tools': tools}]},
         'canvas_layout': {'cards': cards},
@@ -171,7 +174,7 @@ def mixed_layout(monkeypatch):
 
 
 @pytest.mark.parametrize('keep', [[], ['tts'], ['imu']])
-def test_layout_endpoint_reclaims_instances_but_preserves_shared_sensors(calls, mixed_layout, keep):
+def test_layout_endpoint_reclaims_instances_unless_explicitly_exempt(calls, mixed_layout, keep):
     client, cards, events = mixed_layout
     remaining = [c for c in cards if c['id'] in keep]
     response = client.post('/canvas/layout', json={'session_id': 'editor', 'cards': remaining})
@@ -179,7 +182,7 @@ def test_layout_endpoint_reclaims_instances_but_preserves_shared_sensors(calls, 
     assert response.json() == {'code': 200}
     assert config_api.config.main['canvas_layout']['cards'] == remaining
     assert config_api.config.main['core']['project_running'] is False
-    expected = {'ext_camera', 'tts', 'loco', 'legacy', 'unknown'} - set(keep)
+    expected = {'battery', 'camera_head', 'ext_camera', 'tts', 'loco', 'legacy', 'unknown'} - set(keep)
     assert {c[2]['instance_id'] for c in calls} == expected
     assert all(c[2]['action'] == 'stop' for c in calls)
     assert len(calls) == len(expected)
@@ -194,15 +197,39 @@ def test_layout_endpoint_rejects_another_editor_without_stopping_anything(calls,
     assert calls == events == []
 
 
-def test_project_stop_preserves_shared_sensors_and_still_stops_actuators(calls, mixed_layout):
+def test_project_stop_keeps_exempt_tools_but_stops_single_instance_camera(calls, mixed_layout):
     _, cards, events = mixed_layout
     config_api.config.main['core']['project_running'] = True
     results = asyncio.run(config_api._do_stop_project())
     assert config_api.config.main['core']['project_running'] is False
-    assert {c[2]['instance_id'] for c in calls} == {'ext_camera', 'tts', 'loco', 'legacy', 'unknown'}
+    assert {c[2]['instance_id'] for c in calls} == {'battery', 'camera_head', 'ext_camera', 'tts', 'loco', 'legacy', 'unknown'}
     assert all(c[2]['action'] == 'stop' for c in calls)
     assert len(results) == len(cards)
     assert all(r['ok'] for r in results)
     assert events[0] == {'type': 'project_state', 'payload': {'running': False}}
     assert events[-1]['type'] == 'project_stop_done'
     assert events[-1]['payload']['failed'] == []
+    assert events[-1]['payload']['stopped'] == len(cards) - 1
+    assert events[-1]['payload']['kept_running'] == 1
+
+
+def test_only_retained_card_is_not_reported_as_stopped(calls, mixed_layout):
+    _, cards, events = mixed_layout
+    config_api.config.main['canvas_layout']['cards'] = cards[:1]
+    results = asyncio.run(config_api._do_stop_project())
+    assert calls == []
+    assert results[0]['status'] == 'kept_running'
+    item = next(e for e in events if e['type'] == 'project_stop_item')
+    assert item['payload']['status'] == 'kept_running'
+    assert events[-1]['payload'] == {'stopped': 0, 'kept_running': 1, 'total': 1, 'failed': []}
+    assert _run(cards[:1], []) == 0
+
+
+@pytest.mark.parametrize('declaration', [None, {}, {'keep_running': False},
+                                       {'keep_running': 'true'}, {'keep_running': 1}])
+def test_missing_or_invalid_exemption_still_sends_stop(calls, mixed_layout, declaration):
+    _, cards, _ = mixed_layout
+    tool = config_api.config.main['services']['mcp'][0]['tools'][0]
+    tool['inputSchema']['x-stop'] = declaration
+    assert _run(cards[:1], []) == 1
+    assert [c[2] for c in calls] == [{'action': 'stop', 'instance_id': 'imu'}]

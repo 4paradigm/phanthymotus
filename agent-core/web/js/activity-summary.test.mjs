@@ -58,3 +58,21 @@ test('截断是从中间切的，两头都留着', () => {
   assert.ok(out.includes('…（省略'));
   assert.ok(out.endsWith('x"'), out.slice(-20));
 });
+
+test('保持运行与停止成功、失败分别显示', () => {
+  const event = status => ({ type: 'project_stop_item', payload: { tool: 'imu', status } });
+  assert.equal(summarizeEvent(event('kept_running')), '↻ imu 保持运行（未发送 stop）');
+  assert.equal(summarizeEvent(event('stopped')), '✓ imu 已停止');
+  assert.match(summarizeEvent(event('error')), /未停止.*可能仍在运行/);
+});
+
+test('停止汇总分别统计已停止、保持运行及失败，兼容原有事件', () => {
+  for (const [payload, text] of [
+    [{ stopped: 0, total: 1, kept_running: 1 }, '设备收尾完成：0/1 已停止，1 台保持运行'],
+    [{ stopped: 1, total: 3, kept_running: 1, failed: [{ tool: 'camera_head' }] },
+      '设备收尾完成：1/3 已停止，1 台保持运行，1 台未停止（camera_head）'],
+    [{ stopped: 1, total: 1 }, '设备收尾完成：1/1 已停止'],
+  ]) {
+    assert.equal(summarizeEvent({ type: 'project_stop_done', payload }), text);
+  }
+});

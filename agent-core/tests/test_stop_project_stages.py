@@ -276,7 +276,8 @@ def test_a_malformed_declaration_falls_back_to_the_generic_rules(declaration):
     """A driver cannot break every card's stop by sending junk in `x-stop`."""
     rules = api_config.stop_rules({'inputSchema': {'x-stop': declaration}})
     assert rules == {'failed': api_config._STOP_FAILED_STATES,
-                     'pending': api_config._STOP_PENDING_STATES, 'flags': {}}
+                     'pending': api_config._STOP_PENDING_STATES, 'flags': {},
+                     'keep_running': False}
 
 
 def test_a_warning_alongside_a_live_state_is_not_a_failure(rig, monkeypatch):

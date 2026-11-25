@@ -223,16 +223,20 @@ test('the clear button is disabled while read-only or running', () => {
   assert.equal(f.clearButton.disabled, false);
 });
 
-test('single-card removal preserves shared sensors and stops card-owned or unknown tools', async () => {
+test('single-card removal skips stop only for an explicit exemption', async () => {
   for (const [tool, shouldStop] of [
-    [{ name: 'sensor', type: 'sensor' }, false],
-    [{ name: 'sensor', type: 'sensor', multiInstance: false }, false],
+    [{ name: 'sensor', type: 'sensor', inputSchema: { 'x-stop': { keep_running: true } } }, false],
+    [{ name: 'sensor', type: 'sensor' }, true],
+    [{ name: 'camera_head', type: 'sensor', multiInstance: false }, true],
     [{ name: 'sensor', type: 'sensor', multiInstance: true }, true],
     [{ name: 'sensor', type: 'processor', multiInstance: true }, true],
     [{ name: 'sensor', type: 'actuator' }, true],
     ['sensor', true],
+    ...[false, 'true', 1, null].map(keep_running => [
+      { name: 'sensor', type: 'sensor', inputSchema: { 'x-stop': { keep_running } } }, true]),
   ]) {
     const f = fixture();
+    f.ctx._cards[0].toolName = typeof tool === 'string' ? tool : tool.name;
     f.ctx._allMcps[0].tools = [tool];
     await f.api._removeCard('card-0');
     const stops = f.calls.filter(c => c.url === '/api/mcp/device/call');

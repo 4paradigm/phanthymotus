@@ -2526,8 +2526,8 @@ function _initAutoStartToggle() {
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
   const tool = _allMcps.find(m => m.id === mcpId)?.tools?.find(t => t.name === toolName);
-  // Single-instance sensors belong to the device, not to the canvas card.
-  if (action === 'stop' && tool?.type === 'sensor' && !tool.multiInstance) return;
+  // Multiplicity does not determine whether a tool has resources to release.
+  if (action === 'stop' && tool?.inputSchema?.['x-stop']?.keep_running === true) return;
   try {
     const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
       method: 'POST',

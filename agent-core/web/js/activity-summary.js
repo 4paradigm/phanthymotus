@@ -36,14 +36,15 @@ export function summarizeEvent(event) {
     case 'project_stop_begin':
       return `正在收尾 ${(p.cards || []).length} 台设备…`;
     case 'project_stop_item':
+      if (p.status === 'kept_running') return `↻ ${p.tool} 保持运行（未发送 stop）`;
       return p.status === 'stopped'
         ? `✓ ${p.tool} 已停止`
         : `✗ ${p.tool} 未停止${p.message ? `：${p.message}` : ''} —— 该设备可能仍在运行`;
     case 'project_stop_done': {
       const failed = p.failed || [];
-      if (!failed.length) return `设备收尾完成：${p.stopped}/${p.total} 已停止`;
-      return `设备收尾完成：${p.stopped}/${p.total} 已停止，`
-        + `${failed.length} 台未停止（${failed.map((f) => f.tool).join('、')}）`;
+      return `设备收尾完成：${p.stopped}/${p.total} 已停止`
+        + (p.kept_running ? `，${p.kept_running} 台保持运行` : '')
+        + (failed.length ? `，${failed.length} 台未停止（${failed.map((f) => f.tool).join('、')}）` : '');
     }
     case 'peer_pair_request': return `${p.display_name || p.peer_id?.slice(0, 12) || 'peer'} 请求配对 · 验证码 ${p.code}`;
     case 'peer_tool_call':   return `${p.peer || 'peer'} → ${p.tool}${p.action ? `(${p.action})` : ''}`;
