@@ -16,6 +16,8 @@ Lives here rather than in api/mcp_manage.py because mcp_client.py needs it too,
 and api/mcp_manage.py already imports mcp_client — the reverse would cycle.
 """
 
+import json
+
 import config
 
 
@@ -108,3 +110,56 @@ def plan_config_calls(tool_obj: dict, saved_shared: dict, saved_instance: dict,
         # No instance to address: instance-scope values act as shared defaults.
         calls = [({**shared_cfg, **instance_cfg}, {})]
     return [(body, extra) for body, extra in calls if body]
+
+
+def saved_config_rows(mcp_id: str, tool_name: str,
+                      instance_id: str = '') -> tuple[dict, dict]:
+    """The persisted (shared, instance) rows for a tool, as the UI saved them."""
+    shared = config.main.get(f'tool_config:{mcp_id}:{tool_name}', None) or {}
+    instance = {}
+    if instance_id:
+        instance = config.main.get(
+            f'tool_config:{mcp_id}:{tool_name}:{instance_id}', None) or {}
+    return shared, instance
+
+
+def plan_saved_config_calls(mcp_id: str, tool_name: str,
+                            instance_id: str = '') -> tuple[list, list[str], dict]:
+    """(calls, missing, tool_obj) for replaying a tool's saved config.
+
+    One reader for every path that pushes saved config at a device. Each used
+    to re-implement row loading, stale-key dropping and the required check, and
+    they had already drifted: the reconnect restore sent instance-scope keys
+    without addressing (its own docstring said it did not), and the LLM bridge
+    skipped the required check whenever any row existed — so a row holding an
+    emptied required field started a card the dashboard path would refuse.
+
+    `missing` is computed on the same merged view `plan_config_calls` will push,
+    so a refusal here and a push there can never disagree about what is set.
+    Callers decide what a non-empty `missing` means: the start paths refuse,
+    the reconnect restore deliberately ignores it.
+    """
+    tool_obj = find_tool(mcp_id, tool_name)
+    saved_shared, saved_instance = saved_config_rows(mcp_id, tool_name, instance_id)
+    calls = plan_config_calls(tool_obj, saved_shared, saved_instance, instance_id)
+    merged: dict = {}
+    for body, _extra in calls:
+        merged.update(body)
+    missing = missing_required_config(tool_obj, merged)
+    return calls, missing, tool_obj
+
+
+def config_result_adapter_ok(result: dict) -> bool:
+    """False only when a config call explicitly reported unusable credentials.
+
+    `adapter_ok: false` is a driver's verdict on the url/key it was handed.
+    Everything else — a non-JSON ack, an unexpected shape, a missing field —
+    defaults to True: a parsing hiccup in the *checker* must not invent a new
+    way for a card to fail to start.
+    """
+    try:
+        text = ((result or {}).get('content') or [{}])[0].get('text', '{}')
+        parsed = json.loads(text)
+        return bool(parsed.get('adapter_ok', True))
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError, AttributeError):
+        return True

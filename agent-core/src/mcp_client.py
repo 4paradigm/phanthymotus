@@ -728,10 +728,6 @@ def _register_internal_mcps():
 
 # ── 工具调用 ────────────────────────────────────────────────────────────────────
 
-def _get_tool_config(mcp_id: str, tool_name: str) -> dict | None:
-    """查找 per-tool 持久化 config（由前端 sidebar 保存）。"""
-    return config.main.get(f'tool_config:{mcp_id}:{tool_name}', None)
-
 
 async def _transfer_file_args(
     mcp_id: str, url: str, input_schema: dict, args: dict
@@ -951,38 +947,32 @@ async def call_tool(full_name: str, args: dict) -> str:
     # Auto-config: start 前自动 apply 已保存的 config
     action = args.get('action')
     if action == 'start':
-        meta = info.get('tool_meta', {}).get(full_name, {})
-        if meta.get('has_config_schema'):
-            from tool_config import find_tool, missing_required_config
-            saved_cfg = _get_tool_config(mcp_id, tool_name)
-            if saved_cfg:
-                # Drop keys the current schema no longer advertises; a stale row
-                # would otherwise be replayed on every start. See tool_config.
-                from tool_config import find_tool, split_config_by_scope
-                _shared, _inst = split_config_by_scope(find_tool(mcp_id, tool_name), saved_cfg)
-                saved_cfg = {**_shared, **_inst}
-            if saved_cfg:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+        # One planner for rows, scope addressing, stale-key dropping and the
+        # required check — the same one the dashboard path uses, so the two
+        # start doors can no longer disagree about whether a card is configured.
+        # Before this, a saved row (even one whose required fields had since
+        # been emptied or obsoleted) skipped the check entirely, and the
+        # instance row was never read at all.
+        from tool_config import (config_result_adapter_ok,
+                                 plan_saved_config_calls)
+        instance_id = str(args.get('instance_id', '') or '')
+        calls, missing, _tool_obj = plan_saved_config_calls(mcp_id, tool_name, instance_id)
+        if missing:
+            # Name the keys that are actually missing. `provider/url/key`
+            # is one LLM adapter's field list, and a model told to go fill
+            # those in on a camera card has been sent to the wrong form.
+            return (f'[{tool_name}] 尚未配置：缺少 {"、".join(missing)}，'
+                    f'请先在设备面板中填写后再启动。')
+        if calls:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for cfg_body, extra_args in calls:
                     cfg_result = await _jrpc(session, url, 'tools/call', {
                         'name':      tool_name,
-                        'arguments': {'action': 'config', **saved_cfg},
+                        'arguments': {'action': 'config', **cfg_body, **extra_args},
                     })
-                # 检查 config 结果，adapter_ok=false 说明凭据无效
-                try:
-                    cfg_text = (cfg_result.get('content') or [{}])[0].get('text', '{}')
-                    cfg_parsed = json.loads(cfg_text)
-                    if not cfg_parsed.get('adapter_ok', True):
+                    # adapter_ok=false 说明凭据无效
+                    if not config_result_adapter_ok(cfg_result):
                         return f'[{tool_name}] 配置无效（缺少 url/key），请在设备面板中检查配置后再启动。'
-                except (json.JSONDecodeError, IndexError, KeyError):
-                    pass
-            else:
-                # Name the keys that are actually missing. `provider/url/key`
-                # is one LLM adapter's field list, and a model told to go fill
-                # those in on a camera card has been sent to the wrong form.
-                missing = missing_required_config(find_tool(mcp_id, tool_name), {})
-                if missing:
-                    return (f'[{tool_name}] 尚未配置：缺少 {"、".join(missing)}，'
-                            f'请先在设备面板中填写后再启动。')
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:

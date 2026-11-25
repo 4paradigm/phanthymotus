@@ -11,8 +11,7 @@ from pydantic import BaseModel
 
 import config
 import mcp_client
-from tool_config import (missing_required_config, plan_config_calls,
-                         split_config_by_scope)
+from tool_config import (config_result_adapter_ok, plan_saved_config_calls)
 
 router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 
@@ -495,8 +494,16 @@ async def mcp_delete(mcp_id: str):
 async def _restore_saved_configs(mcp_id: str, url: str, tools: list) -> None:
     """Re-send saved tool configs to a device that just came online.
 
-    Only sends shared (non-instance) configs for tools that have configSchema.
-    Called once when a device transitions from offline → online.
+    Replays the shared row of every tool that declares a configSchema, through
+    the same planner as every other config push (`plan_saved_config_calls`):
+    stale keys are dropped, and instance-scope keys found in the shared row
+    ride along unaddressed as defaults, because there is no instance to
+    address yet — per-instance rows are re-sent later, addressed, by the start
+    paths. Never blocks a device from coming online: `missing` is deliberately
+    ignored here, unlike the start paths.
+
+    (The old docstring claimed only shared keys were sent while the code merged
+    instance keys in by hand. The planner makes the code match one story.)
     """
     headers = {'Content-Type': 'application/json'}
     timeout = aiohttp.ClientTimeout(total=5)
@@ -505,26 +512,20 @@ async def _restore_saved_configs(mcp_id: str, url: str, tools: list) -> None:
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for tool in tools:
-                if not isinstance(tool, dict):
+                if not isinstance(tool, dict) or not tool.get('configSchema'):
                     continue
                 tool_name = tool.get('name', '')
-                if not tool.get('configSchema'):
+                calls, _missing, _tool_obj = plan_saved_config_calls(mcp_id, tool_name)
+                if not calls:
                     continue
-                saved_cfg = config.main.get(f'tool_config:{mcp_id}:{tool_name}', None)
-                if not saved_cfg:
-                    continue
-                # Drop keys the current schema no longer advertises, same as the
-                # start path — a stale row must not be replayed on every reconnect.
-                shared_cfg, instance_cfg = split_config_by_scope(tool, saved_cfg)
-                restore_cfg = {**shared_cfg, **instance_cfg}
-                if not restore_cfg:
-                    continue
-                cfg_payload = {
-                    'jsonrpc': '2.0', 'id': 99,
-                    'method': 'tools/call',
-                    'params': {'name': tool_name, 'arguments': {'action': 'config', **restore_cfg}},
-                }
-                await session.post(url, json=cfg_payload, headers=headers)
+                for cfg_body, extra_args in calls:
+                    cfg_payload = {
+                        'jsonrpc': '2.0', 'id': 99,
+                        'method': 'tools/call',
+                        'params': {'name': tool_name,
+                                   'arguments': {'action': 'config', **cfg_body, **extra_args}},
+                    }
+                    await session.post(url, json=cfg_payload, headers=headers)
                 sent.append(tool_name)
     except Exception as e:
         print(f'[mcp/config-restore] {mcp_id} error: {e}')
@@ -1328,30 +1329,14 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             action = req.arguments.get('action')
             _SYSTEM_ACTIONS_NO_CONFIG = {'info', 'stop', 'config'}
             if action and action not in _SYSTEM_ACTIONS_NO_CONFIG:
-                tools = target.get('tools') or []
-                tool_obj = next((t for t in tools if isinstance(t, dict) and t.get('name') == req.tool), None)
-
-                instance_id = req.arguments.get('instance_id', '')
-                saved_shared = config.main.get(f'tool_config:{mcp_id}:{req.tool}', None) or {}
-                saved_instance = {}
-                if instance_id:
-                    saved_instance = config.main.get(f'tool_config:{mcp_id}:{req.tool}:{instance_id}', None) or {}
-
-                # Partition both rows by declared scope, dropping keys the
-                # current schema no longer advertises. Either row can hold
-                # either kind of key: older UI builds saved without filtering.
-                shared_cfg, instance_cfg = split_config_by_scope(tool_obj, saved_shared)
-                inst_shared, inst_own = split_config_by_scope(tool_obj, saved_instance)
-                merged_for_required = {**shared_cfg, **inst_shared, **instance_cfg, **inst_own}
-
-                missing = missing_required_config(tool_obj, merged_for_required)
+                calls, missing, _tool_obj = plan_saved_config_calls(
+                    mcp_id, req.tool, req.arguments.get('instance_id', ''))
                 if missing:
                     return {'code': 400,
                             'message': f'[{req.tool}] 尚未配置：缺少 {"、".join(missing)}，请先在卡片配置里填写后再启动。',
                             'data': None}
 
-                for cfg_body, extra_args in plan_config_calls(
-                        tool_obj, saved_shared, saved_instance, instance_id):
+                for cfg_body, extra_args in calls:
                     cfg_payload = {
                         'jsonrpc': '2.0', 'id': 2,
                         'method': 'tools/call',
@@ -1365,14 +1350,8 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                             return {'code': 400,
                                     'message': f'[{req.tool}] 配置失败：{cfg_error.get("message", "unknown error")}',
                                     'data': None}
-                        cfg_result = cfg_data.get('result', {})
-                        cfg_content = (cfg_result.get('content') or [{}])[0].get('text', '{}')
-                        try:
-                            parsed = json.loads(cfg_content)
-                            if not parsed.get('adapter_ok', True):
-                                return {'code': 400, 'message': f'[{req.tool}] 配置无效（缺少 url/key），请检查配置。', 'data': None}
-                        except (json.JSONDecodeError, IndexError):
-                            pass
+                        if not config_result_adapter_ok(cfg_data.get('result', {})):
+                            return {'code': 400, 'message': f'[{req.tool}] 配置无效（缺少 url/key），请检查配置。', 'data': None}
 
             # ── 文件参数转发：与 mcp_client.call_tool 相同的机制 ────────
             # Canvas cards reach tools through this endpoint, not call_tool, so
