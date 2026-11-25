@@ -4257,14 +4257,8 @@ That key is what `ZXING_WHEEL_511` names.
 
 ### ArUco / AprilTag are deliberately not here
 
-Their output is a 6-DoF pose, not text, and producing it needs the marker's
-printed size plus camera intrinsics. That is a different card with a different
-config and a different output port; `info` says so in `markers` rather than
-leaving the question open. `cv2.aruco`'s presence in the JetPack base OpenCV is
-also unverified, and the only clean way to add it would be replacing OpenCV —
-`opencv-contrib-python` from pip would shadow the base `cv2` the whole vision
-stack and rapidocr are built against (see the `pip uninstall opencv-python` step
-in `Dockerfile.jetson`).
+ArUco poses use the separate [ArUco Processor](#aruco-定位-aruco). The barcode
+card decodes text and does not estimate ArUco or AprilTag poses.
 
 ### Verifying
 
@@ -4324,6 +4318,35 @@ at the form rather than the schema (`web/js/sidebar.js`):
 * **The config panel is English.** The LLM-facing `inputSchema` is not bound by
   this — it is read by a model, not shown in the form.
 
+
+## ArUco 定位 (`aruco`)
+
+Wire a camera's `image/jpeg` output into the card. Every processed frame that
+shows a marker publishes one JSON message on `<camera>/aruco`, and one empty
+message when the markers leave view. Each marker carries its `id` and pixel
+`center_px`, and, when a focal length is known, `translation_m` (camera
+optical frame: +X right, +Y down, +Z forward), `rotation_rvec_rad` and
+`distance_m`. `<camera>/aruco/overlay` is a JPEG with the outlines and axes,
+unless **Publish overlay** is off.
+
+The focal length comes from the camera card's `motus.camera/1` declaration
+(see [Camera Parameters](#camera-parameters-camera_info)), and `pose_status`
+says which case applies:
+
+| `pose_status` | The camera declares | Pose |
+| --- | --- | --- |
+| `calibrated` | `K` (and `D`, when it has distortion) | Metric, rescaled to the frame size |
+| `approximate` | only `half_fov_rad`, as R1 does | Metric, pinhole, no distortion |
+| `uncalibrated` | nothing, as G1, Go2 and the browser camera do | IDs and pixel centres only |
+
+**Marker side (m)** is the outer edge of the black square, without the white
+margin. One card instance assumes one printed size, and a wrong value scales
+every distance by the same factor. Pick the **dictionary** the markers were
+printed from: `DICT_4X4_50` (default) suits small or distant markers,
+`DICT_6X6_250` gives 250 IDs.
+
+OpenCV ships `cv2.aruco` in both JetPack images; the tests fail inside an
+image that lacks it, rather than skip.
 
 ## Camera Parameters (`camera_info`)
 

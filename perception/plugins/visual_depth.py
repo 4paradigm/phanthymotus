@@ -595,8 +595,8 @@ def calibration_origin(cfg: dict, camera_id: str = "", backend: str = "yolo") ->
 def _depthart_camera_error(error, input_topic, declaration) -> str:
     """Why the card will not start, in terms the operator can act on.
 
-    `camera_matrix` says "DepthART requires camera_info with a nine-value K,
-    width and height", which is correct and useless from the canvas: nothing
+    `camera_matrix` says "camera_info requires a nine-value K, width and
+    height", which is correct and useless from the canvas: nothing
     there is called camera_info, and the operator did not leave a field blank —
     the upstream card simply does not declare its optics, and most cards never
     have. Measured on Orin 5: `remote_camera`'s `info()` has no `camera_info`
