@@ -750,6 +750,28 @@ def test_depth_passage_does_not_invent_progress_between_parallel_walls():
     assert replay.register_passage_route(route, occupied, occupied, .14, .04) is None
 
 
+def test_camera_corner_falls_back_to_recent_depth_when_its_keyframe_ages_out():
+    from plugins.navi.policy import CameraPassage, Config
+
+    geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
+    route = replay.Detour(None, ((0., 0.), (1., 0.), (1.6, .8)), geometry, corridor_corner=True)
+    occupied = np.zeros(replay.SHAPE, dtype=bool)
+    row, col = replay.START
+    occupied[row+12:row+41, col-13] = True
+    occupied[row+29, col-13:col+10] = True
+    previous = np.roll(occupied, -1, axis=0)
+    passage = CameraPassage(route, previous, 1140, None, corridor_corner=True,
+                            keyframe=(route, occupied, 1000))
+    config = Config(max_feedback_gap_ms=300, max_depth_age_ms=300)
+
+    assert passage.register(config, geometry, previous, 1140) is route
+    following = passage.register(config, geometry, np.roll(previous, -1, axis=0), 1310,
+                                 previous=(.3, 0., 0.))
+
+    assert following is not None
+    np.testing.assert_allclose(following.points, np.array(route.points) + (-.05, 0.), atol=.01)
+
+
 def test_opening_connects_to_visible_corridor_without_turning_inside_jambs():
     geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
     occupied = ((abs(replay.FORWARD - 1.) < .03) & (abs(replay.RIGHT) > .48))
@@ -775,3 +797,32 @@ def test_opening_handoff_tracker_stops_for_new_collision_without_reversing():
     assert command is not None and command[0] > 0.
     occupied[(.27 < replay.FORWARD) & (replay.FORWARD < .39) & (abs(replay.RIGHT) < .40)] = True
     assert policy.camera_route_command(route, occupied, *args, require_turn=False) is None
+
+
+def test_corner_needs_two_distinct_travel_directions():
+    assert replay.has_corridor_corner(((0., 0.), (.4, 0.), (.72, .08), (.85, .40), (.85, .85)), .30)
+    assert not replay.has_corridor_corner(((0., 0.), (.4, 0.), (.55, .15), (.9, .10)), .30)
+    assert not replay.has_corridor_corner(((0., 0.), (.5, 0.), (.5, .15)), .30)
+
+
+def test_corner_with_no_target_still_bounds_the_complete_stop_to_the_route():
+    from plugins.navi import policy
+
+    geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
+    config = policy.Config(half_width_m=.20)
+    occupied = np.zeros(replay.SHAPE, dtype=bool)
+    args = geometry, config, occupied, None, (.2, 0., 0.), (.2, 0., 0.), (.2, 0., 0.), 0., .1
+    assert policy.camera_arc_clear(*args, route_room=.8)
+    assert not policy.camera_arc_clear(*args, route_room=.04)
+
+
+def test_corridor_corner_previews_the_observed_exit_around_a_wall():
+    geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
+    side_wall = (abs(replay.RIGHT + .60) <= .026) & (replay.FORWARD > -.40)
+    end_wall = (abs(replay.FORWARD - 1.35) <= .026) & (replay.RIGHT > -.65)
+    occupied = side_wall | end_wall
+    route = replay.corridor_corner_route((~occupied, occupied), geometry, .30, (.80, 1.02))
+    assert route is not None and replay.has_corridor_corner(route.points, .30)
+    assert route.points[-1][1] > .6
+    assert all(a[0] <= b[0] for a, b in zip(route.points, route.points[1:]))
+    assert replay.corridor_corner_route((~side_wall, side_wall), geometry, .30, (.80, 1.02)) is None

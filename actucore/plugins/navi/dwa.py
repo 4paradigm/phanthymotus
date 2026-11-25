@@ -381,19 +381,24 @@ def _preferred_command(points, nominal, horizon, yaw_limit, *, differential=Fals
     return max(0., nominal * math.cos(angle)), -nominal * math.sin(angle), -math.copysign(turn, angle)
 
 
+def remaining_route_length(points, *, segments=None):
+    segments = _route_segments(points) if segments is None else segments
+    if not segments:
+        return 0.
+    progress, _, _ = _project_to_route((0., 0.), points, segments)
+    return segments[-1].walked + segments[-1].length - max(0., progress)
+
+
 def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None):
     """Track the finite visible polyline in the current forward/right grid."""
     segments = _route_segments(points)
-    if not segments:
-        return None
-    progress, _, _ = _project_to_route((0., 0.), points, segments)
-    end = segments[-1].walked + segments[-1].length
-    remaining = end - max(0., progress)
+    remaining = remaining_route_length(points, segments=segments)
     if remaining <= 1e-8:
         return None
+    end = segments[-1].walked + segments[-1].length
     if lookahead_m is None:
         lookahead_m = max(.45, nominal * horizon)
-    lookahead = min(end, max(0., progress) + lookahead_m)
+    lookahead = min(end, end - remaining + lookahead_m)
     segment = next((s for s in segments if s.walked + s.length >= lookahead), segments[-1])
     f, r = (start + (lookahead - segment.walked) * axis - pivot
             for start, axis, pivot in zip(segment.start, segment.tangent, body_origin))

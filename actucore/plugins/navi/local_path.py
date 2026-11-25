@@ -555,6 +555,7 @@ class Detour:
     reachable_prefix: bool = False
     topology: tuple[tuple[float, float], ...] = ()  # original ordered nodes, in the observed grid
     passage_exit: tuple[tuple[float, float], tuple[float, float]] | None = None
+    corridor_corner: bool = False
 
 
 def passage_ahead(exit_line):
@@ -562,6 +563,87 @@ def passage_ahead(exit_line):
         return False
     (forward, right), (end_forward, end_right) = exit_line
     return (end_right - right) * forward - (end_forward - forward) * right > 0.
+
+
+def has_corridor_corner(points, span):
+    """Identify a turn with room for distinct entry and exit headings."""
+    if len(points) < 3:
+        return False
+    start = next((i for i, p in enumerate(points) if math.dist(p, points[0]) >= span), None)
+    end = next((i for i in range(len(points) - 1, -1, -1)
+                if math.dist(points[i], points[-1]) >= span), None)
+    if start is None or end is None or start > end:
+        return False
+    a = math.atan2(points[start][1] - points[0][1], points[start][0] - points[0][0])
+    b = math.atan2(points[-1][1] - points[end][1], points[-1][0] - points[end][0])
+    return abs(math.remainder(b - a, math.tau)) >= math.pi / 4
+
+
+def corridor_corner_route(grid, geometry, half_width, target):
+    """Preview a forward quarter turn only where a wall and a clear exit are observed."""
+    free, occupied = grid
+    pivot = -geometry.half_length if geometry.front == 0. else 0.
+    if target[0] <= pivot:
+        return None
+    sides = (math.copysign(1., target[1]),) if abs(target[1]) >= half_width else (1., -1.)
+    front_wall = occupied[:, abs(RIGHT[0]) <= 2 * half_width]
+    wall_rows = np.flatnonzero((front_wall.sum(axis=1) >= math.ceil(1.5 * half_width / RESOLUTION))
+                               & (FORWARD[:, 0] > max(0., geometry.front)))
+    if not len(wall_rows):
+        return None
+    planes = wall_rows[np.argsort(-front_wall.sum(axis=1)[wall_rows], kind="stable")[:3]]
+    obstacles = occupied_squares(occupied)
+    shadow = occluded_cells(free, occupied, geometry)
+    origin = (geometry.base_from_optical[0, 3], -geometry.base_from_optical[1, 3])
+    points = obstacles.centers - origin
+    ranges = np.hypot(*points.T)
+    angles = np.arctan2(points[:, 1], points[:, 0])
+
+    def visible(f, r):
+        if observed_waypoint(free, f, r):
+            return True
+        if not observed_waypoint(~shadow & ~occupied, f, r):
+            return False
+        f, r = f - origin[0], r - origin[1]
+        # A depth return beyond the exit also provides line-of-sight evidence
+        # when the floor itself cannot be classified.
+        angle = math.atan2(r, f)
+        return bool(((abs(angles - angle) <= .05) & (ranges >= math.hypot(f, r) + RESOLUTION)).any())
+
+    routes = []
+    for side in sides:
+        for row in planes:
+            plane = FORWARD[row, 0]
+            side_wall = occupied & (FORWARD >= pivot) & (FORWARD < plane - 2 * RESOLUTION)
+            side_wall &= (-side * RIGHT >= half_width) & (-side * RIGHT <= 3 * half_width)
+            if np.count_nonzero(side_wall.any(axis=1)) * RESOLUTION < 2 * half_width:
+                continue
+            # Leave room at the end wall even while the front corner of the
+            # rectangular footprint rotates about the pivot.
+            exit_f = plane - pivot - max(half_width, geometry.half_length) - 2 * RESOLUTION
+            for scale in (2., 1.5, 1.):
+                radius = scale * half_width
+                entry = exit_f - radius
+                length = half_width
+                if entry < 0. or not visible(pivot + exit_f, side * (radius + length)):
+                    continue
+                approach = [(f, 0., 0.) for f in np.arange(0., entry, RESOLUTION)]
+                curve = [(entry + radius * math.sin(a), side * radius * (1 - math.cos(a)), side * a)
+                         for a in np.linspace(0., math.pi / 2, math.ceil(radius * math.pi / (2 * RESOLUTION)) + 1)]
+                leaving = [(exit_f, side * (radius + r), side * math.pi / 2)
+                           for r in np.linspace(0., length, math.ceil(length / RESOLUTION) + 1)[1:]]
+                path = (*approach, *curve, *leaving)
+                poses = tuple((pivot + f, r, yaw) for f, r, yaw in path)
+                front, rear = (geometry.half_length, geometry.half_length) if pivot else (geometry.front, geometry.rear)
+                _, hit = rectangle_clearance(poses, obstacles, front, rear, half_width, padding=RESOLUTION / 2)
+                if hit is None:
+                    routes.append(Detour(None, tuple((float(f), float(r)) for f, r, _ in path), geometry,
+                                         corridor_corner=True))
+                    break
+            else:
+                continue
+            break
+    return routes[0] if len(routes) == 1 else None
 
 
 def register_passage_route(route, previous, current, travel_m, turn_rad, *, pivot=0.):
@@ -592,9 +674,13 @@ def register_passage_route(route, previous, current, travel_m, turn_rad, *, pivo
         matched = support[row.clip(0, SHAPE[0]-1), col.clip(0, SHAPE[1]-1)] * valid
         scores.append(matched.mean(axis=1))
     scores = np.stack(scores)
-    yaw, shift = np.unravel_index(scores.argmax(), scores.shape)
-    quality = scores[yaw, shift]
-    distinct = ((abs(angles - angles[yaw])[:, None] > .05)
+    quality = scores.max()
+    # Quantized depth cells can score a slightly rotated wall higher than
+    # the same wall on the next exposure. Prefer the smaller correction
+    # within one cell's sampling uncertainty.
+    magnitude = abs(angles)[:, None] / .05 + np.hypot(*shifts.T)[None, :]
+    yaw, shift = np.unravel_index(np.where(scores >= quality - .025, magnitude, np.inf).argmin(), scores.shape)
+    distinct = ((abs(angles - angles[yaw])[:, None] > .05 + 1e-9)
                 | (np.hypot(*(shifts - shifts[shift]).T)[None, :] >= 1.5))
     if quality < .65 or np.any(scores[distinct] >= quality - .08):
         return None
@@ -1434,7 +1520,9 @@ def extend_passage(opening, grid, half_width, target, stop):
     if not path or len(path) < 2:
         return opening
     exit_points = tuple((float(FORWARD[cell]), float(RIGHT[cell])) for cell in path[1:])
-    return Detour(None, opening.points + exit_points, geometry, passage_exit=opening.passage_exit)
+    points = opening.points + exit_points
+    return Detour(None, points, geometry, passage_exit=opening.passage_exit,
+                  corridor_corner=has_corridor_corner(points, half_width))
 
 
 def _turnable_endpoints(cells, occupied, geometry, half_width):

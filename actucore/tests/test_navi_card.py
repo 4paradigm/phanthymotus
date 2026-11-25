@@ -1145,6 +1145,36 @@ def test_an_image_topic_with_no_known_suffix_is_the_camera_not_the_depth_map():
     assert bound["depth_map"] == "/cam/visual_depth"
 
 
+def test_declared_jpeg_input_binds_before_ros_discovery():
+    card, node = _card(), _FakeNode()
+    view_source = "/factory/rgb"
+    bound, problem = card._bind_inputs(
+        node, [view_source, "/cam/objects", "/cam/depth"],
+        input_bindings={"bindings": [{"topic": view_source, "format": "image/jpeg"}]},
+    )
+    assert problem == "" and bound["image"] == view_source
+    assert not bound["unknown"]
+    [(message_type, _, callback, _)] = [
+        subscription for subscription in node.subscription_details if subscription[1] == view_source
+    ]
+    assert message_type.__name__ == "CompressedImage" and callback == card._on_image
+
+
+@pytest.mark.parametrize("companion", ["objects", "visual_depth", "visual_depth_summary"])
+@pytest.mark.parametrize("message_types", [[], ["std_msgs/msg/String"]], ids=["undiscovered", "string"])
+def test_camera_companion_infers_jpeg_only_until_the_ros_graph_has_a_type(companion, message_types):
+    view_source = "/factory/rgb"
+    topics = [view_source, view_source + "/" + companion]
+    if companion != "objects":
+        topics.append("/cam/objects")
+    if companion == "objects":
+        topics.append("/cam/depth")
+    bound, problem = _bind(topics, graph={view_source: message_types})
+    assert problem == ""
+    assert bound["image"] == ("" if message_types else view_source)
+    assert bool(bound["unknown"]) == bool(message_types)
+
+
 def test_the_camera_is_optional():
     """Every canvas drawn before this input existed must keep working."""
     bound, problem = _bind(["/cam/objects", "/cam/visual_depth"])
@@ -2083,6 +2113,52 @@ def test_the_tick_hands_the_frame_off_instead_of_rendering_it():
     # tick to get it.
     assert set(snapshot) >= {"depth_m", "objects", "jpeg", "decision", "track",
                              "bearing", "target", "clearance", "coverage"}
+
+
+def test_restarting_without_rgb_clears_the_previous_camera_snapshot(monkeypatch):
+    from types import SimpleNamespace
+
+    card = _card()
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(card, "_node", _FakeNode()))
+    topics = ["/camera/objects", "/camera/visual_depth_summary"]
+    first_inputs = {"input_topics": ["/camera", *topics], "input_bindings": {"/camera": "image/jpeg"}}
+    assert card._start(first_inputs)["state"] == "running"
+    assert card._binding["image"] == "/camera"
+    card._on_image(SimpleNamespace(data=b"old jpeg"))
+    assert card._stop()["state"] == "stopped"
+
+    try:
+        assert card._start({"input_topics": topics})["state"] == "running"
+        assert not card._binding["image"]
+        assert card._image_jpeg is None and card._info()["image_age_ms"] is None
+    finally:
+        card._stop()
+
+
+def test_view_omits_expired_rgb_and_uses_the_next_fresh_jpeg(monkeypatch):
+    import queue
+    from types import SimpleNamespace
+
+    card = _card(max_obs_age_ms=300)
+    card._view_queue = queue.Queue(maxsize=1)
+    card._depth_map = depth = object()
+    clock = [1000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: clock[0] / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: clock[0] / 1000)
+
+    card._on_image(SimpleNamespace(data=b"first jpeg"))
+    card._publish_view()
+    assert card._view_queue.get_nowait()["jpeg"] == b"first jpeg"
+
+    clock[0] = 1350
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["jpeg"] is None and snapshot["depth_m"] is depth
+
+    clock[0] = 1600
+    card._on_image(SimpleNamespace(data=b"fresh jpeg"))
+    card._publish_view()
+    assert card._view_queue.get_nowait()["jpeg"] == b"fresh jpeg"
 
 
 def test_a_backed_up_queue_keeps_the_newest_frame():
