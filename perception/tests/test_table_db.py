@@ -670,3 +670,16 @@ def test_deleted_blob_freelist_pages_are_reused_under_max_db_bytes(tmp_path):
     assert _call(card, "delete", table="t", where={"rowid": ins1["rowids"][0]})["deleted"] == 1
     ins2_after = _call(card, "insert", table="t", values=[{"k": "2", "f": p2}])
     assert ins2_after["ok"] is True
+
+
+def test_files_travel_in_a_file_param(tmp_path):
+    """agent-core pushes only `format: file` params to the card's container; a
+    path written inside `values` is a path in agent-core's container, which this
+    card cannot open. The schema has to steer the model to `file` + "$file"."""
+    props = TOOLS[0]["inputSchema"]["properties"]
+    assert props["file"]["format"] == "file" and props["path"]["format"] == "file"
+    assert '"$file"' in props["values"]["description"]
+    card = _card(tmp_path)
+    _call(card, "create_table", table="t", columns=[{"name": "照片", "type": "BLOB"}])
+    missing = _call(card, "insert", table="t", values=[{"照片": "/opt/phanthy-motus/x.jpg"}])
+    assert missing["reason"] == "not_found" and "file 参数" in missing["detail"]

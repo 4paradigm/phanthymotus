@@ -42,20 +42,32 @@
 
 BLOB 列存图片或任意文件，字节存在库里，删行、删表、替换、清空时自动回收。
 
+### 文件怎么到卡片
+
+perception 和 agent-core 是两个容器，不共享文件系统，所以文件要**先传到本卡片**，用的是卡片自己的
+`/file/upload`（`utils/file_intake.py`），落在 `/models/uploads/<日期>/` 下，7 天后清理——写入 BLOB 时字节已拷进库里，清理不影响数据。
+两条入口都走这里：
+
+- **画布**：`file`（BLOB）和 `path`（导入表格）两个参数是「选择文件」按钮，浏览器经 agent-core 转发上传，
+  按钮把卡片这边的路径填回参数。
+- **对话**：用户在飞书 / QQ 等渠道发来的附件，先由 agent-core 存进它自己的容器。LLM 把这个路径填进
+  `file` / `path` 参数；这两个参数声明了 `format: "file"`，agent-core 调用前会自动把文件传到本卡片、换成卡片这边的路径。
+
+**只有 `file` / `path` 会被自动传送。** 写在 `values` / `set` 里的路径原样交给卡片，指向 agent-core 容器里的文件就会「文件不存在」。
+所以 BLOB 列一律写 `"$file"`，文件路径放 `file`；每次调用带一个文件。
+
 | 要做的事 | 写法 |
 |---|---|
-| 新增一行带文件 | `insert`：`values` 里 BLOB 列写本机文件路径，`[{"姓名": "张三", "照片": "/work/photos/a.jpg"}]` |
-| 给已有行加 / 换文件 | `update`：`set` 里写新路径，`{"照片": "/work/photos/b.jpg"}` |
-| 删掉某行的文件、保留这一行 | `update`：`set` 里写 `null`，`{"照片": null}` |
+| 新增一行带文件 | `insert`：`values: [{"姓名": "张三", "照片": "$file"}]`，`file: "<路径>"` |
+| 给已有行加 / 换文件 | `update`：`set: {"照片": "$file"}`，`file: "<路径>"`，`where: [["rowid", "=", 3]]` |
+| 删掉某行的文件、保留这一行 | `update`：`set: {"照片": null}` |
 | 删行连同文件 | `delete` |
 | 给表加一个文件列 | `add_column`：`[{"name": "合同", "type": "BLOB"}]` |
 | 读文件 | `select` 返回 `{"type": "BLOB", "name", "mime", "size", "url"}`，`url` 直接 HTTP GET 下载 |
 | 找有 / 没有文件的行 | `where`：`[["照片", "is not null"]]` / `[["照片", "is null"]]` |
-| 统计有文件的行 | `fields`：`["COUNT(照片)"]` |
 
-路径必须在 `/models`、`/tmp`、`/work` 下（`image_roots` 可配），单个文件上限见 `max_file_bytes`。
-`{"readfile": "路径"}` 与直接写路径等价，对应 SQLite 的 `readfile()`。
-画布上可以用 `file` 选择器上传：表只有一个 BLOB 列时自动写入它，否则在 `values` / `set` 里写 `"$file"` 指定列。
+表里只有一个 BLOB 列时，`values` / `set` 里可以不写 `"$file"`，`file` 自动写入那一列。
+卡片自己容器里已有的文件（`/models`、`/tmp`、`/work` 下）也可以直接写路径，或写 `{"readfile": "路径"}`。
 配置了 `ACCESS_TOKEN` 时，下载链接自动带 24 小时有效的签名。
 
 `import` / `export` 只支持 `.csv` 和 `.xlsx`。`.xlsx` 导入时单元格里的图片存为 BLOB 列，导出 `.xlsx` 时图片嵌回单元格；导出 `.csv` 时 BLOB 列写下载链接。

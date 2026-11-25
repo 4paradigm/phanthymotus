@@ -4618,7 +4618,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 
 - `where` 是条件数组 `[["金额", ">", 100], ["姓名", "like", "%张%"]]`，支持 `= != > >= < <= like / not like / in / not in / between / is null / is not null`。
 - `fields` 支持 `COUNT/SUM/AVG/MIN/MAX`（可加 `DISTINCT`），配合 `group_by` 做分组统计。
-- BLOB 列：`insert`/`update` 里写本机文件路径即存入，`set` 里写 `null` 即删除文件，`select` 返回下载 `url`。
+- BLOB 列：文件路径填 `file` 参数（agent-core 会自动传到本卡片），`values`/`set` 里对应列写 `"$file"`；`set` 里写 `null` 即删除文件，`select` 返回下载 `url`。
 - 写操作在 `x-action-params` 里声明 `readOnly: false`，`viewer` 级别的 peer 只能读。
 - 存放位置：`/models/table_db/table_db.db`（宿主挂载目录，重启/升级不丢数据）。各项上限见 `config.yaml` 中 `plugins.table_db`。
 

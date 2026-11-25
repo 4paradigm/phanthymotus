@@ -172,13 +172,13 @@ TOOLS: List[Dict[str, Any]] = [{
                 "items": {"type": "object"},
                 "description": (
                     '要插入的行，每行一个对象，未写的列为空；一次最多 500 行。'
-                    'BLOB 列写本机文件路径。例：[{"姓名": "张三", "金额": 12.5, "照片": "/work/photos/a.jpg"}]'
+                    'BLOB 列写 "$file"，文件路径填在 file 参数里。例：[{"姓名": "张三", "金额": 12.5, "照片": "$file"}]'
                 ),
             },
             "set": {
                 "type": "object",
                 "description": (
-                    '要改成的新值。null 表示清空；BLOB 列写新文件路径即替换，写 null 即删除该文件。'
+                    '要改成的新值。null 表示清空；BLOB 列写 "$file"（文件路径填在 file 参数里）即替换，写 null 即删除该文件。'
                     '例：{"状态": "已完成", "照片": null}'
                 ),
             },
@@ -218,8 +218,8 @@ TOOLS: List[Dict[str, Any]] = [{
                 "format": "file",
                 "uploadTo": "mcp",
                 "description": (
-                    '画布上传文件用：表里只有一个 BLOB 列时自动写入它，否则在 values/set 里写 "$file"。'
-                    '对话中直接在 values/set 里写文件路径即可'
+                    '要存入 BLOB 列的文件路径，例如用户在聊天里发来的图片的路径；会自动传到本卡片。'
+                    '在 values/set 里对应的 BLOB 列写 "$file"；表里只有一个 BLOB 列时可以不写。每次调用一个文件'
                 ),
             },
             "mode": {
@@ -262,7 +262,7 @@ TOOLS: List[Dict[str, Any]] = [{
             },
             "insert": {
                 "params": ["table", "values", "file"], "required": ["table", "values"], "readOnly": False,
-                "description": "插入一行或多行，整批成功或整批失败，返回新行的 rowid。",
+                "description": "插入一行或多行，整批成功或整批失败，返回新行的 rowid。带文件时一次插一行。",
             },
             "select": {
                 "params": ["table", "fields", "where", "group_by", "order_by", "limit", "offset"],
@@ -429,10 +429,20 @@ class TableDbPlugin:
     def _read_local(self, raw_path: Any, cap: int, field_name: str = "path") -> Tuple[bytes, str]:
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise bad_request("%s 必须为非空文件路径" % field_name, column=field_name)
-        resolved = check_under_roots(raw_path.strip(), {"image_roots": self._roots},
-                                     url_action="table_db")
+        not_here = TableDbError(
+            "not_found",
+            "文件不存在：%s。这个路径在本卡片的容器里找不到；把路径填进 file 参数"
+            "（导入表格用 path 参数），会自动传到本卡片，BLOB 列写 \"$file\"" % raw_path,
+            column=field_name)
+        try:
+            resolved = check_under_roots(raw_path.strip(), {"image_roots": self._roots},
+                                         url_action="table_db")
+        except BadInput:
+            # Outside the allowed roots — for a path the model copied from a chat
+            # attachment, that means it lives in agent-core's container.
+            raise not_here from None
         if not os.path.isfile(resolved):
-            raise TableDbError("not_found", "文件不存在：%s" % raw_path, column=field_name)
+            raise not_here
         size = os.path.getsize(resolved)
         if size == 0:
             raise TableDbError("empty", "文件为空：%s" % os.path.basename(resolved), column=field_name)
@@ -463,7 +473,7 @@ class TableDbPlugin:
             error.row = row
             raise
         except BadInput as error:
-            raise TableDbError(error.reason, error.detail, row=row, column=column) from error
+            raise TableDbError("bad_request", error.detail, row=row, column=column) from error
         return FileValue(data=data, name=name, mime=_mime(data, name))
 
     # ── URL formatting & signing ─────────────────────────────────────────────
