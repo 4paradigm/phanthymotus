@@ -154,9 +154,9 @@ are deployed differently:
 |--------|---------------------------|--------------------|
 | driver | yes, per driver | Agent Core extracts it from the image and merges it into the host compose file (`api/drivers.py:_deploy_sync`) |
 | perception | yes | same path as drivers |
-| core | no | updated in place through the web console: `POST /api/system/update` pulls the image and hands over to a restart-helper container |
+| core | no | in production, updated in place through the web console (`POST /api/system/update` pulls the image and hands over to a restart-helper container); for a PR test, swapped into the running agent-core by run-pr-image.sh |
 
-So drivers and perception get a one-line command in the comment:
+So every target gets the same one-line command in the comment:
 
 ```bash
 curl -fsSL https://motus.phanthy.com/run-pr-image.sh | bash -s -- <image-ref>
@@ -192,10 +192,19 @@ it is the same tool production uses, the flags each service declares
 wrote them instead of being re-derived, and `--down` tears everything down
 without touching the host's real compose file.
 
-Core gets only the image reference and a pointer to the web console. It ships no
-service fragment, and starting a second copy by hand would fight the running
-agent — updating it requires the restart helper that `POST /api/system/update`
-hands over to.
+Core gets the same command, but the script treats it differently. It ships no
+service fragment, and a second copy beside the running agent would fight it for
+port 15678, its database and the robot — so run-pr-image.sh recognises a core
+image by its repository name (`…/core:<tag>`) and swaps it into the running
+agent-core container in place: the host's own compose project plus a one-line
+override naming the new image, `--no-deps` so drivers and perception keep
+running. `--down agent-core` recreates it from the host compose file alone,
+which restores the host's image. The container name in the comment comes from
+`agent-core/deploy/docker-compose.yml`.
+
+It used to get only a pointer to the dashboard's deploy panel. That works only
+for a version the console lists, which a PR build is not until it is approved —
+so a core PR had no test path at all from its comment.
 
 The script needs nothing beyond docker: the fragment is wrapped with text
 transforms, so there is no python or yq dependency on the machine under test.

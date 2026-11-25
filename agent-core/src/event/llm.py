@@ -1619,6 +1619,11 @@ class Event:
         self._summary: str | None     = None  # 压缩后的历史摘要
         self._session_id: str | None  = None  # chat history session
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
+        # 每清空一次历史 +1。凡是「先读出 _turns、await 一次 LLM、再写回」的代码
+        # （压缩、溢出重试）和 turn 结束时的保存，都拿它判断中途有没有被清过 ——
+        # 被清过就不写回，否则旧对话会和它的摘要一起回到内存里。
+        self._history_gen = 0
+        self._turn_cancel: asyncio.Event | None = None   # 正在跑的 turn 的取消信号
         self._subagent_mgr = None             # SubagentManager instance
         self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
 
@@ -1927,6 +1932,8 @@ class Event:
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
             collector.set_cancel_event(cancel_ev)
+            self._turn_cancel = cancel_ev
+            turn_gen = self._history_gen
             # 更窄的信号：高优先级 steering 到达时，打断"正在飞的 LLM 请求"或者
             # "还没发出去、卡在排队里的 tool_call"，但不结束这个 turn（跟 cancel_ev
             # 的区别见 event/llm.py 的 RoundReconsider 和 mcp_client.await_pending）。
@@ -1967,6 +1974,7 @@ class Event:
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
                 _cancel_ctx.reset(_cancel_token)
+                self._turn_cancel = None
                 collector.set_cancel_event(None)
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
@@ -1975,9 +1983,41 @@ class Event:
                     import hooks as _hooks_idle
                     asyncio.create_task(_hooks_idle.fire('on_idle'))
                 # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
-                if self._current_turn and not ev.get('_bot_channel_event'):
+                # 这一轮跑的时候历史被清过，就不存：它属于被清掉的那段对话。
+                if (self._current_turn and not ev.get('_bot_channel_event')
+                        and turn_gen == self._history_gen):
                     self._save_current_turn(ev)
                 self._chat_only_active = False
+
+    def forget_conversation(self) -> None:
+        """丢掉内存里的对话上下文，并让正在跑的 turn 停下、不落盘。
+
+        只删数据库不够：`_build_history()` 读的是 `_turns` / `_summary`，模型会继续
+        拿已删的对话做决定。正在跑的 turn 也要停 —— 它的 history 在开头就拼好了，
+        不停下就会带着旧上下文把剩下的 LLM 调用和工具调用跑完。
+        """
+        self._history_gen += 1
+        self._turns = []
+        self._summary = None
+        self._session_id = None
+        self._current_turn = []
+        self._context_pressure = None
+        if self._turn_cancel is not None:
+            self._turn_cancel.set()
+
+    async def clear_history(self, reason: str = 'history cleared') -> None:
+        """清空全部历史：内存上下文、子代理、数据库，三处一起。
+
+        顺序有讲究：先停 turn 和子代理，再删库。子代理在跑的时候每轮都往
+        chat_history 写，先删库就会被它补回去。
+        """
+        import chat_history
+        self.forget_conversation()
+        if self._subagent_mgr is not None:
+            await self._subagent_mgr.discard_all(reason)
+        chat_history.clear_all()
+        # 等子代理的那几秒里，被取消的 turn 可能还碰过这些字段
+        self.forget_conversation()
 
     def _flush_current_turn(self, trigger_event: dict | None = None):
         """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
@@ -2088,10 +2128,14 @@ class Event:
         recent_turns = self._turns[-max_kept:]
 
         print(f'[decision] compressing history: {len(old_turns)} old turns, keeping {max_kept} recent')
+        gen = self._history_gen
         summary = await _compress_turns(old_turns)
         # Rolling summary: 合并旧摘要（固定预算重写，而非无限拼接）
-        if self._summary:
+        if self._summary and gen == self._history_gen:
             summary = await _rewrite_summary(self._summary, summary, summary_budget)
+        if gen != self._history_gen:
+            print('[decision] history cleared during compression — discarding summary')
+            return
 
         self._summary = summary
         self._turns = recent_turns
@@ -2571,14 +2615,17 @@ class Event:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
                     if len(self._turns) > 2 and not bot_restricted:
+                        gen = self._history_gen
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
-                        if self._summary:
+                        if self._summary and gen == self._history_gen:
                             llm_cfg = config.main.get('event', {}).get('llm', {})
                             budget = llm_cfg.get('summary_max_chars', 5000)
                             summary = await _rewrite_summary(self._summary, summary, budget)
-                        self._summary = summary
-                        self._turns = self._turns[-2:]
+                        # 压缩期间历史被清过：不写回，cancel_event 已置位，这一轮马上会停
+                        if gen == self._history_gen:
+                            self._summary = summary
+                            self._turns = self._turns[-2:]
                         # 重建 history 并重试（复用冻结的 system）
                         history = self._build_history()
                         current_history = history + _sanitize(_scrub(turn_messages))
