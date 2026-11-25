@@ -63,6 +63,15 @@ class DepthError(ValueError):
     """A depth payload that cannot be decoded into a map."""
 
 
+def observation_ms(depth, fallback=None):
+    """Clock for motion admission. Keep the source stamp for geometric registration."""
+    if depth is None:
+        return fallback
+    if depth.get("receipt_timed"):
+        return depth.get("frame_id", fallback)
+    return depth.get("capture_ms") or (depth.get("frame_id") if fallback is None else fallback)
+
+
 def decode(payload: bytes) -> np.ndarray:
     """A `image/depth-zlib` buffer as a 640x480 float array of metres.
 

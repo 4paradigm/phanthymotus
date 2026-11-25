@@ -307,6 +307,7 @@ class _ForwardCheck:
     forward_feedback_room_m: float | None = None
     bearing_only: bool = False
     camera_passage: policy_mod.CameraPassage | None = None
+    target_source_ms: int | None = None
 
     def matches_target_receipt(self, receipt_ms):
         return (self.planning_guard.association is None or self.target_source is not None
@@ -2147,9 +2148,9 @@ class NaviPlugin:
                 if capture is not None:
                     valid_age = 0 <= now - capture <= depth_age
                     if valid_age or depth.get("receipt_timed"):
-                        # Preserve the upstream time for motion registration and publication.
+                        # Preserve the upstream time for motion registration.
                         depth["capture_ms"] = capture
-                    if not valid_age:
+                    else:
                         depth["capture_invalid"] = True
             odom_age = now - self._odom_ms
             odom = (self._odom
@@ -2236,7 +2237,7 @@ class NaviPlugin:
             occupied = scan.views[-1][3]
         if probe or (motion_guard is not None and target_source is None):
             renewable = False
-        depth_ms = depth.get("capture_ms") or depth["frame_id"]
+        depth_ms = depth_mod.observation_ms(depth)
         if motion_guard is not None and scan.current_frame:
             depth_ms = min(depth_ms, scan.current_frame)
         track = state.tracker.track
@@ -2249,14 +2250,14 @@ class NaviPlugin:
                 and anchor is not None and anchor.frame is not None and not anchor.target_missing
                 and anchor.reference_ms == motion_guard.checked_ms and track is not None
                 and track.state == CONFIRMED and track.observed and track.front_fix is not None
-                and fix is not None and fix.capture_ms is not None and target_source is not None
+                and fix is not None and fix.observation_ms is not None and target_source is not None
                 and track.source == target_source and anchor.generation == track.generation == motion_guard.generation
                 and anchor.frame == track.frame and tuple(track.front_fix) == (anchor.x, anchor.y)
                 and math.dist(anchor.frame.grid_point((anchor.x, anchor.y), geometry), motion_guard.goal) < 1e-9):
             revision = policy_mod.dwa_target_revision(state)
             if revision[1] == motion_guard.target_revision[1]:
                 motion_guard = replace(motion_guard, target_revision=revision, deadline_ms=min(
-                    motion_guard.deadline_ms, fix.capture_ms + config.depth_age_limit_ms))
+                    motion_guard.deadline_ms, fix.observation_ms + config.depth_age_limit_ms))
         direct_association = None
         if (motion_guard is None and config.local_controller == "dwa"
                 and (target_source is not None or state.camera_arc_selected)
@@ -2269,13 +2270,14 @@ class NaviPlugin:
             direct_association = track.snapshot(stamp), pose
         passage = None
         if state.camera_arc_selected and state.view_detour is not None and occupied is not None:
+            capture = depth.get("capture_ms") or depth_ms
             previous_passage = state.published_camera_passage
             if (previous_passage is not None and previous_passage.corridor_corner
                     and state.dwa_trace.get("retained_route")):
-                passage = previous_passage.advance(config, state.view_detour, occupied, depth_ms,
+                passage = previous_passage.advance(config, state.view_detour, occupied, capture,
                                                    corner_only=bool(state.dwa_trace.get("corner_only")))
             else:
-                passage = policy_mod.CameraPassage(state.view_detour, occupied, depth_ms,
+                passage = policy_mod.CameraPassage(state.view_detour, occupied, capture,
                                                     track.generation if track else None, state.view_detour.corridor_corner)
         return _ForwardCheck(geometry, depth["frame_id"], depth.get("source_frame_id"),
                              objects_ms, decision.distance_m, previous_twist, mount_frame,
@@ -2287,12 +2289,12 @@ class NaviPlugin:
                              motion_guard.front_required if motion_guard else False, objects_ms,
                              input_revision, motion_guard.memory_revision if motion_guard else None,
                              motion_guard.target_revision if motion_guard else None,
-                             depth_ms, motion_guard, fix.capture_ms if fix else None,
+                             depth_ms, motion_guard, fix.observation_ms if fix else None,
                              (objects_ms, input_revision[2]) if (
                                  fix is not None and input_revision and motion_guard is not None
                                  and motion_guard.association is not None and target_source is not None
                                  and target_source == motion_guard.association.source) else None,
-                             direct_association, camera_passage=passage)
+                             direct_association, camera_passage=passage, target_source_ms=fix.capture_ms if fix else None)
 
     def _registered_dwa_scene(self, check, depth, odom, now_ms, depth_ms, geometry, twists, *, scan, sources,
                               anchor_changed):
@@ -2315,7 +2317,7 @@ class NaviPlugin:
             return policy_mod.dwa_registration(pose, current, stamp, now_ms, geometry, twists,
                                                reference=reference)
 
-        view = registration(depth_ms, depth.get("obstacle_capture_pose"))
+        view = registration(min(depth_ms, depth.get("capture_ms") or depth_ms), depth.get("obstacle_capture_pose"))
         projection = local_path.DepthProjection.for_observation(depth)
         grid = projection.grid_for(geometry, require_valid_depth=True, check_free_space=guard.visibility_required)
         if grid is None:
@@ -2442,7 +2444,7 @@ class NaviPlugin:
         if ((source is None) != (check.source_id is None) or (feedback is None) != (check.feedback_source is None)
                 or depth_id < prior_depth_id or feedback_id < prior_feedback_id):
             return reject("stale_observation")
-        depth_ms = depth.get("capture_ms") or depth["frame_id"]
+        depth_ms = depth_mod.observation_ms(depth)
         odom_ms = min(odom["received_ms"], odom.get("stamp_ms", odom["received_ms"]))
         if route_room is not None and "received_speed_ms" in odom:
             speed_ms = odom.get("component_speed_ms")
@@ -2733,6 +2735,7 @@ class NaviPlugin:
                                            (target_source is None or target_source != check.target_source)
                                             else check.target_receipt_ms),
                         target_capture_ms=depth_ms if live_point is not None else check.target_capture_ms,
+                        target_source_ms=depth.get("capture_ms") if live_point is not None else check.target_source_ms,
                         target_detection=(objects_ms, revision[2]) if live_point is not None else check.target_detection,
                         front_required=check.front_required if target_pending else front_required,
                         guard_horizon_s=prediction.duration, forward_feedback_room_m=feedback_room,
@@ -2795,7 +2798,7 @@ class NaviPlugin:
                     pose.frame != check.mount_frame):
                 return None
             geometry = replace(geometry, base_from_optical=mount)
-        depth_ms = depth.get("capture_ms") or depth["frame_id"]
+        depth_ms = depth_mod.observation_ms(depth)
         measured = odom_mod.planar_feedback(odom)
         received_ms = (odom or {}).get("received_ms")
         odom_ms, feedback_source = None, None
@@ -2866,7 +2869,9 @@ class NaviPlugin:
             # Sweep the handoff from the speed already on the wire as well.
             velocities += (self._wire_twist,)
         speed = max(math.hypot(vx, vy) for vx, vy, _ in velocities)
-        range_ms = min(distance_ms, check.target_capture_ms or distance_ms) if command_only else distance_ms
+        range_ms = distance_ms
+        if command_only:
+            range_ms = min(range_ms, check.target_source_ms or check.target_capture_ms or distance_ms)
         if speed * (horizon + (now_ms - range_ms) / 1000) > check.distance_m - config.stop_distance_m:
             if diagnostics is not None:
                 diagnostics["reason"] = "target_standoff"
@@ -2879,8 +2884,9 @@ class NaviPlugin:
             if grid is None:
                 return None
             occupied = grid[1]
+        scene_ms = min(depth_ms, depth.get("capture_ms") or depth_ms)
         clear = not local_path.motion_sweep_hits(occupied, geometry, half_width, horizon, velocities,
-                                                 padding=speed * (now_ms - depth_ms) / 1000).any()
+                                                 padding=speed * (now_ms - scene_ms) / 1000).any()
         if clear and command_only:
             ahead = policy_mod.projected_forward_clearance(occupied, geometry, config)
             if (ahead is not None and ahead + policy_mod.FORWARD_CLEARANCE_MARGIN_M < check.distance_m
@@ -2924,9 +2930,10 @@ class NaviPlugin:
         corner_only = match is None and corner and not any(target_objects(objects, check.target, config))
         if match is None and not corner_only:
             return None
-        obs_ms = capture if corner_only else min(capture, receipt)
-        deadline = int(min(now_ms + self._ttl_ms, obs_ms + max_age, capture + config.depth_age_limit_ms))
-        if not capture <= now_ms < deadline:
+        depth_ms = depth_mod.observation_ms(depth)
+        obs_ms = depth_ms if corner_only else min(depth_ms, receipt)
+        deadline = int(min(now_ms + self._ttl_ms, obs_ms + max_age, depth_ms + config.depth_age_limit_ms))
+        if not depth_ms <= now_ms < deadline:
             return None
         grid = local_path.project_observation(depth, geometry, require_valid_depth=True, check_free_space=False)
         if grid is None:
@@ -2934,7 +2941,7 @@ class NaviPlugin:
         goal = None if corner_only else local_path.target_in_grid(geometry, match.point[0], -match.point[1])
         previous = self._wire_twist or check.previous_twist
         proof = replace(check, previous_twist=previous, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
-                        depth_ms=capture, target_ms=0 if corner_only else receipt, target_receipt_ms=receipt,
+                        depth_ms=depth_ms, target_ms=0 if corner_only else receipt, target_receipt_ms=receipt,
                         target_source=source, distance_m=None if corner_only else match.range_m,
                         input_revision=_motion_inputs(objects, depth, odom))
         if passage is not None:
@@ -3008,16 +3015,9 @@ class NaviPlugin:
             with_capture_timing=self._config.local_planning or self._config.local_controller == "dwa")
         max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
         bounded_age = type(max_age) in (int, float) and 0 < max_age < math.inf
-        receipt_timed = bool(depth and depth.get("receipt_timed"))
-        planning_depth = depth
-        if receipt_timed:
-            planning_depth = dict(depth)
-            planning_depth.pop("capture_invalid", None)
-        frame_ms = (depth or {}).get("frame_id")
-        if depth and not receipt_timed:
-            frame_ms = depth.get("capture_ms") or frame_ms
+        frame_ms = depth_mod.observation_ms(depth)
         if bounded_age and frame_ms is not None and depth.get("control_ms", frame_ms) - frame_ms >= max_age:
-            planning_depth["capture_invalid"] = True
+            depth["capture_invalid"] = True
         input_revision, selection_constraints, admission_ms = None, None, 0
         dwa_time_left = None
         epoch, action_id = self._output_epoch, self._acp_action_id
@@ -3041,7 +3041,7 @@ class NaviPlugin:
                 if corner and not any(target_objects(objects, self._state.target, self._config)):
                     target_stamp = planning_ms
                 admission_deadline = min(admission_deadline, min(capture, feedback, target_stamp) + planning_age)
-                if (planning_depth and (receipt_timed or depth.get("capture_ms")) and not planning_depth.get("capture_invalid")
+                if (depth and (depth.get("receipt_timed") or depth.get("capture_ms")) and not depth.get("capture_invalid")
                         and admission_deadline > planning_ms):
                     # Leave part of a tick for first-write validation and publishing.
                     reserve_s = min(control_period_s / 4, (admission_deadline - planning_ms) / 4000)
@@ -3060,7 +3060,7 @@ class NaviPlugin:
         scan_guarded = previous_scan.active or bool(previous_scan.result_frame)
         was_searching = (self._config.local_planning and self._last_decision is not None
                          and self._last_decision.status == policy_mod.SEARCHING)
-        decision = policy_mod.step(detections=objects, depth=planning_depth, odom=odom,
+        decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
                                    dt=dt, control_period_s=control_period_s, command_dt_s=coverage,
                                    command_interrupted=bool(deadline and tick > deadline), dwa_admission_ms=admission_ms,
@@ -3117,7 +3117,7 @@ class NaviPlugin:
             obs_ms = now_ms
         elif (self._config.local_planning and any(values)
                 and depth is not None and depth.get("frame_id") is not None):
-            obs_ms = min(obs_ms, depth.get("capture_ms") or scan.single_depth_ms or depth["frame_id"])
+            obs_ms = min(obs_ms, depth_mod.observation_ms(depth, scan.single_depth_ms or depth["frame_id"]))
             motion_pose = (odom or {}).get("motion_pose")
             if motion_pose is not None and (scan.pose_origin is not None or not odom.get("velocity_history")):
                 obs_ms = min(obs_ms, motion_pose.stamp_ms)
@@ -3135,7 +3135,7 @@ class NaviPlugin:
         if self._state.checked_prefix and any(values):
             stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
             feedback_ms = (odom or {}).get(stamp_key, (odom or {}).get("received_ms"))
-            depth_ms = (depth or {}).get("capture_ms") or scan.current_frame
+            depth_ms = depth_mod.observation_ms(depth, scan.current_frame)
             if feedback_ms is not None and depth_ms:
                 prefix_deadline = min(feedback_ms + self._config.max_feedback_gap_ms,
                                       depth_ms + self._config.depth_age_limit_ms)
@@ -3145,7 +3145,7 @@ class NaviPlugin:
         corner_only = bool((guard is not None and guard.corner_only)
                            or (camera_arc and self._state.dwa_trace.get("corner_only")))
         if corner_only and depth is not None:
-            obs_ms = min((depth.get("capture_ms") or depth["frame_id"]),
+            obs_ms = min(depth_mod.observation_ms(depth),
                          (odom or {}).get("received_ms", now_ms), now_ms)
             stale = bounded_age and max_age <= now_ms - obs_ms
         target_observed = (origin.acceptance.target_observed if origin is not None else
@@ -3270,8 +3270,7 @@ class NaviPlugin:
                          depth_timing.get("source_stamp_ns"), depth_timing.get("frame_id"),
                          depth_timing.get("control_ms"), now_ms, obs_ms)
                 if scan.active and scan.receipt_only and not scan.command_only:
-                    if scan.buffered_turn and obs_ms == (depth_timing.get("capture_ms") or
-                                                         depth_timing.get("frame_id")):
+                    if scan.buffered_turn and obs_ms == depth_mod.observation_ms(depth_timing):
                         scan.pause_for_depth(now_ms)
                     else:
                         scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
@@ -3663,7 +3662,7 @@ class NaviPlugin:
         if (depth_id == (check.source_id or check.frame_id)
                 and odom_id == (check.feedback_source or check.feedback_ms)):
             return False
-        depth_ms = depth.get("capture_ms") or depth.get("frame_id", 0)
+        depth_ms = depth_mod.observation_ms(depth) or 0
         feedback_ms = min(odom.get("received_ms", 0), odom.get("stamp_ms", now_ms))
         if (not 0 <= now_ms - depth_ms < self._config.depth_age_limit_ms
                 or not 0 <= now_ms - feedback_ms < min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)):
@@ -3706,7 +3705,8 @@ class NaviPlugin:
             depth = snapshot[1] or {}
             original_depth_ms = origin.forward_check.depth_ms
             depth_deadline = original_depth_ms + min(max_age, self._config.depth_age_limit_ms)
-            newer_exposure = ((depth.get("capture_ms") or 0) > original_depth_ms
+            latest_ms = depth.get("frame_id") if depth.get("receipt_timed") else depth.get("capture_ms")
+            newer_exposure = ((latest_ms or 0) > original_depth_ms
                               and depth_deadline - now_ms <= period)
             renew = (slow_first_send or newer_exposure) and self._fresh_first_send(origin, snapshot, now_ms)
             # A fixed-window check can match a new detector frame without
@@ -3983,7 +3983,7 @@ class NaviPlugin:
                     now_ms = int(time.time() * 1000)
                     max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
                     fresh = (depth is not None and not depth.get("capture_invalid")
-                             and 0 <= now_ms - (depth.get("capture_ms") or depth["frame_id"]) < max_age)
+                             and 0 <= now_ms - depth_mod.observation_ms(depth) < max_age)
                     if not fresh and self._retain_checked_route(active, now_ms):
                         self._last_decision.reason = "等待有效深度，当前指令保留到原截止时间"
                         return True
@@ -4099,6 +4099,7 @@ class NaviPlugin:
             frame, ground = self._depth_map, self._depth_ground
             projection = self._depth_projection
             received, captured = self._depth_ms, self._depth_capture_ms
+            receipt_timed = self._depth_vendor.get("hardware_capture_timestamp_available") is False
             source = self._depth_source_ms
             odom_ms = self._odom_ms
         config = self._config
@@ -4108,7 +4109,7 @@ class NaviPlugin:
             return stop
         if not 0 <= now_ms - odom_ms <= self._odom_max_age_ms:
             return "局部规划：运动反馈已到期，停车后重规划", True
-        depth_ms = min(received, captured) if captured is not None else received
+        depth_ms = received if receipt_timed or captured is None else min(received, captured)
         if (work.depth_grid is not None and source is not None and work.depth_grid[0] is not None
                 and source <= work.depth_grid[0]):
             if source < work.depth_grid[0]:
@@ -4136,7 +4137,8 @@ class NaviPlugin:
         velocity = max(math.hypot(*v) for v in velocities)
         keep = policy_mod._keepout_m(config)
         radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), keep)
-        padding = (velocity + radius * abs(feedback.motion[2])) * (now_ms - depth_ms) / 1000
+        scene_ms = min(depth_ms, captured or depth_ms)
+        padding = (velocity + radius * abs(feedback.motion[2])) * (now_ms - scene_ms) / 1000
         reason = leg.check(feedback.pose, feedback.motion, previous, command, work.depth_grid[2],
                            keep, horizon, brake_horizon, padding=padding)
         if reason is not None:
@@ -5146,8 +5148,8 @@ class NaviPlugin:
         if person and track.observed and track.front_box and track.measured_point is not None:
             fix = track.measured_point
             now_ms = int(time.time() * 1000)
-            if (fix.box == track.front_box and fix.capture_ms
-                    and 0 <= now_ms - fix.capture_ms < self._config.depth_age_limit_ms
+            if (fix.box == track.front_box and fix.observation_ms
+                    and 0 <= now_ms - fix.observation_ms < self._config.depth_age_limit_ms
                     and track.front_fix is not None and track.since_obs_s * 1000 < self._config.max_obs_age_ms
                     and 0 <= now_ms - objects_ms < self._config.max_obs_age_ms
                     and observation_source(objects) == track.source

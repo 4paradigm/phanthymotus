@@ -2070,6 +2070,29 @@ def test_late_depth_can_be_replaced_before_a_fast_first_send(monkeypatch, update
             assert end == original_end
 
 
+@pytest.mark.parametrize("obstacle", [False, True])
+def test_receipt_timed_depth_rechecks_first_send_and_repeat(monkeypatch, obstacle):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    snapshot[0][1].update(receipt_timed=True, capture_ms=100, source_frame_id=100)
+    message = card.next_command()
+    assert message["values"][0] > 0 and message["obs_stamp_ms"] == 1000
+    assert card._stage_command(message, card._output_epoch)
+    assert packets[-1]["values"][0] > 0
+    advance_snapshot(snapshot, clock, 1100)
+    snapshot[0][1].update(capture_ms=150, source_frame_id=150)
+    snapshot[0][2].update(received_speed_ms=1100, component_speed_ms=1100)
+    if obstacle:
+        snapshot[0][1]["map"][220:370, 302:338] = .10
+    card._dispatch_command()
+    assert len(packets) == 2
+    if obstacle:
+        assert not any(packets[-1]["values"])
+        assert card._dwa_publication["reason"] == "footprint_collision"
+    else:
+        assert packets[-1]["values"][0] > 0
+
+
 def test_slow_first_send_uses_one_check_for_the_new_window(monkeypatch):
     card, packets, clock, snapshot, message = selected_card(monkeypatch, live_target=True)
     old_end = message["stamp_ms"] + message["ttl_ms"]

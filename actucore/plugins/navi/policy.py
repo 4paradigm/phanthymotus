@@ -70,7 +70,7 @@ from .camera import half_fov as _resolve_half_fov
 from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, CAMERA_OCCUPANCY_MEMORY_RANGE_M, MAP_AGE_MS, ODOM_GAP_MS,
                           NearProjection, SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW,
                           TURN_SPEED_REDUCTION, confirmed_square_coverage, relative_pose_at)
-from .depth import has_valid_returns
+from .depth import has_valid_returns, observation_ms
 from .track import AssociationSnapshot, ObservationFrame, Track, Tracker, observation_source, observation_transform, target_objects
 from . import local_path
 from . import dwa
@@ -3332,10 +3332,10 @@ def dwa_measured_target(track, geometry, now_ms, depth_age_ms, registration, *, 
     fix = track.measured_point
     if fix is None:
         return None
-    if fix.capture_ms is None:
+    if fix.observation_ms is None:
         if track.measured_range_m is None:
             return None
-    elif not 0 <= now_ms - fix.capture_ms < depth_age_ms:
+    elif not 0 <= now_ms - fix.observation_ms < depth_age_ms:
         return None
     point, frame = fix.standoff_point or fix.point, fix.frame
     stamp, pose = fix.capture_ms or track_ms, fix.capture_pose
@@ -4252,8 +4252,9 @@ def _preview_corridor_corner(depth, config, state, geometry, distance, bearing):
         if config.odom_expected or state.dwa_progress.requires_feedback:
             return None
         capture = depth.get("capture_ms") or scan.current_frame
-        age = ((depth.get("control_ms") or scan.current_frame) - capture) / 1000
-        if not 0 <= age < config.depth_age_limit_ms / 1000:
+        control_ms = depth.get("control_ms") or scan.current_frame
+        age = (control_ms - capture) / 1000
+        if not 0 <= control_ms - observation_ms(depth, scan.current_frame) < config.depth_age_limit_ms:
             return None
         command = camera_route_command(route, grid[1], config, target, config.vx_max, state.commanded,
                                        state.command_tail, age, state.dwa_admission_ms / 1000, require_turn=False)
@@ -4268,7 +4269,8 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
     control_ms = depth.get("control_ms") or scan.current_frame
     capture_ms = depth.get("capture_ms") or scan.current_frame
     age_s = (control_ms - capture_ms) / 1000
-    if not 0 <= age_s < config.depth_age_limit_ms / 1000 or not scan.matches_route_view(depth):
+    if (not 0 <= control_ms - observation_ms(depth, scan.current_frame) < config.depth_age_limit_ms
+            or not scan.matches_route_view(depth)):
         return None
     target = (None if corner_only else
               local_path.target_in_grid(geometry, distance * math.cos(bearing), distance * math.sin(bearing)))

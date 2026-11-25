@@ -1832,7 +1832,7 @@ def test_planning_rejects_depth_already_expired_by_the_downstream_limit(monkeypa
     card.next_command()
 
 
-@pytest.mark.parametrize("header_age", [None, 750, 1700])
+@pytest.mark.parametrize("header_age", [None, 750, 1109, 1700])
 def test_unsynchronized_depth_plans_from_receipt_and_expires_on_silence(monkeypatch, header_age):
     import numpy as np
 
@@ -1842,7 +1842,7 @@ def test_unsynchronized_depth_plans_from_receipt_and_expires_on_silence(monkeypa
     now = [2000]
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
     source = None if header_age is None else now[0] - header_age
-    card._set_depth_map(np.ones((8, 8)), capture_ms=source, received_ms=1980)
+    card._set_depth_map(np.ones((8, 8)), capture_ms=source, received_ms=1730)
     inputs = []
 
     def step(**kwargs):
@@ -1854,13 +1854,11 @@ def test_unsynchronized_depth_plans_from_receipt_and_expires_on_silence(monkeypa
     monkeypatch.setattr(navi_plugin.policy_mod, "step", step)
     message = card.next_command()
     depth, budget = inputs[-1]
-    assert depth["frame_id"] == 1980 and depth["receipt_timed"]
+    assert depth["frame_id"] == 1730 and depth["receipt_timed"]
     assert not depth.get("capture_invalid") and budget() > 0.
     assert depth.get("capture_ms") == source
-    if header_age == 1700:
-        assert not any(message["values"])
-    else:
-        assert message["values"][0] > 0. and message["obs_stamp_ms"] == (source or 1980)
+    assert message["values"][0] > 0. and message["obs_stamp_ms"] == 1730
+    assert not card.observation(with_capture_timing=True)[1].get("capture_invalid")
     now[0] = 3200
     card.next_command()
     assert inputs[-1][0] is None

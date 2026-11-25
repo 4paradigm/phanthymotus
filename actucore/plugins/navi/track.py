@@ -76,6 +76,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .depth import observation_ms
 from .odom import PlanarPose
 
 TENTATIVE = "tentative"    # seen, not yet trusted enough to move a robot
@@ -146,6 +147,11 @@ class MeasuredPoint:
     capture_pose: PlanarPose | None
     standoff_point: tuple[float, float] | None = None
     box: tuple | None = None
+    received_ms: int | None = None
+
+    @property
+    def observation_ms(self):
+        return self.received_ms if self.received_ms is not None else self.capture_ms
 
 
 @dataclass(frozen=True)
@@ -241,7 +247,8 @@ class Track:
         self.measured_range_m = range_m
         self.measured_point = MeasuredPoint(
             tuple(point), self.frame, depth.get("capture_ms") or depth.get("frame_id") or depth.get("control_ms"),
-            depth.get("obstacle_capture_pose"), standoff_point, self.front_box)
+            depth.get("obstacle_capture_pose"), standoff_point, self.front_box,
+            depth.get("frame_id") if depth.get("receipt_timed") else None)
 
     def snapshot(self, reference_ms):
         return AssociationSnapshot(
@@ -731,7 +738,7 @@ class Tracker:
         track.front_reference = point
         # Frame reception and processing may already have used part of
         # the depth budget. Reading this frame again cannot renew it.
-        stamp = depth.get("frame_id") if depth.get("receipt_timed") else depth.get("capture_ms") or depth.get("frame_id")
+        stamp = observation_ms(depth)
         now = depth.get("control_ms")
         track.front_age_s = (max(0, now - stamp) / 1000
                              if type(now) is int and type(stamp) is int else 0.)
