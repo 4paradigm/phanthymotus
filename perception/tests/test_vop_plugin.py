@@ -399,7 +399,26 @@ def test_stream_can_publish_tracking_preview_with_bboxes_disabled():
     jpeg = image_pub.messages[0]
     image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
     assert image.shape == (100, 200, 3)
-    assert image[40, 70].max() > 100
+    # The label touches the top edge. Its text rasterization and JPEG
+    # artifacts differ across OpenCV builds, so check the unobstructed edge.
+    bottom_edge = image[88:93, 48:93]
+    assert np.count_nonzero(bottom_edge.max(axis=2) > 100) >= 40
+
+
+def test_info_declares_overlay_for_configured_instance_before_start():
+    plugin, _ = _plugin()
+    plugin.dispatch("vop", {
+        "action": "config", "instance_id": "preview-card", "publish_overlay": True,
+    })
+    base = {"action": "info", "input_topic": "/cam/rgb"}
+    preview = plugin.dispatch("vop", dict(base, instance_id="preview-card"))
+    plain = plugin.dispatch("vop", dict(base, instance_id="other-card"))
+    assert preview["state"] == "idle"
+    assert preview["instances"] == {}
+    assert plain["topic_out"] == [{"topic": "/cam/rgb/objects", "format": "data/json"}]
+    assert preview["topic_out"] == plain["topic_out"] + [
+        {"topic": "/cam/rgb/objects/overlay_img", "format": "image/jpeg"},
+    ]
 
 
 def test_stream_uses_weak_boxes_without_publishing_them(monkeypatch):
