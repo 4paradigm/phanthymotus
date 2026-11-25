@@ -1,0 +1,9 @@
+2026-10-22 本地测试记录（从已执行终端结果摘录）
+项目：4paradigm/phanthymotus；提交PR前复核
+命令：python3 -B -m unittest discover -s skills/bumi-platform-guide/tests -v
+
+Ran 18 tests in 0.469s
+OK
+
+附加只读检查：全部Python文件AST解析、JSON文件解析通过；交付skill.json与当前配置/渲染器输出一致。
+测试使用临时SQLite数据库，不连接真机；不代表平台LLM、扬声器或视觉验收通过。

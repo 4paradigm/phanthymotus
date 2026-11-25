@@ -1,0 +1,15 @@
+{
+  "driver_url": null,
+  "perception_url": null,
+  "vision_topic": null,
+  "asr_topic": null,
+  "audio_topic": null,
+  "wave": {"recording_id": 101, "window_s": null, "measured": false},
+  "point_a": {"recording_id": 104, "window_s": null, "measured": false},
+  "person_hold_s": 1,
+  "absent_rearm_s": 5,
+  "vision_max_age_s": 2,
+  "reminder_gap_s": 2,
+  "speech_timeout_s": 60,
+  "audio_tail_s": 0.5
+}
