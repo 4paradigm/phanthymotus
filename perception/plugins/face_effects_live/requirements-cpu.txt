@@ -1,0 +1,9 @@
+# Install in a dedicated venv/container, not into a shared perception runtime.
+numpy>=1.26,<3
+opencv-python-headless>=4.10,<6
+onnxruntime==1.23.2
+psutil>=5.9
+
+# Optional EGL desktop OpenGL renderer: moderngl==5.12.0
+# Jetson: use a JetPack-compatible OpenCV and ORT build; do not install this
+# x86 benchmark environment over vendor CUDA/OpenCV/ROS packages.

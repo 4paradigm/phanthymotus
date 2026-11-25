@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Face Effects Live · 离线验收</title>
+<style>
+body{margin:24px;background:#10151b;color:#e9eff5;font:16px system-ui;max-width:1100px}h1{font-size:25px}section{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:16px 0}input,select,button{font:inherit;padding:8px;background:#233140;color:inherit;border:1px solid #586b7f;border-radius:6px}input{min-width:280px}canvas{display:block;background:#000;width:100%;max-height:65vh;object-fit:contain;border:1px solid #586b7f}pre{white-space:pre-wrap;color:#bcd1df}small{color:#b1bdc9}
+</style>
+<h1>Face Effects Live <small>离线 Canvas 验收</small></h1>
+<p>选择本地视频路径后启动。画面在本机处理；模型和源需在服务端配置。</p>
+<section><label>视频文件 <input id="path" placeholder="本机可读视频路径"></label><button id="start">启动回放</button><button id="stop">停止</button><label>特效 <select id="effect"><option value="all">全部</option><option>crown</option><option>glasses</option><option>orbit</option><option value="none">关闭特效</option></select></label></section>
+<canvas id="view" width="1280" height="720" aria-label="实时特效画面"></canvas>
+<p id="notice" role="status">尚未启动</p><details><summary>验收诊断数据</summary><pre id="status"></pre></details>
+<script type="module">
+const $=id=>document.getElementById(id), ctx=$('view').getContext('2d');
+let id=0, closed=false;
+async function call(action,extra={}) {
+ const response=await fetch('/mcp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:++id,method:'tools/call',params:{name:'face_effects_live',arguments:{action,...extra}}})});
+ const rpc=await response.json(); if(rpc.error) throw Error(rpc.error.message);
+ const result=JSON.parse(rpc.result.content[0].text); if(!result.ok) throw Error(result.error||'操作失败'); return result;
+}
+function error(e){$('notice').textContent=e.message;}
+$('start').onclick=async()=>{try{await call('start',{source_kind:'file',source_uri:$('path').value});$('notice').textContent='回放中';}catch(e){error(e);}};
+$('stop').onclick=async()=>{try{await call('stop');ctx.clearRect(0,0,$('view').width,$('view').height);$('notice').textContent='已停止';}catch(e){error(e);}};
+$('effect').onchange=()=>{const e=$('effect').value;call('select_effects',{effects:e==='all'?['crown','glasses','orbit']:e==='none'?[]:[e]}).catch(error);};
+async function update(){
+ try{
+  const [frame,status]=await Promise.all([fetch('/frame.jpg'),fetch('/status').then(r=>r.json())]);
+  if(frame.status===200){const bitmap=await createImageBitmap(await frame.blob());$('view').width=bitmap.width;$('view').height=bitmap.height;ctx.drawImage(bitmap,0,0);bitmap.close();}
+  else{ctx.clearRect(0,0,$('view').width,$('view').height);}
+  $('status').textContent=JSON.stringify({state:status.state,error:status.error,input_error:status.input_error,processed:status.processed,overwritten:status.overwritten,latency_ms:status.latency_ms,result:status.result},null,2);
+ }catch(e){error(e);}
+ if(!closed)setTimeout(update,34);
+}
+window.addEventListener('pagehide',()=>{closed=true;});update();
+</script></html>

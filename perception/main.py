@@ -122,6 +122,14 @@ class PerceptionBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        if plugins_cfg.get("face_effects_live", {}).get("enabled", False):
+            try:
+                from plugins.face_effects_live.plugin import FaceEffectsLivePlugin
+                self._plugins.append(FaceEffectsLivePlugin(plugins_cfg["face_effects_live"], executor))
+                log.info("FaceEffectsLivePlugin loaded")
+            except Exception:
+                log.error("FaceEffectsLivePlugin failed to load", exc_info=True)
+
         # Built before ASR, and that order is load-bearing: ASR takes a handle
         # to this plugin so the voiceprint can be computed on the VAD segment it
         # already cut, concurrently with transcription. The handle is optional —
@@ -389,7 +397,9 @@ def make_handler():
             if self.path in ("/vad/test", "/tts/test"):
                 self._send(405, '{"error":"Use POST"}')
                 return
-            if self.path.split("?")[0] == "/sse":
+            # Core appends /sse to the registered /mcp URL. Retain the old
+            # direct endpoint while supporting that actual host contract.
+            if self.path.split("?")[0] in ("/sse", "/mcp/sse"):
                 # SSE streaming endpoint for ACP completion events
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -568,10 +578,11 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     music_call = (name == 'phanthy_music' or name.startswith('phanthy_music_')
-                  or name == 'audio_mixer' or name.startswith('audio_mixer_'))
+                  or name == 'audio_mixer' or name.startswith('audio_mixer_')
+                  or name == 'face_effects_live' or name.startswith('face_effects_live_'))
                     if not is_info:
                         if music_call:
-                            log.info("[mcp] tools/call: phanthy_music (payload omitted)")
+                            log.info("[mcp] tools/call: %s (payload omitted)", name)
                         else:
                             log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
@@ -593,7 +604,7 @@ def make_handler():
                     else:
                         if not is_info:
                             if music_call:
-                                log.info("[mcp] phanthy_music result received (payload omitted)")
+                                log.info("[mcp] %s result received (payload omitted)", name)
                             else:
                                 log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})

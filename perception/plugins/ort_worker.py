@@ -320,6 +320,10 @@ class OrtWorker:
         a name: a spawned child cannot be handed a closure, and a name means it imports
         the same implementation rather than a copy. This class still knows nothing about
         what it is hosting.
+
+        A service can request a worker-owned ONNX session with `_ort_session`
+        (model_path, providers and options). Its factory receives `session`
+        in the child, including when the worker rebuilds the service.
         """
         with self._lock:
             self._closed = False
@@ -361,6 +365,25 @@ class OrtWorker:
                 log.warning("[ort] worker died; restarting and reloading its sessions")
                 self._ensure_started()
             return self._request(("run", key, output_names, feeds, post_kwargs),
+                                 timeout=RUN_TIMEOUT_S)
+
+    def run_many(self, key: str, output_names, feeds_batch, post_kwargs=None,
+                 preprocess=None, profile=False):
+        """Run 1..8 fixed-shape observations in one bounded RPC, in input order.
+
+        This is repeated inference, not a change to the ONNX batch dimension.
+        Existing run/session/provider/restart semantics remain unchanged. The
+        bound prevents one caller from submitting an unbounded worker job.
+        """
+        if not isinstance(feeds_batch, (list, tuple)) or not 1 <= len(feeds_batch) <= 8:
+            raise ValueError("run_many requires 1..8 input feeds")
+        with self._lock:
+            if self._closed:
+                raise OrtWorkerError("the ORT worker is closed")
+            if not self.alive:
+                self._ensure_started()
+            return self._request(("run_many", key, output_names, feeds_batch, post_kwargs,
+                                  preprocess, profile),
                                  timeout=RUN_TIMEOUT_S)
 
     def _request(self, command, timeout: float):
@@ -413,6 +436,10 @@ class OrtSessionProxy:
     def run(self, output_names, feeds, run_options=None, post_kwargs=None):
         del run_options                     # never used by either caller
         return self._worker.run(self._key, output_names, feeds, post_kwargs)
+
+    def run_many(self, output_names, feeds_batch, post_kwargs=None, preprocess=None, profile=False):
+        return self._worker.run_many(self._key, output_names, feeds_batch, post_kwargs,
+                                     preprocess, profile)
 
     def get_providers(self):
         return list(self._providers)
@@ -526,6 +553,27 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
         return [{"name": e.name, "shape": list(e.shape), "type": e.type}
                 for e in entries]
 
+    def _create_session(model_path, providers, options):
+        opts = ort.SessionOptions()
+        if options.get("intra_op_num_threads") is not None:
+            opts.intra_op_num_threads = int(options["intra_op_num_threads"])
+        if options.get("log_severity_level") is not None:
+            opts.log_severity_level = int(options["log_severity_level"])
+        for config_key, config_value in (options.get("session_config") or {}).items():
+            opts.add_session_config_entry(str(config_key), str(config_value))
+        level = options.get("graph_optimization_level")
+        if level:
+            opts.graph_optimization_level = getattr(
+                ort.GraphOptimizationLevel, level)
+        # Positionally aligned with `providers`, e.g.
+        # [{"cudnn_conv_algo_search": "HEURISTIC"}, {}] — see
+        # kokoro_direct.py for why Kokoro's Japanese session needs this.
+        provider_options = options.get("provider_options")
+        if provider_options:
+            return ort.InferenceSession(model_path, opts, providers=providers,
+                                        provider_options=provider_options)
+        return ort.InferenceSession(model_path, opts, providers=providers)
+
     while True:
         try:
             command = cmd_q.get()
@@ -538,25 +586,8 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
         try:
             if verb == "load":
                 _, _, key, model_path, providers, options, postprocess = command
-                opts = ort.SessionOptions()
-                if options.get("intra_op_num_threads") is not None:
-                    opts.intra_op_num_threads = int(options["intra_op_num_threads"])
-                if options.get("log_severity_level") is not None:
-                    opts.log_severity_level = int(options["log_severity_level"])
-                level = options.get("graph_optimization_level")
-                if level:
-                    opts.graph_optimization_level = getattr(
-                        ort.GraphOptimizationLevel, level)
-                # Positionally aligned with `providers`, e.g.
-                # [{"cudnn_conv_algo_search": "HEURISTIC"}, {}] — see
-                # kokoro_direct.py for why Kokoro's Japanese session needs this.
-                provider_options = options.get("provider_options")
                 started = time.monotonic()
-                if provider_options:
-                    sess = ort.InferenceSession(model_path, opts, providers=providers,
-                                                provider_options=provider_options)
-                else:
-                    sess = ort.InferenceSession(model_path, opts, providers=providers)
+                sess = _create_session(model_path, providers, options)
                 post = None
                 if postprocess:
                     module = importlib.import_module(postprocess["module"])
@@ -577,7 +608,12 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
                 _, _, key, module_name, func_name, kwargs = command
                 module = importlib.import_module(module_name)
                 started = time.monotonic()
-                obj = getattr(module, func_name)(**kwargs)
+                factory = getattr(module, func_name)
+                session_spec = kwargs.pop("_ort_session", None)
+                if session_spec is None:
+                    obj = factory(**kwargs)
+                else:
+                    obj = factory(session=_create_session(**session_spec), **kwargs)
                 services[key] = obj
                 describe = getattr(obj, "describe", None)
                 wlog.info("built service %s from %s.%s in %.2fs",
@@ -626,6 +662,37 @@ def _ort_worker_main(cmd_q, res_q, log_level: int) -> None:
                     # candidates already lives, and the caller wants the survivors.
                     outputs = post(outputs, **(post_kwargs or {}))
                 res_q.put((req_id, "ok", outputs))
+
+            elif verb == "run_many":
+                _, _, key, output_names, feeds_batch, post_kwargs, preprocess, profile = command
+                if not isinstance(feeds_batch, (list, tuple)) or not 1 <= len(feeds_batch) <= 8:
+                    raise ValueError("run_many requires 1..8 input feeds")
+                entry = sessions.get(key)
+                if entry is None:
+                    raise ValueError(f"session {key!r} is not loaded in the worker")
+                sess, post = entry
+                prepare = None
+                if preprocess:
+                    module = importlib.import_module(preprocess['module'])
+                    prepare = getattr(module, preprocess['func'])
+                replies = []; preparation = inference = postprocessing = 0.
+                for feeds in feeds_batch:
+                    started = time.perf_counter()
+                    if prepare is not None:
+                        feeds = prepare(feeds, **preprocess.get('kwargs', {}))
+                    prepared = time.perf_counter()
+                    outputs = sess.run(output_names, feeds)
+                    inferred = time.perf_counter()
+                    if post is not None:
+                        outputs = post(outputs, **(post_kwargs or {}))
+                    finished = time.perf_counter()
+                    preparation += (prepared-started)*1000
+                    inference += (inferred-prepared)*1000
+                    postprocessing += (finished-inferred)*1000
+                    replies.append(outputs)
+                payload = {'outputs':replies,'worker_prepare_ms':preparation,
+                           'worker_inference_ms':inference,'worker_post_ms':postprocessing} if profile else replies
+                res_q.put((req_id, "ok", payload))
 
             else:
                 res_q.put((req_id, "error", f"unknown verb {verb!r}"))

@@ -1,0 +1,12 @@
+# OPTIONAL offline alternative/ROI backend. Use a NEW pure venv, not the
+# default Core/ROS environment: MP requires protobuf<5 and host packages may
+# require protobuf>=6. Full clean resolution and Face Tasks inference tested
+# on Linux x86_64 Python3.11. Actual resolved versions are in evidence/round2.
+mediapipe==0.10.21
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+onnxruntime==1.23.2
+psutil==7.1.3
+jax==0.4.35
+jaxlib==0.4.35
+matplotlib==3.9.4
