@@ -565,20 +565,36 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     # tracking corrections already use the regular route score and Driver ramp.
     transition_slot = bool(slots > 1 and handoff_yaw_step > 0. and any(previous[:2])
                            and abs(previous[2]) > 2 * handoff_yaw_step)
-    slots -= int(transition_slot)
+    entry_slot = (slots > 1 and guidance and not follow_published and target is not None
+                  and any(yaw_limit) and any(abs(r - ref[0][1]) >= local_path.RESOLUTION / 2
+                                             for ref in routes for _, r in ref[1:]))
+    slots -= int(transition_slot or entry_slot)
     obstacles = local_path.occupied_squares(grid[1]) if occupied is None else occupied
     context = MotionContext(measured, previous, horizon, latency_s, geometry, footprint, obstacles, remembered,
                             supported_region, target, stop_distance, acceleration, braking, rotation_center,
                             terminal_boundary, motion_frame, measured_target)
 
     def interpolate(choice, room=math.inf):
-        if not transition_slot or choice is None or not any(choice.command[:2]) or budget.expired():
+        if not (transition_slot or entry_slot) or choice is None or not any(choice.command[:2]) or budget.expired():
             return choice
         vx, vy, wz = choice.command
         delta = wz - previous[2]
-        if abs(wz) >= handoff_yaw_step or abs(delta) <= 2 * handoff_yaw_step:
-            return choice
-        command = vx, vy, previous[2] + math.copysign(handoff_yaw_step, delta)
+        entering = entry_slot and vx > 0. and vy == wz == 0.
+        if entering:
+            # Track the selected reference at the incoming forward speed.
+            # The first packet can turn without reopening the route decision.
+            body_origin = ((rotation_center or ((geometry.front - geometry.rear) / 2, 0.))
+                           if footprint_mode == "camera_approx" else (0., 0.))
+            tracked = track_route(routes[choice.reference_index], vx, horizon, yaw_limit,
+                                  body_origin=body_origin, lateral=False,
+                                  lookahead_m=max(.45, x_speed * horizon), yaw_floor=floors[3])
+            if tracked is None or not tracked[0][2]:
+                return choice
+            command = vx, 0., tracked[0][2]
+        else:
+            if not transition_slot or abs(wz) >= handoff_yaw_step or abs(delta) <= 2 * handoff_yaw_step:
+                return choice
+            command = vx, vy, previous[2] + math.copysign(handoff_yaw_step, delta)
         if not _legal_command(command, limits, floors):
             return choice
         budget.remaining -= 1
@@ -601,7 +617,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         if validate_candidate is not None and not validate_candidate(command, poses, prediction.duration).accepted:
             return choice
         components = replace(components, obstacle=_obstacle_score(check))
-        diag["handoff_yaw_interpolated"] = True
+        diag["entry_arc_selected" if entering else "handoff_yaw_interpolated"] = True
         diag["admissible_candidates"] += 1
         return Choice(command, poses[:prediction.moving_count], components.total, progress,
                       check.min_clearance_m, prediction, check, components, choice.reference_index)

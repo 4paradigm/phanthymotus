@@ -186,6 +186,27 @@ def test_dwa_is_default_and_has_bounded_configuration():
 STRAIGHT = ((0., 0.), (.8, 0.))
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+@pytest.mark.parametrize("arc_clear", [False, True])
+def test_new_detour_prefers_a_checked_first_arc_on_its_selected_side(side, arc_clear):
+    route = ((0., 0.), (.65, side * .12), (1.4, side * .28))
+    straight = (.20, 0., 0.)
+    arc, _ = dwa.track_route(route, .20, 1., (-.7, .7), body_origin=(0., 0.),
+                             lateral=False, yaw_floor=.04)
+    assert arc[2] * side < 0.
+    swept = []
+
+    def visible(command, poses, duration):
+        swept.append(command)
+        return dwa.CandidateCheck(command == straight or (arc_clear and command == arc), "occluded_prefix")
+
+    choice = _run(route, previous=straight, measured=straight, x_limit=(0., .20),
+                  candidate_budget=dwa.CandidateBudget(64), guidance=True, validate_candidate=visible)
+    assert arc in swept
+    assert choice.check.accepted
+    assert choice.command == (arc if arc_clear else straight)
+
+
 @pytest.mark.parametrize("follow_published", [False, True])
 @pytest.mark.parametrize("allow_transition", [False, True])
 def test_moving_arc_handoff_sweeps_interpolated_yaw(follow_published, allow_transition):

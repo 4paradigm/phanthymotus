@@ -4230,7 +4230,8 @@ def _preview_corridor_corner(depth, config, state, geometry, distance, bearing):
     return _use_dwa(state, proposal, math.copysign(1., route.points[-1][1])) if proposal is not None else None
 
 
-def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *, ahead=None, corner_only=False):
+def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
+                   ahead=None, corner_only=False, retain_only=False):
     scan = state.active_scan
     control_ms = depth.get("control_ms") or scan.current_frame
     capture_ms = depth.get("capture_ms") or scan.current_frame
@@ -4257,7 +4258,7 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *, ahe
     command = (camera_route_command(route, grid[1], config, target, vx, state.commanded,
                                     state.command_tail, age_s, admission, require_turn=False) if route else None)
     retained = command is not None
-    if not retained and (corner_only or ahead is None):
+    if not retained and (corner_only or ahead is None or retain_only):
         return None
     if command is None:
         width = _keepout_m(config)
@@ -4348,11 +4349,11 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     local_command = None
     local_route = None
     dwa_lateral_routes = []
-    if (config.local_controller == "dwa" and not config.odom_expected and scan is not None
-            and scan.command_only and not state.dwa_progress.requires_feedback and scan.current_frame
-            and geometry is not None and may_scan and vx > 0. and target_distance is not None
-            and target_bearing is not None and ((foreground and approaching)
-                                                 or state.published_camera_passage is not None)):
+    camera_detour = (config.local_controller == "dwa" and not config.odom_expected and scan is not None
+                     and scan.command_only and not state.dwa_progress.requires_feedback and scan.current_frame
+                     and geometry is not None and may_scan and vx > 0. and target_distance is not None
+                     and target_bearing is not None)
+    if camera_detour and ((foreground and approaching) or state.published_camera_passage is not None):
         arc = _camera_detour(depth, config, state, geometry, vx, target_distance, target_bearing,
                              ahead=ahead if foreground and approaching else None)
         if arc is not None:
@@ -4439,6 +4440,14 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         corridor_clear = _target_corridor_clear(
             depth, config, scan, target_distance, target_bearing, (motion, state.commanded, (vx, vy, yaw)))
         needs_detour = not corridor_clear
+    if (camera_detour and observed_obstacle and needs_detour
+            and (state.published_camera_passage is not None
+                 or (state.goal_anchor is None and not scan.attempted
+                     and abs(target_bearing) >= config.align_tol * config.half_fov_rad))):
+        arc = _camera_detour(depth, config, state, geometry, vx, target_distance, target_bearing, ahead=ahead,
+                             retain_only=state.published_camera_passage is not None)
+        if arc is not None:
+            return arc
 
     scale = 1.
     if corridor_clear:
