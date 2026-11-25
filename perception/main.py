@@ -12,6 +12,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   measure          物体可见宽高测量（VOP + 深度 + camera_info）
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
+  table_db         表格数据库（导入 xlsx/csv，增删改查与计数，SQLite，只用标准库）
   pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
 
@@ -266,6 +267,15 @@ class PerceptionBundle:
             self._plugins.append(BarcodeScanPlugin(plugins_cfg["barcode"], executor))
             log.info("BarcodeScanPlugin loaded")
 
+        # Standard library only (sqlite3 + zipfile): nothing to download, so the
+        # constructor cannot fail on a machine without extra wheels. Lives here,
+        # not in agent-core, because the files it hands out must be readable by
+        # face_recognition / ocr / vop under this container's /models.
+        if plugins_cfg.get("table_db", {}).get("enabled", False):
+            from plugins.table_db import TableDbPlugin
+            self._plugins.append(TableDbPlugin(plugins_cfg.get("table_db", {}), executor))
+            log.info("TableDbPlugin loaded")
+
         if plugins_cfg.get("soundevent", {}).get("enabled", False):
             from plugins.soundevent import SoundEventPlugin
             self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
@@ -407,6 +417,29 @@ def make_handler():
                     with _sse_lock:
                         if client_queue in _sse_clients:
                             _sse_clients.remove(client_queue)
+                return
+            # Plugins may serve a GET route of their own (table_db hands stored
+            # files to browsers, vision cards and agent-core, none of which can
+            # read this container's /models). The plugin authorises the request
+            # itself: its links are consumed by clients that cannot add headers,
+            # so it signs them (see TableDbPlugin.handle_http_get).
+            for plugin in (_bundle._plugins if _bundle is not None else []):
+                handler = getattr(plugin, "handle_http_get", None)
+                if handler is None:
+                    continue
+                served = handler(self.path, dict(self.headers))
+                if served is None:
+                    continue
+                status, body, content_type, filename = served
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                if filename:
+                    from urllib.parse import quote
+                    self.send_header("Content-Disposition",
+                                     "attachment; filename*=UTF-8''%s" % quote(filename))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             self.send_response(404)
             self.end_headers()

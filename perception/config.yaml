@@ -431,6 +431,23 @@ plugins:
     # 码里的内容是不可信输入，会直接进 LLM 的上下文 —— 这是对那个暴露面的上限
     max_text_chars: 2048
 
+  # 表格数据库：skill 用自己的库（db = skill slug）维护条目，可导入飞书发来的
+  # SQLite 数据表卡片：单库表级 CRUD（tables / create_table / drop_table /
+  # insert / select / update / delete）与 .csv / .xlsx 导入导出（import / export）。
+  # 列类型遵循 SQLite 标准（TEXT / INTEGER / REAL / BLOB），文件以 BLOB 存储。
+  table_db:
+    enabled: true
+    # 数据存于 <data_dir>/table_db.db；export 导出的临时文件在 cache/ 下，24 小时过期。
+    data_dir: /models/table_db
+    max_file_bytes: 8388608         # 单个 BLOB 文件 8 MiB
+    max_import_bytes: 67108864      # 导入的表格文件 64 MiB
+    max_cache_bytes: 536870912      # export 缓存总上限 512 MiB
+    max_db_bytes: 2147483648        # 数据库文件上限 2 GiB
+    max_rows: 20000                 # 单表行数
+    max_columns: 64
+    max_tables: 50                  # 表数量上限
+    max_cell_chars: 2000            # 单格 TEXT 上限
+
   soundevent:
     enabled: true
   # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的

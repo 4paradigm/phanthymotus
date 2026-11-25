@@ -3258,8 +3258,11 @@ function _syncEmptyState() {
   }
 }
 
+// Quotes too: descriptions land in placeholder="..." / title="...", and a driver
+// whose description carried a JSON example used to cut the attribute short.
 function _esc(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ── Editor Lock UI ───────────────────────────────────────────────────────────
