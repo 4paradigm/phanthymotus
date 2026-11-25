@@ -880,7 +880,11 @@ class OCRPlugin:
                 # The instance goes back to idle; the next start picks up the
                 # merged per-instance configuration.
                 self._dispose(instance_id, retired)
-            return {"status": "configured", "instance_id": instance_id}
+            # Ack echoes the effective merged config — the readback channel for
+            # the round-trip contract (tests/test_config_contract.py).
+            return {"status": "configured", "instance_id": instance_id,
+                    "config": {**self._plugin_cfg,
+                               **self._instance_configs.get(instance_id, {})}}
 
         with self._state_lock:
             updated_cfg = {**self._plugin_cfg, **cfg}
@@ -897,7 +901,8 @@ class OCRPlugin:
                     merged = merge_rate_cfg(updated_cfg, inst)
                     node._language = merged.get("language", self._language)
                     node._min_interval = ocr_interval(merged)
-                return {"status": "configured", "adapter_loaded": self._adapter is not None, "reused": self._adapter is not None}
+                return {"status": "configured", "adapter_loaded": self._adapter is not None, "reused": self._adapter is not None,
+                        "config": updated_cfg}
 
             # Model-affecting change: invalidate any in-flight load, drop the
             # cached adapter and retire nodes built on it. Pending starts stay
@@ -916,7 +921,8 @@ class OCRPlugin:
             self._dispose(node_key, node)
         if stale_adapter is not None:
             _close_quietly(stale_adapter)
-        return {"status": "configured", "adapter_loaded": False, "reused": False}
+        return {"status": "configured", "adapter_loaded": False, "reused": False,
+                "config": updated_cfg}
 
 
 def _close_quietly(adapter) -> None:

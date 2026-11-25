@@ -566,7 +566,11 @@ class BarcodeScanPlugin:
                 node = self._nodes.get(instance_id)
                 if node is not None:
                     self._apply_window(node, {**self._plugin_cfg, **previous, **cfg})
-            return {"status": "configured", "instance_id": instance_id}
+            # Ack echoes the effective merged config — the readback channel for
+            # the round-trip contract (tests/test_config_contract.py).
+            return {"status": "configured", "instance_id": instance_id,
+                    "config": {**self._plugin_cfg,
+                               **self._instance_configs.get(instance_id, {})}}
 
         with self._state_lock:
             self._plugin_cfg = {**self._plugin_cfg, **cfg}
@@ -577,7 +581,7 @@ class BarcodeScanPlugin:
                     node,
                     {**self._plugin_cfg, **self._instance_configs.get(node_key, {})},
                 )
-        return {"status": "configured"}
+            return {"status": "configured", "config": self._plugin_cfg}
 
     @staticmethod
     def _apply_window(node: _BarcodeNode, cfg: dict) -> None:

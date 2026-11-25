@@ -1774,7 +1774,10 @@ class FaceRecognitionPlugin:
                 # detect_fps is applied in place; no reason to retire a
                 # live subscription for a frame-rate change.
                 node.apply_config(merged)
-            return {"status": "configured", "instance_id": instance_id}
+            # Ack echoes the effective merged config — the readback channel for
+            # the round-trip contract (tests/test_config_contract.py).
+            return {"status": "configured", "instance_id": instance_id,
+                    "config": merged}
 
         evicted = 0
         with self._state_lock:
@@ -1811,7 +1814,7 @@ class FaceRecognitionPlugin:
                                              DEFAULT_UNKNOWN_CAPACITY))
                 )
             result = {"status": "configured", "engine_loaded": nodes_live,
-                      "reused": nodes_live}
+                      "reused": nodes_live, "config": updated}
             if capacity_changed:
                 result["unknown_evicted"] = evicted
                 result["unknown_capacity"] = int(
@@ -1824,7 +1827,8 @@ class FaceRecognitionPlugin:
             self._dispose(node_key, node)
         if stale_engine is not None:
             _close_quietly(stale_engine)
-        return {"status": "configured", "engine_loaded": False, "reused": False}
+        return {"status": "configured", "engine_loaded": False, "reused": False,
+                "config": updated}
 
     # ── engine access for the action paths ────────────────────────────────
 

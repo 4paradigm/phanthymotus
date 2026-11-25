@@ -433,6 +433,26 @@ plugins:
 
   soundevent:
     enabled: true
+
+  # 电池状态卡：把驱动的 battery 话题（各机型字段不同）归一成一套字段，看板
+  # 用 sensor/battery 画电量表，skill 用 status 查最新读数和新鲜度。
+  #
+  # 默认开着但不占资源：没在画布上接线启动时，只有这个 facade 对象，ROS 节点
+  # 在 start 时才建。只读 —— 不告警、不发声，低电阈值和播报由 skill 决定。
+  battery_monitor:
+    enabled: true
+    # 画布没接输入时（比如只剩一张孤立卡）的兜底 topic；留空则该卡报 error。
+    input_topic: ""
+    output_topic: /perception/battery
+    # 超过这个秒数没收到新读数就标记 stale，看板置灰。驱动一般是 1 Hz，
+    # 10 s 能容忍启动抖动和偶发丢包，又不至于在机器人关机后长时间显示旧电量。
+    stale_after_s: 10
+    # 输入话题的字段命名约定。auto 只认字段名带单位的键；g1 额外认宇树 G1 的
+    # 裸字段：current(mA)、temperature(°C，电芯数组)、cell_vol(mV，电芯数组)。
+    # 字段名不带单位、又从没核对过单位的驱动（Adam、K1 的裸 current），不给
+    # profile 就不映射 —— 宁可少一个数，也不发布一个量纲错的数。
+    input_profile: auto
+
   # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的
   # 一个开关 —— soundevent 也直接订麦克风，声纹又跑在 ASR 切出来的段上，装在
   # ASR 里面只治 ASR 一家。详见 plugins/echo_cancellation.py 的模块文档。

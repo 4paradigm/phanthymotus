@@ -233,6 +233,16 @@ class PerceptionBundle:
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
             log.info("MeasurePlugin loaded")
 
+        # No model, no heavy imports: the card creates its ROS node only when
+        # the canvas starts it with a wired battery topic, so enabling it on a
+        # machine that never uses it costs one idle facade object.
+        if plugins_cfg.get("battery_monitor", {}).get("enabled", False):
+            from plugins.battery_monitor import BatteryMonitorPlugin
+            self._plugins.append(
+                BatteryMonitorPlugin(plugins_cfg["battery_monitor"], executor)
+            )
+            log.info("BatteryMonitorPlugin loaded")
+
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["pose"].get("namespace", "").strip()

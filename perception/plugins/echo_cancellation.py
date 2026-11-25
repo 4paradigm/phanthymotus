@@ -1680,7 +1680,10 @@ class EchoCancellationPlugin:
             self._do_stop(key)
             self._do_start(key, input_topic)
 
-        result = {"status": "configured"}
+        # The ack echoes the effective merged config: the round-trip contract
+        # (tests/test_config_contract.py) has no other interface-level way to
+        # observe that the keys the dialog sent were actually consumed.
+        result = {"status": "configured", "config": self._merged_cfg(instance_id)}
         if instance_id:
             result["instance_id"] = instance_id
         return result

@@ -54,6 +54,18 @@ class _FakeSubscription:
         self.qos = qos
 
 
+class _FakeTimer:
+    """Stores its callback; tests fire it by calling `timer.callback()`."""
+
+    def __init__(self, period, callback):
+        self.period = period
+        self.callback = callback
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
 class _FakeNode:
     instances: list = []
 
@@ -61,6 +73,7 @@ class _FakeNode:
         self._name = name
         self.publishers = []
         self.subscriptions = []
+        self.timers = []
         self.destroyed = False
         _FakeNode.instances.append(self)
 
@@ -76,6 +89,11 @@ class _FakeNode:
         subscription = _FakeSubscription(topic, callback, qos)
         self.subscriptions.append(subscription)
         return subscription
+
+    def create_timer(self, period, callback):
+        timer = _FakeTimer(period, callback)
+        self.timers.append(timer)
+        return timer
 
     def destroy_subscription(self, subscription):
         # Plugins drop the subscription on stop() and recreate it on the next
