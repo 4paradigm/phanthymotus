@@ -758,7 +758,7 @@ RUN set -e; \
 RUN --mount=type=cache,id=perception-rtabmap-ccache-jp${JP_VERSION},target=/var/cache/rtabmap-ccache \
     bash /tmp/build_rtabmap_ros_group.sh odom
 
-COPY perception/native/rtabmap/visual_recovery_ros.patch perception/native/rtabmap/bounded_preview_ros.patch perception/native/rtabmap/VisualRecovery.h perception/native/rtabmap/WallAlignment.h /tmp/rtabmap-visual-recovery/
+COPY perception/native/rtabmap/visual_recovery_ros.patch perception/native/rtabmap/bounded_preview_ros.patch perception/native/rtabmap/VisualRecovery.h perception/native/rtabmap/WallAlignment.h perception/native/rtabmap/GroundHeight.h /tmp/rtabmap-visual-recovery/
 RUN set -e; \
     git -C /tmp/rtabmap-ws/src/rtabmap_ros apply --check /tmp/rtabmap-visual-recovery/visual_recovery_ros.patch; \
     git -C /tmp/rtabmap-ws/src/rtabmap_ros apply /tmp/rtabmap-visual-recovery/visual_recovery_ros.patch; \
@@ -775,6 +775,7 @@ RUN set -e; \
     printf '%s\n' 'motus_visual_recovery/1' > /opt/rtabmap_ros/share/rtabmap_slam/motus_visual_recovery_v1; \
     printf '%s\n' 'motus_scan_origin_recovery/1' > /opt/rtabmap_ros/share/rtabmap_slam/motus_scan_origin_recovery_v1; \
     printf '%s\n' 'motus_chassis_origin_recovery/1' > /opt/rtabmap_ros/share/rtabmap_slam/motus_chassis_origin_recovery_v1; \
+    printf '%s\n' 'motus_temporal_ground_height/1' > /opt/rtabmap_ros/share/rtabmap_slam/motus_temporal_ground_height_v1; \
     cd /work; rm -rf /tmp/rtabmap-ws /tmp/build_rtabmap_ros_group.sh
 
 # ── Application code ───────────────────────────────────────────────

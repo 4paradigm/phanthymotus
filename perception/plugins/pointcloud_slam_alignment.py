@@ -85,6 +85,9 @@ def align_pose(samples, cloud_stamp_ns, *, max_gap_ms):
                                   prediction, continuity,
                                   sample.chassis_origin if sample.chassis_origin == previous.chassis_origin else None,
                                   sample.visual_origin if sample.visual_origin == previous.visual_origin else None,
-                                  sample.external_origin if sample.external_origin == previous.external_origin else None)
+                                  sample.external_origin if sample.external_origin == previous.external_origin else None,
+                                  gravity_aligned=bool(previous.gravity_aligned and sample.gravity_aligned and continuity
+                                      and sample.external_origin and previous.external_origin == sample.external_origin
+                                      and stamp_ns-previous.stamp_ns <= max_gap_ms*1_000_000))
             previous = sample
     raise ValueError('no numeric pose at cloud timestamp')

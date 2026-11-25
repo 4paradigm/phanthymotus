@@ -29,6 +29,7 @@ class PoseSample:
     external_origin: tuple = None
     chassis_clock_epoch: str = None
     device_stamp_ns: int = None
+    gravity_aligned: bool = False
 
     @property
     def declared_origin(self):
@@ -111,13 +112,17 @@ def decode_slam_odom(sample):
     external = (quality.get('pose_source') == 'external_fusion' and reference == 'body' and
                 all(isinstance(value, str) and value for value in origin))
     fusion = vendor.get('external_fusion')
+    gravity_stamp = fusion.get('body_gravity_stamp_ns') if isinstance(fusion, dict) else None
+    gravity_aligned = (external and type(gravity_stamp) is int and gravity_stamp > 0 and
+                       precise is not None and abs(precise-gravity_stamp) <= 50_000_000)
     if external and isinstance(fusion, dict) and fusion.get('update') == 'external':
         observed = fusion.get('observed')
         if isinstance(observed, list) and len(observed) == 6 and not all(observed[i] is True for i in (0, 1, 5)):
             raise ValueError('external motion does not constrain planar position and heading')
     return PoseSample(stamp, pose.get('frame_id', ''), pose.get('child_frame_id', ''),
                       origin[0], position, quaternion, covariance, quality.get('clock_id'),
-                      reference, observation, precise, external_origin=origin if external else None)
+                      reference, observation, precise, external_origin=origin if external else None,
+                      gravity_aligned=gravity_aligned)
 
 
 def decode_slam_prediction(sample, anchor):

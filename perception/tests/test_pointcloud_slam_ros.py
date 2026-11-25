@@ -1122,3 +1122,37 @@ def test_mark_between_native_keyframes_uses_same_run_body_displacement(node):
     node._odom(NS(data=json.dumps(chassis(5100, 0., segment='reset'))))
     with pytest.raises(ValueError, match='continuity lost'):
         node.change_place('错图', remove=False)
+
+
+@pytest.mark.parametrize('supported', [True, False])
+def test_gravity_marker_requires_native_support_and_fresh_fused_pose(tmp_path, monkeypatch, supported):
+    import zlib
+    import plugins.pointcloud_slam_ros as ros
+    from test_pointcloud_slam_stream import external_fusion
+
+    binary = tmp_path/'lib/rtabmap_slam/rtabmap'
+    if supported:
+        marker = tmp_path/'share/rtabmap_slam/motus_temporal_ground_height_v1'
+        marker.parent.mkdir(parents=True)
+        marker.touch()
+    monkeypatch.setattr(NativeProcess, 'validate_runtime', lambda self: binary)
+    monkeypatch.setattr(ros, 'RtabmapProcess', NativeProcess)
+    n = ros.RtabmapNode('/rgbd_odometry/i_6f6e65/state/odom', '/c', settings(), session_dir=tmp_path/'session')
+    n._receipt_clock = lambda: 1.
+    n.start()
+    try:
+        for count, ms in enumerate((1000, 1100), 1):
+            value = external_fusion(ms)
+            value['vendor']['motus_slam']['stamp_ns'] = ms*1_000_000
+            value['vendor']['external_fusion'] = {'body_gravity_stamp_ns': ms*1_000_000 if count==1 else 1}
+            n._measurement_clock_ns = lambda: ms*1_000_000
+            n._odom(NS(data=json.dumps(value)))
+            n._cloud(cloud(ms*1_000_000))
+            assert _wait_until(lambda: n.status()['forwarded_clouds'] == count)
+        markers = [zlib.decompress(bytes(m.user_data)[:-12]) for m in published(n, '/sensor_data')[0].raw_messages]
+        assert markers[0][:8] == (b'MOTUSCG1' if supported else b'MOTUSCH1')
+        assert markers[1][:8] == b'MOTUSCH1'
+        assert markers[0][8:] == markers[1][8:]
+    finally:
+        n.close()
+        n.destroy_node()

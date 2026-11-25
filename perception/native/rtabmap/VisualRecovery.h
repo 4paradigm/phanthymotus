@@ -2,6 +2,7 @@
 // Coordinates: native_odom <- visual_odom / external_odom. No robot/frame policy.
 #pragma once
 #include "WallAlignment.h"
+#include "GroundHeight.h"
 #include <rtabmap/core/Rtabmap.h>
 #include <rtabmap/core/Memory.h>
 #include <rtabmap/core/Signature.h>
@@ -57,6 +58,9 @@ public:
         bool refining=rtabmap::Parameters::defaultRGBDNeighborLinkRefining();
         rtabmap::Parameters::parse(p,"RGBD/NeighborLinkRefining",refining);
         imageMode_=!refining;
+        bool planar=rtabmap::Parameters::defaultRegForce3DoF();
+        rtabmap::Parameters::parse(p,"Reg/Force3DoF",planar);
+        heightEnabled_=!planar && !refining;
         rtabmap::Parameters::parse(p, "Vis/MinInliers", minInliers_=rtabmap::Parameters::defaultVisMinInliers());
         rtabmap::Parameters::parse(p, "RGBD/OptimizeMaxError", maxError_=rtabmap::Parameters::defaultRGBDOptimizeMaxError());
         rtabmap::Parameters::parse(p, "RGBD/MaxOdomCacheSize", maxOdomCacheSize_=rtabmap::Parameters::defaultRGBDMaxOdomCacheSize());
@@ -97,7 +101,7 @@ public:
     }
 
     bool process(rtabmap::Rtabmap & map, rtabmap::SensorData & data,
-                 const rtabmap::Transform & external, const cv::Mat & covariance,
+                 const rtabmap::Transform & rawExternal, const cv::Mat & covariance,
                  const std::vector<float> & velocity=std::vector<float>(),
                  const std::map<std::string,float> & statistics=std::map<std::string,float>())
     {
@@ -106,12 +110,49 @@ public:
         if(visualLossStamp_>0. && !(data.stamp()>visualLossStamp_))
         {
             walls_.reset();
+            groundHeight_.reset();
             // Reject delayed observations before they can alter F2M. A clock
             // regression also invalidates the pending same-gauge recovery.
             visualLossStamp_=0.; visualAlignment_.reset(); visualInliers_=0;
             state_=Searching; odom_.setNull(); return false;
         }
-        const auto chassis=takePayload(data,"MOTUSCH1",40);
+        const auto chassis=takePayload(data,"MOTUSCH1",40,"MOTUSCG1");
+        const bool gravityMeasured=!chassis.empty() && std::memcmp(chassis.data,"MOTUSCG1",8)==0;
+        auto external=rawExternal;
+        // Correct in the measured odometry frame, before any map-frame transform.
+        if(heightEnabled_ && !chassis.empty() && !external.isNull() &&
+           std::any_of(chassis.data+24,chassis.data+40,[](unsigned char x){return x!=0;}))
+        {
+            if(groundHeight_ && (data.stamp()<=heightStamp_ ||
+               !std::equal(heightGauge_.begin(),heightGauge_.end(),chassis.data+8)))
+                groundHeight_.reset();
+            heightStamp_=data.stamp();
+            if(gravityMeasured && !localizationMode_ && map.getMemory()->isIncremental())
+            {
+                if(!groundHeight_)
+                {
+                    groundHeight_.emplace(map.getParameters());
+                    std::copy_n(chassis.data+8,heightGauge_.size(),heightGauge_.begin());
+                }
+                groundHeight_->observe(data,rawExternal);
+            }
+            if(groundHeight_ && groundHeight_->offset()!=0.)
+            {
+                external=rtabmap::Transform(rawExternal.dataMatrix().clone());
+                external.data()[11]+=groundHeight_->offset();
+            }
+        }
+        else if(groundHeight_)
+        {
+            // A missing pose has no gauge of its own. Resume the accumulated offset
+            // only if the next measured pose confirms the same origin and run.
+            if(external.isNull() && data.stamp()>heightStamp_)
+            {
+                groundHeight_->clearObservations();
+                heightStamp_=data.stamp();
+            }
+            else groundHeight_.reset();
+        }
         if(!chassis.empty()) sawChassis_=true;
         if(!takePayload(data,"MOTUSRAW",8).empty())
         {
@@ -904,13 +945,14 @@ private:
         return shape[0]==1 && shape[2]==CV_8UC1?shape[1]:0;
     }
 
-    static cv::Mat takePayload(rtabmap::SensorData & data, const char * tag, int columns)
+    static cv::Mat takePayload(rtabmap::SensorData & data, const char * tag, int columns, const char * alternate=nullptr)
     {
         const auto & bytes=data.userDataCompressed();
         if(payloadColumns(bytes)!=columns)
             return {};
         const auto payload=rtabmap::uncompressData(bytes);
-        if(payload.empty() || std::memcmp(payload.data,tag,8)!=0)
+        if(payload.empty() || (std::memcmp(payload.data,tag,8)!=0 &&
+           (!alternate || std::memcmp(payload.data,alternate,8)!=0)))
             return {};
         data.setUserData(cv::Mat(),true);
         return payload;
@@ -1165,6 +1207,10 @@ private:
         return true;
     }
     WallAlignment walls_;
+    bool heightEnabled_=false;
+    double heightStamp_=0.;
+    std::array<unsigned char,32> heightGauge_{};
+    std::optional<GroundHeight> groundHeight_;
     std::unique_ptr<rtabmap::Odometry> estimator_;
     std::unique_ptr<rtabmap::RegistrationIcp> inertialIcp_,scanIcp_,revisitIcp_;
     rtabmap::RegistrationIcp neighborIcp_;

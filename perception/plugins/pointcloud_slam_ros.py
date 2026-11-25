@@ -531,11 +531,13 @@ class RtabmapNode(Node):
                     self._session_dir / ('segment_' + str(index)) / 'rtabmap.db')
         process = RtabmapProcess(database, namespace, self._settings,
                                 **({'restored': True} if restored else {}))
-        process.validate_runtime()
+        executable = process.validate_runtime()
+        height_support = bool(executable and (Path(executable).parents[2] /
+                              'share/rtabmap_slam/motus_temporal_ground_height_v1').is_file())
         segment = dict(segment_id=restored['segment_id'] if restored else pose.segment_id or 'segment_'+str(index),
             frame_id=restored['frame_id'] if restored else '', source_frame_id=pose.frame_id if pose else '',
             pose_reference=getattr(pose, 'pose_reference', None),
-            process=process, snapshot=restored.get('snapshot') if restored else None,
+            process=process, gravity_height=height_support, snapshot=restored.get('snapshot') if restored else None,
             places=deepcopy(restored.get('places', [])) if restored else [],
             submitted_poses=OrderedDict(), place_anchor=None, graph=None, cloud=None, finalized=False, closing=False,
             native_loop_closures=0, native_proximity_detections=0, native_updates=0,
@@ -658,7 +660,9 @@ class RtabmapNode(Node):
                 if measured.chassis_origin is not None or measured.external_origin is not None:
                     gauge = measured.chassis_origin or measured.declared_origin
                     origin = hashlib.blake2b(json.dumps(gauge).encode(), digest_size=16).digest()
-                    payload = b'MOTUSCH1' + origin + (run or bytes(16))
+                    gravity = (segment.get('gravity_height') and run and measured.gravity_aligned
+                               and abs(measured.stamp_ns-stamp) <= 50_000_000)
+                    payload = (b'MOTUSCG1' if gravity else b'MOTUSCH1') + origin + (run or bytes(16))
                 elif self._scan_origin_recovery or (
                         measured.visual_origin is not None and measured.external_continuity is None):
                     origin = hashlib.blake2b(json.dumps(measured.visual_origin).encode(), digest_size=16).digest()

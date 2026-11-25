@@ -90,3 +90,13 @@ def test_slam_decoder_keeps_legacy_top_level_pose_time():
     result = decode_slam_odom(value)
     assert result.stamp_ms == 1234
     assert result.stamp_ns == 1_234_000_000
+
+
+@pytest.mark.parametrize('offset,expected', [(0, True), (50_000_000, True), (50_000_001, False), (None, False)])
+def test_height_matching_requires_capture_timed_body_gravity(offset, expected):
+    from plugins.pointcloud_slam_odom import decode_slam_odom
+    value = standard_sample()
+    tick = 3_000_000_000
+    value['vendor']['motus_slam'].update(pose_source='external_fusion', pose_reference='body', stamp_ns=tick)
+    value['vendor']['external_fusion'] = {} if offset is None else {'body_gravity_stamp_ns': tick-offset}
+    assert decode_slam_odom(value).gravity_aligned is expected

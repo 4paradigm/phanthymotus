@@ -111,3 +111,12 @@ def test_equivalent_opposite_quaternions_do_not_spin_or_divide_by_zero():
     b = pose(1200, quaternion=(0., 0., 0., -1.))
     result = align_pose([a, b], 1_100_000_000, max_gap_ms=250)
     assert result.quaternion == pytest.approx((0., 0., 0., 1.))
+
+
+def test_height_matching_requires_both_gravity_observations_in_one_bounded_run():
+    from dataclasses import replace
+    a = replace(pose(1000), gravity_aligned=True, external_continuity=b'a', external_origin=('s','odom','body'))
+    b = replace(a, stamp_ms=1100)
+    assert align_pose([a,b], 1_050_000_000, max_gap_ms=200).gravity_aligned
+    for end in (replace(b, gravity_aligned=False), replace(b, external_continuity=b'b'), replace(b, stamp_ms=1600)):
+        assert not align_pose([a,end], 1_050_000_000, max_gap_ms=200).gravity_aligned
