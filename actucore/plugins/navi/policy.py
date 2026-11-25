@@ -776,6 +776,7 @@ class State:
     dwa_predictions: dwa.PredictionCache = field(default_factory=dwa.PredictionCache)
     decision_id: int = 0
     search_sweep_checked: bool = False
+    search_feedback_ms: int | None = None
     detour_leg: PathLeg | None = None
     executing_leg: PathLeg | None = None
     goal_anchor: DetourGoal | None = None
@@ -910,6 +911,7 @@ class Decision:
     k_fwd_effective: float | None = None
     k_yaw_effective: float | None = None
     dwa_acceptance: DwaAcceptance | None = None
+    hold_search: bool = False
 
     @property
     def publishes(self) -> bool:
@@ -1501,6 +1503,16 @@ def step(*, detections, depth, odom, config: Config, state: State,
         # Do not carry an increased approach gain through a hold, search or
         # blocked corridor and release it as a jump on the next approach.
         state.adaptive_fwd_scale = 1.0
+    if not decision.hold_search:
+        feedback = planar_feedback(odom)
+        sample = odom or {}
+        speed_ms = sample.get("received_speed_ms", sample.get("stamp_ms", sample.get("received_ms")))
+        state.search_feedback_ms = (speed_ms
+                                    if decision.status == SEARCHING and state.search_sweep_checked
+                                    and decision.values and decision.values[5] and not any(decision.values[:5])
+                                    and feedback is not None and math.hypot(*feedback[:2]) <= STILL_LINEAR
+                                    and type(speed_ms) is int
+                                    else None)
     if state.dwa_selected and state.dwa_proposal is not None and decision.values is not None:
         final = tuple(decision.values[i] for i in (0, 1, 5))
         if any(decision.values) and (final != state.dwa_proposal.command or any(decision.values[2:5])):
@@ -1760,6 +1772,38 @@ def _search_for_target(depth, config, state, dt, odom):
     return Decision(_twist(0., 0., 0.), AVOIDING, reason)
 
 
+def _continue_search_without_speed(depth, config, state, dt, odom):
+    previous_scan = state.active_scan
+    stamp = (depth or {}).get("control_ms")
+    last_speed = state.search_feedback_ms
+    yaw = state.commanded[2]
+    if (stamp is None or last_speed is None or not 0 <= stamp - last_speed < config.max_feedback_gap_ms
+            or not yaw or any(state.commanded[:2]) or not state.command_dt_s or state.feedback_guard_s
+            or config.use_obstacle_history or previous_scan.active or previous_scan.result_frame
+            or state.detour_leg is not None or state.published_dwa_route is not None
+            or state.published_camera_passage is not None or state.reacquire_generation is not None):
+        return None
+    mount = depth.get("body_from_optical")
+    if mount is not None and mount[0, 2] < .75:
+        return None
+    vx, vy, wz = planar_axes(odom)
+    if math.hypot(vx or 0., vy or 0.) > STILL_LINEAR or (wz or 0.) * yaw < -STILL_YAW * abs(yaw):
+        return None
+    scan = ActiveScan(use_obstacle_history=False)
+    geometry = config.scan_geometry or config.local_geometry
+    scan.observe_single(depth, geometry, config.depth_age_limit_ms, stamp)
+    if _search_turn_stop(depth, config, state, requested_yaw=yaw, scan=scan) is not None:
+        return None
+    decision = _search(config, state, dt, odom, requested_yaw=yaw)
+    decision.hold_search = bool(decision.values and decision.values[5])
+    if decision.hold_search:
+        decision.reason = "原地搜索：速度暂缺，维持已检查的转向"
+        # Restart measured registration when speed returns. Estimated motion
+        # is used only for the search, never added to the measured pose history.
+        previous_scan.invalidate()
+    return decision
+
+
 def _observation_command(scan, geometry, config, state, odom, dt, control_period_s, depth=None):
     yaw_limits = (_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
     vx, vy, yaw = state.commanded
@@ -1824,7 +1868,13 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # is also the only way the coast clock advances while the card is blind —
     # otherwise a camera that stopped publishing would leave a track coasting
     # for ever, and the robot driving towards a prediction nobody is checking.
-    ego, ego_measured = _ego_twist(odom, state, command_fraction=state.command_dt_s / dt if dt else 0.)
+    speed_ms = (odom or {}).get("component_speed_ms", (odom or {}).get("received_speed_ms"))
+    now_ms = (depth or {}).get("control_ms") or (odom or {}).get("control_ms") or (odom or {}).get("received_ms")
+    speed_stale = bool(odom and ("component_speed_ms" in odom or "received_speed_ms" in odom)
+                       and (type(speed_ms) is not int or now_ms is None
+                            or not 0 <= now_ms - speed_ms <= config.max_feedback_gap_ms))
+    ego_odom = ({"pose_feedback": odom.get("pose_feedback")} if speed_stale else odom)
+    ego, ego_measured = _ego_twist(ego_odom, state, command_fraction=state.command_dt_s / dt if dt else 0.)
     recovering = state.reacquire_generation is not None
     detection_source = observation_source(detections) if recovering else None
     fresh_recovery = (recovering and detections is not None and objects_ms > state.reacquire_receipt_ms
@@ -1930,6 +1980,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     feedback = planar_feedback(odom) if config.local_planning else None
     if config.local_planning and config.local_geometry is not None:
+        if (config.local_controller == "dwa" and anchor is None
+                and (feedback is None or speed_stale
+                     or (state.uses_received_speed and (odom or {}).get("received_speed_ms") is None))
+                and (track is None or not track.observed) and detections is not None
+                and not any(target_objects(detections, state.target, config))):
+            continued = _continue_search_without_speed(depth, config, state, dt, ego_odom)
+            if continued is not None:
+                return continued
         if odom and all(odom.get(axis) is not None for axis in ("vx", "vy", "wz")):
             state.uses_received_speed = "received_speed_ms" in odom
         motion_pose = (odom or {}).get("motion_pose")
@@ -2969,12 +3027,12 @@ def _worth_strafing(lateral: float, config: Config, state, dt: float) -> bool:
         dt=dt, min_dwell_s=config.min_dwell_s)
 
 
-def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None) -> str | None:
+def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None, scan=None) -> str | None:
     """Check the next target-search turn, including travel before a watchdog stop."""
     ahead, coverage = _clearance(depth, config)
     state.last_clearance, state.last_coverage = ahead, coverage
-    scan = state.active_scan
-    command_only = state.motion_source == "command"
+    scan = state.active_scan if scan is None else scan
+    command_only = scan.command_only or state.motion_source == "command"
     geometry = (config.scan_geometry or config.local_geometry
                 if scan.receipt_only or command_only else config.scan_geometry)
     can_plan = config.local_planning and (config.search_rate > 0 or requested_yaw is not None)
@@ -3011,6 +3069,8 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
         if has_sweep:
             horizon = (config.watchdog_ms + config.depth_age_limit_ms + 50) / 1000
             speed = max(math.hypot(*motion[:2]), math.hypot(*state.commanded[:2]))
+            if scan is not state.active_scan:
+                speed = max(speed, STILL_LINEAR)
             slack = speed * horizon
             age = max(0, scan.control_ms - scan.near_revision) / 1000
             blocked = not scan.clear_sweep(geometry, config.half_width_m, slack)

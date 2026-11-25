@@ -812,6 +812,22 @@ def test_ego_motion_prefers_pose_feedback_to_an_unmeasured_axis():
     assert not measured
 
 
+@pytest.mark.parametrize("age, measured_vx, expected", [
+    (100, 0., (0., .1, .25)),
+    (301, 0., (.15, .1, .25)),
+    (100, None, (.15, .1, .25)),
+])
+def test_tracker_fills_unavailable_speed_from_covered_command(monkeypatch, age, measured_vx, expected):
+    state = _state(commanded=(.3, .2, .5))
+    observed = {}
+    monkeypatch.setattr(state.tracker, "step", lambda **kw: observed.update(kw))
+    odom = dict(vx=measured_vx, vy=None, wz=None, received_ms=1000, component_speed_ms=1000-age)
+    P.step(detections=None, depth=dict(_depth(), control_ms=1000), odom=odom,
+           config=_cfg(), state=state, dt=.2, command_dt_s=.1)
+    assert observed["ego"] == pytest.approx(expected)
+    assert not observed["ego_measured"]
+
+
 def test_anchor_predicts_motion_only_until_the_previous_command_expires():
     anchor = P.DetourGoal(3., 0.)
     state = _state(goal_anchor=anchor, commanded=(0., 0., .5))

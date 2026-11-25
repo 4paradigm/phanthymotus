@@ -156,6 +156,54 @@ def test_lost_received_speed_holds_after_source_guard_expires(monkeypatch, late_
     assert not any(card._last_decision.values)
 
 
+@pytest.mark.parametrize("event", ["clear", "obstacle", "long_gap", "target"])
+def test_search_turn_uses_its_checked_window_through_a_speed_miss(monkeypatch, event):
+    card, packets, clock, snapshot = observation_card(monkeypatch)
+    card._command_timer = object()
+    config, state = card._config, card._state
+    config.use_obstacle_history = False
+    state.goal_anchor = None
+    state.commanded = (0., 0., 0.)
+    state.missing_frames = config.lost_frames - 1
+    _, depth, odom, _ = snapshot[0]
+    clear = np.full_like(depth["map"], 5.)
+    objects = {"timestamp": 1.0, "objects": []}
+    measured = dict(odom, vx=0., received_speed_ms=1000,
+                    velocity_history=((1000, 1000, (0., 0., 0.)),))
+    snapshot[0] = objects, dict(depth, map=clear), measured, 1000
+    card._tick()
+    first, = packets
+    assert first["values"][5] and not any(first["values"][:5])
+    window = card._scheduled_command
+    assert state.search_feedback_ms == 1000
+
+    stamp = 1300 if event == "long_gap" else 1100
+    clock[0] = stamp
+    frame = clear.copy()
+    if event == "obstacle":
+        frame[220:370, 302:338] = .25
+    if event == "target":
+        objects = {"timestamp": 1.1, "objects": [
+            {"name": "person", "position": [0., 0.], "confidence": .95}]}
+    invalid = dict(vx=None, vy=None, wz=None, received_ms=stamp, received_speed_ms=None,
+                   velocity_history=(*measured["velocity_history"], (stamp, stamp, None)))
+    snapshot[0] = objects, dict(depth, map=frame, frame_id=stamp, capture_ms=stamp,
+                                 control_ms=stamp, source_frame_id=stamp), invalid, stamp
+    card._tick()
+    if event == "clear":
+        assert packets == [first]
+        assert card._scheduled_command is window
+        assert state.searched_rad == pytest.approx(.1 * abs(first["values"][5]))
+        clock[0] = 1200
+        normal = dict(measured, received_ms=1200, received_speed_ms=1200, source_sample_id=1200,
+                      velocity_history=(*invalid["velocity_history"], (1200, 1200, (0., 0., 0.))))
+        snapshot[0] = objects, dict(depth, map=clear, control_ms=1200), normal, stamp
+        card._tick()
+        assert len(packets) == 2 and packets[-1]["values"] == first["values"]
+    else:
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+
+
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
 def test_selected_route_first_write_reuses_unchanged_planning_proof(monkeypatch, body):
     card, packets, _, _, message = selected_card(monkeypatch, body=body, live_target=True)

@@ -3093,6 +3093,15 @@ class NaviPlugin:
         now = time.time()
         scan = self._state.active_scan
         self._last_decision = decision
+        if decision.hold_search:
+            # Keep the already published turn and its original deadline.
+            if (was_searching and outgoing_arc is not None and outgoing_arc.sent
+                    and outgoing_arc.turn is None and outgoing_arc.dwa_origin is None
+                    and outgoing_arc.expires_at > time.monotonic()
+                    and tuple(outgoing_arc.message["values"]) == tuple(decision.values)):
+                return None
+            decision.hold_search = False
+            decision.values = [0.] * ACTION_DIM
         if (self._command_timer is not None and self._config.local_planning
                 and decision.status == policy_mod.BLIND
                 and (depth is None or depth.get("capture_invalid"))):
@@ -3993,6 +4002,12 @@ class NaviPlugin:
                 self._command_window = (time.monotonic() - (now_ms - active.message["stamp_ms"]) / 1000,
                                         active.expires_at)
             self._pending_route = None
+            if (message is None and self._last_decision is not None and self._last_decision.hold_search
+                    and active is not None and active.sent
+                    and active.turn is None and active.dwa_origin is None
+                    and now_ms < active.expires_ms and time.monotonic() < active.expires_at
+                    and active.message["values"] == self._last_decision.values):
+                return True
             if ((message is None or not any(message["values"])) and active is not None and active.sent
                     and self._last_decision is not None
                     and self._last_decision.reason == policy_mod.DEPTH_CAPTURE_STALE):
