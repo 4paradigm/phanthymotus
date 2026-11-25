@@ -580,6 +580,10 @@ assert not any(0x4E00 <= ord(c) <= 0x9FFF for c in out), out; \
 print('[build] janome ok, no kanji left: %s' % out)"; \
     fi && rm -f /tmp/ja-requirements.txt
 
+# ByteTrack assignment. Use wheels and preserve the JetPack NumPy pin.
+RUN pip3 install --no-cache-dir --no-deps --only-binary=:all: -i "${PYPI_MIRROR}" lap==0.5.12 && \
+    python3 -c "import lap"
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py

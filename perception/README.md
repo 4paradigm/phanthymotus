@@ -3211,6 +3211,13 @@ resolve — a card saved before the switch must not come back as `state: error`.
 
 ### vop's streamed payload: `publish_bbox` and `publish_color`
 
+Camera-stream detections include an integer `track_id`, scoped to the running
+VOP instance. Tracking uses ByteTrack's two-stage association with Kalman
+prediction. Detections below the configured confidence, down to 0.1, can
+maintain an active track internally but are omitted from the output. A strong
+detection can recover a lost track within one second. Only observed boxes are
+published. One-shot photo and URL results keep their existing fields.
+
 Two knobs govern what one detected object costs on the topic. **They affect the
 stream only** — `recognize` / `recognize_by_url` always answer in full, because
 that reply is asked for once and read once, and a caller who cannot see the

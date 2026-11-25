@@ -51,6 +51,7 @@ from std_msgs.msg import String
 from utils.ros_lifecycle import dispose_node
 
 from plugins.image_input import BadInput, load_image_bytes
+from plugins.vop_tracking import LOW_CONFIDENCE, VOPTracker
 
 log = logging.getLogger(__name__)
 
@@ -403,6 +404,7 @@ class _VOPNode(Node):
         self._worker: Optional[threading.Thread] = None
         self._last_inference_time = 0.0
         self._detect_count = 0
+        self._tracker = VOPTracker()
         self._running = False
         # Serializes start/stop on this node. The plugin calls both from HTTP
         # handler threads, and the canvas routinely does config→start→stop→start
@@ -497,6 +499,7 @@ class _VOPNode(Node):
             except queue.Empty:
                 continue
             started = time.time()
+            frame_time = time.monotonic()
             try:
                 frame = cv2.imdecode(
                     np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
@@ -504,10 +507,15 @@ class _VOPNode(Node):
                 if frame is None:
                     continue
                 outputs, meta = self._model.infer(frame)
+                confidence = self._confidence
                 boxes, scores, classes = decode_detections(
-                    outputs, meta, self._confidence
+                    outputs, meta, min(confidence, LOW_CONFIDENCE)
                 )
-                objects = self._extract_objects(boxes, scores, classes, frame)
+                tracks = self._tracker.update(boxes, scores, classes, frame_time, confidence)
+                visible = np.flatnonzero(scores >= confidence)
+                objects = self._extract_objects(boxes[visible], scores[visible], classes[visible], frame)
+                for obj, index in zip(objects, visible):
+                    obj["track_id"] = tracks[int(index)]
                 self._publish_objects(objects, started)
             except Exception as e:
                 log.error(f"[vop] inference error: {e}", exc_info=True)

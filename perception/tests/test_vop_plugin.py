@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -318,8 +320,51 @@ def test_the_full_frame_path_publishes_decoded_objects():
     assert payload["objects"] == [
         {"name": "door", "position": [0.5, -0.5], "confidence": 0.9,
          "bbox": [100.0, 0.0, 200.0, 50.0],
-         "color": "black gray neutral", "brightness": 0.0}
+         "color": "black gray neutral", "brightness": 0.0, "track_id": 1}
     ]
+
+
+def test_vop_track_ids_follow_boxes_and_expire_after_missed_detections():
+    tracker = vop_plugin.VOPTracker()
+    left, right = (0, 0, 20, 20), (50, 0, 70, 20)
+
+    def update(now, boxes, scores, classes):
+        return tracker.update(np.array(boxes), np.array(scores), np.array(classes), now, 0.3)
+
+    assert update(0.0, [left, right], [0.9, 0.9], [1, 1]) == {0: 1, 1: 2}
+    assert update(0.2, [right, left], [0.9, 0.9], [1, 1]) == {0: 2, 1: 1}
+    for now in (0.4, 0.8, 1.2):
+        assert update(now, [right, left], [0.9, 0.2], [1, 1]) == {0: 2}
+    assert update(1.4, [right, left], [0.9, 0.9], [1, 1]) == {0: 2, 1: 1}
+    assert update(2.0, [right], [0.9], [1]) == {0: 2}
+    assert update(2.5, [right, left], [0.9, 0.9], [1, 1]) == {0: 2, 1: 3}
+    assert update(2.6, [right], [0.9], [2]) == {0: 4}
+
+
+def test_vop_reacquires_moving_object_at_predicted_position():
+    tracker = vop_plugin.VOPTracker()
+
+    def update(now, *positions):
+        boxes = np.array([(x, 0, x + 20, 20) for x in positions]).reshape(-1, 4)
+        return tracker.update(boxes, np.full(len(positions), 0.9),
+                              np.ones(len(positions)), now, 0.3)
+
+    for step in range(5):
+        assert update(step / 5, step * 8) == {0: 1}
+    assert update(1.0) == {}
+    assert update(1.2) == {}
+    assert update(1.4, 56) == {0: 1}  # No overlap with the last observed box at x=32.
+
+
+def test_vop_low_confidence_box_cannot_create_or_reactivate_a_track():
+    tracker = vop_plugin.VOPTracker()
+    box = np.array([[0, 0, 20, 20]])
+    classes = np.array([1])
+    assert tracker.update(box, np.array([0.2]), classes, 0.0, 0.3) == {}
+    assert tracker.update(box, np.array([0.9]), classes, 0.2, 0.3) == {0: 1}
+    assert tracker.update(box[:0], np.array([]), classes[:0], 0.4, 0.3) == {}
+    assert tracker.update(box, np.array([0.2]), classes, 1.0, 0.3) == {}
+    assert tracker.update(box, np.array([0.9]), classes, 1.4, 0.3) == {0: 2}
 
 
 def test_low_confidence_detections_are_dropped():
@@ -332,6 +377,32 @@ def test_low_confidence_detections_are_dropped():
     pub = node.publishers[0]
     assert _wait_until(lambda: bool(pub.messages))
     assert json.loads(pub.messages[0])["objects"] == []
+
+
+def test_stream_uses_weak_boxes_without_publishing_them(monkeypatch):
+    frame_time = 10.0
+    monkeypatch.setattr(
+        vop_plugin, "time", SimpleNamespace(time=time.time, monotonic=lambda: frame_time)
+    )
+    model = _FakeModel(rows=[[0, 0, 20, 20, 0.9, 1]])
+    plugin, executor = _plugin(model=model)
+    node = _node_with(plugin, executor)
+    pub = node.publishers[0]
+    frame = _FakeCompressedImage(frame_bytes(200, 100))
+
+    def publish_frame(x, score):
+        nonlocal frame_time
+        frame_time += 0.25
+        model._output[0, 0] = [x, 0, x + 20, 20, score, 1]
+        expected = len(pub.messages) + 1
+        node._image_cb(frame)
+        assert _wait_until(lambda: len(pub.messages) >= expected)
+        return json.loads(pub.messages[-1])["objects"]
+
+    assert publish_frame(0, 0.9)[0]["track_id"] == 1
+    for x in range(4, 25, 4):
+        assert publish_frame(x, 0.2) == []
+    assert publish_frame(28, 0.9)[0]["track_id"] == 1
 
 
 # ── discoverability ──────────────────────────────────────────────────────────
