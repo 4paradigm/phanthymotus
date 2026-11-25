@@ -957,7 +957,7 @@ def test_isolated_blocker_detour_enters_on_expanded_circle_tangent():
     box = (abs(f - 1.95) <= .201) & (abs(r) <= .251)
     route = local_path.clearance_route((~box, box), _geometry(), .30, (3.05, 0.), .60, (0., 0.),
                                        body_half_width=.25)
-    radius = math.hypot(.225, .275) + .50
+    radius = math.hypot(.225, .275) + 3 * .25
     angle = math.asin(radius / 1.95)
     forward, right = route.points[1]
     assert abs(math.atan2(right, forward)) == pytest.approx(angle, abs=.09)
@@ -988,3 +988,30 @@ def test_wide_corridor_scores_its_midline_below_both_offsets():
     for offset in (-.15, .15):
         shifted = ((.5, .25 + offset), (2., .25 + offset))
         assert score(shifted, walls, _geometry(), .27) > 0.
+
+
+def test_box_detour_holds_passing_lane_until_the_rear_clears():
+    geometry = _geometry()
+    f, r = local_path.FORWARD, local_path.RIGHT
+    occupied = (abs(f - 1.60) <= .401) & (abs(r) <= .301)
+    route = local_path.clearance_route((~occupied, occupied), geometry, .30, (3.25, 0.), .60,
+                                       (0., 0.), body_half_width=.25)
+    assert route is not None
+    clear_at = float(f[occupied].max()) + local_path.RESOLUTION / 2 + geometry.rear
+    side = [abs(right) for forward, right in route.topology if 1.60 <= forward < clear_at]
+    assert len(side) > 2
+    assert all(after >= before - 1e-9 for before, after in zip(side, side[1:]))
+
+
+def test_compact_detour_exit_follows_the_tangent_toward_the_target():
+    f, r = local_path.FORWARD, local_path.RIGHT
+    box_center, goal = 1.25, 3.75
+    occupied = (abs(f - box_center) <= .301) & (abs(r) <= .151)
+    route = local_path.clearance_route((~occupied, occupied), _geometry(), .30, (goal, 0.), .60,
+                                       (0., 0.), body_half_width=.25)
+    assert route is not None
+    radius = math.hypot(.325, .175) + 3 * .25
+    slope = math.tan(math.asin(radius / (goal - box_center)))
+    exit_leg = [(forward, right) for forward, right in route.topology if forward >= 2.5]
+    assert len(exit_leg) >= 4
+    assert all(abs(abs(right) - (goal-forward)*slope) <= .1 for forward, right in exit_leg)

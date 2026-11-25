@@ -1488,8 +1488,8 @@ def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tole
                                          heading_tolerance=heading_tolerance).size
 
 
-def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half_width, start):
-    """Weight the measured corridor midpoint or the tangent of a compact blocker."""
+def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half_width, start, target):
+    """Weight the measured corridor midpoint or the tangents of a compact blocker."""
     cols = np.arange(occupied.shape[1])
     left = np.maximum.accumulate(np.where(occupied, cols, -1), axis=1)
     right = np.minimum.accumulate(np.where(occupied, cols, len(cols))[:, ::-1], axis=1)[:, ::-1]
@@ -1498,14 +1498,14 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     midline_error = abs(cols - (left + right) / 2) * RESOLUTION
     cost = np.where(opening, 8. * np.square(midline_error / half_width), cost)
     if not len(blockers[0]):
-        return cost
+        return cost, None
     pivot = (geometry.front - geometry.rear) / 2
     nearest = np.hypot(FORWARD[blockers] - pivot, RIGHT[blockers]).argmin()
     row, col = (int(axis[nearest]) for axis in blockers)
     # A measured opening beside the blocker is more informative than a circle
     # around a jamb or wall. Its traversability is still decided by the caller.
     if (opening[row, :] & (abs(cols - col) * RESOLUTION <= 3 * half_width)).any():
-        return cost
+        return cost, None
     remaining = set(zip(*np.nonzero(occupied)))
     remaining.remove((row, col))
     component = [(row, col)]
@@ -1517,23 +1517,23 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
                 component.append(neighbor)
     low, high = np.min(component, axis=0), np.max(component, axis=0)
     if (low == 0).any() or (high == np.array(occupied.shape) - 1).any():
-        return cost
+        return cost, None
     span = (high - low + 1) * RESOLUTION
     body_width = 2 * body_half_width
     if max(span) > 3 * body_width:
-        return cost
+        return cost, None
     center = ((low + high) / 2 - START) * RESOLUTION
     forward, lateral = center[0] - pivot, center[1]
     distance = math.hypot(forward, lateral)
-    # Circumscribe the occupied cell squares, then add one full chassis width.
-    radius = math.hypot(*span) / 2 + body_width
+    # Circumscribe the occupied cells, then add three chassis half widths.
+    radius = math.hypot(*span) / 2 + 3 * body_half_width
     if distance <= radius:
-        return cost
+        return cost, None
     bearing = math.atan2(lateral, forward)
     offset = math.asin(radius / distance)
     tangents = [angle for angle in (bearing - offset, bearing + offset) if abs(angle) <= math.pi / 2]
     if not tangents:
-        return cost
+        return cost, None
     f = FORWARD - FORWARD[start]
     r = RIGHT - RIGHT[start]
     travel = np.hypot(f, r)
@@ -1541,7 +1541,31 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     error = np.minimum.reduce([np.square(heading - angle) for angle in tangents])
     entry_length = max(.45, geometry.front + geometry.rear)
     weight = np.clip((entry_length + RESOLUTION - travel) / RESOLUTION, 0., 1.)
-    return np.where(opening, cost, (1. - weight) * cost + weight * 8. * error)
+    cost = np.where(opening, cost, (1. - weight) * cost + weight * 8. * error)
+
+    to_target = np.asarray(target) - center
+    target_range = math.hypot(*to_target)
+    if target_range <= radius:
+        return cost, None
+    # Use the obstacle-to-target axis so rotating the camera does not move
+    # the point at which the chassis has passed the measured obstacle.
+    direction = to_target / target_range
+    normal = np.array((-direction[1], direction[0]))
+    forward, right = FORWARD - center[0], RIGHT - center[1]
+    along = forward * direction[0] + right * direction[1]
+    across = abs(forward * normal[0] + right * normal[1])
+    rear_clear = abs(direction) @ (span / 2) + math.hypot(geometry.rear, half_width)
+    slope = radius / math.sqrt(target_range**2 - radius**2)
+    lane_min = abs(normal) @ (span / 2) + half_width + RESOLUTION
+    passing_offset = np.clip((target_range - rear_clear) * slope + 2 * RESOLUTION, lane_min, radius)
+    blend = np.clip((along - rear_clear) / half_width, 0., 1.)
+    tangent_offset = (target_range - along) * slope
+    desired = passing_offset + blend * (tangent_offset - passing_offset)
+    exit_error = abs(across - desired)
+    cost = np.where((along >= 0.) & (along <= target_range) & ~opening,
+                    8. * np.square(exit_error / half_width), cost)
+    exit_region = (along >= rear_clear) & (along <= target_range) & ~opening
+    return cost, exit_region & (exit_error <= RESOLUTION)
 
 
 def clearance_route(grid, geometry, half_width, target, stop, approach_origin, previous=(), *,
@@ -1592,7 +1616,8 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     length = max(RESOLUTION, math.hypot(dx, dy))
     lateral = abs((FORWARD-target[0])*dy - (RIGHT-target[1])*dx) / length
     cost += .5 * lateral / max(.15, half_width)
-    cost = _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half_width or half_width, start)
+    cost, tangent_goal = _detour_shape_cost(cost, occupied, blockers, geometry, half_width,
+                                           body_half_width or half_width, start, target)
     if previous:
         distance = np.full_like(clearance, np.inf)
         for f, r in previous:
@@ -1606,7 +1631,7 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     integral = padded.cumsum(0).cumsum(1)
     unknown = integral[size:, size:] - integral[:-size, size:] - integral[size:, :-size] + integral[:-size, :-size]
     cost += 5. * unknown / size**2
-    preferred = goal & (lateral <= RESOLUTION) & allowed
+    preferred = goal & (tangent_goal if tangent_goal is not None else lateral <= RESOLUTION) & allowed
     allowed &= remaining >= stop
     if not (goal & allowed).any():
         return None
