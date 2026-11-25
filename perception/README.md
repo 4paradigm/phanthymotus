@@ -3218,6 +3218,11 @@ maintain an active track internally but are omitted from the output. A strong
 detection can recover a lost track within one second. Only observed boxes are
 published. One-shot photo and URL results keep their existing fields.
 
+Enable `publish_overlay` on a VOP instance to watch the tracked boxes and
+`class #ID` labels on the same video frame. The second output
+`<input>/objects/overlay_img` is an `image/jpeg` stream. It is off by default
+to avoid the extra JPEG encode and works independently of `publish_bbox`.
+
 Two knobs govern what one detected object costs on the topic. **They affect the
 stream only** — `recognize` / `recognize_by_url` always answer in full, because
 that reply is asked for once and read once, and a caller who cannot see the

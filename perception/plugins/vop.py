@@ -365,11 +365,15 @@ TOOLS = [
                 # caller who cannot see the frame has no other way to get the
                 # pixel box back.
                 "publish_bbox":  {"type": "boolean", "description": "在流式结果里带上像素框 [x1,y1,x2,y2]。关掉只剩中心点，下游想按目标区域采样另一张对齐的图（如深度图）就只能取一小块", "default": True, "scope": "instance"},
+                "publish_overlay": {"type": "boolean", "title": "跟踪预览", "description": "输出带检测框、类别和跟踪 ID 的视频。每帧额外编码一次 JPEG。", "default": False, "scope": "instance"},
                 "publish_color": {"type": "string", "enum": list(COLOR_LEVELS), "description": "流式结果里的颜色详略：name=三元组+亮度（默认），full=全部 16 个字段，off=不发。每个对象每帧的差别是 27 B 与 239 B", "default": "name", "scope": "instance"},
             },
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
-        "topic_out": [{"format": "data/json",  "desc": "detected objects with positions"}],
+        "topic_out": [
+            {"format": "data/json", "desc": "detected objects with positions"},
+            {"format": "image/jpeg", "desc": "跟踪预览（启用 publish_overlay 后输出）"},
+        ],
     }
 ]
 
@@ -381,7 +385,8 @@ class _VOPNode(Node):
 
     def __init__(self, input_topic: Optional[str], model, confidence: float, fps: float,
                  node_suffix: str, vocabulary: Optional[list] = None,
-                 publish_bbox: bool = True, publish_color: str = "name"):
+                 publish_bbox: bool = True, publish_color: str = "name",
+                 publish_overlay: bool = False):
         super().__init__(f"vop_{node_suffix}" if node_suffix else "vop")
         # Topic-less is a supported mode, as in plugins/tts.py: a card driven
         # only by recognize_by_photo has no camera to subscribe to, but still
@@ -398,6 +403,10 @@ class _VOPNode(Node):
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
+        self._pub_overlay = (
+            self.create_publisher(CompressedImage, f"{self._output_topic}/overlay_img", _PUB_QOS)
+            if input_topic and publish_overlay else None
+        )
         self._sub: Optional[object] = None
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
@@ -517,8 +526,40 @@ class _VOPNode(Node):
                 for obj, index in zip(objects, visible):
                     obj["track_id"] = tracks[int(index)]
                 self._publish_objects(objects, started)
+                if self._pub_overlay is not None:
+                    self._publish_overlay_frame(frame, boxes[visible], objects)
             except Exception as e:
                 log.error(f"[vop] inference error: {e}", exc_info=True)
+
+    def _publish_overlay_frame(self, frame, boxes, objects):
+        import cv2
+
+        # Boxes and pixels come from the same inference call.
+        palette = ((67, 220, 250), (230, 167, 71), (110, 225, 110),
+                   (190, 114, 244), (250, 190, 95), (112, 148, 255))
+        height, width = frame.shape[:2]
+        scale = max(0.5, width / 1920)
+        stroke = max(2, round(scale * 3))
+        for box, obj in zip(boxes, objects):
+            left, top, right, bottom = (int(round(value)) for value in box)
+            track_id = obj["track_id"]
+            color = palette[(track_id - 1) % len(palette)]
+            cv2.rectangle(frame, (left, top), (right, bottom), color, stroke)
+            label = f"{obj['name']} #{track_id}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (text_width, text_height), baseline = cv2.getTextSize(label, font, scale, stroke)
+            x = max(0, min(left, width - text_width - 8))
+            y = max(text_height + 6, min(top, height - baseline - 4))
+            cv2.rectangle(frame, (x, y - text_height - 6),
+                          (x + text_width + 8, y + baseline + 2), color, cv2.FILLED)
+            cv2.putText(frame, label, (x + 4, y), font, scale, (0, 0, 0), stroke,
+                        cv2.LINE_AA)
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok:
+            message = CompressedImage()
+            message.format = "jpeg"
+            message.data = encoded.tobytes()
+            self._pub_overlay.publish(message)
 
     def _class_name(self, cls_id: int) -> str:
         """Resolve a class id through the engine's frozen vocabulary.
@@ -603,6 +644,7 @@ class VideoObjectPerceptionPlugin:
         self._confidence = float(plugin_cfg.get("confidence", 0.3))
         self._fps = int(plugin_cfg.get("fps", 5))
         self._publish_bbox = bool(plugin_cfg.get("publish_bbox", True))
+        self._publish_overlay = bool(plugin_cfg.get("publish_overlay", False))
         self._publish_color = _color_level(plugin_cfg.get("publish_color"))
         self._model_name = canonical_model_name(plugin_cfg.get("model", DEFAULT_MODEL))
         self._vocabulary: list[str] = []      # filled from the bundle's vocab.json
@@ -929,13 +971,15 @@ class VideoObjectPerceptionPlugin:
             confidence = float(icfg.get("confidence", self._confidence))
             fps = int(icfg.get("fps", self._fps))
             publish_bbox = bool(icfg.get("publish_bbox", self._publish_bbox))
+            publish_overlay = bool(icfg.get("publish_overlay", self._publish_overlay))
             publish_color = (_color_level(icfg["publish_color"])
                              if "publish_color" in icfg else self._publish_color)
             suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
             input_for_node = input_topic or None
             node = _VOPNode(input_for_node, self._model, confidence, fps,
                             node_suffix=suffix, vocabulary=self._vocabulary,
-                            publish_bbox=publish_bbox, publish_color=publish_color)
+                            publish_bbox=publish_bbox, publish_color=publish_color,
+                            publish_overlay=publish_overlay)
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()
@@ -1046,6 +1090,7 @@ class VideoObjectPerceptionPlugin:
                     "confidence": node._confidence,
                     "fps": node._fps,
                     "publish_bbox": node._publish_bbox,
+                    "publish_overlay": node._pub_overlay is not None,
                     "publish_color": node._publish_color,
                     "detect_count": node._detect_count,
                 }
@@ -1064,6 +1109,17 @@ class VideoObjectPerceptionPlugin:
             topics_in = [{"topic": input_topic, "format": "image/jpeg"}] if input_topic else []
             topics_out = ([{"topic": output_topic_for(input_topic), "format": "data/json"}]
                           if (input_topic or nodes) else [])
+            with self._nodes_lock:
+                overlay_enabled = self._instance_configs.get(instance_id, {}).get(
+                    "publish_overlay", self._publish_overlay
+                )
+            if instance_id in nodes:
+                overlay_enabled = nodes[instance_id]._pub_overlay is not None
+            if input_topic and overlay_enabled:
+                topics_out.append({
+                    "topic": f"{output_topic_for(input_topic)}/overlay_img",
+                    "format": "image/jpeg",
+                })
             state = "running" if instances else "idle"
             info = {
                 "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
@@ -1246,6 +1302,8 @@ class VideoObjectPerceptionPlugin:
                     self._fps = int(cfg["fps"])
                 if "publish_bbox" in cfg:
                     self._publish_bbox = bool(cfg["publish_bbox"])
+                if "publish_overlay" in cfg:
+                    self._publish_overlay = bool(cfg["publish_overlay"])
                 if "publish_color" in cfg:
                     self._publish_color = _color_level(cfg["publish_color"])
                 return {"status": "configured", "config": cfg}

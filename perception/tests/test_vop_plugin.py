@@ -379,6 +379,29 @@ def test_low_confidence_detections_are_dropped():
     assert json.loads(pub.messages[0])["objects"] == []
 
 
+def test_stream_can_publish_tracking_preview_with_bboxes_disabled():
+    import cv2
+
+    plugin, executor = _plugin(
+        {"publish_overlay": True, "publish_bbox": False},
+        model=_FakeModel(rows=[[40, 40, 100, 90, 0.9, 1]]),
+    )
+    node = _node_with(plugin, executor)
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    json_pub, image_pub = node.publishers
+    assert _wait_until(lambda: bool(image_pub.messages))
+    detected = json.loads(json_pub.messages[0])["objects"][0]
+    assert detected["track_id"] == 1
+    assert "bbox" not in detected
+    assert image_pub.topic == json_pub.topic + "/overlay_img"
+    info = plugin.dispatch("vop", {"action": "info"})
+    assert info["topic_out"][1] == {"topic": image_pub.topic, "format": "image/jpeg"}
+    jpeg = image_pub.messages[0]
+    image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert image.shape == (100, 200, 3)
+    assert image[40, 70].max() > 100
+
+
 def test_stream_uses_weak_boxes_without_publishing_them(monkeypatch):
     frame_time = 10.0
     monkeypatch.setattr(
