@@ -1,0 +1,10 @@
+# Offline CPython 3.10 runtime; exact versions exercised in the personal environment.
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+jsonschema==4.26.0
+PyYAML==6.0.3
+attrs==26.1.0
+jsonschema-specifications==2025.9.1
+referencing==0.37.0
+rpds-py==0.30.0
+typing-extensions==4.16.0

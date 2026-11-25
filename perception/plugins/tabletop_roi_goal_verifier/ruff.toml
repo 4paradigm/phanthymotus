@@ -1,0 +1,3 @@
+# The official JetPack 5 Perception image ships Python 3.8.
+# Prevent automated lint fixes from reintroducing pairwise/datetime.UTC.
+target-version = "py38"
