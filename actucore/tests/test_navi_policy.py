@@ -5230,7 +5230,8 @@ def test_checked_prefix_slows_before_stopping_for_an_obstacle_near_the_sweep():
 
 @pytest.mark.parametrize("corridor_clear", [False, True])
 @pytest.mark.parametrize("route_state", ["initial", "published", "memory"])
-def test_camera_only_tries_an_early_arc_for_a_visible_blocked_corridor(monkeypatch, corridor_clear, route_state):
+@pytest.mark.parametrize("ahead", [1.2, 1.8])
+def test_camera_only_tries_an_arc_for_a_visible_blocked_corridor(monkeypatch, corridor_clear, route_state, ahead):
     grid = P.local_path
     geometry = grid.camera_square(P.HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .275, at_front=True)
     config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
@@ -5241,25 +5242,55 @@ def test_camera_only_tries_an_early_arc_for_a_visible_blocked_corridor(monkeypat
         state.goal_anchor = P.DetourGoal(3., 0.)
     scan = state.active_scan
     scan.command_only, scan.receipt_only, scan.current_frame = True, True, 1000
-    occupied = np.isclose(grid.FORWARD, 1.8) & (abs(grid.RIGHT) <= .20)
+    occupied = np.isclose(grid.FORWARD, ahead) & (abs(grid.RIGHT) <= .20)
     scan.views.append((1000, scan.pose, ~occupied, occupied))
     depth = dict(_scene(3.), frame_id=1000)
     command = (.2, 0., -.12, P.AVOIDING, "checked camera arc")
-    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (1.8, 1.))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (ahead, 1.))
     monkeypatch.setattr(P, "_target_corridor_clear", lambda *args: corridor_clear)
     seen = []
 
     def camera_arc(*args, ahead, **kwargs):
-        seen.append(ahead)
+        seen.append(round(ahead, 6) if ahead is not None else None)
         return command if ahead is not None else None
 
     monkeypatch.setattr(P, "_camera_detour", camera_arc)
     result = P._avoid(.2, 0., -.2, depth, config, P.APPROACHING, "", state,
                       target_distance=3., target_bearing=.2, may_scan=True)
-    tries_early_arc = not corridor_clear and route_state != "memory"
-    assert seen == ([None] if route_state == "published" else []) + ([1.8] if tries_early_arc else [])
-    if tries_early_arc:
+    if route_state == "published" and ahead < config.approach_check_distance_m:
+        assert seen == [ahead]
         assert result == command
+        return
+    tries_arc = not corridor_clear and (route_state != "memory" or ahead < config.approach_check_distance_m)
+    assert seen == ([None] if route_state == "published" else []) + ([ahead] if tries_arc else [])
+    if tries_arc:
+        assert result == command
+
+
+@pytest.mark.parametrize(("ahead", "corridor_clear", "has_route"),
+                         [(None, True, False), (1.2, True, False), (1.2, False, False),
+                          (None, True, True), (None, False, True)])
+def test_remembered_goal_only_plans_a_detour_for_a_blocked_corridor(monkeypatch, ahead, corridor_clear, has_route):
+    grid = P.local_path
+    geometry = grid.camera_square(P.HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .275, at_front=True)
+    config = _cfg(local_planning=True, local_geometry=geometry, use_lateral=False)
+    state = _state(motion_source="measured", goal_anchor=P.DetourGoal(3., 0.))
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    if has_route:
+        state.dwa_guidance = P.DwaGuidance(scan.motion_frame, state.goal_anchor, ((0., 0.), (1., .4)), (0., 0.))
+    occupied = np.isclose(grid.FORWARD, 1.2) & np.isclose(grid.RIGHT, .7)
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    depth = dict(_scene(3.), frame_id=1000, ground=occupied)
+    command = (.2, 0., -.12, P.AVOIDING, "checked detour")
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (ahead, 1.))
+    monkeypatch.setattr(P, "_target_corridor_clear", lambda *args: corridor_clear)
+    monkeypatch.setattr(P, "_dwa_unavailable_reason", lambda *args, **kwargs: None)
+    monkeypatch.setattr(P, "_start_detour_segment", lambda *args, **kwargs: command)
+
+    result = P._avoid(.2, 0., -.2, depth, config, P.APPROACHING, "tracking", state,
+                      target_distance=3., target_bearing=.2, may_scan=True)
+    assert result == ((.2, 0., -.2, P.APPROACHING, "tracking") if corridor_clear else command)
 
 
 def test_exhausted_camera_route_retries_only_with_new_depth_and_search_budget():

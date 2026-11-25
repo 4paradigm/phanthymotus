@@ -81,6 +81,26 @@ def test_retained_route_sweeps_an_executable_yaw_when_pursuit_falls_below_the_fl
     assert choice.check.reason is None
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+@pytest.mark.parametrize("arc_clear", [False, True])
+def test_a_bent_route_sweeps_the_declared_turn_floor_before_sending(side, arc_clear):
+    swept = []
+
+    def visible(command, poses, duration):
+        swept.append(command)
+        return dwa.CandidateCheck(arc_clear, "occluded_prefix")
+
+    choice = _run(((0., 0.), (1., side * .15)), follow_published=True,
+                  target=None, x_limit=(0., .12), floors=(.12, 0., .4, .2),
+                  validate_candidate=visible)
+    expected = (.12, 0., -side * .2)
+    assert swept == [expected]
+    if arc_clear:
+        assert choice.command == expected and choice.check.accepted
+    else:
+        assert choice is None
+
+
 @pytest.mark.parametrize("blocked", [False, True])
 def test_short_window_checks_the_preferred_motion_before_fanning_out(monkeypatch, blocked):
     previous = (.2, 0., -.12)
@@ -188,9 +208,10 @@ STRAIGHT = ((0., 0.), (.8, 0.))
 
 @pytest.mark.parametrize("side", [-1., 1.])
 @pytest.mark.parametrize("arc_clear", [False, True])
-def test_new_detour_prefers_a_checked_first_arc_on_its_selected_side(side, arc_clear):
+@pytest.mark.parametrize("initial_yaw", [0., .0042])
+def test_new_detour_prefers_a_checked_first_arc_on_its_selected_side(side, arc_clear, initial_yaw):
     route = ((0., 0.), (.65, side * .12), (1.4, side * .28))
-    straight = (.20, 0., 0.)
+    initial = (.20, 0., -side * initial_yaw)
     arc, _ = dwa.track_route(route, .20, 1., (-.7, .7), body_origin=(0., 0.),
                              lateral=False, yaw_floor=.04)
     assert arc[2] * side < 0.
@@ -198,13 +219,13 @@ def test_new_detour_prefers_a_checked_first_arc_on_its_selected_side(side, arc_c
 
     def visible(command, poses, duration):
         swept.append(command)
-        return dwa.CandidateCheck(command == straight or (arc_clear and command == arc), "occluded_prefix")
+        return dwa.CandidateCheck(command == initial or (arc_clear and command == arc), "occluded_prefix")
 
-    choice = _run(route, previous=straight, measured=straight, x_limit=(0., .20),
+    choice = _run(route, previous=initial, measured=initial, x_limit=(0., .20), floors=(.08, .08, .7, 0.),
                   candidate_budget=dwa.CandidateBudget(64), guidance=True, validate_candidate=visible)
     assert arc in swept
     assert choice.check.accepted
-    assert choice.command == (arc if arc_clear else straight)
+    assert choice.command == (arc if arc_clear else initial)
 
 
 @pytest.mark.parametrize("follow_published", [False, True])

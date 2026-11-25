@@ -4155,7 +4155,8 @@ class NaviPlugin:
             tracked = dwa.track_route(
                 transform.points(origin.acceptance.route_points), math.hypot(*origin.acceptance.command[:2]),
                 original.prediction_horizon_s, (-policy_mod._scan_yaw_rate(cfg, 1.), policy_mod._scan_yaw_rate(cfg, -1.)),
-                body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral)
+                body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral,
+                yaw_floor=cfg.floor_wz_moving)
         values = checked = None
         if tracked is None:
             diagnostics.setdefault("reason", "route_end")

@@ -415,8 +415,10 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
         speed = min(speed, yaw_cap * (f * f + r * r) / (2. * abs(r)))
     vx, vy, wz = _preferred_command(((0., 0.), (f, r)), speed, horizon, yaw_limit, differential=not lateral)
     if 0. < abs(wz) < yaw_floor:
-        # Quantize before the caller sweeps the actual executable twist.
-        wz = math.copysign(yaw_floor, wz) if abs(wz) >= yaw_floor / 2 else 0.
+        # A lateral offset resolved by the grid needs steering, even at low speed.
+        minimum = math.copysign(yaw_floor, wz)
+        turn = abs(r) >= local_path.RESOLUTION / 2 or abs(wz) >= yaw_floor / 2
+        wz = minimum if turn and yaw_limit[0] <= minimum <= yaw_limit[1] else 0.
     return (vx, vy, wz), remaining
 
 
@@ -579,8 +581,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             return choice
         vx, vy, wz = choice.command
         delta = wz - previous[2]
-        entering = entry_slot and vx > 0. and vy == wz == 0.
-        if entering:
+        entry_yaw = 0.
+        if entry_slot and vx > 0. and vy == 0.:
             # Track the selected reference at the incoming forward speed.
             # The first packet can turn without reopening the route decision.
             body_origin = ((rotation_center or ((geometry.front - geometry.rear) / 2, 0.))
@@ -588,9 +590,13 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             tracked = track_route(routes[choice.reference_index], vx, horizon, yaw_limit,
                                   body_origin=body_origin, lateral=False,
                                   lookahead_m=max(.45, x_speed * horizon), yaw_floor=floors[3])
-            if tracked is None or not tracked[0][2]:
+            route_yaw = tracked[0][2] if tracked is not None else 0.
+            if wz * route_yaw >= 0. and abs(wz) < abs(route_yaw):
+                entry_yaw = route_yaw
+            elif not wz:
                 return choice
-            command = vx, 0., tracked[0][2]
+        if entry_yaw:
+            command = vx, 0., entry_yaw
         else:
             if not transition_slot or abs(wz) >= handoff_yaw_step or abs(delta) <= 2 * handoff_yaw_step:
                 return choice
@@ -617,7 +623,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         if validate_candidate is not None and not validate_candidate(command, poses, prediction.duration).accepted:
             return choice
         components = replace(components, obstacle=_obstacle_score(check))
-        diag["entry_arc_selected" if entering else "handoff_yaw_interpolated"] = True
+        diag["entry_arc_selected" if entry_yaw else "handoff_yaw_interpolated"] = True
         diag["admissible_candidates"] += 1
         return Choice(command, poses[:prediction.moving_count], components.total, progress,
                       check.min_clearance_m, prediction, check, components, choice.reference_index)
