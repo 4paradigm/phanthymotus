@@ -814,7 +814,8 @@ def test_ego_motion_prefers_pose_feedback_to_an_unmeasured_axis():
 
 @pytest.mark.parametrize("age, measured_vx, expected", [
     (100, 0., (0., .1, .25)),
-    (301, 0., (.15, .1, .25)),
+    (500, 0., (0., .1, .25)),
+    (501, 0., (.15, .1, .25)),
     (100, None, (.15, .1, .25)),
 ])
 def test_tracker_fills_unavailable_speed_from_covered_command(monkeypatch, age, measured_vx, expected):

@@ -91,6 +91,7 @@ BLIND = "blind"          # no usable observation — distinct from "nothing seen
 FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
 DEPTH_CAPTURE_STALE = "等待新的有效深度"
+SPEED_SAMPLE_MAX_AGE_MS = 500
 FEEDBACK_STALE = "运动反馈已到期，停车等待新速度"
 FEEDBACK_SWITCH = "运动反馈来源已切换，等待底盘停稳"
 
@@ -1878,7 +1879,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     now_ms = (depth or {}).get("control_ms") or (odom or {}).get("control_ms") or (odom or {}).get("received_ms")
     speed_stale = bool(odom and ("component_speed_ms" in odom or "received_speed_ms" in odom)
                        and (type(speed_ms) is not int or now_ms is None
-                            or not 0 <= now_ms - speed_ms <= config.max_feedback_gap_ms))
+                            or not 0 <= now_ms - speed_ms <= SPEED_SAMPLE_MAX_AGE_MS))
     ego_odom = ({"pose_feedback": odom.get("pose_feedback")} if speed_stale else odom)
     ego, ego_measured = _ego_twist(ego_odom, state, command_fraction=state.command_dt_s / dt if dt else 0.)
     recovering = state.reacquire_generation is not None
@@ -1987,7 +1988,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     feedback = planar_feedback(odom) if config.local_planning else None
     if config.local_planning and config.local_geometry is not None:
         speed_missing = (feedback is None or speed_stale
-                         or (state.uses_received_speed and (odom or {}).get("received_speed_ms") is None))
+                         or (state.uses_received_speed and (
+                             odom.get("received_speed_ms") is None or odom.get("received_ms") is None)))
         if (config.local_controller == "dwa" and anchor is None
                 and speed_missing
                 and (track is None or not track.observed) and detections is not None
@@ -1995,7 +1997,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
             continued = _continue_search_without_speed(depth, config, state, dt, ego_odom)
             if continued is not None:
                 return continued
-        if (config.local_controller == "dwa" and speed_missing and state.published_dwa_route is not None
+        if (config.local_controller == "dwa" and state.published_dwa_route is not None
+                and (speed_missing or (odom or {}).get("received_ms") is None)
                 and any(state.commanded[:2])):
             # Leave the selected frame intact while the publisher checks the
             # motion already issued. No replacement route has been selected.
@@ -2052,7 +2055,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
             speed_ms = (odom or {}).get("received_speed_ms")
             now_ms = (depth or {}).get("control_ms") or (odom or {}).get("received_ms")
             if (feedback is None or speed_ms is None or now_ms is None
-                    or not 0 <= now_ms - speed_ms <= config.max_feedback_gap_ms):
+                    or not 0 <= now_ms - speed_ms <= SPEED_SAMPLE_MAX_AGE_MS):
                 return Decision(_twist(0., 0., 0.), AVOIDING, FEEDBACK_STALE)
         if any(state.commanded):
             state.command_tail = state.commanded

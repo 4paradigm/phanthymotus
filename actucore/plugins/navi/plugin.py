@@ -374,6 +374,17 @@ class _ScheduledCommand:
     checking: bool = False
     checking_new_target: bool = False
     retry_after_rejection: bool = False
+    predicted_depth_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class _PredictedRouteCheck:
+    work: _ScheduledCommand
+    revision: tuple
+    objects_ms: int
+    observation_ms: int
+    deadline_ms: int
+    depth_ms: int
 
 # A direct hardware depth topic is allowed to come up after Navi.  Do not wait
 # in ``start`` (that would turn an upstream loading delay into a canvas-wide
@@ -1464,6 +1475,7 @@ class NaviPlugin:
                            "max_depth_age_ms": self._config.depth_age_limit_ms,
                            "scan_odom_linear_tolerance_mps": self._config.scan_odom_linear_tolerance_mps,
                            "max_feedback_gap_ms": self._config.max_feedback_gap_ms,
+                           "max_speed_age_ms": policy_mod.SPEED_SAMPLE_MAX_AGE_MS,
                            "use_obstacle_history": self._config.use_obstacle_history,
                            "stop_tolerance_m": self._config.stop_tolerance_m,
                            "arrival_distance_m": self._config.arrival_distance_m,
@@ -3913,13 +3925,13 @@ class NaviPlugin:
                 self._dwa_event(identity, "veto", "superseded")
 
     def _route_feedback_missing(self, odom, now_ms):
-        if odom is None or odom_mod.planar_feedback(odom) is None:
+        if odom is None or odom.get("received_ms") is None or odom_mod.planar_feedback(odom) is None:
             return True
         stamp = odom.get("received_speed_ms", odom.get("received_ms"))
         return type(stamp) is not int or not 0 <= now_ms - stamp < self._config.max_feedback_gap_ms
 
-    def _check_predicted_outgoing_route(self, work, snapshot, now_ms):
-        """Sweep the existing packet using its wire twist during a speed gap."""
+    def _check_predicted_outgoing_route(self, work, snapshot, now_ms, *, renew):
+        """Check the wire twist and the room left on the same route."""
         config = self._config
         origin = work.dwa_origin
         objects, depth, odom, objects_ms = snapshot
@@ -3928,29 +3940,35 @@ class NaviPlugin:
                 or origin.acceptance.angle_controlled or origin.acceptance.corridor_corner
                 or config.use_obstacle_history or objects is None or depth is None
                 or depth.get("capture_invalid") or track is None or not track.observed
+                or self._state.arrived or self._state.failed_reason
                 or work.turn is not None or work.leg is not None or work.stop_reason is not None
-                or now_ms >= work.expires_ms or time.monotonic() >= work.expires_at
                 or self._dwa_publish_rejection(work.message, origin, now_ms, sent=True) is not None):
-            return False
+            return None
         check = origin.forward_check
         guard, geometry = check.motion_guard, check.geometry
         depth_ms = depth_mod.observation_ms(depth)
         max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or config.max_obs_age_ms
         if (depth_ms is None or not 0 <= now_ms - depth_ms < min(config.depth_age_limit_ms, max_age)
                 or not 0 <= now_ms - objects_ms < min(config.max_obs_age_ms, max_age)
-                or not 0 <= now_ms - check.feedback_ms < config.max_feedback_gap_ms
                 or (check.mount_frame is not None
                     and (depth.get("body_from_optical") is None
                          or not np.array_equal(depth["body_from_optical"], geometry.base_from_optical)))):
-            return False
+            return None
+        observation_ms = min(depth_ms, objects_ms)
+        period_ms = math.ceil(1000 / self._rate_hz)
+        deadline_ms = int(min(now_ms + min(self._ttl_ms, 2 * period_ms),
+                              depth_ms + config.depth_age_limit_ms, objects_ms + config.max_obs_age_ms,
+                              observation_ms + max_age))
+        if now_ms >= deadline_ms:
+            return None
         match = self._dwa_target_match(check, objects, depth, odom, objects_ms, geometry,
                                        check.front_required, follow_route=True)
         if match is None or match.point is None:
-            return False
+            return None
         projection = local_path.DepthProjection.for_observation(depth)
         grid = projection.grid_for(geometry, require_valid_depth=True, check_free_space=guard.visibility_required)
         if grid is None:
-            return False
+            return None
         command = self._wire_twist
         partial = odom_mod.planar_axes(odom)
         rates = (command, guard.measured, guard.previous, (0., 0., 0.),
@@ -3961,13 +3979,38 @@ class NaviPlugin:
                                                     grid[1], guard_blind_sides=True)
         goal = local_path.target_in_grid(geometry, match.point[0], -match.point[1])
         goal_error = registration.error(math.hypot(*goal))
-        end = max(work.expires_ms, work.message["stamp_ms"] + work.message["ttl_ms"] + config.watchdog_ms)
+        end = max(work.expires_ms, work.message["stamp_ms"] + work.message["ttl_ms"] + config.watchdog_ms,
+                  deadline_ms + config.watchdog_ms if renew else now_ms)
         prediction = motion.predict_motion(command, command, command, hold_s=(end - now_ms + 50) / 1000,
                                            latency_s=0., geometry=geometry, mode=guard.footprint.mode,
                                            acceleration=config.motion_acceleration, braking=config.motion_braking,
                                            initial_bounds=bounds)
-        room = dwa.remaining_route_length(origin.acceptance.route_points)
-        room -= (now_ms - check.planning_guard.checked_ms) / 1000 * max(math.hypot(*v[:2]) for v in rates)
+        planned = check.planning_guard
+        if planned.pose is None or guard.pose is None or planned.pose.frame != guard.pose.frame:
+            return None
+        anchor = policy_mod.dwa_registration(planned.pose, guard.pose, planned.checked_ms, guard.checked_ms,
+                                            geometry, rates)
+        route = tuple(map(tuple, anchor.points(origin.acceptance.route_points)))
+        elapsed = (now_ms - guard.checked_ms) / 1000
+        if elapsed < 0.:
+            return None
+        # Consume the unseen translation from the original path. Camera
+        # frames can refresh collision evidence, but cannot reset this room.
+        room = dwa.remaining_route_length(route) - elapsed * max(math.hypot(*v[:2]) for v in rates)
+        room -= anchor.error(math.hypot(*route[-1]))
+        if room <= 0.:
+            return None
+        if renew:
+            past = motion.predict_motion(guard.measured, guard.previous, command, hold_s=elapsed,
+                                         latency_s=0., geometry=geometry, mode=guard.footprint.mode,
+                                         acceleration=config.motion_acceleration, braking=config.motion_braking,
+                                         stop=False)
+            prior_path = past.camera_poses if guard.footprint.mode == "camera_approx" else past.body_poses
+            future_path = prediction.camera_poses if guard.footprint.mode == "camera_approx" else prediction.body_poses
+            pose = local_path.GridTransform(*prior_path[-1])
+            positions = pose.points([point[:2] for point in future_path[:prediction.moving_count]])
+            if not dwa.stays_on_route(route, positions, guard.footprint.half_width):
+                return None
         result = motion.evaluate_motion(
             prediction, footprint=guard.footprint, occupied=(registration.squares(cells),), remembered=(),
             supported_region=local_path.SUPPORTED_REGION, original_goal=goal,
@@ -3978,15 +4021,50 @@ class NaviPlugin:
             result = dwa.check_measured_standoff(
                 prediction, result, (front, registration.error(math.hypot(*front))), config.stop_distance_m)
         if not result.accepted:
-            return False
+            return None
         if guard.visibility_required:
             shadow = local_path.occluded_cells(*grid, geometry)
             poses = prediction.camera_poses if guard.footprint.mode == "camera_approx" else prediction.body_poses
             if not policy_mod.dwa_trace_visible(poses, shadow, registration):
-                return False
+                return None
+        return _PredictedRouteCheck(work, _motion_inputs(*snapshot[:3]), objects_ms, observation_ms, deadline_ms,
+                                    depth_ms)
+
+    def _prediction_inputs_current(self, proof):
         latest = self._observation_snapshot(with_capture_timing=True)
-        return (latest[3] == objects_ms and _motion_inputs(*latest[:3]) == _motion_inputs(*snapshot[:3])
-                and int(time.time() * 1000) < work.expires_ms and time.monotonic() < work.expires_at)
+        now_ms = int(time.time() * 1000)
+        return (self._scheduled_command is proof.work and latest[3] == proof.objects_ms
+                and _motion_inputs(*latest[:3]) == proof.revision
+                and now_ms < proof.deadline_ms and self._route_feedback_missing(latest[2], now_ms))
+
+    def _continue_predicted_route(self, work, snapshot, now_ms):
+        period_ms = math.ceil(1000 / self._rate_hz)
+        depth_ms = depth_mod.observation_ms(snapshot[1])
+        last_depth = work.predicted_depth_ms or work.forward_check.depth_ms
+        renew = (depth_ms is not None and depth_ms > last_depth
+                 and (now_ms - work.message["stamp_ms"] >= period_ms
+                      or now_ms + period_ms >= work.expires_ms or time.monotonic() >= work.expires_at))
+        proof = self._check_predicted_outgoing_route(work, snapshot, now_ms, renew=renew)
+        if proof is None:
+            return False
+        if not self._prediction_inputs_current(proof):
+            return None
+        if not renew:
+            return now_ms < work.expires_ms and time.monotonic() < work.expires_at
+        message = dict(work.message, obs_stamp_ms=proof.observation_ms)
+        message.pop("control_interface", None)
+        stamp = int(time.time() * 1000)
+        published = self._published
+        decision = self._last_decision
+        if decision is not None:
+            reason = decision.reason
+            decision.reason = "局部规划：按上一条指令预测运动，沿当前路线续发"
+        written = (self._send_scheduled(message, stamp, proof.deadline_ms - stamp,
+                                       dwa_origin=work.dwa_origin, prediction=proof)
+                   and self._published > published and self._continuing_dwa_output(work.dwa_origin))
+        if decision is not None and not written:
+            decision.reason = reason
+        return written
 
     def _retain_checked_route(self, work, now_ms, *, rejected=None, check_outgoing_sweep=False):
         # A failed handoff does not extend the checked route or authorize a
@@ -4137,8 +4215,9 @@ class NaviPlugin:
                         and self._last_decision.reason in (policy_mod.FEEDBACK_STALE, policy_mod.FEEDBACK_SWITCH)):
                     snapshot = self._observation_snapshot(with_capture_timing=True)
                     if (self._route_feedback_missing(snapshot[2], now_ms)
-                            and self._check_predicted_outgoing_route(active, snapshot, now_ms)):
+                            and self._continue_predicted_route(active, snapshot, now_ms)):
                         self._state.commanded = self._wire_twist
+                        self._last_decision.values = list(active.message["values"])
                         self._last_decision.reason = "局部规划：按上一条指令预测运动，维持当前路线"
                         return True
                 if (no_route and active is not None and active.camera_arc_end_ms is not None
@@ -4354,12 +4433,22 @@ class NaviPlugin:
             started = time.monotonic()
             route_end, route_end_at = work.repeat_until or (work.expires_ms, work.expires_at)
             cutoff, cutoff_at = min(route_end, work.expires_ms), min(route_end_at, work.expires_at)
-            if (self._scheduled_command is not work or not self._continuing_dwa_output(origin)
-                    or now_ms >= cutoff or started >= cutoff_at):
+            if self._scheduled_command is not work or not self._continuing_dwa_output(origin):
                 return
             check = origin.forward_check
             fixed_arc = self._fixed_arc(work)
             snapshot = self._observation_snapshot(with_capture_timing=True)
+            if (not fixed_arc and origin.acceptance.route_points
+                    and not self._config.use_obstacle_history and self._route_feedback_missing(snapshot[2], now_ms)):
+                continued = self._continue_predicted_route(work, snapshot, now_ms)
+                if continued is not False:
+                    return
+                if work.predicted_depth_ms is not None:
+                    self._cancel_scheduled_motion(stop=(now_ms, "局部规划：预测续发复检未通过", False),
+                                                  dwa_reason="predicted_route_veto")
+                    return
+            if now_ms >= cutoff or started >= cutoff_at or (work.repeat_until is None and not fixed_arc):
+                return
             revision = _motion_inputs(*snapshot[:3])
             odom = snapshot[2] or {}
             target_refresh = False
@@ -4401,9 +4490,6 @@ class NaviPlugin:
         # Projection and the full receive-watchdog/braking sweep may overlap
         # cancellation or a replacement plan. Reclaim the wire only afterwards.
         diagnostics = {}
-        if self._route_feedback_missing(snapshot[2], now_ms) and not fixed_arc:
-            if self._check_predicted_outgoing_route(work, snapshot, now_ms):
-                return
         if (fresh_feedback or target_refresh) and not fixed_arc:
             checked, values = self._check_route_control(
                 origin, check, max_age, now_ms, snapshot, scan, diagnostics, renew=True,
@@ -4689,7 +4775,8 @@ class NaviPlugin:
             return
         work = self._scheduled_command
         if (work is not None and work.sent and work.dwa_origin is not None
-                and (work.repeat_until is not None or self._fixed_arc(work))):
+                and (work.repeat_until is not None or self._fixed_arc(work)
+                     or work.dwa_origin.acceptance.route_points)):
             with self._output_lock:
                 if self._scheduled_command is not work or work.checking:
                     return
@@ -4924,7 +5011,7 @@ class NaviPlugin:
         return self._wire_seq
 
     def _send_scheduled(self, message, now_ms, ttl_ms, *, dwa_origin=None, diagnostic=None, stop_reason=None,
-                        repeat_feedback=None):
+                        repeat_feedback=None, prediction=None):
         """Serialize wire sequence numbers for plan results and checked repeats."""
         seq = message["seq"] if message is not None else 0
         if self._command_timer is not None:
@@ -4937,7 +5024,11 @@ class NaviPlugin:
         else:
             packet = dict(message, seq=seq, stamp_ms=now_ms, ttl_ms=ttl_ms)
         try:
-            moving = (self._publish_command(packet, dwa_origin=dwa_origin, diagnostic=diagnostic,
+            if prediction is not None:
+                moving = self._publish_checked_command(packet, dwa_origin, diagnostic, stop_reason,
+                                                       prediction=prediction)
+            else:
+                moving = (self._publish_command(packet, dwa_origin=dwa_origin, diagnostic=diagnostic,
                                             stop_reason=stop_reason, repeat_feedback=repeat_feedback)
                       if dwa_origin is not None or diagnostic is not None
                       else self._publish_command(packet))
@@ -4996,7 +5087,8 @@ class NaviPlugin:
         with self._output_lock:
             return self._publish_checked_command(message, dwa_origin, diagnostic, stop_reason, repeat_feedback=repeat_feedback)
 
-    def _publish_checked_command(self, message, dwa_origin, diagnostic, stop_reason, *, repeat_feedback=None):
+    def _publish_checked_command(self, message, dwa_origin, diagnostic, stop_reason, *,
+                                 repeat_feedback=None, prediction=None):
         from std_msgs.msg import String
 
         renewed_first_send = False
@@ -5015,9 +5107,14 @@ class NaviPlugin:
             return self._wire_moving
         if origin is not None and any(message["values"]):
             now_ms = int(time.time() * 1000)
-            rejection = self._dwa_publish_rejection(message, origin, now_ms)
+            rejection = self._dwa_publish_rejection(message, origin, now_ms, sent=prediction is not None)
             work = self._scheduled_command
-            if rejection is None and repeat_feedback is not None:
+            if prediction is not None:
+                if (rejection is not None or not self._continuing_dwa_output(origin)
+                        or message["values"] != prediction.work.message["values"]
+                        or not self._prediction_inputs_current(prediction)):
+                    return self._wire_moving
+            elif rejection is None and repeat_feedback is not None:
                 proof = origin.forward_check
                 latest = self._observation_snapshot(with_capture_timing=True)
                 revision = _motion_inputs(*latest[:3])
@@ -5119,7 +5216,9 @@ class NaviPlugin:
                 return self._wire_moving
         camera_write = moving and work is not None and work.camera_arc_end_ms is not None
         try:
-            with self._obs_lock if camera_write else nullcontext():
+            with self._obs_lock if camera_write or prediction is not None else nullcontext():
+                if prediction is not None and not self._prediction_inputs_current(prediction):
+                    return self._wire_moving
                 if camera_write:
                     check = work.forward_check
                     snapshot = self._observation_snapshot(with_capture_timing=True)
@@ -5160,13 +5259,24 @@ class NaviPlugin:
                 work.expires_ms = write_ms + watchdog
                 work.expires_at = write_tick + watchdog / 1000
                 self._command_window = (write_tick, work.expires_at)
-        if (moving and origin is not None and work is not None and work.dwa_origin is not None
+        if moving and prediction is not None:
+            remaining = message["stamp_ms"] + message["ttl_ms"] - write_ms
+            watchdog = (self._descriptor.get("rate") or {}).get("watchdog_ms")
+            lease = watchdog if watchdog == self._config.watchdog_ms else min(remaining, self._config.watchdog_ms)
+            work.message = message
+            work.predicted_depth_ms = prediction.depth_ms
+            work.expires_ms = write_ms + lease
+            work.expires_at = write_tick + lease / 1000
+            work.repeat_until = work.expires_ms, work.expires_at
+            self._command_window = (write_tick, work.expires_at)
+        elif (moving and origin is not None and work is not None and work.dwa_origin is not None
                 and work.dwa_origin.identity == origin.identity):
             # TTL is an admission deadline. Once written, ordinary translation
             # has the receive-watchdog hold already swept by dwa_hold().
             guard = origin.forward_check.motion_guard
             if renewed_first_send:
                 work.message, work.forward_check, work.dwa_origin = message, origin.forward_check, origin
+                work.predicted_depth_ms = None
                 work.expires_ms = guard.deadline_ms
                 work.expires_at = write_tick + (work.expires_ms - write_ms) / 1000
             watchdog = (self._descriptor.get("rate") or {}).get("watchdog_ms")
@@ -5180,6 +5290,8 @@ class NaviPlugin:
                     end = planned.checked_ms + round(planned.prediction_horizon_s * 1000)
                     work.repeat_until = end, write_tick + (end - write_ms) / 1000
                 work.message, work.forward_check, work.dwa_origin = message, origin.forward_check, origin
+                if repeat_feedback is not None:
+                    work.predicted_depth_ms = None
                 work.retry_after_rejection = False
                 work.expires_ms = write_ms + watchdog
                 work.expires_at = write_tick + watchdog / 1000

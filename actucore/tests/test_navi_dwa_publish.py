@@ -156,7 +156,7 @@ def test_lost_received_speed_holds_after_source_guard_expires(monkeypatch, late_
     assert not any(card._last_decision.values)
 
 
-@pytest.mark.parametrize("event", ["clear", "source_switch", "obstacle", "long_gap", "target"])
+@pytest.mark.parametrize("event", ["clear", "source_switch", "registration_missing", "obstacle", "long_gap", "target"])
 def test_search_turn_uses_its_checked_window_through_a_speed_miss(monkeypatch, event):
     card, packets, clock, snapshot = observation_card(monkeypatch)
     card._command_timer = object()
@@ -177,7 +177,7 @@ def test_search_turn_uses_its_checked_window_through_a_speed_miss(monkeypatch, e
     window = card._scheduled_command
     assert state.search_feedback_ms == 1000
 
-    stamp = {"source_switch": 1310, "long_gap": 1450}.get(event, 1100)
+    stamp = {"source_switch": 1310, "registration_missing": 1330, "long_gap": 1450}.get(event, 1100)
     clock[0] = stamp
     frame = clear.copy()
     if event == "obstacle":
@@ -187,6 +187,8 @@ def test_search_turn_uses_its_checked_window_through_a_speed_miss(monkeypatch, e
             {"name": "person", "position": [0., 0.], "confidence": .95}]}
     invalid = dict(vx=None, vy=None, wz=None, received_ms=stamp, received_speed_ms=None,
                    velocity_history=(*measured["velocity_history"], (stamp, stamp, None)))
+    if event == "registration_missing":
+        invalid = dict(vx=0., vy=0., wz=0., received_speed_ms=1000)
     snapshot[0] = objects, dict(depth, map=frame, frame_id=stamp, capture_ms=stamp,
                                  control_ms=stamp, source_frame_id=stamp), invalid, stamp
     card._tick()
@@ -200,7 +202,7 @@ def test_search_turn_uses_its_checked_window_through_a_speed_miss(monkeypatch, e
         snapshot[0] = objects, dict(depth, map=clear, control_ms=1200), normal, stamp
         card._tick()
         assert len(packets) == 2 and packets[-1]["values"] == first["values"]
-    elif event == "source_switch":
+    elif event in ("source_switch", "registration_missing"):
         assert len(packets) == 2 and packets[-1]["values"] == first["values"]
         assert state.motion_source == "measured"
         assert state.feedback_guard_s == 0.
@@ -401,6 +403,47 @@ def test_speed_gap_checks_previous_route_by_prediction(monkeypatch, blocked):
         assert card._scheduled_command is work
         assert work.expires_ms == expiry
         assert card._wire_twist == (initial["values"][0], initial["values"][1], initial["values"][5])
+
+
+@pytest.mark.parametrize("new_depth", ["clear", "obstacle", "missing", "repeated"])
+def test_predicted_route_can_send_after_the_original_deadline(monkeypatch, new_depth):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    packet = card.next_command()
+    assert card._stage_command(packet, card._output_epoch)
+    initial, = packets
+    work = card._scheduled_command
+    original_deadline = work.expires_ms
+    route = work.dwa_origin.acceptance.route_points
+    measured_check = work.forward_check
+
+    def missing_speed(stamp, obstacle=False):
+        advance_snapshot(snapshot, clock, stamp, obstacle=obstacle)
+        objects, depth, odom, _ = snapshot[0]
+        snapshot[0] = objects, depth, dict(odom, vx=None, vy=None, wz=None), stamp
+
+    missing_speed(original_deadline - 40)
+    card._dispatch_command()
+    assert packets[-1]["seq"] > initial["seq"]
+    assert packets[-1]["values"] == initial["values"]
+    assert work.expires_ms > original_deadline
+
+    if new_depth == "repeated":
+        clock[0] = work.expires_ms
+    else:
+        missing_speed(original_deadline + 60, obstacle=new_depth == "obstacle")
+    if new_depth == "missing":
+        objects, _, odom, stamp = snapshot[0]
+        snapshot[0] = objects, None, odom, stamp
+    card._dispatch_command()
+
+    if new_depth == "clear":
+        assert packets[-1]["stamp_ms"] > original_deadline
+        assert all(row["values"] == initial["values"] for row in packets)
+        assert work.dwa_origin.acceptance.route_points == route
+        assert work.forward_check is measured_check
+    else:
+        assert not any(packets[-1]["values"])
 
 
 @pytest.mark.parametrize("target_missing", [False, True])

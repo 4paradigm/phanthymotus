@@ -406,6 +406,12 @@ def remaining_route_length(points, *, segments=None):
     return segments[-1].walked + segments[-1].length - max(0., progress)
 
 
+def stays_on_route(points, positions, half_width):
+    segments = _route_segments(points)
+    return bool(segments) and all(
+        _project_to_route(position, points, segments)[1] <= max(.30, half_width) for position in positions)
+
+
 def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None, yaw_floor=0.):
     """Track the finite visible polyline in the current forward/right grid."""
     segments = _route_segments(points)
