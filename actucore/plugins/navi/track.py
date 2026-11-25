@@ -731,7 +731,7 @@ class Tracker:
         track.front_reference = point
         # Frame reception and processing may already have used part of
         # the depth budget. Reading this frame again cannot renew it.
-        stamp = depth.get("capture_ms") or depth.get("frame_id")
+        stamp = depth.get("frame_id") if depth.get("receipt_timed") else depth.get("capture_ms") or depth.get("frame_id")
         now = depth.get("control_ms")
         track.front_age_s = (max(0, now - stamp) / 1000
                              if type(now) is int and type(stamp) is int else 0.)

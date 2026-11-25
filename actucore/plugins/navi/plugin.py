@@ -2041,7 +2041,9 @@ class NaviPlugin:
             self._depth_ground = projection.ground
             self._depth_projection = projection
             self._depth_bands = bands
-            self._depth_ms = received_ms
+            if not (self._depth_vendor.get("hardware_capture_timestamp_available") is False
+                    and source_stamp_ns and source_stamp_ns == self._depth_source_ns):
+                self._depth_ms = received_ms
             expected_frame = self._depth_vendor.get("frame_id")
             self._depth_source_ns = (source_stamp_ns if not expected_frame or not source_frame
                                      or source_frame == expected_frame else None)
@@ -2140,10 +2142,15 @@ class NaviPlugin:
                 if self._depth_source_ms is not None:
                     depth["source_frame_id"] = self._depth_source_ms
                 capture = self._depth_capture_ms
-                if capture is not None and 0 <= now - capture <= depth_age:
-                    depth["capture_ms"] = capture
-                elif capture is not None:
-                    depth["capture_invalid"] = True
+                if self._depth_vendor.get("hardware_capture_timestamp_available") is False:
+                    depth["receipt_timed"] = True
+                if capture is not None:
+                    valid_age = 0 <= now - capture <= depth_age
+                    if valid_age or depth.get("receipt_timed"):
+                        # Preserve the upstream time for motion registration and publication.
+                        depth["capture_ms"] = capture
+                    if not valid_age:
+                        depth["capture_invalid"] = True
             odom_age = now - self._odom_ms
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)
@@ -3001,12 +3008,16 @@ class NaviPlugin:
             with_capture_timing=self._config.local_planning or self._config.local_controller == "dwa")
         max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
         bounded_age = type(max_age) in (int, float) and 0 < max_age < math.inf
-        if bounded_age and depth is not None and "control_ms" in depth:
-            capture = depth.get("capture_ms") or depth["frame_id"]
-            if depth["control_ms"] - capture >= max_age:
-                # An expired frame cannot produce a command the driver admits.
-                # Let the policy take its normal stop-and-refresh path immediately.
-                depth["capture_invalid"] = True
+        receipt_timed = bool(depth and depth.get("receipt_timed"))
+        planning_depth = depth
+        if receipt_timed:
+            planning_depth = dict(depth)
+            planning_depth.pop("capture_invalid", None)
+        frame_ms = (depth or {}).get("frame_id")
+        if depth and not receipt_timed:
+            frame_ms = depth.get("capture_ms") or frame_ms
+        if bounded_age and frame_ms is not None and depth.get("control_ms", frame_ms) - frame_ms >= max_age:
+            planning_depth["capture_invalid"] = True
         input_revision, selection_constraints, admission_ms = None, None, 0
         dwa_time_left = None
         epoch, action_id = self._output_epoch, self._acp_action_id
@@ -3014,7 +3025,7 @@ class NaviPlugin:
             input_revision = _motion_inputs(objects, depth, odom)
             selection_constraints = self._dwa_constraints()
             planning_ms = (depth or {}).get("control_ms") or int(time.time() * 1000)
-            capture = (depth or {}).get("capture_ms") or (depth or {}).get("frame_id") or planning_ms
+            capture = frame_ms or planning_ms
             feedback = (odom or {}).get("received_ms") or planning_ms
             feedback = min(feedback, (odom or {}).get("stamp_ms", feedback))
             admission_deadline = min(planning_ms + self._ttl_ms, capture + self._config.depth_age_limit_ms)
@@ -3030,9 +3041,8 @@ class NaviPlugin:
                 if corner and not any(target_objects(objects, self._state.target, self._config)):
                     target_stamp = planning_ms
                 admission_deadline = min(admission_deadline, min(capture, feedback, target_stamp) + planning_age)
-                depth_room_ms = capture + min(planning_age, self._config.depth_age_limit_ms) - planning_ms
-                if (depth and depth.get("capture_ms") and not depth.get("capture_invalid")
-                        and 0 < depth_room_ms <= 2000 * control_period_s and admission_deadline > planning_ms):
+                if (planning_depth and (receipt_timed or depth.get("capture_ms")) and not planning_depth.get("capture_invalid")
+                        and admission_deadline > planning_ms):
                     # Leave part of a tick for first-write validation and publishing.
                     reserve_s = min(control_period_s / 4, (admission_deadline - planning_ms) / 4000)
                     cutoff = time.monotonic() + (admission_deadline / 1000 - time.time()) - reserve_s
@@ -3050,7 +3060,7 @@ class NaviPlugin:
         scan_guarded = previous_scan.active or bool(previous_scan.result_frame)
         was_searching = (self._config.local_planning and self._last_decision is not None
                          and self._last_decision.status == policy_mod.SEARCHING)
-        decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
+        decision = policy_mod.step(detections=objects, depth=planning_depth, odom=odom,
                                    config=self._config, state=self._state,
                                    dt=dt, control_period_s=control_period_s, command_dt_s=coverage,
                                    command_interrupted=bool(deadline and tick > deadline), dwa_admission_ms=admission_ms,
@@ -3683,8 +3693,7 @@ class NaviPlugin:
         handoff_deadline = None
         if self._continuing_dwa_output(origin):
             handoff_deadline = self._wire_dwa_origin.forward_check.motion_guard.deadline_ms
-        # A slow plan can leave less than two control ticks for publishing. Use the
-        # same first physical check to establish a new finite window when possible.
+        # Either planning time or a late depth exposure can consume the first-send window.
         period = math.ceil(1000 / self._rate_hz)
         work = self._scheduled_command
         outgoing = work.previous_route if work is not None else None
@@ -3694,7 +3703,12 @@ class NaviPlugin:
         for attempt in range(2):
             slow_first_send = (now_ms - origin.acceptance.motion_guard.checked_ms >= period
                                and origin.forward_check.motion_guard.deadline_ms - now_ms <= 2 * period)
-            renew = slow_first_send and self._fresh_first_send(origin, snapshot, now_ms)
+            depth = snapshot[1] or {}
+            original_depth_ms = origin.forward_check.depth_ms
+            depth_deadline = original_depth_ms + min(max_age, self._config.depth_age_limit_ms)
+            newer_exposure = ((depth.get("capture_ms") or 0) > original_depth_ms
+                              and depth_deadline - now_ms <= period)
+            renew = (slow_first_send or newer_exposure) and self._fresh_first_send(origin, snapshot, now_ms)
             # A fixed-window check can match a new detector frame without
             # taking its timestamp. Renew from the original association so
             # the newer frame has to earn its own deadline on a fresh sweep.
@@ -3986,7 +4000,12 @@ class NaviPlugin:
                     return True
                 blocked_candidate = (diagnostic is not None
                                      and diagnostic.veto_reason in ("footprint_collision", "remembered_obstacle"))
-                if ((no_route or blocked_candidate)
+                search_timed_out = (diagnostic is not None and diagnostic.decision_id == self._state.decision_id
+                                    and self._last_decision is not None
+                                    and self._last_decision.status in (policy_mod.ALIGNING, policy_mod.AVOIDING)
+                                    and self._state.dwa_trace.get("fallback_reason") == "search_deadline"
+                                    and diagnostic.veto_reason is None)
+                if ((no_route or blocked_candidate or search_timed_out)
                         and self._retain_checked_route(self._scheduled_command, now_ms, check_outgoing_sweep=True)):
                     return True
                 self._scheduled_command = None

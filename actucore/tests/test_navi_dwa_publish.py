@@ -1978,8 +1978,8 @@ def test_first_send_cannot_renew_superseded_evidence(monkeypatch, change):
     assert reason and checked is None
 
 
-@pytest.mark.parametrize("depth_age_ms,short_window", [(700, False), (850, True), (1000, False)])
-def test_only_a_usable_short_depth_window_bounds_dwa_search(monkeypatch, depth_age_ms, short_window):
+@pytest.mark.parametrize("depth_age_ms,search_ms", [(700, 225), (850, 125), (1000, None)])
+def test_usable_input_window_bounds_dwa_search(monkeypatch, depth_age_ms, search_ms):
     card, _, clock, snapshot = observation_card(monkeypatch, live_target=True)
     card._descriptor["rate"]["max_obs_age_ms"] = 1000
     card._config.max_depth_age_ms = 1200
@@ -1989,9 +1989,9 @@ def test_only_a_usable_short_depth_window_bounds_dwa_search(monkeypatch, depth_a
 
     def step(**kwargs):
         time_left = kwargs["dwa_time_left"]
-        if short_window:
-            assert time_left() == pytest.approx(.125)
-            clock[0] += 125
+        if search_ms is not None:
+            assert time_left() == pytest.approx(search_ms / 1000)
+            clock[0] += search_ms
             assert time_left() == pytest.approx(0.)
         else:
             assert time_left is None
@@ -2037,6 +2037,37 @@ def test_route_expiring_during_planning_rechecks_only_fresh_inputs(monkeypatch, 
         assert not any(message["values"])
         assert card._dwa_publication["reason"] == (
             "footprint_collision" if update == "obstacle" else "publish_expired")
+
+
+@pytest.mark.parametrize("update", ["clear", "obstacle", "same_capture"])
+def test_late_depth_can_be_replaced_before_a_fast_first_send(monkeypatch, update):
+    card, packets, clock, snapshot = observation_card(monkeypatch, live_target=True)
+    card._descriptor["rate"]["max_obs_age_ms"] = 1000
+    card._config.max_depth_age_ms = 1200
+    objects, depth, odom, receipt = snapshot[0]
+    snapshot[0] = objects, dict(depth, capture_ms=50, source_frame_id=50), odom, receipt
+    message = card.next_command()
+    assert message["values"][0] > 0.
+    original_end = message["stamp_ms"] + message["ttl_ms"]
+    assert original_end == 1050
+    advance_snapshot(snapshot, clock, 1040, obstacle=update == "obstacle")
+    objects, depth, odom, receipt = snapshot[0]
+    capture = 50 if update == "same_capture" else 340
+    snapshot[0] = objects, dict(depth, capture_ms=capture, source_frame_id=capture), odom, receipt
+
+    card._publish_command(message)
+
+    if update == "obstacle":
+        assert all(not any(p["values"]) for p in packets)
+        assert card._dwa_publication["reason"] == "footprint_collision"
+    else:
+        packet, = packets
+        assert packet["values"] == message["values"]
+        end = packet["stamp_ms"] + packet["ttl_ms"]
+        if update == "clear":
+            assert original_end < end <= 1340
+        else:
+            assert end == original_end
 
 
 def test_slow_first_send_uses_one_check_for_the_new_window(monkeypatch):

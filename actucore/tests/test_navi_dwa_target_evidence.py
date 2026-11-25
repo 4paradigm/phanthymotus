@@ -1018,7 +1018,8 @@ def test_slow_plan_refreshes_only_with_new_original_target_and_clear_sweep(monke
 @pytest.mark.parametrize("scene,can_advance,vx_max,update", [
     ("clear", True, .30, None), ("clear", True, .12, None), ("hole", True, .30, None),
     ("invalid", False, .30, None), ("blocked", False, .30, None),
-    ("detour", True, .30, None), ("anchored_hole", True, .30, None),
+    ("detour", True, .30, None), ("short_detour", True, .30, None),
+    ("anchored_hole", True, .30, None),
     ("hole", True, .30, "same_person"), ("clear", True, .30, "new_hole"),
     ("hole", False, .30, "closer_surface"), ("hole", False, .30, "obstacle"),
     ("hole", False, .30, "missing_person"), ("hole", False, .30, "moved_person"),
@@ -1037,8 +1038,18 @@ def test_visible_person_without_front_fix(monkeypatch, scene, can_advance, vx_ma
         depth["map"][48:145, 287:354] = 0.
     if scene == "blocked":
         depth["map"][220:370, 302:338] = .25
-    elif scene == "detour":
+    elif scene in ("detour", "short_detour"):
         depth["map"][220:370, 302:338] = .65
+    if scene == "short_detour":
+        original_route = state.local_plan.route
+        attempts = []
+
+        def timed_route(*args, **kwargs):
+            attempts.append(args[4])
+            clock[0] += 120
+            return original_route(*args, **kwargs)
+
+        monkeypatch.setattr(state.local_plan, "route", timed_route)
     state.goal_anchor = None
     config.depth_intrinsics = config.local_geometry.horizontal
     person = {"name": "person", "position": [0., -.6], "confidence": .95,
@@ -1077,7 +1088,11 @@ def test_visible_person_without_front_fix(monkeypatch, scene, can_advance, vx_ma
         assert calls[-1][0]["x_limit"][1] == pytest.approx(vx_max)
         assert 0. < packets[-1]["values"][0] <= vx_max
         assert packets[-1]["values"][1:5] == [0.] * 4
-        assert bool(packets[-1]["values"][5]) == (scene == "detour")
+        if scene == "short_detour":
+            assert len(attempts) == 1 and clock[0] == 1120
+            assert state.dwa_trace["branch"] == "visual_probe"
+        else:
+            assert bool(packets[-1]["values"][5]) == (scene == "detour")
     elif update == "moved_person":
         assert not packets
         assert card._dwa_publication["reason"] == "stale_observation"

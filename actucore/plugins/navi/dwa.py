@@ -188,9 +188,13 @@ class CandidateBudget:
     outcomes: dict = field(default_factory=dict)
     predictions: PredictionCache | None = None
     time_left: Callable[[], float] | None = None
+    early_return_s: float = math.inf
 
     def for_context(self, context):
         return self.outcomes.setdefault(context.key(), {})
+
+    def short_window(self):
+        return self.time_left is not None and self.time_left() <= self.early_return_s
 
     def expired(self):
         return self.time_left is not None and self.time_left() <= 0.
@@ -781,7 +785,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         retaining_speed = try_handoff and cmd == handoff
         capped_straight = (ordinal == 0 and straight_reference and cmd == straight
                            and (continuing or (not any(previous) and x_speed == nominal)))
-        early_translation = budget.time_left is not None and any(cmd[:2]) and not retaining_speed
+        early_translation = budget.short_window() and any(cmd[:2]) and not retaining_speed
         if scores and ((retaining_speed or capped_straight) and scores[0][2] == 0 or early_translation):
             checked = admissible(cmd)
             if checked is None:

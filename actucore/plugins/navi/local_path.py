@@ -1326,8 +1326,8 @@ def motion_sweep_clear(grid, geometry, half_width, horizon, velocities):
     return not motion_sweep_hits(grid[1], geometry, half_width, horizon, velocities).any()
 
 
-def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):
-    """Check a straight segment with the footprint already facing its heading."""
+def segment_obstacle_forwards(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):
+    """Chassis-forward coordinates of occupied cells touched along the segment."""
     cos, sin = math.cos(angle), math.sin(angle)
     f, r = FORWARD[occupied], RIGHT[occupied]
     forward, right = f * cos + r * sin, -f * sin + r * cos
@@ -1336,9 +1336,13 @@ def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tole
         # Rotating a cell through the settling tolerance moves it by at most
         # this chord. A fresh grid can also round it into the next cell.
         cell += 2 * np.hypot(f, r) * math.sin(heading_tolerance / 2) + RESOLUTION
-    return not ((forward >= -geometry.rear - cell)
-                & (forward <= length + geometry.front + cell)
-                & (abs(right) <= half_width + cell)).any()
+    return f[(forward >= -geometry.rear - cell) & (forward <= length + geometry.front + cell)
+             & (abs(right) <= half_width + cell)]
+
+
+def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):
+    return not segment_obstacle_forwards(occupied, geometry, half_width, angle, length,
+                                         heading_tolerance=heading_tolerance).size
 
 
 def clearance_route(grid, geometry, half_width, target, stop, approach_origin, previous=()):

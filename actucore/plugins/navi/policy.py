@@ -1363,7 +1363,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
     state.dwa_motion_guard = None
     state.decision_id += 1
     state.dwa_budget = (dwa.CandidateBudget(min(config.dwa_samples, dwa.MAX_SEARCH_CANDIDATES),
-                                          predictions=state.dwa_predictions, time_left=dwa_time_left)
+                                          predictions=state.dwa_predictions, time_left=dwa_time_left,
+                                          early_return_s=2 * control_period_s if control_period_s else math.inf)
                         if config.local_controller == "dwa" else None)
     state.dwa_trace = dict(decision_id=state.decision_id, controller_requested=config.local_controller,
                            controller_used="legacy", eligible=False, branch=None, geometry_mode=None,
@@ -1988,7 +1989,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 scan.hold_for_replan("主动观察：等候头部恢复前向观测")
             return Decision(_twist(0., 0., 0.), AVOIDING, "相机朝向未覆盖车体前方，停车")
         was_scanning = scan.active
-        can_align = (config.scan_geometry is not None and (depth or {}).get("capture_ms")
+        can_align = (config.scan_geometry is not None and not (depth or {}).get("receipt_timed")
+                     and (depth or {}).get("capture_ms")
                      and (odom or {}).get("stamp_ms"))
         receipt_only = scan.receipt_only if was_scanning or scan.result_frame else not can_align
         geometry = (config.scan_geometry or config.local_geometry) if receipt_only else config.scan_geometry
@@ -2930,9 +2932,9 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
                     and (current is None or alternate - current >= SIDE_SWITCH_ADVANTAGE_M)):
                 direction = -direction
         motion = state.command_tail if command_only else scan.motion
+        yaw = -direction * config.search_rate if requested_yaw is None else requested_yaw
         if any(math.hypot(vx, vy) > STILL_LINEAR or wz * direction > STILL_YAW
                for vx, vy, wz in (motion, state.commanded)):
-            yaw = -direction * config.search_rate if requested_yaw is None else requested_yaw
             if (has_sweep and config.local_controller == "dwa" and not command_only and yaw
                     and state.missing_frames + 1 >= config.lost_frames
                     and _check_dwa_turn(depth, config, state, geometry, None, "search", (0., 0., yaw))):
@@ -2949,7 +2951,9 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
             if not blocked and scan.near_hits is not None and age:
                 blocked = not scan.clear_sweep(geometry, config.half_width_m, slack + speed * age,
                                                occupied=scan.near_hits)
-            if blocked:
+            if blocked and not (config.local_controller == "dwa" and not command_only and yaw
+                                and state.missing_frames + 1 >= config.lost_frames
+                                and _check_dwa_turn(depth, config, state, geometry, None, "search", (0., 0., yaw))):
                 state.recovery = True
                 return "原地搜索：转身扫掠范围有障碍，停车"
             state.search_sweep_checked = True
@@ -3500,22 +3504,30 @@ def _visual_approach(depth, config, state, geometry, track, feedback, objects_ms
     route = Detour(None, ((0., 0.), point), geometry)
     side = math.copysign(1., bearing)
     heading = -_clamp(bearing, _scan_yaw_rate(config, side))
-    seeds = tuple(_prefix_commands(config, config.vx_max, heading, (side, -side), False))
     scan = state.active_scan
     grid = scan.grid()
-    ahead = projected_forward_clearance(grid[1], geometry, config)
+    ahead = _target_path_obstacle(grid[1], geometry, config, point, 0.)
+    seeds = tuple(_prefix_commands(config, config.vx_max, heading, (side, -side) if ahead is not None else (), False))
     proposal = None
     if ahead is not None and ahead < lookahead:
         observation = dict(depth, projected_grid=grid, scan_revision=scan.poses[-1][0],
                            body_half_width=config.half_width_m, allow_unknown=True,
                            preview_occluded=True, finite_turn=True)
-        detours = (state.local_plan.route(
-            observation, geometry, _keepout_m(config), ahead, direction,
-            config.depth_age_limit_ms, config.watchdog_ms) for direction in (side, -side))
-        routes = tuple(ref for ref in detours if ref is not None)
-        if routes:
-            proposal = _dwa_detour(depth, config, state, routes[0], None, None, branch="visual_probe",
-                                   motion=feedback, candidate_commands=seeds, alternates=routes[1:], guidance=True)
+        routes = []
+        budget = state.dwa_budget
+        for direction in (side, -side):
+            if budget is not None and budget.expired():
+                break
+            candidate = state.local_plan.route(observation, geometry, _keepout_m(config), ahead, direction,
+                                               config.depth_age_limit_ms, config.watchdog_ms)
+            if candidate is not None:
+                routes.append(candidate)
+            if routes and (direction == -side or (budget is not None and budget.short_window())):
+                proposal = _dwa_detour(depth, config, state, routes[0], None, None, branch="visual_probe",
+                                       motion=feedback, candidate_commands=seeds, alternates=routes[1:], guidance=True)
+                if proposal is not None:
+                    break
+                routes.clear()
     if proposal is None:
         proposal = _dwa_detour(depth, config, state, route, None, None, branch="visual_probe",
                                motion=feedback, candidate_commands=seeds, guidance=True)
@@ -4066,6 +4078,17 @@ def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distanc
     return None
 
 
+def _target_path_obstacle(occupied, geometry, config, target, stop_distance):
+    forward, right = target
+    length = max(0., math.hypot(forward, right) - stop_distance)
+    hits = local_path.segment_obstacle_forwards(occupied, geometry, _keepout_m(config),
+                                               math.atan2(right, forward), length)
+    transform = geometry.base_from_optical
+    if not hits.size:
+        return None
+    return max(0., (float(hits.min()) - transform[0, 3]) / transform[0, 2]) if transform[0, 2] > 0. else 0.
+
+
 def _target_corridor_clear(depth, config, scan, distance, bearing, velocities):
     """Check the footprint up to the target's stand-off point in the current view."""
     geometry = (config.scan_geometry or config.local_geometry
@@ -4080,15 +4103,20 @@ def _target_corridor_clear(depth, config, scan, distance, bearing, velocities):
         geometry, distance * math.cos(bearing), distance * math.sin(bearing))
     if forward <= 0.:
         return False
-    length = max(0., math.hypot(forward, right) - config.stop_distance_m)
-    keep = _keepout_m(config)
     horizon = (config.depth_age_limit_ms + config.watchdog_ms + 50) / 1000
-    if not local_path.segment_clear(occupied, geometry, keep, math.atan2(right, forward), length):
+    if _target_path_obstacle(occupied, geometry, config, (forward, right), config.stop_distance_m) is not None:
         return False
     motion_grid = scan.grid(include_near=False) if scan.near_squares is not None else (free, occupied)
-    return (local_path.motion_sweep_clear(motion_grid, geometry, config.half_width_m, horizon, velocities)
-            and (scan.near_squares is None or not scan.near_motion_hits(
-                geometry, config.half_width_m, horizon, velocities).any()))
+    if not local_path.motion_sweep_clear(motion_grid, geometry, config.half_width_m, horizon, velocities):
+        # A straight forward command keeps the same rectangular cross-section through braking.
+        if not all(vx >= 0. and vy == 0. and wz == 0. for vx, vy, wz in velocities):
+            return False
+        speed = max(vx for vx, _, _ in velocities)
+        travel = speed * horizon + speed**2 / (2 * config.motion_braking[0])
+        if not local_path.segment_clear(motion_grid[1], geometry, _keepout_m(config), 0., travel):
+            return False
+    return (scan.near_squares is None or not scan.near_motion_hits(
+        geometry, config.half_width_m, horizon, velocities).any())
 
 
 def _near_sweep_hits(config, scan, odom, state, twist):
@@ -4215,6 +4243,8 @@ def _preview_corridor_corner(depth, config, state, geometry, distance, bearing):
         return None
     grid = scan.observed_grid()
     target = local_path.target_in_grid(geometry, distance * math.cos(bearing), distance * math.sin(bearing))
+    if _target_path_obstacle(grid[1], geometry, config, target, config.stop_distance_m) is None:
+        return None
     route = local_path.corridor_corner_route(grid, geometry, _keepout_m(config), target)
     if route is None:
         return None
@@ -4334,6 +4364,27 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                                             foreground=foreground)
         if following is not None:
             return following
+    path_clear = None
+    if (config.local_controller == "dwa" and may_scan and geometry is not None and scan is not None
+            and not scan.has_result and not scan.attempted and target_distance is not None
+            and target_bearing is not None and scan.views and scan.matches_route_view(depth)):
+        target = local_path.target_in_grid(geometry, target_distance * math.cos(target_bearing),
+                                           target_distance * math.sin(target_bearing))
+        free, occupied = scan.grid(include_near=False)
+        if target[0] > 0. and (occupied.any() or (current_target_observed(state) and free.any())):
+            obstacle = _target_path_obstacle(occupied, geometry, config, target, config.stop_distance_m)
+            if obstacle is None and ahead is not None and ahead <= config.obstacle_stop_m and state.dwa_projection:
+                raw = state.dwa_projection.grid_for(geometry, require_valid_depth=True, check_free_space=False)
+                if raw is None:
+                    return 0., 0., 0., AVOIDING, "等待可用深度确认近障位置"
+                obstacle = _target_path_obstacle(raw[1], geometry, config, target, config.stop_distance_m)
+                if obstacle is None and not occupied.any():
+                    return 0., 0., 0., AVOIDING, "近距回波尚未定位到目标路径，等待新观测"
+            path_clear = obstacle is None
+            if obstacle is not None:
+                ahead = obstacle if ahead is None else min(ahead, obstacle)
+                foreground = plan_obstacle = True
+                state.last_clearance = ahead
     stop = config.obstacle_stop_m
     check_distance = config.approach_check_distance_m
     depth_age_s = config.depth_age_limit_ms / 1000
@@ -4422,7 +4473,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         observed_obstacle = (scan.grid()[1] & ahead_band & (abs(RIGHT) <= _keepout_m(config))).any()
     needs_detour = near or plan_obstacle or observed_obstacle or (foreground and approaching)
     corridor_clear = False
-    if not near and may_scan and scan is not None and not scan.has_result:
+    if (not near or path_clear) and may_scan and scan is not None and not scan.has_result:
         saved = state.dwa_guidance
         continuing_detour = (config.local_controller == "dwa"
                              and (state.published_dwa_route is not None
@@ -4435,6 +4486,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             corridor_clear = _target_corridor_clear(
                 depth, config, scan, target_distance, target_bearing, (motion, state.commanded, (vx, vy, yaw)))
             needs_detour = not corridor_clear
+            if path_clear and needs_detour and not continuing_detour:
+                return 0., 0., 0., AVOIDING, "目标直达路径畅通，等待当前运动扫掠范围清空"
     if (needs_detour and config.local_controller == "dwa" and state is not None and state.goal_anchor is not None
             and may_scan and geometry is not None and scan is not None and scan.views and scan.current_frame
             and target_distance is not None and target_bearing is not None and not scan.command_only

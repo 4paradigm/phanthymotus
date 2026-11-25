@@ -1832,6 +1832,56 @@ def test_planning_rejects_depth_already_expired_by_the_downstream_limit(monkeypa
     card.next_command()
 
 
+@pytest.mark.parametrize("header_age", [None, 750, 1700])
+def test_unsynchronized_depth_plans_from_receipt_and_expires_on_silence(monkeypatch, header_age):
+    import numpy as np
+
+    card = _card(local_planning=True, max_depth_age_ms=1200)
+    card._descriptor = _descriptor(rate={"max_obs_age_ms": 1000})
+    card._depth_vendor = {"timestamp_source": "driver_receive", "hardware_capture_timestamp_available": False}
+    now = [2000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    source = None if header_age is None else now[0] - header_age
+    card._set_depth_map(np.ones((8, 8)), capture_ms=source, received_ms=1980)
+    inputs = []
+
+    def step(**kwargs):
+        inputs.append((kwargs["depth"], kwargs["dwa_time_left"]))
+        if kwargs["depth"] is not None:
+            return navi_plugin.policy_mod.Decision([.1, 0., 0., 0., 0., 0.], navi_plugin.policy_mod.APPROACHING)
+        return navi_plugin.policy_mod.Decision(None, navi_plugin.policy_mod.SEARCHING)
+
+    monkeypatch.setattr(navi_plugin.policy_mod, "step", step)
+    message = card.next_command()
+    depth, budget = inputs[-1]
+    assert depth["frame_id"] == 1980 and depth["receipt_timed"]
+    assert not depth.get("capture_invalid") and budget() > 0.
+    assert depth.get("capture_ms") == source
+    if header_age == 1700:
+        assert not any(message["values"])
+    else:
+        assert message["values"][0] > 0. and message["obs_stamp_ms"] == (source or 1980)
+    now[0] = 3200
+    card.next_command()
+    assert inputs[-1][0] is None
+
+
+def test_repeated_driver_depth_header_does_not_restart_the_receipt_clock(monkeypatch):
+    import numpy as np
+
+    card = _card(local_planning=True, max_depth_age_ms=1200)
+    card._depth_vendor = {"hardware_capture_timestamp_available": False}
+    now = [2000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    frame = np.ones((8, 8))
+    card._set_depth_map(frame, capture_ms=1300, source_stamp_ns=1_300_000_000)
+    now[0] = 3300
+    card._set_depth_map(frame, capture_ms=1300, source_stamp_ns=1_300_000_000)
+    assert card.observation(with_capture_timing=True)[1] is None
+    card._set_depth_map(frame, capture_ms=2500, source_stamp_ns=2_500_000_000)
+    assert card.observation(with_capture_timing=True)[1]["frame_id"] == 3300
+
+
 def test_first_avoidance_turn_that_expires_during_planning_reenters_a_stop_hold(monkeypatch):
     policy = navi_plugin.policy_mod
     card = _card(local_planning=True)

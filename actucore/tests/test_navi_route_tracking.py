@@ -121,6 +121,24 @@ def test_route_expiry_does_not_emit_a_zero_or_renew_the_packet(monkeypatch):
     assert card._scheduled_command is None
 
 
+@pytest.mark.parametrize("blocked", [False, True])
+def test_planner_search_deadline_rechecks_the_executing_route(monkeypatch, blocked):
+    card, packets, clock, snapshot = route_card(monkeypatch, advance=False)
+    active = card._scheduled_command
+    if blocked:
+        advance_snapshot(snapshot, clock, 1050, obstacle=True)
+    card._state.decision_id += 1
+    card._state.dwa_trace = {"fallback_reason": "search_deadline"}
+    card._last_decision = policy.Decision([0.] * 6, policy.ALIGNING, "已看到人，等待可验证的接近空间")
+    stop = card._command_message([0.] * 6, clock[0] / 1000, clock[0])
+    card._remember_decision(stop, card._output_epoch, card._acp_action_id)
+    assert card._stage_command(stop, card._output_epoch)
+    if blocked:
+        assert not any(packets[-1]["values"])
+    else:
+        assert card._scheduled_command is active and len(packets) == 1
+
+
 def test_no_planner_result_leaves_the_valid_route_with_the_controller(monkeypatch):
     card, packets, _, _ = route_card(monkeypatch, advance=False)
     current = card._scheduled_command

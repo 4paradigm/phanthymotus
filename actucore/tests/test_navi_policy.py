@@ -4774,6 +4774,36 @@ def test_verified_target_corridor_releases_near_stop_recovery(monkeypatch):
     assert not state.recovery and not state.blocked_for_s
 
 
+@pytest.mark.parametrize("forward,right,range_hint,blocked", [
+    (.4, .55, .4, False), (.25, .30, .25, False), (2., 0., 2., False),
+    (.4, .10, .4, True), (1., .50, None, True),
+])
+def test_new_detour_requires_an_obstacle_along_the_target_path(monkeypatch, forward, right, range_hint, blocked):
+    g = P.local_path
+    geometry = g.camera_square(P.HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20, stop_distance_m=.60)
+    state = _state(motion_source="measured")
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    occupied = np.isclose(g.FORWARD, forward) & np.isclose(g.RIGHT, right)
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    frame = np.ones((8, 8))
+    depth = dict(frame_id=1000, map=frame, ground=frame.astype(bool))
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (range_hint, 1.))
+    detour = (.10, 0., -.25, P.AVOIDING, "detour")
+    calls = []
+    monkeypatch.setattr(P, "_dwa_unavailable_reason", lambda *args, **kwargs: None)
+    def plan(*args):
+        calls.append(True)
+        return detour
+    monkeypatch.setattr(P, "_dwa_recovery_route", plan)
+    result = P._avoid(.2, 0., 0., depth, config, P.APPROACHING, "tracking", state,
+                      target_distance=2., target_bearing=.45 if range_hint is None else 0.,
+                      odom=dict(vx=0., vy=0., wz=0.), may_scan=True)
+    assert bool(calls) == blocked
+    assert result == (detour if blocked else (.2, 0., 0., P.APPROACHING, "tracking"))
+
+
 @pytest.mark.parametrize("range_m, speed", [(1.1, .2), (.75, .1)])
 def test_default_speed_reduction_starts_at_one_metre(monkeypatch, range_m, speed):
     config = _cfg(stop_distance_m=.60)
@@ -5093,6 +5123,29 @@ def test_target_search_uses_a_directional_sweep_for_retained_obstacles(monkeypat
     assert decision.values[0] == 0.
 
 
+@pytest.mark.parametrize("obstacle_right,can_turn", [(.40, True), (.15, False)])
+def test_stationary_search_checks_the_requested_arc_inside_the_turn_circle(monkeypatch, obstacle_right, can_turn):
+    from plugins.navi import active_scan
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    g = P.local_path
+    geometry = g.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20, half_length=.45)
+    config = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
+                  half_width_m=.20, search_rate=.20, lost_frames=1)
+    state = _state(motion_source="measured")
+    hits = np.isclose(g.FORWARD, 0.) & np.isclose(g.RIGHT, obstacle_right)
+    assert hits.any() and not state.active_scan.clear_sweep(geometry, .20, 0., occupied=hits)
+    state.active_scan.near_projection = NearProjection(hits=hits, stamp_ms=1000)
+    empty = np.zeros_like(hits)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (~empty, empty))
+    frame = np.ones((8, 8))
+    decision = P.step(detections=_detections(), depth=dict(map=frame, frame_id=1000, control_ms=1000),
+                      odom=dict(vx=0., vy=0., wz=0., received_ms=1000), state=state, config=config, dt=.1)
+    assert bool(decision.values[5]) == can_turn
+    if can_turn:
+        assert state.dwa_motion_guard.check.accepted and decision.status == P.SEARCHING
+
+
 @pytest.mark.parametrize("lateral", [.35, .40])
 def test_off_axis_remembered_door_jamb_allows_a_checked_prefix(monkeypatch, lateral):
     from plugins.navi.camera import HorizontalIntrinsics
@@ -5281,7 +5334,7 @@ def test_remembered_goal_only_plans_a_detour_for_a_blocked_corridor(monkeypatch,
     scan.receipt_only, scan.current_frame = True, 1000
     if has_route:
         state.dwa_guidance = P.DwaGuidance(scan.motion_frame, state.goal_anchor, ((0., 0.), (1., .4)), (0., 0.))
-    occupied = np.isclose(grid.FORWARD, 1.2) & np.isclose(grid.RIGHT, .7)
+    occupied = np.isclose(grid.FORWARD, 1.2) & np.isclose(grid.RIGHT, .7 if corridor_clear else .25)
     scan.views.append((1000, scan.pose, ~occupied, occupied))
     depth = dict(_scene(3.), frame_id=1000, ground=occupied)
     command = (.2, 0., -.12, P.AVOIDING, "checked detour")
