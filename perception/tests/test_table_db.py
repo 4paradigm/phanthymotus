@@ -130,6 +130,29 @@ def test_examples_are_real_json():
         _json.loads(example)
 
 
+def test_descriptions_are_generic():
+    """Examples use placeholder names, never a business's columns or a person.
+
+    A model copies example column names: shown ["金额", ">", 100] it writes that
+    against a table that has no 金额. Placeholders teach the syntax only.
+    """
+    import re as _re
+    schema = TOOLS[0]["inputSchema"]
+    texts = [TOOLS[0]["description"]]
+    texts += [spec.get("description", "") for spec in schema["properties"].values()]
+    texts += [spec.get("description", "") for spec in schema["x-action-params"].values()]
+    texts += [item["description"] for item in schema["properties"]["action"]["oneOf"]]
+    allowed = {"列A", "列B", "列C", "文件列", "值1", "值2", "新值", "列名", "rowid"}
+    for text in texts:
+        for word in ("张三", "李四", "姓名", "金额", "照片", "类别", "状态", "客户", "订单",
+                     "聊天", "飞书", "QQ", "人脸", "访客"):
+            assert word not in text, (word, text)
+        # Quoted Chinese in an example is a column name or a value: placeholders only.
+        for name in _re.findall(r'"([^"\s，。：；、$%]*[\u4e00-\u9fff][^"\s，。：；、$%]*)"', text):
+            name = _re.sub(r"^(SUM|COUNT|AVG|MIN|MAX)\((.+)\)( DESC)?$", r"\2", name)
+            assert name in allowed, (name, text)
+
+
 def test_write_actions_are_not_read_only_to_peers():
     """Perception is read-only to a viewer peer unless the card says otherwise."""
     params = TOOLS[0]["inputSchema"]["x-action-params"]

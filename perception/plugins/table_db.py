@@ -128,7 +128,7 @@ _WHERE_DESC = (
     '筛选条件，多个条件之间是 AND。每个条件写成 [列名, 运算符, 值]。'
     '运算符：= != > >= < <= like、not like（% 匹配任意字符）、in、not in（值为数组）、'
     'between（值为 [下限, 上限]）、is null、is not null（不写值）。'
-    '例：[["金额", ">", 100], ["姓名", "like", "%张%"], ["状态", "in", ["待处理", "处理中"]]]。'
+    '例：[["列A", ">", 100], ["列B", "like", "%关键字%"], ["列C", "in", ["值1", "值2"]]]。'
     '行号列名为 rowid。'
 )
 
@@ -156,7 +156,7 @@ TOOLS: List[Dict[str, Any]] = [{
                 }, "required": ["name"]},
                 "description": (
                     '列定义，type 取 TEXT（文本，默认）/ INTEGER（整数）/ REAL（小数）/ BLOB（图片或文件）。'
-                    '例：[{"name": "姓名"}, {"name": "金额", "type": "REAL"}, {"name": "照片", "type": "BLOB"}]'
+                    '例：[{"name": "列A"}, {"name": "列B", "type": "REAL"}, {"name": "文件列", "type": "BLOB"}]'
                 ),
             },
             "fields": {
@@ -164,7 +164,7 @@ TOOLS: List[Dict[str, Any]] = [{
                 "items": {"type": "string"},
                 "description": (
                     '要返回的列，不填返回全部列。可写聚合 COUNT(*)、COUNT(列)、COUNT(DISTINCT 列)、'
-                    'SUM(列)、AVG(列)、MIN(列)、MAX(列)。例：["类别", "SUM(金额)", "COUNT(*)"]'
+                    'SUM(列)、AVG(列)、MIN(列)、MAX(列)。例：["列A", "SUM(列B)", "COUNT(*)"]'
                 ),
             },
             "values": {
@@ -172,14 +172,14 @@ TOOLS: List[Dict[str, Any]] = [{
                 "items": {"type": "object"},
                 "description": (
                     '要插入的行，每行一个对象，未写的列为空；一次最多 500 行。'
-                    'BLOB 列写 "$file"，文件路径填在 file 参数里。例：[{"姓名": "张三", "金额": 12.5, "照片": "$file"}]'
+                    'BLOB 列写 "$file"，文件路径填在 file 参数里。例：[{"列A": "值1", "列B": 12.5, "文件列": "$file"}]'
                 ),
             },
             "set": {
                 "type": "object",
                 "description": (
                     '要改成的新值。null 表示清空；BLOB 列写 "$file"（文件路径填在 file 参数里）即替换，写 null 即删除该文件。'
-                    '例：{"状态": "已完成", "照片": null}'
+                    '例：{"列A": "新值", "文件列": null}'
                 ),
             },
             "where": {"type": "array", "items": {"type": "array"}, "description": _WHERE_DESC},
@@ -188,13 +188,13 @@ TOOLS: List[Dict[str, Any]] = [{
                 "items": {"type": "string"},
                 "description": (
                     '分组列，每组返回一行；fields 里的普通列必须出现在这里，其余写聚合。'
-                    '去重也用它。例：["类别"]'
+                    '去重也用它。例：["列A"]'
                 ),
             },
             "order_by": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": '排序，每项写 列名 或 列名 DESC；分组查询可按聚合排序。例：["SUM(金额) DESC", "类别"]',
+                "description": '排序，每项写 列名 或 列名 DESC；分组查询可按聚合排序。例：["SUM(列B) DESC", "列A"]',
             },
             "limit": {
                 "type": "integer", "minimum": 1, "maximum": MAX_PAGE_ROWS,
@@ -218,7 +218,7 @@ TOOLS: List[Dict[str, Any]] = [{
                 "format": "file",
                 "uploadTo": "mcp",
                 "description": (
-                    '要存入 BLOB 列的文件路径，例如用户在聊天里发来的图片的路径；会自动传到本卡片。'
+                    '要存入 BLOB 列的文件路径，填你拿到的本地路径即可，会自动传到本卡片。'
                     '在 values/set 里对应的 BLOB 列写 "$file"；表里只有一个 BLOB 列时可以不写。每次调用一个文件'
                 ),
             },
