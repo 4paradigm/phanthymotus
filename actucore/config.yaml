@@ -6,6 +6,16 @@
 mcp_port: 15730
 
 plugins:
+  eef:
+    enabled: true
+
+  autonomous_task:
+    enabled: true
+    base_url: ""
+    key: ""
+    model_name: ""
+    arm_mode: left
+
   vla:
     # enabled 只决定这张卡片**出不出现**在工具列表和侧边栏里，不决定它动不动。
     # 关掉的话 actucore 又变回一个空的 MCP host，画布上无从连起。
