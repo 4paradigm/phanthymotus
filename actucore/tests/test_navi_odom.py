@@ -26,6 +26,15 @@ def _sample(twist, frame="body", schema=O.SCHEMA):
             "twist": list(twist), "pose": None}
 
 
+def test_continuation_travel_uses_wire_twist_only_for_uncovered_intervals():
+    history = ((1000, 1000, (.1, 0., 0.)), (1100, 1100, (.1, 0., 0.)),
+               (1200, 1200, (.1, 0., 0.)), (1600, 1600, (.1, 0., 0.)),
+               (1700, 1700, (.3, 0., 0.)))
+    # 50+100 ms measured at .1, 400 ms missing, 100 ms measured at
+    # average .2, then an uncovered 50 ms beyond the newest sample.
+    assert abs(O.travel_since(history, 1050, 1750, 300, (.2, 0., .5)) - .125) < 1e-9
+
+
 # ── the axis order is the contract ───────────────────────────────────────────
 
 def test_the_axes_are_motus_control_twist_axes():

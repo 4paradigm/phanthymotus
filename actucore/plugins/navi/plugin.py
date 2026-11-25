@@ -3963,12 +3963,15 @@ class NaviPlugin:
             rates += (guard.measured,)
         bounds = tuple(tuple(bound(axis) for axis in zip(*rates)) for bound in (min, max))
         speed = max(math.hypot(*v[:2]) for v in rates)
+        history = (odom or {}).get("velocity_history")
+        if history is None:
+            # A stale latest sample does not invalidate the earlier measured
+            # part of the interval. The uncovered tail uses the wire twist.
+            with self._obs_lock:
+                history = tuple(self._velocity_history)
         unobserved_travel = 0.
         if target_pending:
-            # A slowing feedback sample cannot add back distance that could
-            # already have been travelled before this check.
-            speed_cap = math.hypot(config.vx_max, config.vy_max if config.use_lateral else 0.)
-            unobserved_travel = (now_ms - target_ms) * max(speed, speed_cap) / 1000
+            unobserved_travel = odom_mod.travel_since(history, target_ms, now_ms, config.max_feedback_gap_ms, command)
         motion_room = policy_mod.MAX_PREDICTED_DETOUR_TRAVEL_M - unobserved_travel
         if direct:
             travel = speed * (config.watchdog_ms + deadline_ms - now_ms + 50) / 1000
@@ -3998,7 +4001,8 @@ class NaviPlugin:
             return None
         # Consume the unseen translation from the original path. Camera
         # frames can refresh collision evidence, but cannot reset this room.
-        room = dwa.remaining_route_length(route) - elapsed * speed
+        travelled = odom_mod.travel_since(history, guard.checked_ms, now_ms, config.max_feedback_gap_ms, command)
+        room = dwa.remaining_route_length(route) - travelled
         room -= anchor.error(math.hypot(*route[-1]))
         if target_pending:
             room = min(room, motion_room)

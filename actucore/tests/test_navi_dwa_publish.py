@@ -3692,6 +3692,37 @@ def test_direct_target_loss_uses_remaining_motion_room_after_track_expires(monke
         assert not any(packets[-1]["values"][:2])
 
 
+@pytest.mark.parametrize("with_feedback", [True, False])
+def test_direct_target_loss_accounts_for_measured_or_commanded_travel(monkeypatch, with_feedback):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=False)
+    snapshot = [card._observation_snapshot(with_capture_timing=True)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._config.use_obstacle_history = False
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    card._tick()
+    first, = packets
+    work = card._scheduled_command
+    vx = first["values"][0]
+    assert vx > .08
+    card._config.vx_max = .8
+    # Allow the actual packet and brake, but distinguish measured travel at
+    # .08 m/s from half a second at the last published speed or the speed cap.
+    stop_travel = vx * .75 + vx**2 / (2 * card._config.motion_braking[0])
+    work.forward_check = replace(work.forward_check, target_ms=1000, previous_twist=(vx, 0., 0.),
+                                 distance_m=card._config.stop_distance_m + stop_travel + .06)
+    advance_snapshot(snapshot, clock, 1500, vx=.08)
+    _, depth, odom, _ = snapshot[0]
+    odom = dict(odom, velocity_history=tuple((ms, ms, (.08, 0., 0.)) for ms in range(1000, 1501, 100)))
+    snapshot[0] = ({"objects": [], "timestamp": 1.5}, depth, odom if with_feedback else None, 1500)
+
+    proof = card._check_predicted_outgoing_route(work, snapshot[0], 1500, renew=True, target_pending=True)
+
+    assert bool(proof) == with_feedback
+    if not with_feedback:
+        work.forward_check = replace(work.forward_check, distance_m=work.forward_check.distance_m + vx * .5)
+        assert card._check_predicted_outgoing_route(work, snapshot[0], 1500, renew=True, target_pending=True)
+
+
 def test_duplicate_detection_keeps_evidence_for_an_association_miss(monkeypatch):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
     card._config.use_obstacle_history = False

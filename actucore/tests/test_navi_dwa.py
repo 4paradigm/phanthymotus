@@ -81,6 +81,27 @@ def test_retained_route_sweeps_an_executable_yaw_when_pursuit_falls_below_the_fl
     assert choice.check.reason is None
 
 
+@pytest.mark.parametrize("visible", [True, False])
+def test_short_retained_route_checks_a_slower_stop_without_changing_path(visible):
+    route = ((-.30, .02), (.04, .025), (.216, .006), (.387, -.028), (.555, -.077))
+    checked = []
+
+    def validate(command, trajectory, duration):
+        checked.append(command)
+        return dwa.CandidateCheck(visible, "occluded_prefix")
+
+    diag = {}
+    choice = _run(route, follow_published=True, horizon=1.75, latency_s=.25, route_error=.075,
+                  measured=(.2525, 0., .071), previous=(.25, 0., .058),
+                  target=None, diagnostics=diag, validate_candidate=validate)
+    assert diag["rejected"]["insufficient_room"] == 3
+    assert checked and 0. < checked[-1][0] < .25
+    if visible:
+        assert choice is not None and choice.command == checked[-1]
+    else:
+        assert choice is None and diag["rejected"]["occluded_prefix"] == 1
+
+
 @pytest.mark.parametrize("side", [-1., 1.])
 @pytest.mark.parametrize("arc_clear", [False, True])
 def test_a_bent_route_sweeps_the_declared_turn_floor_before_sending(side, arc_clear):
