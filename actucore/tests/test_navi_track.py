@@ -606,8 +606,9 @@ def test_person_front_surface_uses_latest_valid_depth_frame():
 
     feed(100, 10)
     result = tracker.track
-    assert result.range_m == pytest.approx(math.hypot(1.6, 1.6 * 12 / 60), abs=.03)
-    assert result.bearing_rad == pytest.approx(math.atan(12 / 60), abs=.015)
+    assert result.range_m == pytest.approx(2.5)
+    assert math.hypot(*result.measured_point.standoff_point) == pytest.approx(math.hypot(1.6, 1.6 * 12 / 60), abs=.03)
+    assert result.bearing_rad == pytest.approx(0.)
     assert result.measured_range_m == result.range_m
 
     changed = image.copy()
@@ -617,7 +618,8 @@ def test_person_front_surface_uses_latest_valid_depth_frame():
         assert result.range_m > 1.5
         assert result.measured_range_m is None
     result = feed(300, 11, changed)  # Still the same valid detection payload.
-    assert result.range_m < 1.1
+    assert result.range_m == pytest.approx(2.5)
+    assert math.hypot(*result.measured_point.standoff_point) < 1.1
     assert result.measured_range_m == result.range_m
 
     for stamp in range(400, 1100, 100):
@@ -637,6 +639,27 @@ def test_person_front_surface_rejects_a_separate_near_layer_at_box_bottom(foregr
     point = front_surface(frame, bbox, HorizontalIntrinsics(640, 492., 318.))
 
     assert np.linalg.norm(point) == pytest.approx(expected)
+
+
+def test_person_arrival_ignores_bottom_foreground_connected_by_filled_depth():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    cfg = _cfg(stop_distance_m=.60, stop_tolerance_m=.05,
+               depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
+    state = P.State(target="person")
+    person = dict(_obj("person"), bbox_norm=(.1, .1, .9, .9))
+    image = np.full((60, 80), 2.)
+    # Mixed depth bridges the foreground and body, so the sorted box depths
+    # have no large gap. The near return is confined to the bottom of the box.
+    image[45:54, 32:36] = .62
+    image[45:54, 36:72] = np.linspace(.62, 2., 36)
+    for stamp in (100, 200, 300, 400):
+        decision = P.step(detections=_stamped(stamp, person), depth=dict(map=image, frame_id=stamp),
+                          odom=dict(vx=0., vy=0., wz=0.), config=cfg, state=state, dt=.1)
+    assert not state.arrived
+    assert state.tracker.track.range_m == pytest.approx(2., abs=.02)
+    assert decision.status != P.ARRIVED
+    assert image.min() == pytest.approx(.62)
 
 
 def test_person_front_surface_ignores_a_new_depth_frame_without_a_return():
@@ -718,7 +741,8 @@ def test_person_foreground_patch_does_not_become_evidence_after_last_fix_expires
     image[44:51, 35:45] = 2.8
     track = _feed(tracker, _stamped(stamp, person), config=cfg, target="person",
                   depth=dict(map=image, frame_id=stamp + 100))
-    assert track.measured_range_m == pytest.approx(2.8)
+    assert track.measured_range_m == pytest.approx(3.)
+    assert math.hypot(*track.measured_point.standoff_point) == pytest.approx(2.8)
 
 
 def test_local_front_range_retains_only_the_remaining_depth_freshness_window():

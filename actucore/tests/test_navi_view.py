@@ -334,6 +334,16 @@ def test_a_tracked_range_that_disagrees_with_the_measurement_is_flagged():
 
 
 @needs_cv2
+def test_person_overlay_shows_only_the_associated_measurement(monkeypatch):
+    labels = []
+    monkeypatch.setattr(V, "_text", lambda frame, label, *args, **kwargs: labels.append(label))
+    _render(box=(.3, .3, .6, .8), measured=2.,
+            track={"name": "person", "state": "confirmed", "range_m": .63})
+    assert "meas 2.00m" in labels
+    assert all("0.63m" not in label for label in labels)
+
+
+@needs_cv2
 def test_both_numbers_are_drawn_when_a_measurement_exists():
     plain = _render(box=(0.3, 0.3, 0.6, 0.8),
                     track={"state": "confirmed", "range_m": 1.23})

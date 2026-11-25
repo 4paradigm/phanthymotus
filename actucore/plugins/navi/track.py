@@ -144,6 +144,8 @@ class MeasuredPoint:
     frame: ObservationFrame | None
     capture_ms: int | None
     capture_pose: PlanarPose | None
+    standoff_point: tuple[float, float] | None = None
+    box: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,7 @@ class TargetMatch:
     point: tuple[float, float] | None  # camera forward, left, when a surface was measured
     range_m: float | None
     image_region: tuple | None = None
+    standoff_point: tuple[float, float] | None = None
 
 
 def observation_source(detections):
@@ -219,8 +222,8 @@ class Track:
     # is held to the same evidence — see `_hit`.
     reacquire_hits: int = 0
 
-    # Navigation uses the measured front surface. Association still uses
-    # the object's box-based position, which is steadier through occlusions.
+    # The goal uses the associated box measurement. Keep its nearest coherent
+    # surface independently for physical standoff checks.
     front_required: bool = False
     front_fix: np.ndarray | None = None
     front_reference: np.ndarray | None = None  # last trusted fix, even after expiry
@@ -234,11 +237,11 @@ class Track:
     image_region: tuple | None = None
     frame: ObservationFrame | None = None
 
-    def record_range(self, range_m, point, depth):
+    def record_range(self, range_m, point, depth, *, standoff_point=None):
         self.measured_range_m = range_m
         self.measured_point = MeasuredPoint(
             tuple(point), self.frame, depth.get("capture_ms") or depth.get("frame_id") or depth.get("control_ms"),
-            depth.get("obstacle_capture_pose"))
+            depth.get("obstacle_capture_pose"), standoff_point, self.front_box)
 
     def snapshot(self, reference_ms):
         return AssociationSnapshot(
@@ -591,10 +594,12 @@ def match_observation(snapshot, detections, depth, *, ego_motion, elapsed_s, tar
         corrected, _ = _correct(mean, cov, candidate, config)
         front_limit = config.depth_age_limit_ms if config.local_planning else config.max_obs_age_ms
         has_fix = snapshot.has_front_fix and snapshot.front_age_s + elapsed_s <= front_limit / 1000
-        point = _front_point(depth, box, config, reference, has_fix, True, corrected[:2], elapsed_s)
-        if point is None:
+        surface = _front_point(depth, box, config, reference, has_fix, True, corrected[:2], elapsed_s)
+        if surface is None:
             return (TargetMatch(snapshot.generation, source, None, None, _image_region(candidate["obj"]))
                     if allow_missing_surface else None)
+        return TargetMatch(snapshot.generation, source, tuple(point), candidate["range_m"],
+                           standoff_point=tuple(surface))
     return TargetMatch(snapshot.generation, source, tuple(point), polar_of(point)[0])
 
 
@@ -687,7 +692,7 @@ class Tracker:
                 if matched["name"].lower() == "person" and box and config.depth_intrinsics is not None:
                     self.track.front_required = True
                 self.track.front_box = tuple(box) if self.track.front_required and box else None
-                self._update_front(depth, config, dt)
+                self._update_front(depth, config, dt, matched["range_m"])
             if (self.track.accepted_detection and not self.track.front_required and matched["range_measured"]
                     and depth is not None and depth.get("map") is not None
                     and not depth.get("capture_invalid")):
@@ -701,7 +706,7 @@ class Tracker:
 
         return self.track if (self.track and self.track.drivable) else None
 
-    def _update_front(self, depth, config, dt):
+    def _update_front(self, depth, config, dt, range_m=None):
         """Measure the associated person in the newest usable depth image."""
         track = self.track
         box = track.front_box
@@ -718,15 +723,19 @@ class Tracker:
                              track.range_known, track.position, dt)
         if point is None:
             return
-        range_m = polar_of(point)[0]
-        track.front_fix = track.front_reference = point
+        if range_m is None:
+            from .depth import sample_box
+            range_m = sample_box(depth["map"], box)
+        bearing = (track.image_region[0] or (0.,))[0] * config.half_fov_rad
+        track.front_fix = point_of(range_m, bearing)
+        track.front_reference = point
         # Frame reception and processing may already have used part of
         # the depth budget. Reading this frame again cannot renew it.
         stamp = depth.get("capture_ms") or depth.get("frame_id")
         now = depth.get("control_ms")
         track.front_age_s = (max(0, now - stamp) / 1000
                              if type(now) is int and type(stamp) is int else 0.)
-        track.record_range(range_m, point, depth)
+        track.record_range(range_m, track.front_fix, depth, standoff_point=tuple(point))
 
     # ── 1. predict: mostly a statement about our own motion ──────────────────
 
@@ -753,7 +762,7 @@ class Tracker:
         if track.front_reference is not None:
             track.front_reference = rotation @ (track.front_reference - translation)
             if track.front_fix is not None:
-                track.front_fix = track.front_reference
+                track.front_fix = rotation @ (track.front_fix - translation)
 
     # ── 2. associate ─────────────────────────────────────────────────────────
 
@@ -893,6 +902,7 @@ class Tracker:
             return {"state": LOST, "reason": self.last_reason}
         return {
             "state": track.state,
+            "name": track.name,
             "hits": track.hits,
             "coast_s": round(track.coast_s, 2),
             "age_s": round(track.age_s, 1),

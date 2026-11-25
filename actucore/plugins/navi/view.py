@@ -439,7 +439,9 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
         rng = (track or {}).get("range_m")
         label = f"{state}" + (f"  {rng:.2f}m" if rng is not None else "  ?m")
         colour = _TARGET
-        if measured is not None:
+        if (track or {}).get("name", "").lower() == "person":
+            label = f"meas {measured:.2f}m" if measured is not None else state
+        elif measured is not None:
             # **Both numbers, because the gap between them is a real failure
             # mode.** The tracked range is a filtered estimate that has been
             # ego-motion compensated every tick since the last observation, and

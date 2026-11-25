@@ -5168,14 +5168,15 @@ def test_legacy_wheeled_detour_can_leave_box_corner_when_grid_search_has_no_comp
                            -scan.turn_angle, scan.advance_m, heading_tolerance=P.ANGLE_TOLERANCE)
 
 
-def test_person_arrival_uses_single_valid_front_surface_at_configured_standoff():
+@pytest.mark.parametrize("person_range,arrived", [(2.6, False), (.599, True)])
+def test_person_arrival_uses_box_measurement_at_configured_standoff(person_range, arrived):
     from plugins.navi.camera import HorizontalIntrinsics
 
     config = _cfg(confirm_hits=1, stop_distance_m=.60, stop_tolerance_m=.01,
                   depth_intrinsics=HorizontalIntrinsics(80, 65., 39.5))
     state = P.State(target="person")
     person = _obj("person", bbox=(.2, .1, .8, .9))
-    frame = np.full((60, 80), 2.6, dtype=np.float32)
+    frame = np.full((60, 80), person_range, dtype=np.float32)
     frame[22:31, 36:44] = .599
 
     decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=100),
@@ -5183,8 +5184,9 @@ def test_person_arrival_uses_single_valid_front_surface_at_configured_standoff()
     assert decision.status != P.ARRIVED and not any(decision.values or ())
     decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=200),
                       odom=None, config=config, state=state, dt=.1)
-    assert decision.status == P.ARRIVED and not any(decision.values)
-    assert decision.distance_m == pytest.approx(.60, abs=.002)
+    assert (decision.status == P.ARRIVED) == arrived
+    assert not any(decision.values)
+    assert decision.distance_m == pytest.approx(person_range, abs=.002)
 
 
 def test_legacy_wheeled_box_corner_prefers_longer_checked_escape_to_the_open_side(monkeypatch):

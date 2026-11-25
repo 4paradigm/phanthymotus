@@ -3333,12 +3333,14 @@ def dwa_measured_target(track, geometry, now_ms, depth_age_ms, registration, *, 
             return None
     elif not 0 <= now_ms - fix.capture_ms < depth_age_ms:
         return None
-    point, frame = fix.point, fix.frame
+    point, frame = fix.standoff_point or fix.point, fix.frame
     stamp, pose = fix.capture_ms or track_ms, fix.capture_pose
     if track.front_required and track.front_fix is not None and track.measured_range_m is None:
         # The tracker already transported this coasting front to its tick frame.
         # Its original capture still limits the lifetime above.
-        point, frame, stamp, pose = track.front_fix, track.frame, track_ms, None
+        surface = track.front_reference if fix.standoff_point is not None else track.front_fix
+        point = min((surface, track.front_fix), key=lambda p: math.hypot(*p))
+        frame, stamp, pose = track.frame, track_ms, None
     point = (frame.grid_point(point, geometry) if frame is not None else
              local_path.target_in_grid(geometry, point[0], -point[1]))
     view = registration(stamp, pose)

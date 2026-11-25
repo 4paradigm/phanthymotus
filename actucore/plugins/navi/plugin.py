@@ -2575,7 +2575,8 @@ class NaviPlugin:
                     return reject("target_range_unavailable")
                 range_pending = True
             else:
-                live_point = match.point[0], -match.point[1]
+                surface = match.standoff_point or match.point
+                live_point = surface[0], -surface[1]
         elif (front_required and not guard.probe_region and revision[2] != check.input_revision[2] and isinstance(objects, dict)
               and any(target_objects(objects, check.target, config))):
             target_pending = True
@@ -5092,6 +5093,7 @@ class NaviPlugin:
             None, ((0., 0.), leg.remaining(pose)), leg.geometry)
         project_detour = True
         with self._obs_lock:
+            objects, objects_ms = self._objects, self._objects_ms
             image_age = int(time.time() * 1000) - self._image_ms
             jpeg = (self._image_jpeg if self._image_ms and 0 <= image_age <= self._config.max_obs_age_ms
                     else None)
@@ -5120,7 +5122,22 @@ class NaviPlugin:
                     origin = (f, r, heading + scan.directions[0] * scan.turn_angle)
                 selected = policy_mod.PathLeg(geometry, (scan.advance_m, 0.), origin)
                 detour = local_path.Detour(None, ((0., 0.), selected.remaining(scan.pose)), geometry)
+        person = track is not None and track.front_required
+        person_measurement = None
+        if person and track.observed and track.front_box and track.measured_point is not None:
+            fix = track.measured_point
+            now_ms = int(time.time() * 1000)
+            if (fix.box == track.front_box and fix.capture_ms
+                    and 0 <= now_ms - fix.capture_ms < self._config.depth_age_limit_ms
+                    and track.front_fix is not None and track.since_obs_s * 1000 < self._config.max_obs_age_ms
+                    and 0 <= now_ms - objects_ms < self._config.max_obs_age_ms
+                    and observation_source(objects) == track.source
+                    and any(tuple(obj.get("bbox_norm") or ()) == track.front_box
+                            for obj in (objects or {}).get("objects", ()))):
+                person_measurement = track.front_box, math.hypot(*fix.point)
         snapshot = {
+            "person": person,
+            "person_measurement": person_measurement,
             # Arrays and payloads are *replaced* by their callbacks, never
             # mutated in place, so holding a reference is a safe snapshot.
             "depth_m": depth,
@@ -5128,7 +5145,7 @@ class NaviPlugin:
             "detour": detour,
             "executing": executing,
             "project_detour": project_detour,
-            "objects": self._objects,
+            "objects": objects,
             "jpeg": jpeg,
             "decision": self._last_decision,
             "track": self._state.tracker.describe(),
@@ -5237,6 +5254,8 @@ class NaviPlugin:
         detector is not seeing the target at all there is simply no box, which
         is itself the thing worth showing.
         """
+        if snapshot.get("person"):
+            return snapshot["person_measurement"] or (None, None)
         payload = snapshot["objects"] or {}
         target = snapshot["target"]
         bearing = snapshot["bearing"]
