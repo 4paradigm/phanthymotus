@@ -4,10 +4,11 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
 import { openDeployPanel } from './deploy-panel.js';
+import { parseToolReply, keptSelection, failureReply } from './config-options.js';
 
 /**
  * 分区图标。
@@ -445,9 +446,7 @@ function _buildChip(mcp, tool) {
     _showDetail(mcp, tool);
   });
 
-  chip.addEventListener('pointerdown', () => { ensureEdit(); });
   chip.addEventListener('dragstart', (e) => {
-    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     chip.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -589,9 +588,7 @@ function _buildToolCard(mcp, tool) {
   }
 
   // Drag (for canvas drop)
-  card.addEventListener('pointerdown', () => { ensureEdit(); });
   card.addEventListener('dragstart', (e) => {
-    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     card.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -947,6 +944,80 @@ function _llmSourceInput(key, saved) {
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
+// Help under a field, only when there is a separate title to help — otherwise
+// the description is already serving as the label and repeating it is noise.
+// Both config dialogs use it: the tool-level one showed no help at all, so a
+// driver's explanation of a field (what to do before a choice appears, say)
+// never reached the one dialog a card without instance fields has.
+function _fieldHelp(def) {
+  if (!def.title || !def.description) return null;
+  const help = document.createElement('p');
+  help.className = 'tool-config-help';
+  help.textContent = def.description;
+  return help;
+}
+
+// x-options-action: the button beside a field whose choices the tool finds
+// itself. Rules and reply format in config-options.js.
+function _optionsActionButton(bodyEl, mcpId, toolName, action, key, persist) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'tool-config-options-btn';
+  btn.textContent = '检测';
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    btn.textContent = '检测中…';
+    let reply;
+    try {
+      // Stored first: the action works from the saved settings, and what was
+      // just typed (an address, a password) is what it needs.
+      if (!(await persist())) return;
+      const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool: toolName, arguments: { action } }),
+      });
+      const json = await res.json();
+      if (json.code !== 200) throw new Error(json.message || `HTTP ${res.status}`);
+      reply = parseToolReply(json.data);
+    } catch (err) {
+      reply = failureReply(key, err);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '检测';
+    }
+    if (reply) _applyOptionsReply(bodyEl, reply);
+  });
+  return btn;
+}
+
+function _applyOptionsReply(bodyEl, reply) {
+  for (const [key, choices] of Object.entries(reply.options || {})) {
+    const select = bodyEl.querySelector(`select[data-key="${key}"]`);
+    if (!select || !Array.isArray(choices)) continue;
+    const current = select.value;
+    [...select.options].filter(o => o.value !== '').forEach(o => o.remove());
+    for (const item of choices) {
+      const option = document.createElement('option');
+      option.value = item.const ?? '';
+      option.textContent = item.title || String(item.const);
+      select.appendChild(option);
+    }
+    select.value = keptSelection(current, choices);
+  }
+  for (const [key, text] of Object.entries(reply.help || {})) {
+    const field = bodyEl.querySelector(`[data-key="${key}"]`)?.closest('.tool-config-field');
+    if (!field) continue;
+    let help = field.querySelector('.tool-config-help');
+    if (!help) {
+      help = document.createElement('p');
+      help.className = 'tool-config-help';
+      field.appendChild(help);
+    }
+    help.textContent = text;
+  }
+}
+
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
   // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
   // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
@@ -955,7 +1026,6 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     alert('Stop agent before modifying');
     return;
   }
-  if (!(await ensureEdit())) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
@@ -1085,7 +1155,18 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
     }
 
     fieldWrapper.appendChild(label);
-    fieldWrapper.appendChild(input);
+    if (def['x-options-action']) {
+      // The field and its button on one row; the button is added once the
+      // save path below exists.
+      const row = document.createElement('div');
+      row.className = 'tool-config-options-row';
+      row.appendChild(input);
+      fieldWrapper.appendChild(row);
+    } else {
+      fieldWrapper.appendChild(input);
+    }
+    const help = _fieldHelp(def);
+    if (help) fieldWrapper.appendChild(help);
     bodyEl.appendChild(fieldWrapper);
   }
 
@@ -1135,8 +1216,11 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
   // Handlers
   const close = () => { overlay.classList.add('hidden'); };
-  const save = async () => {
-    if (!(await ensureEdit())) return;
+  // Collect and store the form; null when it could not be. Shared by Save and
+  // by an x-options-action button, which has to store what was typed before
+  // the tool can act on it.
+  const persist = async () => {
+    if (!(await ensureEdit())) return null;
     const values = {};
     for (const input of bodyEl.querySelectorAll('[data-key]')) {
       if (!input.value.trim()) continue;
@@ -1148,7 +1232,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
       } catch (err) {
         alert(err.message);
-        return;
+        return null;
       }
     }
 
@@ -1161,16 +1245,27 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       });
       if (!resp.ok) {
         alert(`配置保存失败 (HTTP ${resp.status})`);
-        return;
+        return null;
       }
     } catch (err) {
       alert('配置保存失败: ' + err.message);
       console.error('[config] save failed:', err);
-      return;
+      return null;
     }
 
     // Update local cache
     _toolConfigs[configKey] = values;
+    return values;
+  };
+
+  for (const [key, def] of Object.entries(props)) {
+    const row = def['x-options-action'] && bodyEl.querySelector(`[data-key="${key}"]`)?.closest('.tool-config-options-row');
+    if (row) row.appendChild(_optionsActionButton(bodyEl, mcpId, toolName, def['x-options-action'], key, persist));
+  }
+
+  const save = async () => {
+    const values = await persist();
+    if (!values) return;
 
     // Update sidebar card status indicator
     const card = _scroll.querySelector(`.sidebar-tool-card[data-mcp-id="${mcpId}"][data-tool-name="${toolName}"]`);
@@ -1258,7 +1353,6 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     alert('Stop agent before modifying');
     return;
   }
-  if (!(await ensureEdit())) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
@@ -1451,14 +1545,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.value = vals[key] != null ? vals[key] : (def.default != null ? def.default : '');
     }
 
-    // Help text, only when there is a separate title to help — otherwise the
-    // description is already serving as the label and repeating it is noise.
-    let help = null;
-    if (def.title && def.description) {
-      help = document.createElement('p');
-      help.className = 'tool-config-help';
-      help.textContent = def.description;
-    }
+    const help = _fieldHelp(def);
 
     const host = isShared ? sharedHost : (def.advanced ? advancedHost() : bodyEl);
     host.appendChild(label);

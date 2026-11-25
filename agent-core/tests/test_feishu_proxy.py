@@ -4,6 +4,7 @@ Run: cd agent-core && python3 -m pytest tests/test_feishu_proxy.py -q
 """
 
 import asyncio
+import inspect
 import pathlib
 import sys
 import time
@@ -103,6 +104,22 @@ class SdkProxyPatchTest(unittest.TestCase):
     def _stub(**attrs):
         return types.SimpleNamespace(**attrs)
 
+    def test_patch_forwards_the_sdk_call_arguments(self):
+        """Since 1.7.5 the SDK passes connection headers to the hook. Both
+        shapes must reach it, and only 'proxy' may be dropped."""
+
+        def hook(connection_headers=None):
+            return {'additional_headers': dict(connection_headers or {}),
+                    'proxy': None, 'ping_interval': 30}
+
+        mod = self._stub(_ws_connect_kwargs=hook)
+        feishu._enable_sdk_env_proxy(mod)
+
+        self.assertEqual(mod._ws_connect_kwargs({'X-Test': '1'}),
+                         {'additional_headers': {'X-Test': '1'}, 'ping_interval': 30})
+        self.assertEqual(mod._ws_connect_kwargs(connection_headers={'X-Test': '2'}),
+                         {'additional_headers': {'X-Test': '2'}, 'ping_interval': 30})
+
     def test_patch_strips_proxy_and_keeps_everything_else(self):
         mod = self._stub(_ws_connect_kwargs=lambda: {'proxy': None, 'ping_interval': 30})
         feishu._enable_sdk_env_proxy(mod)
@@ -138,11 +155,20 @@ class SdkProxyPatchTest(unittest.TestCase):
             import lark_oapi.ws.client as ws_mod
         except ImportError as e:
             self.skipTest(f'lark_oapi not installed ({e})')
+        original = getattr(ws_mod, '_ws_connect_kwargs', None)
         self.assertTrue(
-            callable(getattr(ws_mod, '_ws_connect_kwargs', None)),
+            callable(original),
             'lark_oapi.ws.client._ws_connect_kwargs is gone — _enable_sdk_env_proxy '
             'now silently does nothing and Feishu will ignore HTTPS_PROXY',
         )
+
+        # Same canary, one step further: the patched hook must accept the
+        # installed helper's own call shape and differ only by 'proxy'.
+        self.addCleanup(setattr, ws_mod, '_ws_connect_kwargs', original)
+        feishu._enable_sdk_env_proxy(ws_mod)
+        args = ({'X-Test': '1'},) if 'connection_headers' in inspect.signature(original).parameters else ()
+        expected = {key: value for key, value in original(*args).items() if key != 'proxy'}
+        self.assertEqual(ws_mod._ws_connect_kwargs(*args), expected)
 
 
 if __name__ == '__main__':

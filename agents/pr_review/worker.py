@@ -640,8 +640,7 @@ async def _execute_builds(
 
         # Note which container the target declares, while the worktree still
         # exists. Its presence is what tells the comment that run-pr-image.sh
-        # will work. Drivers and perception ship a fragment; core does not
-        # (it self-updates via the web console).
+        # will work — for core too, which run-pr-image.sh swaps in place.
         rel = service_yaml_path(target, driver_path)
         if result.success and result.image_tag and rel:
             svc = read_service_yaml(worktree, rel)

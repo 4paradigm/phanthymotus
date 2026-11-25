@@ -149,9 +149,9 @@ class BuildResult:
     image_tag: str  # full image ref when successful
     log_tail: str  # last N lines, for the PR comment
     log_path: str = ""  # full log on disk, for the dashboard
-    # Container the target's deploy/service.yml declares. Set only when the
-    # target ships a parseable fragment, so it doubles as the signal that
-    # run-pr-image.sh will work for this image.
+    # Container the target's compose service declares (core's comes from its
+    # compose template). Set only when that parses, so it doubles as the signal
+    # that run-pr-image.sh will work for this image.
     container_name: str = ""
     # JetPack version for a perception build, "" for core and drivers. Part of
     # the build's identity, not a detail of it: one job can produce two

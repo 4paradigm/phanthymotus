@@ -779,6 +779,34 @@ html, body {
 .tool-config-desc + .tool-config-label {
   margin-top: 14px;
 }
+/* x-options-action: the field and the button that fetches its choices. */
+.tool-config-options-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.tool-config-options-row > .tool-config-input {
+  flex: 1;
+  min-width: 0;
+}
+.tool-config-options-btn {
+  flex: none;
+  padding: 0 14px;
+  border: 1px solid var(--border-med);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.tool-config-options-btn:hover:not(:disabled) {
+  background: var(--accent-dim);
+}
+.tool-config-options-btn:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
 /* Per-field help. Sits under its input, quieter than the label, so the label
    can stay a short name and the explanation still has somewhere to live. */
 .tool-config-help {
@@ -1438,6 +1466,43 @@ html, body {
   margin: 0 4px;
 }
 
+.canvas-clear-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 5px 6px;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+/* Hover-capable pointers only: a tap leaves an emulated :hover behind on touch
+   screens, so the button stayed red after 取消 as if the clear were still armed. */
+@media (hover: hover) {
+  .canvas-clear-btn:hover:not(:disabled) {
+    background: var(--red-bg);
+    color: var(--red);
+  }
+}
+.canvas-clear-btn:disabled {
+  opacity: .45;
+  cursor: default;
+}
+@media (pointer: coarse) {
+  .canvas-clear-btn { min-height: 44px; }
+}
+/* Tablets: the clear button sits inline in the zoom bar, so its 44px would
+   stretch the bar around 24px zoom buttons. Give those the same floor. Phones
+   are excluded — there the clear button floats above the bar, and the zoom
+   buttons keep their own 32px from the max-width: 768px block. */
+@media (pointer: coarse) and (min-width: 769px) {
+  .canvas-ctrl-btn { width: 44px; height: 44px; }
+}
+
 /* ── Canvas Top Control (智能控制 button) ─────────────────────────────── */
 .canvas-top-control {
   position: absolute;
@@ -2089,6 +2154,16 @@ html, body {
 }
 .canvas-field-input:focus {
   border-color: var(--accent);
+}
+.canvas-field-help {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .canvas-card-footer {
@@ -5639,6 +5714,12 @@ html, body {
 .task-actions button.danger { color: var(--red); }
 .task-actions button.danger:hover { border-color: var(--red); }
 
+.task-section-title {
+  font-size: 0.8rem; font-weight: 600; margin: 18px 0 8px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.task-section-title small { font-weight: 400; font-size: 0.72rem; color: var(--text-dim); }
+
 /* Task edit form */
 .task-edit-form label {
   display: block; font-size: 0.72rem; color: var(--text-dim);
@@ -6823,6 +6904,18 @@ html, body {
     bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 10px);
     right: 12px;
     z-index: 50;
+  }
+  /* Keep the clear action above the zoom controls, away from the editor bar. */
+  .canvas-clear-sep { display: none; }
+  .canvas-clear-btn {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 8px);
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    box-shadow: var(--shadow-sm);
   }
 
   /* Bottom-left, opposite the zoom controls — not top-left, which is the

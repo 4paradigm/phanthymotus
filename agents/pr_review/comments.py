@@ -5,7 +5,7 @@ Lives in its own module so both `trigger` (acknowledgment) and `worker`
 """
 
 from .builder import split_image_ref
-from .models import BuildResult, TestResult
+from .models import BuildResult, BuildTarget, TestResult
 from .reviewer import Finding
 
 # Marker prefixed to every bot comment, so bot comments are identifiable.
@@ -436,12 +436,33 @@ def _deploy_help(built: list[BuildResult]) -> str:
     behaviour of whichever one happened to be fixed. There is now one copy, at
     motus.phanthy.com, and install.sh also drops it at
     /opt/phanthy-motus/run-pr-image.sh.
+
+    Core gets the same command. It cannot run beside the agent already on the
+    machine, so the script swaps the image into the running agent-core
+    container instead, and `--down` restores the host's image. Its block says
+    so, because "replaces what is running" is not what the others do.
     """
     out = "\n### Try it\n"
 
     runnable = [r for r in built if r.container_name]
     for r in runnable:
         name = r.label()
+        if r.target == BuildTarget.CORE:
+            out += f"""
+**{name}**
+
+```bash
+curl -fsSL https://motus.phanthy.com/run-pr-image.sh | bash -s -- {r.image_tag}
+```
+
+Agent Core cannot run beside the one already on the machine, so this replaces
+the running `{r.container_name}` with this image in place — drivers and
+perception keep running. It stays until `--down agent-core`, which puts the
+host's own image back; `--logs agent-core` and `--status` work as for the
+others. Files hot-copied into the old container (`docker cp`) do not survive
+the swap.
+"""
+            continue
         out += f"""
 **{name}**
 
@@ -462,15 +483,14 @@ occupies. Use the copy `install.sh` leaves on the machine — `sudo bash
 `docker exec -it {r.container_name} bash`.
 """
 
-    # Targets with no service fragment — in practice just core, which is the
-    # agent itself and updates in place rather than running as a second copy.
-    web_only = [r for r in built if not r.container_name]
-    if web_only:
-        names = ", ".join(r.label() for r in web_only)
+    # A build whose checkout declared no container — not expected for any
+    # target, but the image is still installable from the console.
+    undeclared = [r for r in built if not r.container_name]
+    if undeclared:
+        names = ", ".join(r.label() for r in undeclared)
         out += f"""
-**{names}** — deployed by updating through the web console, not by running a
-container: Agent Core pulls the image and hands over to a restart helper. Open
-the dashboard's deploy panel and upgrade to this version.
+**{names}** — no compose service declared in the checkout, so there is no
+command for it here. Deploy it from the web console's deploy panel.
 """
 
     if runnable:
