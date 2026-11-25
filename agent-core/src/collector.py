@@ -73,6 +73,8 @@ _cancel_event: asyncio.Event | None = None
 # 作废（见 event/llm.py 的 RoundReconsider）。
 _reconsider_event: asyncio.Event | None = None
 _current_turn_priority: int = 0
+_current_channel_scope: tuple | None = None
+_current_turn_restricted: bool = False
 _source_ring: dict[str, deque] = {}  # per-source ring buffer（所有事件）
 
 # 优先级判定规则
@@ -274,6 +276,25 @@ def set_turn_priority(priority: int):
     _current_turn_priority = priority
 
 
+def set_turn_scope(trigger: dict | None):
+    """Keep same-authority steering separate from isolated follow-up messages."""
+    global _current_channel_scope, _current_turn_restricted
+    _current_channel_scope = trigger.get('_channel_scope') if trigger else None
+    _current_turn_restricted = bool(trigger and (
+        trigger.get('_bot_channel_event') or trigger.get('_viewer_channel_event')
+        or trigger.get('_chat_only_channel')))
+
+
+def _can_steer(event: dict) -> bool:
+    if _current_turn_restricted:
+        return False
+    if not _is_channel_event(event):
+        return True
+    scope = channel_scope([event])
+    return (scope is not None and scope == _current_channel_scope
+            and scope[4] in ('operator', 'owner'))
+
+
 def set_interrupt_mode(mode: str):
     """设置打断模式：steer | interrupt | followup。"""
     global _interrupt_mode
@@ -298,9 +319,7 @@ async def drain_steering() -> list[dict]:
     while not _steering_queue.empty():
         try:
             event = _steering_queue.get_nowait()
-            # Channel events must receive their own authorization context.
-            # Also handle events queued before the current turn started.
-            if _is_channel_event(event):
+            if not _can_steer(event):
                 _priority_pending.append(event)
             else:
                 items.append(event)
@@ -379,6 +398,32 @@ def _human_channel_payloads(events: list[dict]) -> list[dict]:
             if payload.get('sender_type') not in ('bot', 'app')]
 
 
+def channel_scope(events: list[dict]) -> tuple | None:
+    """Identity and policy of a single authorized human Channel conversation."""
+    payloads = _human_channel_payloads(events)
+    if not payloads or len(payloads) != len(events):
+        return None
+    scopes = []
+    for payload in payloads:
+        identity = tuple(payload.get(key) for key in ('platform', 'channel_id', 'chat_id', 'user_id'))
+        role = payload.get('user_role')
+        if (not all(isinstance(value, str) and value for value in identity)
+                or role not in ('viewer', 'operator', 'owner')):
+            return None
+        scopes.append((*identity, role, payload.get('chat_only') is True))
+    return scopes[0] if all(scope == scopes[0] for scope in scopes) else None
+
+
+def channel_context_key(trigger: dict) -> str:
+    scope = trigger.get('_channel_scope')
+    if (not isinstance(scope, (tuple, list)) or len(scope) != 6
+            or not all(isinstance(value, str) and value for value in scope[:4])
+            or scope[4] not in ('viewer', 'operator', 'owner')
+            or not isinstance(scope[5], bool)):
+        return ''
+    return _json.dumps(scope, ensure_ascii=False, separators=(',', ':'))
+
+
 def has_viewer_only_channel_event(events: list[dict]) -> bool:
     """Fail closed if any human message is read-only, including mixed batches."""
     if any(_is_channel_event(ev) and not _channel_payloads([ev]) for ev in events):
@@ -453,8 +498,9 @@ def _split_by_authorization(events: list[dict]) -> list[list[dict]]:
             else:
                 trust = _bot_trust_class([event])
                 role = payload.get('user_role')
-                role_class = 'operator' if role in ('operator', 'owner') else 'viewer'
-                key = ('channel', trust, role_class, channel, chat, user)
+                role_class = role if role in ('operator', 'owner') else 'viewer'
+                key = ('channel', trust, role_class, payload.get('platform'), channel,
+                       chat, user, payload.get('chat_only') is True)
         key = (event.get('_chat_only_key'), key)
         if not batches or key != last_key:
             batches.append([])
@@ -467,10 +513,8 @@ def _chat_history_blocks(batch: list[dict]) -> str:
     """Prepend each distinct (channel_id, chat_id)'s own recent recap (see
     channel/manager.py:get_chat_history) ahead of this batch's <event> blocks.
 
-    The shared global turn history (event/llm.py:self._turns) doesn't separate
-    by chat — this gives the model an explicit, scoped reminder of what this
-    exact conversation said, so it's less likely to answer person A with
-    context that only came from person B.
+    This recap is an upgrade fallback for conversations without a persisted
+    scoped session. The dispatcher omits it when full Channel history is restored.
     """
     from channel.manager import manager as channel_manager
     seen = set()
@@ -483,16 +527,15 @@ def _chat_history_blocks(batch: list[dict]) -> str:
         if not channel_id or not chat_id or (channel_id, chat_id) in seen:
             continue
         seen.add((channel_id, chat_id))
-        history = channel_manager.get_chat_history(channel_id, chat_id)
         user_id = payload.get('user_id')
         user_role = payload.get('user_role')
         sender_type = payload.get('sender_type') or 'user'
-        # Legacy entries lack identity/role and must not be fed into a turn with
-        # another sender's authority. Include only this sender's same-role recap.
-        history = [entry for entry in history
-                   if user_id and entry.get('user_id') == user_id
-                   and entry.get('user_role') == user_role
-                   and entry.get('sender_type') == sender_type]
+        if not user_id:
+            continue
+        # Filter before applying the recap limit; another sender's traffic
+        # must not hide entries which are still retained for this user.
+        history = channel_manager.get_chat_history(
+            channel_id, chat_id, user_id=user_id, user_role=user_role, sender_type=sender_type)
         if not history:
             continue
         lines = []
@@ -531,6 +574,8 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
         '_viewer_channel_event': has_viewer_only_channel_event(batch),
         '_channel_event': any(_is_channel_event(event) for event in batch),
+        '_channel_scope': channel_scope(batch),
+        '_channel_trigger_text': formatted,
         '_channel_message_ids': channel_message_ids(batch),
         '_channel_image_paths': channel_image_paths(batch),
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
@@ -975,9 +1020,9 @@ async def _drain_loop():
 
                 # 按模式处理
                 if _interrupt_mode == 'steer':
-                    # A channel event must not inherit the current turn's tools,
-                    # reply context or scoped image allow-list.
-                    if _is_channel_event(ev):
+                    # Same-sender operator steering keeps its authority. Other
+                    # contexts wait for a turn with their own tools and routing.
+                    if not _can_steer(ev):
                         _priority_pending.append(ev)
                         continue
                     # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过

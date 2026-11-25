@@ -15,6 +15,7 @@ const POLL_MS = 3000;
 
 const KIND_GROUPS = [
   { kind: 'main',        label: '主代理' },
+  { kind: 'channel',     label: '渠道会话' },
   { kind: 'subagent',    label: '子代理' },
   { kind: 'bg_subagent', label: '后台子代理' },
 ];

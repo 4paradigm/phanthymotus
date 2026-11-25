@@ -4,6 +4,7 @@ import json
 import re
 import time
 import uuid
+from contextvars import ContextVar
 
 from config import _get_conn
 
@@ -11,9 +12,14 @@ from config import _get_conn
 KIND_MAIN = 'main'
 KIND_SUBAGENT = 'subagent'
 KIND_BG_SUBAGENT = 'bg_subagent'
+KIND_CHANNEL = 'channel'
+
+# None is a non-channel turn; an empty key is an unidentifiable Channel input.
+# Set by the dispatcher, never supplied by a model tool argument.
+current_channel_context: ContextVar[str | None] = ContextVar('channel_history_context', default=None)
 
 
-def create_session(kind: str = KIND_MAIN) -> str:
+def create_session(kind: str = KIND_MAIN, *, context_key: str = '') -> str:
     """Create a new chat session, return its ID.
 
     `kind` separates the main agent's own conversation from delegated ones, so the
@@ -22,8 +28,8 @@ def create_session(kind: str = KIND_MAIN) -> str:
     sid = str(uuid.uuid4())
     with _get_conn() as conn:
         conn.execute(
-            'INSERT INTO chat_sessions (id, started_at, kind) VALUES (?, ?, ?)',
-            (sid, time.time(), kind)
+            'INSERT INTO chat_sessions (id, started_at, kind, context_key) VALUES (?, ?, ?, ?)',
+            (sid, time.time(), kind, context_key)
         )
         conn.commit()
     return sid
@@ -245,19 +251,33 @@ def rebuild_fts():
         conn.commit()
 
 
-def search(query: str, limit: int = 10) -> list[dict]:
+def search(query: str, limit: int = 10, *, context_key: str | None = None,
+           include_channels: bool = True) -> list[dict]:
     """全文搜索历史对话。"""
+    if context_key == '':
+        return []  # An unidentified Channel input has no authorized history.
     with _get_conn() as conn:
         _ensure_fts(conn)
         try:
+            where = ''
+            params = [query]
+            if context_key is not None:
+                where = ' AND cs.kind = ? AND cs.context_key = ?'
+                params.extend([KIND_CHANNEL, context_key])
+            elif not include_channels:
+                where = ' AND cs.kind != ?'
+                params.append(KIND_CHANNEL)
+            params.append(limit)
             rows = conn.execute('''
                 SELECT cm.session_id, cm.turn_index, cm.messages, cm.created_at
                 FROM chat_messages_fts fts
                 JOIN chat_messages cm ON cm.id = fts.rowid
-                WHERE fts MATCH ?
+                JOIN chat_sessions cs ON cs.id = cm.session_id
+                WHERE fts.content MATCH ?
+            ''' + where + '''
                 ORDER BY rank
                 LIMIT ?
-            ''', (query, limit)).fetchall()
+            ''', params).fetchall()
         except Exception:
             return []
     results = []
@@ -278,6 +298,27 @@ def search(query: str, limit: int = 10) -> list[dict]:
 
 
 # ── 重启续跑 ──────────────────────────────────────────────────────────────────
+
+def get_channel_session(context_key: str, limit: int = 18) -> dict | None:
+    """Restore only this sender's same-platform, same-role Channel conversation."""
+    if not context_key:
+        return None
+    with _get_conn() as conn:
+        row = conn.execute(
+            'SELECT id FROM chat_sessions WHERE kind=? AND context_key=? '
+            'ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 1',
+            (KIND_CHANNEL, context_key),
+        ).fetchone()
+        if not row:
+            return None
+        sid = row[0]
+        rows = conn.execute(
+            'SELECT turn_index, messages FROM chat_messages WHERE session_id=? '
+            'ORDER BY turn_index DESC LIMIT ?', (sid, limit),
+        ).fetchall()
+    return {'session_id': sid, 'next_turn_index': rows[0][0] + 1 if rows else 0,
+            'turns': [json.loads(row[1]) for row in reversed(rows)]}
+
 
 def get_last_session_turns(limit: int = 10) -> dict | None:
     """获取主代理最近一个 session 的最后 N 轮，用于重启续跑。

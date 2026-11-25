@@ -319,7 +319,9 @@ class ChannelManager:
         all_history[channel_id] = channel_history
         config.main['channel_chat_history'] = all_history
 
-    def get_chat_history(self, channel_id: str, chat_id: str, limit: int = 6) -> list[dict]:
+    def get_chat_history(self, channel_id: str, chat_id: str, limit: int = 6, *,
+                         user_id: str | None = None, user_role: str | None = None,
+                         sender_type: str | None = None) -> list[dict]:
         """Return this chat's own recent exchanges (oldest first), independent of the
         shared global turn history."""
         all_history = config.main.get('channel_chat_history', {})
@@ -332,6 +334,10 @@ class ChannelManager:
         if not isinstance(entries, list):
             return []
         valid = [e for e in entries if isinstance(e, dict) and isinstance(e.get('text'), str)]
+        if user_id is not None:
+            valid = [e for e in valid if e.get('user_id') == user_id
+                     and e.get('user_role') == user_role
+                     and e.get('sender_type') == sender_type]
         return valid[-limit:]
 
     # ── Persistent conversation context ──────────────────────────────────────
@@ -616,7 +622,7 @@ class ChannelManager:
         cls = _ADAPTER_CLASSES.get(platform)
         if cls is None:
             msg = (f'[channel] No adapter for platform: {platform}. '
-                   'Supported: telegram, slack, feishu, lan, wecom')
+                   f'Supported: {", ".join(sorted(_ADAPTER_CLASSES)) or "none"}')
             print(msg)
             await self._push_error(msg)
             return
@@ -760,8 +766,8 @@ class ChannelManager:
                     elif adapter := self._adapters.get(msg.channel_id):
                         await adapter.send_message(OutboundMessage(
                             chat_id=msg.chat_id,
-                            text='Pending approval. An admin has been notified.',
-                            source_message_id=msg.message_id,
+                            text='Pending approval. Please contact an admin.',
+                            reply_to_message_id=msg.message_id,
                         ))
                     return
 
@@ -976,9 +982,6 @@ class ChannelManager:
                 files=attachments,
                 mention_open_id=mention_open_id,
                 expect_reply=expect_reply,
-                # 触发事件的 message_id：长连接型平台（WeCom）据此精确找回
-                # 该次回调的 req_id，而不是靠 chat_id 猜「最近一条」。
-                source_message_id=source_message_id,
                 reply_to_message_id=ctx.get('message_id', ''),
             ))
             parts = []

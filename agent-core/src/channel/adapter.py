@@ -83,11 +83,7 @@ class OutboundMessage:
     # 兼容旧调用方：直接给字节的图片
     image_bytes: bytes | None = None
     image_caption: str = ''
-    # 触发事件的 message_id（精确回复用）。必须留在末尾且带默认值：
-    # 现有 4 个适配器与 manager.py 的按位置构造都不受影响。
-    # 长连接型平台（如 WeCom）回复必须回带该消息回调的 req_id，适配器
-    # 据此从 msgid → req_id 映射里精确取值，避免同一会话连发多条时回错消息。
-    source_message_id: str = ''
+    # 原消息 ID：用于原位回复，也用于长连接平台找回该消息的请求上下文。
     reply_to_message_id: str = ''
 
 
