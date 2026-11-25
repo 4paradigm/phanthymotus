@@ -28,6 +28,19 @@ VIEW_JPEG_QUALITY = 90
 FLEX_FORMAT = "control/hand_flex"
 FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")
 
+# Fields accepted by the internal `config` action (tests / automation). This
+# is deliberately separate from configSchema.properties: the canvas renders
+# every declared property in BOTH the tool-level and the per-card dialog, so
+# only hand/hand_confidence belong there. Everything else is fixed at deploy
+# time but still needs to be switchable in offline tests (backend=mock etc).
+CONFIGURABLE = frozenset({
+    "hand", "hand_confidence", "backend", "model_dir", "model_path",
+    "model_family", "mock_pose", "slew_rate", "rate_hz",
+    "keypoint_topic", "view_topic", "draw_view", "line_width",
+    "point_radius", "view_jpeg_quality",
+    "handedness_source", "min_visibility",
+})
+
 
 class HandLandmarksPlugin:
     PREFIX = 'hand_landmarks'
@@ -57,31 +70,15 @@ class HandLandmarksPlugin:
         def field(kind, default, scope='shared', **extra):
             return dict(type=kind, default=default, scope=scope, **extra)
 
-        # All configSchema properties except `hand` and `hand_confidence` are
-        # hidden from the canvas form via
-        # x-show-when against a value `hand` can never take ("__hidden__"):
-        # the canvas renders every property and offers no native hide flag.
-        # All values stay in config.yaml / code and config actions can still
-        # change them; only the canvas form is hidden. `hand` stays visible
-        # and is the control field for x-show-when.
-        _hidden = {'x-show-when': {'hand': '__hidden__'}}
+        # Only the two operator-tunable knobs are declared in configSchema.
+        # Everything else (backend/model plumbing, topics, rate, preview) is
+        # fixed in config.yaml or module constants and must not appear in
+        # either the tool-level or the per-card instance config dialog. The
+        # canvas renders every property it is given, so omitting them here is
+        # the only reliable way to hide them in both dialogs.
         props = {
-            'backend': field('string', 'rtmpose', enum=['rtmpose', 'mediapipe', 'mock'], **_hidden),
             'hand': field('string', 'Right', enum=['Right', 'Left', 'either']),
-            'model_dir': field('string', '/models/hand', **_hidden),
-            'model_path': field('string', '', **_hidden),
-            'model_family': field('string', '', enum=['', 'jp61', 'jp511'], **_hidden),
-            'mock_pose': field('string', 'open', enum=['open', 'fist', 'alternate'], **_hidden),
             'hand_confidence': field('number', 0.3),
-            'slew_rate': field('number', 20.0, **_hidden),
-            'rate_hz': field('number', 10, 'instance', **_hidden),
-            'keypoint_topic': field('string', KEYPOINTS, 'instance', **_hidden),
-            'view_topic': field('string', VIEW, 'instance', **_hidden),
-            # Skeleton-preview knobs are hidden and pinned to module constants.
-            'draw_view': field('boolean', VIEW_ALWAYS_ON, 'instance', **_hidden),
-            'line_width': field('integer', VIEW_LINE_WIDTH, 'instance', **_hidden),
-            'point_radius': field('integer', VIEW_POINT_RADIUS, 'instance', **_hidden),
-            'view_jpeg_quality': field('integer', VIEW_JPEG_QUALITY, 'instance', **_hidden),
         }
         return [{'name': self.PREFIX, 'type': 'processor', 'multiInstance': False,
                  'description': '识别单手 21 个关键点，输出五指弯曲量和绿色骨架预览。',
@@ -105,8 +102,8 @@ class HandLandmarksPlugin:
             if action == 'config':
                 if self.state != 'idle':
                     return {'state': 'error', 'error': '请先停止卡片再修改配置'}
-                allowed = self.get_tools()[0]['configSchema']['properties']
-                self.cfg.update({k: v for k, v in args.items() if k in allowed})
+                self.cfg.update({k: v for k, v in args.items()
+                                 if k in CONFIGURABLE})
                 return {'state': self.state, 'config': dict(self.cfg)}
             if action == 'start':
                 if self.state == 'idle':
