@@ -15,9 +15,10 @@
 | 接收用户在群里的 @ | 接收群聊中提及机器人的消息 | `im:message.group_at_msg:readonly` | 不使用 Bot @ Bot 时的最小群聊权限 |
 | 接收其他机器人和用户在群里的 @ | 获取群组中其他机器人和用户 @ 当前机器人的消息 | `im:message.group_at_msg.include_bot:readonly` | 使用 Bot @ Bot 时替代上一项 |
 | 下载收到的图片、音频、视频和文件 | 读取消息 | `im:message:readonly` | 使用入站附件时必需 |
+| 接收用户单独补发的群聊图片 | 获取群组中所有消息 | `im:message.group_msg` | 使用群聊图片补充时需要；会接收机器人所在群的所有用户消息 |
 | 上传并发送图片、音频、视频和文件 | 获取与上传图片或文件资源 | `im:resource` | 发送附件时必需 |
 
-`im:message.group_at_msg.include_bot:readonly` 仅适用于企业自建应用。不要申请 `im:message.group_msg.include_bot:read`；本功能只需要收到明确 `@` 当前机器人的消息，不需要读取群内所有消息。
+`im:message.group_at_msg.include_bot:readonly` 仅适用于企业自建应用。Bot @ Bot 只需要收到明确 `@` 当前机器人的消息，不需要申请 `im:message.group_msg.include_bot:read`；用户单独补发的群聊图片需要 `im:message.group_msg`。
 
 4. 进入 **事件与回调 → 事件配置**：
 
@@ -29,16 +30,18 @@
 
 ### 批量导入标准权限
 
-需要单聊、群聊、附件和 Bot @ Bot 的 Phanthy Motus 机器人，可直接使用 [标准权限清单](./feishu-bot-permissions.json)。该清单与已验收的上海 G1 应用当前导出格式一致；`include_bot` 已包含用户和其他机器人在群里的 `@` 消息，因此没有重复申请仅用户群聊的 `im:message.group_at_msg:readonly`。
+需要单聊、群聊、附件和 Bot @ Bot 的 Phanthy Motus 机器人，可直接使用 [标准权限清单](./feishu-bot-permissions.json)。该清单以已验收的上海 G1 应用导出格式为基础，并增加 `im:message.group_msg` 以接收群聊补图；`include_bot` 已包含用户和其他机器人在群里的 `@` 消息，因此没有重复申请仅用户群聊的 `im:message.group_at_msg:readonly`。
 
 1. 进入 **权限管理 → 批量处理 → 批量导入/导出权限 → 导入**。
 2. 复制权限清单的完整 JSON，粘贴到编辑器中，点击 **格式化 JSON → 下一步，确认新增权限**。飞书当前采用粘贴 JSON，不是上传文件；导入只会新增权限，不会关闭已有权限。
-3. 确认 5 项均为 **应用身份** 权限，然后进入 **版本管理与发布**，创建并发布新版本。
-4. 发布后回到 **批量导入/导出权限 → 导出**，确认 `tenant` 列表包含清单中的 5 个 Scope，`user` 为空。
+3. 确认 6 项均为 **应用身份** 权限，然后进入 **版本管理与发布**，创建并发布新版本。
+4. 发布后回到 **批量导入/导出权限 → 导出**，确认 `tenant` 列表包含清单中的 6 个 Scope，`user` 为空。
 
-只做纯文本且不收发附件时，可从导入内容中删除 `im:message:readonly` 和 `im:resource`；不使用 Bot @ Bot 时，则用权限表中的 `im:message.group_at_msg:readonly` 替换 `im:message.group_at_msg.include_bot:readonly`。
+只做纯文本且不收发附件时，可从导入内容中删除 `im:message:readonly`、`im:resource` 和 `im:message.group_msg`；不使用 Bot @ Bot 时，则用权限表中的 `im:message.group_at_msg:readonly` 替换 `im:message.group_at_msg.include_bot:readonly`。
 
 ## 2. 在 Agent Core 中添加飞书 Channel
+
+启动和健康检查都需要飞书机器人身份。应用需启用机器人能力并发布，`/bot/v3/info` 必须返回 `bot.open_id`；无法取得身份时，启动会报错；运行中的健康检查会失败。
 
 1. 打开 Agent Core Web Dashboard。
 2. 进入 **设置 → 渠道 → + Add Channel**。
@@ -97,6 +100,24 @@ App Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、
 ```
 
 `channel_reply` 回复当前消息时使用 `source_message_id` 找回精确会话，不会被后到的群聊或私聊改写目标。主动向已配置的对端 Bot 发任务时，改用 `trusted_bot_id`；Core 会根据配置的 `chat_id` 发到固定群，并结构化 `@` 该 Bot。两个参数不能同时使用。
+
+### 群聊中可选的图片补充
+
+纯文字消息立即交给 Agent 处理，图片不是必填项。群聊图片补充默认可用，无需配置开关或新增 Canvas 卡片。需要先 `@` 提出要求、再单独发送图片时：
+
+1. 在飞书权限管理中开通应用身份的 `im:message.group_msg` 和 `im:message:readonly`，完成审批并发布新版本；只开通群聊 `@` 权限不会收到后续没有 `@` 的图片。
+2. 在 `decision_core` 配置中打开 **模型支持图片输入**（`vision_input`），使用支持图片输入的模型。沿用现有 Channel 工具权限，使用有 `Read` 权限的账号进行读图验收。
+3. 在群内发送 `@机器人 请识别图片中的文字`，再在 60 秒内由同一账号单独发送图片；文字请求也可以独立完成，不要求一定补图。
+
+Core 只关联同一个 Channel、同一个群、同一个发送人的最近一条 `@` 文本。
+图文消息会在下载附件前缓存文字上下文，因此下载期间补发的图片也能关联；附件占位符不会作为原要求。
+同一窗口内可补发多张图片，每张都是新的补充事件，并保留自己的消息 ID；新的 `@` 文本替换旧的关联上下文。
+无关文字、其他用户的图片、过期图片和表情不会触发 Agent，也不会下载附件。
+私聊图片继续按普通附件处理。
+
+补图事件的 `files` 携带下载后的图片路径，`related_request` 携带原文字消息的 `message_id` 和 `text`。
+Core 在本次事件的运行时说明中要求 Agent 用 `Read` 查看本次图片、结合原要求分析，再通过 `channel_reply` 回复本次图片消息，并避免重复执行先前已完成的动作。保留原有系统提示词的设备升级后同样获得这些补图规则，无需覆盖用户的提示词文件。
+下载失败会明确标注未获得图片内容；图片补充不会改变模型能力、用户角色或工具权限。
 
 ## 4. 机器人什么时候才会 @
 

@@ -785,6 +785,8 @@ class ChannelManager:
         }
         if files:
             payload['files'] = files
+        if msg.related_request:
+            payload['related_request'] = msg.related_request
         if private_chat:
             payload['chat_only'] = True
         if trusted_bot_id:
@@ -814,6 +816,7 @@ class ChannelManager:
                 'expect_reply': msg.expect_reply,
                 'trusted_bot_id': trusted_bot_id,
                 'files': files,
+                **({'related_request': msg.related_request} if msg.related_request else {}),
             }
         })
 

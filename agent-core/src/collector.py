@@ -613,6 +613,16 @@ def _slim_acp_result(status, result):
             'head': text[:_ACP_RESULT_CHARS]}
 
 
+# 协议说明随事件提供，已有设备的自定义系统提示词无需迁移。
+_CHANNEL_IMAGE_FOLLOWUP_INSTRUCTIONS = (
+    '这是补充图片事件。related_request 是同一用户先前 @ 消息的上下文，'
+    '用于理解本次补充图片，不是重新下达原指令。不要重复执行之前已经完成的动作。\n'
+    '若本次 files 含图片，使用 Read 查看并结合原要求分析；'
+    '下载或读图失败时如实说明未获得图片内容，不要依据旧上下文编造本次图片内容。\n'
+    '通过 channel_reply 将本次 message_id 作为 source_message_id 回复。'
+)
+
+
 def _format_priority_batch(events: list[dict]) -> str:
     """格式化 P>0 事件为 XML（精简 perf 字段后的文本）。"""
     parts = []
@@ -623,6 +633,9 @@ def _format_priority_batch(events: list[dict]) -> str:
         channel = _infer_channel(ev)
         source = ev.get('source', '')
         text = _slim_event_text(ev.get('text', ''))
+        if any(isinstance(payload.get('related_request'), dict) and payload['related_request']
+               for payload in _channel_payloads([ev])):
+            text = _CHANNEL_IMAGE_FOLLOWUP_INSTRUCTIONS + '\n' + text
         parts.append(f'<event source="{source}" channel="{channel}" ts="{ts}">\n{text}\n</event>')
     return '\n'.join(parts)
 

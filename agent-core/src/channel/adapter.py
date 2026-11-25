@@ -63,6 +63,7 @@ class InboundMessage:
     chat_type: str = ''        # p2p | group
     mentions: list[dict] = field(default_factory=list)
     expect_reply: bool | None = None  # 机器人协作消息是否明确要求继续 @
+    related_request: dict = field(default_factory=dict)  # 补图关联的原消息 {message_id, text}
 
 
 @dataclass
