@@ -539,7 +539,6 @@ class NaviPlugin:
         self._depth_vertical = None
         self._depth_bands = {}
         self._depth_ms = 0
-        self._depth_capture_ms = None
         self._depth_source_ms = None
         self._depth_source_ns = None
         self._depth_vendor = {}
@@ -854,7 +853,6 @@ class NaviPlugin:
             self._depth_vertical = None
             self._depth_bands = {}
             self._depth_ms = 0
-            self._depth_capture_ms = None
             self._depth_source_ms = None
             self._depth_source_ns = None
             self._depth_vendor = {}
@@ -1302,6 +1300,12 @@ class NaviPlugin:
                 command_timer, self._command_timer = self._command_timer, None
                 self._publisher = None
 
+        # Detach before destroying handles that may still be in the wait set.
+        if node is not None and self._executor is not None:
+            try:
+                self._executor.remove_node(node)
+            except Exception:                                 # noqa: BLE001
+                pass
         self._cancel_pending_depth_bind(node)
         if node is not None:
             for active_timer in (timer, command_timer):
@@ -1310,11 +1314,6 @@ class NaviPlugin:
                         node.destroy_timer(active_timer)
                     except Exception:                         # noqa: BLE001
                         pass
-            try:
-                if self._executor is not None:
-                    self._executor.remove_node(node)
-            except Exception:                                 # noqa: BLE001
-                pass
             try:
                 node.destroy_node()
             except Exception:                                 # noqa: BLE001
@@ -2039,18 +2038,20 @@ class NaviPlugin:
         bands = depth_mod.nearest_by_band(depth)
         projection = local_path.DepthProjection.received(depth, ground)
         with self._obs_lock:
+            expected_frame = self._depth_vendor.get("frame_id")
+            if expected_frame and source_frame and source_frame != expected_frame:
+                return
+            source = source_stamp_ns or (capture_ms * 10**6 if capture_ms else None)
+            if source and source == self._depth_source_ns:
+                # A repeated exposure is still the same observation.
+                return
             self._depth_map = projection.frame
             self._depth_ground = projection.ground
             self._depth_projection = projection
             self._depth_bands = bands
-            if not (self._depth_vendor.get("hardware_capture_timestamp_available") is False
-                    and source_stamp_ns and source_stamp_ns == self._depth_source_ns):
-                self._depth_ms = received_ms
-            expected_frame = self._depth_vendor.get("frame_id")
-            self._depth_source_ns = (source_stamp_ns if not expected_frame or not source_frame
-                                     or source_frame == expected_frame else None)
+            self._depth_ms = received_ms
+            self._depth_source_ns = source or None
             self._depth_source_ms = capture_ms or None
-            self._depth_capture_ms = capture_ms if type(capture_ms) is int and 0 < capture_ms <= received_ms else None
 
     def _on_depth_map(self, message):
         received_ms = int(time.time() * 1000)
@@ -2120,6 +2121,8 @@ class NaviPlugin:
             fresh_depth = now - self._depth_ms <= depth_age
             depth = ({"map": self._depth_map, "bands": dict(self._depth_bands),
                       "frame_id": self._depth_ms} if fresh_depth else None)
+            if depth is not None and self._depth_map is not None:
+                depth["receipt_timed"] = True
             if depth is not None and self._depth_ground is not None:
                 depth["ground"] = self._depth_ground
             if depth is not None:
@@ -2131,28 +2134,17 @@ class NaviPlugin:
                     if self._binding.get("body_mount"):
                         depth["body_mount_required"] = True
                     if ns is not None:
+                        # The header identifies the paired extrinsics. Timing
+                        # and pose registration use the same receipt clock.
                         depth["source_stamp_ns"] = ns
-                        if 0 <= now - ns // 10**6 <= depth_age:
-                            clock = self._depth_vendor.get("clock_reference") or {}
-                            mount = self._mounts.get(ns)
-                            if (mount is not None and isinstance(clock, dict)
-                                    and clock.get("clock_id") == clock.get("timestamp_basis") == "host_realtime"):
-                                depth["body_from_optical"], depth["mount_accuracy_validated"] = mount
-                            capture_pose = odom_mod.obstacle_pose_at(self._obstacle_poses, ns)
-                            if capture_pose is not None:
-                                depth["obstacle_capture_pose"] = capture_pose
+                        mount = self._mounts.get(ns)
+                        if mount is not None:
+                            depth["body_from_optical"], depth["mount_accuracy_validated"] = mount
+                    pose = odom_mod.obstacle_pose_at(self._obstacle_poses, self._depth_ms * 10**6)
+                    if pose is not None:
+                        depth["obstacle_capture_pose"] = pose
                 if self._depth_source_ms is not None:
                     depth["source_frame_id"] = self._depth_source_ms
-                capture = self._depth_capture_ms
-                if self._depth_vendor.get("hardware_capture_timestamp_available") is False:
-                    depth["receipt_timed"] = True
-                if capture is not None:
-                    valid_age = 0 <= now - capture <= depth_age
-                    if valid_age or depth.get("receipt_timed"):
-                        # Preserve the upstream time for motion registration.
-                        depth["capture_ms"] = capture
-                    else:
-                        depth["capture_invalid"] = True
             odom_age = now - self._odom_ms
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)
@@ -3101,6 +3093,16 @@ class NaviPlugin:
         now = time.time()
         scan = self._state.active_scan
         self._last_decision = decision
+        if (self._command_timer is not None and self._config.local_planning
+                and decision.status == policy_mod.BLIND
+                and (depth is None or depth.get("capture_invalid"))):
+            # A missing observation can't authorize a new packet. The
+            # publisher still owns any previously admitted command window.
+            decision.reason = policy_mod.DEPTH_CAPTURE_STALE
+            if not decision.publishes:
+                if deadline > tick:
+                    self._state.commanded = previous_twist
+                return None
         origin = (self._dwa_origin(decision.dwa_acceptance, selection_constraints, epoch, action_id, had_scan_motion)
                   if decision.dwa_acceptance is not None else None)
         if self._config.local_controller == "dwa":
@@ -3991,6 +3993,16 @@ class NaviPlugin:
                 self._command_window = (time.monotonic() - (now_ms - active.message["stamp_ms"]) / 1000,
                                         active.expires_at)
             self._pending_route = None
+            if ((message is None or not any(message["values"])) and active is not None and active.sent
+                    and self._last_decision is not None
+                    and self._last_decision.reason == policy_mod.DEPTH_CAPTURE_STALE):
+                _, depth, _, _ = self._observation_snapshot(with_capture_timing=True)
+                now_ms = int(time.time() * 1000)
+                max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+                fresh = (depth is not None and not depth.get("capture_invalid")
+                         and 0 <= now_ms - depth_mod.observation_ms(depth) < max_age)
+                if not fresh:
+                    return True
             if message is None:
                 if self._scheduled_command is not None:
                     if not self._retain_checked_route(self._scheduled_command, int(time.time() * 1000)):
@@ -4008,18 +4020,6 @@ class NaviPlugin:
             if not any(message["values"]):
                 if diagnostic is not None and diagnostic.discarded_proposal:
                     return True
-                if (active is not None and active.repeat_until is not None and self._last_decision is not None
-                        and self._last_decision.reason == policy_mod.DEPTH_CAPTURE_STALE):
-                    # The already written command was swept through its watchdog
-                    # window. Expired depth cannot authorize another write.
-                    _, depth, _, _ = self._observation_snapshot(with_capture_timing=True)
-                    now_ms = int(time.time() * 1000)
-                    max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
-                    fresh = (depth is not None and not depth.get("capture_invalid")
-                             and 0 <= now_ms - depth_mod.observation_ms(depth) < max_age)
-                    if not fresh and self._retain_checked_route(active, now_ms):
-                        self._last_decision.reason = "等待有效深度，当前指令保留到原截止时间"
-                        return True
                 if command_only and (not self._wire_moving
                                      or (self._last_decision is not None
                                          and self._last_decision.status == policy_mod.BLIND)):
@@ -4131,8 +4131,7 @@ class NaviPlugin:
             history = tuple(self._velocity_history)
             frame, ground = self._depth_map, self._depth_ground
             projection = self._depth_projection
-            received, captured = self._depth_ms, self._depth_capture_ms
-            receipt_timed = self._depth_vendor.get("hardware_capture_timestamp_available") is False
+            depth_ms = self._depth_ms
             source = self._depth_source_ms
             odom_ms = self._odom_ms
         config = self._config
@@ -4142,7 +4141,6 @@ class NaviPlugin:
             return stop
         if not 0 <= now_ms - odom_ms <= self._odom_max_age_ms:
             return "局部规划：运动反馈已到期，停车后重规划", True
-        depth_ms = received if receipt_timed or captured is None else min(received, captured)
         if (work.depth_grid is not None and source is not None and work.depth_grid[0] is not None
                 and source <= work.depth_grid[0]):
             if source < work.depth_grid[0]:
@@ -4170,8 +4168,7 @@ class NaviPlugin:
         velocity = max(math.hypot(*v) for v in velocities)
         keep = policy_mod._keepout_m(config)
         radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), keep)
-        scene_ms = min(depth_ms, captured or depth_ms)
-        padding = (velocity + radius * abs(feedback.motion[2])) * (now_ms - scene_ms) / 1000
+        padding = (velocity + radius * abs(feedback.motion[2])) * (now_ms - depth_ms) / 1000
         reason = leg.check(feedback.pose, feedback.motion, previous, command, work.depth_grid[2],
                            keep, horizon, brake_horizon, padding=padding)
         if reason is not None:

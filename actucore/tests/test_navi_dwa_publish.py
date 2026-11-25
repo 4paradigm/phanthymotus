@@ -3467,3 +3467,25 @@ def test_route_renewal_standoff_rechecks_the_actual_packet(monkeypatch, blocked)
         assert packets == [first]
         assert card._scheduled_command is work
         assert (work.expires_ms, work.expires_at, work.repeat_until) == window
+
+
+def test_missing_depth_does_not_rewrite_the_sent_direct_command(monkeypatch):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=True)
+    snapshot = [card._observation_snapshot(with_capture_timing=True)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._command_timer = object()
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    work = card._scheduled_command
+    first, = packets
+    assert work.sent and first["values"][0] > 0.
+    original_window = work.expires_ms, work.expires_at
+    clock[0] += 100
+    objects, _, odom, target_ms = snapshot[0]
+    snapshot[0] = objects, None, odom, target_ms
+
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    card._dispatch_command()
+
+    assert packets == [first]
+    assert card._scheduled_command is work
+    assert (work.expires_ms, work.expires_at) == original_window

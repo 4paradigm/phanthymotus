@@ -39,10 +39,11 @@ class CandidateScore:
     smooth: float
     heading: float
     goal: float
+    arrival: float = 0.
 
     @property
     def total(self):
-        return self.path + self.progress + self.obstacle + self.smooth + self.heading + self.goal
+        return self.path + self.progress + self.obstacle + self.smooth + self.heading + self.goal + self.arrival
 
 
 @dataclass(frozen=True)
@@ -564,7 +565,19 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     references = tuple(_score_route(ref, coverage) for ref in routes)
     if any(ref is None for ref in references):
         return None
-    progress_scale = max(.2, min(1.0, math.hypot(x_speed, y_speed) * horizon))
+    translation_speed = math.hypot(x_speed, y_speed)
+    progress_scale = max(.2, min(1.0, translation_speed * horizon))
+    arrival_costs = (0.,) * len(routes)
+    # An unfinished reference may still need an unseen detour. Compare
+    # arrival times once each choice reaches the target standoff.
+    if len(routes) > 1 and target is not None and all(
+            abs(math.dist(ref[-1], target) - stop_distance) <= local_path.RESOLUTION for ref in routes):
+        speed = max(.1, translation_speed)
+        times = tuple(local_path.route_time_s(ref, *limits) for ref in routes)
+        fastest = min(times)
+        if math.isfinite(fastest):
+            # Convert seconds into the existing normalized tracking cost.
+            arrival_costs = tuple((eta - fastest) * speed / progress_scale for eta in times)
     nominal = min(max(x_speed, y_speed), .35)
     preferred = tuple(_preferred_command(ref, nominal, horizon, yaw_limit,
                                          differential=guidance and not y_speed and footprint_mode == "body")
@@ -786,6 +799,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 progress_scale=progress_scale, target=target, segments=segments_by_reference[index],
                 initial_position=initial_positions[index], guidance=guidance)
             if components is not None:
+                if arrival_costs[index]:
+                    components = replace(components, arrival=arrival_costs[index])
                 scores.append((components, progress, index))
             else:
                 rejection = reason

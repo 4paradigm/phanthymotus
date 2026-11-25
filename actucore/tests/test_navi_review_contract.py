@@ -116,16 +116,10 @@ def test_visual_age_obeys_both_config_and_driver(monkeypatch, configured, declar
         card._stop()
 
 
-@pytest.mark.parametrize("receipt_age,capture_age,expected", [
-    (800, None, {}),
-    (801, None, None),
-    (0, 800, {"capture_ms": 122656}),
-    (0, 801, {"capture_invalid": True}),
-    (100, 800, {"capture_ms": 122656}),
-    (100, 801, {"capture_invalid": True}),
-])
+@pytest.mark.parametrize("receipt_age,fresh", [(800, True), (801, False)])
+@pytest.mark.parametrize("capture_age", [None, 800, 801])
 def test_depth_age_is_independent_of_other_observations(monkeypatch, receipt_age,
-                                                        capture_age, expected):
+                                                        capture_age, fresh):
     import numpy as np
 
     now_ms = 123456
@@ -142,11 +136,11 @@ def test_depth_age_is_independent_of_other_observations(monkeypatch, receipt_age
         objects, depth, odom = card.observation()
         assert objects is None and odom is None
         assert card._info()["config"]["max_obs_age_ms"] == 500
-        if expected is None:
-            assert depth is None
-        else:
+        assert (depth is not None) is fresh
+        if fresh:
             assert depth["map"] is frame
-            assert {k: depth[k] for k in ("capture_ms", "capture_invalid") if k in depth} == expected
+            assert depth["frame_id"] == now_ms - receipt_age
+            assert "capture_ms" not in depth and "capture_invalid" not in depth
         assert card._info()["config"]["max_depth_age_ms"] == 800
     finally:
         card._stop()

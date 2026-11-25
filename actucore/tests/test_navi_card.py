@@ -521,7 +521,6 @@ def test_legacy_card_scans_the_clearer_side_then_replans_with_the_current_view(m
             card._depth_map = np.ones((2, 2), dtype=float)
             card._depth_ground = np.ones((2, 2), dtype=bool)
             card._depth_ms = stamp
-            card._depth_capture_ms = stamp
         return card.next_command()
 
     assert tick(100_000)["values"] == [0.] * 6
@@ -554,7 +553,9 @@ def test_legacy_card_scans_the_clearer_side_then_replans_with_the_current_view(m
     assert command["values"][1:] == [0.] * 5
     assert command["obs_stamp_ms"] == 101_450
     card._odom_stamp_verified = False
-    assert tick(101_800)["values"] == [0.] * 6
+    fresh = tick(101_800)
+    assert fresh["values"][0] > 0.
+    assert fresh["obs_stamp_ms"] == 101_800
 
 
 def test_card_keeps_consecutive_motion_when_one_speed_axis_is_missing(monkeypatch):
@@ -610,23 +611,19 @@ def test_card_keeps_consecutive_motion_when_one_speed_axis_is_missing(monkeypatc
     assert card._velocity_history[-1][2] is None
 
 
-def test_card_does_not_treat_receipt_time_as_scan_capture_time(monkeypatch):
+def test_card_uses_receipt_time_without_reusing_the_source_clock(monkeypatch):
     import numpy as np
 
     card = _card()
     monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
     frame = np.ones((2, 2), dtype=float)
-    for capture in (None, 123_001):
+    for capture in (None, 123_001, 122_000, 122_950):
         card._set_depth_map(frame, capture_ms=capture)
         depth = card.observation(with_capture_timing=True)[1]
         assert depth["frame_id"] == 123_000
         assert "capture_ms" not in depth
+        assert not depth.get("capture_invalid")
 
-    card._set_depth_map(frame, capture_ms=122_000)
-    depth = card.observation(with_capture_timing=True)[1]
-    assert depth["capture_invalid"] and "capture_ms" not in depth
-    card._set_depth_map(frame, capture_ms=122_950)
-    assert card.observation(with_capture_timing=True)[1]["capture_ms"] == 122_950
 
 
 @pytest.mark.parametrize("sweep_observed, pose_only", [(True, False), (False, False), (False, True)])
@@ -1841,8 +1838,7 @@ def test_planning_rejects_depth_already_expired_by_the_downstream_limit(monkeypa
     card._descriptor = _descriptor(rate={"max_obs_age_ms": 600})
     now_ms = 123_456
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
-    card._depth_ms = now_ms - 20
-    card._depth_capture_ms = now_ms - age_ms
+    card._depth_ms = now_ms - age_ms
 
     def step(**kwargs):
         assert kwargs["depth"].get("capture_invalid", False) is expired
@@ -1852,13 +1848,14 @@ def test_planning_rejects_depth_already_expired_by_the_downstream_limit(monkeypa
     card.next_command()
 
 
+@pytest.mark.parametrize("has_hardware_clock", [False, True])
 @pytest.mark.parametrize("header_age", [None, 750, 1109, 1700])
-def test_unsynchronized_depth_plans_from_receipt_and_expires_on_silence(monkeypatch, header_age):
+def test_depth_plans_from_receipt_with_either_clock(monkeypatch, header_age, has_hardware_clock):
     import numpy as np
 
     card = _card(local_planning=True, max_depth_age_ms=1200)
     card._descriptor = _descriptor(rate={"max_obs_age_ms": 1000})
-    card._depth_vendor = {"timestamp_source": "driver_receive", "hardware_capture_timestamp_available": False}
+    card._depth_vendor = {"hardware_capture_timestamp_available": has_hardware_clock}
     now = [2000]
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
     source = None if header_age is None else now[0] - header_age
@@ -1876,7 +1873,7 @@ def test_unsynchronized_depth_plans_from_receipt_and_expires_on_silence(monkeypa
     depth, budget = inputs[-1]
     assert depth["frame_id"] == 1730 and depth["receipt_timed"]
     assert not depth.get("capture_invalid") and budget() > 0.
-    assert depth.get("capture_ms") == source
+    assert "capture_ms" not in depth
     assert message["values"][0] > 0. and message["obs_stamp_ms"] == 1730
     assert not card.observation(with_capture_timing=True)[1].get("capture_invalid")
     now[0] = 3200
@@ -1884,11 +1881,12 @@ def test_unsynchronized_depth_plans_from_receipt_and_expires_on_silence(monkeypa
     assert inputs[-1][0] is None
 
 
-def test_repeated_driver_depth_header_does_not_restart_the_receipt_clock(monkeypatch):
+@pytest.mark.parametrize("has_hardware_clock", [False, True])
+def test_repeated_driver_depth_header_does_not_restart_the_receipt_clock(monkeypatch, has_hardware_clock):
     import numpy as np
 
     card = _card(local_planning=True, max_depth_age_ms=1200)
-    card._depth_vendor = {"hardware_capture_timestamp_available": False}
+    card._depth_vendor = {"hardware_capture_timestamp_available": has_hardware_clock}
     now = [2000]
     monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
     frame = np.ones((8, 8))
@@ -2706,15 +2704,15 @@ def test_dynamic_body_mount_is_bound_to_the_depth_camera_and_exact_capture(monke
     deliver()
     message.header.frame_id = "other_camera"
     card._on_depth_map(message)
-    assert "body_from_optical" not in observation()
+    np.testing.assert_array_equal(observation()["body_from_optical"], matrix)
     now[0] += 2.
     message.header.frame_id = "optical"
     card._on_depth_map(message)
     deliver()
-    assert "body_from_optical" not in observation()
+    assert observation() is None
 
 
-def test_obstacle_pose_uses_plain_timestamps_on_both_sides_of_capture(monkeypatch):
+def test_obstacle_pose_pairs_on_both_sides_of_depth_receipt(monkeypatch):
     from types import SimpleNamespace
     import numpy as np
 
@@ -2722,7 +2720,7 @@ def test_obstacle_pose_uses_plain_timestamps_on_both_sides_of_capture(monkeypatc
     monkeypatch.setattr(navi_plugin.time, "time", lambda: 10.2)
     declaration = _decl(_DEPTH_TOPIC, vendor={})
     card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding())
-    card._set_depth_map(np.ones((8, 8)), source_stamp_ns=10_060_000_000, capture_ms=10_060)
+    card._set_depth_map(np.ones((8, 8)), source_stamp_ns=10_030_000_000, capture_ms=10_030, received_ms=10_060)
     def pose(stamp, x, segment="run", child="base_link"):
         slam = dict(status="tracking", segment_id=segment)
         data = dict(schema="motus.odom/1", frame="body", stamp_ms=10_197,

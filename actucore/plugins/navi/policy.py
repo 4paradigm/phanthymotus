@@ -90,7 +90,7 @@ STUCK = "stuck"
 BLIND = "blind"          # no usable observation — distinct from "nothing seen"
 FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
-DEPTH_CAPTURE_STALE = "深度采集时间已过期或无效；保持停车"
+DEPTH_CAPTURE_STALE = "等待新的有效深度"
 
 
 class LocalHold(Enum):
@@ -3804,12 +3804,19 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
     return _use_dwa(state, proposal, state.escape_side)
 
 
-def _route_rank(plan, target):
+def _route_travel_limits(config):
+    (_, forward), (_, right) = _local_velocity_limits(config, 1.)
+    _, (_, left) = _local_velocity_limits(config, -1.)
+    return (0., forward), (-right, left), (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
+
+
+def _route_rank(plan, target, config):
+    limits = _route_travel_limits(config)
+    duration = local_path.route_time_s(plan.points, *limits)
     residual = math.dist(plan.points[-1], local_path.target_in_grid(plan.geometry, *target))
-    length = sum(math.dist(a, b) for a, b in zip(plan.points, plan.points[1:]))
-    headings = [math.atan2(b[1] - a[1], b[0] - a[0]) for a, b in zip(plan.points, plan.points[1:])]
-    turns = sum(abs(math.remainder(b - a, math.tau)) for a, b in zip(headings, headings[1:]))
-    return round(residual / local_path.RESOLUTION), length + local_path.RESOLUTION * turns
+    speed = math.hypot(limits[0][1], max(-limits[1][0], limits[1][1]))
+    remaining_s = max(0., residual - config.stop_distance_m) / speed if speed else math.inf
+    return duration + remaining_s
 
 
 def _dwa_route_reference(plan, visible, target, stop, tolerance):
@@ -3872,7 +3879,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
 
     opening = (local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target)
                if not closest or dwa_only else None)
-    detour_opening = (local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target, True)
+    travel_limits = _route_travel_limits(config)
+    detour_opening = (local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target, True, travel_limits)
                       if config.local_controller == "dwa" and (not closest or dwa_only) else None)
     if detour_opening is not None:
         joined = local_path.extend_passage(detour_opening, grid, keep, target, config.stop_distance_m)
@@ -3933,7 +3941,7 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                 yield plan
 
     def candidates():
-        plans = (sorted(routes(), key=lambda plan: _route_rank(plan, optical_target))
+        plans = (sorted(routes(), key=lambda plan: _route_rank(plan, optical_target, config))
                  if closest and optical_target is not None else routes())
         for plan in plans:
             yield plan, True, "reachable_prefix" if plan.reachable_prefix else "route"
@@ -4139,11 +4147,12 @@ def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distanc
         if marked.any():
             return max(0., (float(FORWARD[marked].min()) - transform[0, 3]) / front)
         return None
+    frame_ms = observation_ms(depth)
     verified = (not scan.receipt_only and geometry.free_space_validated
-                and geometry is config.scan_geometry and scan.current_frame == depth.get("capture_ms"))
+                and geometry is config.scan_geometry and scan.current_frame == frame_ms)
     capture_pose = depth.get("obstacle_capture_pose")
     if (capture_pose is None and not depth.get("body_mount_required")
-            and pose.stamp_ms == depth.get("capture_ms")):
+            and pose.stamp_ms == frame_ms):
         capture_pose = pose
     current = None
     if (geometry is config.scan_geometry and scan.current_frame and type(source) is int
@@ -4397,8 +4406,9 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
     if command is None:
         width = _keepout_m(config)
         offset = geometry.base_from_optical
+        travel_limits = _route_travel_limits(config)
         opening = (local_path.opening_route(depth["map"], grid[1], geometry, width,
-                                            ahead * offset[0, 2] + offset[0, 3], target, True)
+                                            ahead * offset[0, 2] + offset[0, 3], target, True, travel_limits)
                    if ahead is not None else None)
         if opening is not None:
             route = local_path.extend_passage(opening, grid, width, target, config.stop_distance_m)
@@ -4708,7 +4718,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         if compare_dwa_routes and route is not None:
                             dwa_lateral_routes.append((candidate, route))
                         if local_command is not None and (not rank_fallback or local_route is None or
-                                route is None or _route_rank(route, route_target) >= _route_rank(local_route, route_target)):
+                                route is None or _route_rank(route, route_target, config)
+                                >= _route_rank(local_route, route_target, config)):
                             continue
                         side, local_command, local_route = candidate, command, route
                         if not compare_dwa_routes and (not rank_fallback or route is None):

@@ -58,6 +58,32 @@ def allowed_centers(grid, start, half_cells, allow_unknown=False):
     return np.pad(blocked_count == 0, ((rear, front), (dc, dc)), constant_values=False)
 
 
+def route_time_s(points, x_limit, y_limit, yaw_limit):
+    """Estimate forward/turn or fixed-heading travel using signed chassis rates.
+
+    A differential chassis must align with each tangent. A strafe-capable
+    chassis can hold its starting heading and translate on both axes at once.
+    This ranks references only; the motion model still admits every command.
+    """
+    def axis_time(displacement, limits):
+        if abs(displacement) < 1e-8:
+            return 0.
+        speed = limits[1] if displacement > 0. else -limits[0]
+        return abs(displacement) / speed if speed > 0. else math.inf
+
+    heading = aligned = fixed = 0.
+    for (f, r), (next_f, next_r) in zip(points, points[1:]):
+        dx, dy = next_f - f, next_r - r
+        length = math.hypot(dx, dy)
+        if length < 1e-8:
+            continue
+        tangent = math.atan2(dy, dx)
+        aligned += axis_time(length, x_limit) + axis_time(math.remainder(heading - tangent, math.tau), yaw_limit)
+        fixed += max(axis_time(dx, x_limit), axis_time(-dy, y_limit))
+        heading = tangent
+    return min(aligned, fixed)
+
+
 def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None, steps=STEPS,
                   target_cells=None, target_cost=None, cell_cost=None):
     if not allowed[start]:
@@ -1480,12 +1506,12 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
                   reachable_prefix=reachable_prefix, topology=topology)
 
 
-def opening_route(frame, occupied, geometry, half_width, plane, target, allow_detour=False):
+def opening_route(frame, occupied, geometry, half_width, plane, target, allow_detour=False, travel_limits=None):
     """Propose a measured opening; checked detours may leave the direct goal ray."""
     if (plane <= geometry.front or target is None or target[0] <= plane
             or geometry.horizontal is None or geometry.vertical is None or geometry.base_from_optical[0, 2] <= 0.):
         return None
-    route = _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour)
+    route = _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour, travel_limits)
     if route is not None or not allow_detour:
         return route
     # The nearest obstacle determines braking. Its depth can be the edge of a
@@ -1494,13 +1520,13 @@ def opening_route(frame, occupied, geometry, half_width, plane, target, allow_de
     nearby = depths[(depths >= plane + RESOLUTION)
                     & (depths < min(target[0], plane + 1.5))]
     for probe in nearby[::2]:
-        route = _opening_at_plane(frame, occupied, geometry, half_width, probe, target, True)
+        route = _opening_at_plane(frame, occupied, geometry, half_width, probe, target, True, travel_limits)
         if route is not None:
             return route
     return None
 
 
-def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour):
+def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour, travel_limits):
     band = occupied & (abs(FORWARD - plane) <= .10)
     cols = np.flatnonzero(band.any(axis=0))
     if allow_detour:
@@ -1509,8 +1535,13 @@ def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allo
         # the body/goal ray inside it here discards that useful reference.
         gaps = [(RIGHT[0, a], RIGHT[0, b]) for a, b in zip(cols[:-1], cols[1:])
                 if RIGHT[0, b] - RIGHT[0, a] - RESOLUTION >= 2 * half_width]
-        gaps.sort(key=lambda gap: math.hypot(plane, sum(gap) / 2)
-                  + math.hypot(target[0] - plane, target[1] - sum(gap) / 2))
+        def opening_cost(gap):
+            midpoint = (plane, sum(gap) / 2)
+            if travel_limits is None:
+                return math.hypot(*midpoint) + math.dist(midpoint, target)
+            return route_time_s(((0., 0.), midpoint, target), *travel_limits)
+
+        gaps.sort(key=opening_cost)
     else:
         left, right = cols[cols < START[1]], cols[cols > START[1]]
         if (band[:, START[1]].any() or left.size < 2 or right.size < 2

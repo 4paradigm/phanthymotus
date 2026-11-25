@@ -64,7 +64,7 @@ class DepthError(ValueError):
 
 
 def observation_ms(depth, fallback=None):
-    """Clock for motion admission. Keep the source stamp for geometric registration."""
+    """Return the observation time used for motion admission and registration."""
     if depth is None:
         return fallback
     if depth.get("receipt_timed"):

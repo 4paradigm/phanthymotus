@@ -8,7 +8,7 @@ import math
 
 import numpy as np
 
-from .depth import has_valid_returns
+from .depth import has_valid_returns, observation_ms
 from .local_path import (FORWARD, FREE, OCCUPIED, RESOLUTION, RIGHT, SHAPE, START, UNKNOWN,
                          Geometry, ObstacleSquares, clearance_margin, confirmed_free, frozen_grid, frozen_mask, motion_sweep_hits, observe,
                          occluded_cells, project_observation, visible_prefix)
@@ -526,7 +526,8 @@ class ActiveScan:
             self.receipt_only = receipt_only
         stamp = (odom or {}).get("received_ms" if self.receipt_only else "stamp_ms")
         self.control_ms = (depth or {}).get("control_ms") or 0
-        capture = (depth or {}).get("capture_ms")
+        capture = ((depth or {}).get("frame_id") if (depth or {}).get("receipt_timed")
+                   else (depth or {}).get("capture_ms"))
         motion = planar_feedback(odom)
         if type(stamp) is not int or stamp <= 0 or geometry is None or motion is None:
             if self.receipt_only and self.active and geometry is not None:
@@ -1028,14 +1029,14 @@ class ActiveScan:
         grid = frozen_grid(grid)
         free, occupied = grid
         clear = grid.confirmed_free
-        capture_ms = depth.get("capture_ms") or stamp
+        capture_ms = observation_ms(depth, stamp)
         capture = depth.get("obstacle_capture_pose")
         if capture is None and self.keep_physical_views:
             if not self.receipt_only:
                 capture = self._body_pose_at(capture_ms, coords, self.pose_origin)
-            elif depth.get("capture_ms") and not self.command_only:
-                # Receipt alone does not locate an older image. A verified
-                # capture time can use contiguous measured relative motion.
+            elif not self.command_only and (depth.get("receipt_timed") or depth.get("capture_ms")):
+                # Use contiguous measured relative motion at the frame's
+                # registration time when no absolute pose is available.
                 paired = self._pose_at(capture_ms)
                 if paired is not None:
                     if anchor is None:

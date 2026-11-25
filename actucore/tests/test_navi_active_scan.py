@@ -934,11 +934,23 @@ def test_scan_waits_for_the_odometry_bracket_instead_of_discarding_the_depth(mon
     _tick(lookout, geometry, 1000)
     assert lookout.begin((-1., 1.))
     _tick(lookout, geometry, 1050)
+
     waiting = lookout.update(_depth(1120), _odom(1100), geometry)
     assert waiting.yaw == 0 and lookout.active
     assert lookout.update(_depth(1220), _odom(1200), geometry) is None
     assert lookout.current_frame == 1120
     assert lookout.command(geometry, .33, .25, 600).yaw > 0
+
+
+def test_receipt_timed_scan_uses_latest_frame_without_waiting_for_odom(monkeypatch):
+    lookout, geometry, _, _ = _setup(monkeypatch)
+    for received, feedback in ((1120, 1100), (1220, 1200)):
+        observation = _depth(received)
+        observation.pop("capture_ms")
+        observation["receipt_timed"] = True
+        odom = {**_odom(feedback), "received_ms": feedback}
+        assert lookout.update(observation, odom, geometry, receipt_only=True) is None
+        assert lookout.current_frame == received
 
 
 def test_calibrated_view_fusion_is_reused_until_pose_changes_or_a_view_expires():

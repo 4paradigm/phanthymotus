@@ -909,3 +909,27 @@ def test_timed_route_keeps_only_a_verified_prefix_when_scoring_runs_out(monkeypa
         assert choice is None
     else:
         assert choice is not None and choice.command == predictions[0] and choice.check.accepted
+
+
+def test_route_cost_prefers_a_longer_path_when_turns_take_longer():
+    straight = ((0., 0.), (1., 0.))
+    shortcut = ((0., 0.), (.3, .3), (.6, 0.))
+    uphill = ((0., 0.), (.3, -.3), (.6, 0.))
+    assert local_path.route_time_s(shortcut, (0., .5), (0., 0.), (-.5, 1.)) > (
+        local_path.route_time_s(straight, (0., .5), (0., 0.), (-.5, 1.)))
+    assert local_path.route_time_s(shortcut, (0., .5), (0., 0.), (-.5, 1.)) < (
+        local_path.route_time_s(uphill, (0., .5), (0., 0.), (-.5, 1.)))
+
+
+def test_route_cost_credits_simultaneous_translation_when_lateral_axis_is_declared():
+    diagonal = ((0., 0.), (.6, .2))
+    assert local_path.route_time_s(diagonal, (0., .5), (-.25, .4), (0., 0.)) == pytest.approx(1.2)
+    assert math.isinf(local_path.route_time_s(diagonal, (0., .5), (0., .4), (0., 0.)))
+
+
+def test_alternate_references_with_the_same_visible_prefix_rank_by_arrival_time():
+    slow = ((0., 0.), (.7, 0.), (.8, .2), (1.3, 0.))
+    fast = ((0., 0.), (.7, 0.), (1.3, 0.))
+    choice = _run(slow, alternate_routes=(fast,), yaw_limits=(-.15, .15), target=(2., 0.))
+    assert choice is not None and choice.check.accepted
+    assert choice.reference_index == 1

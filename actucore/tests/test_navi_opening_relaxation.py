@@ -133,3 +133,17 @@ def test_offset_opening_reference_is_centred_while_body_overlaps_jambs():
     assert len(crossing) > 2
     assert crossing == pytest.approx([.5] * len(crossing), abs=local_path.RESOLUTION)
     assert max(crossing) - min(crossing) < 1e-8
+
+
+def test_equal_distance_openings_rank_by_declared_turn_time():
+    frame, geometry, plane, _ = _scene(body=False)
+    frame.fill(5.)
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    row = local_path.START[0] + round(plane / local_path.RESOLUTION)
+    edges = (-.65, -.20, .20, .65)
+    for right in edges:
+        occupied[row, local_path.START[1] + round(right / local_path.RESOLUTION)] = True
+    route = local_path.opening_route(frame, occupied, geometry, .18, plane, (3., 0.), True,
+                                     travel_limits=((0., .5), (0., 0.), (-.10, .80)))
+    assert route is not None
+    assert route.passage_exit[0][1] > 0.
