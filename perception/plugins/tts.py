@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-plugins/tts.py — the TTS tool contract and its ONNX Runtime engines.
+plugins/tts.py — the TTS tool contract and its inference engines.
 
 Engines are named `<model>-<languages>`, the same shape `asr_model` uses:
-`vits2-zh-en` (TensorRT, implemented in plugins/vits2_tts_trt), `matcha-zh-en`
-(Matcha-icefall), `mms-th` (MMS VITS) and `kokoro-multi` (Kokoro-82M v1.0). The
-last three all run on sherpa-onnx, which is why naming any of them after the
-framework did not work.
+`vits2-zh-en` (TensorRT), `matcha-zh-en` (Matcha-icefall), `mms-th` (MMS VITS)
+and `kokoro-multi` (Kokoro-82M v1.0 with sherpa-onnx). Supported Jetson images
+also offer `kokoro-multi-trt` (eight-language TensorRT).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -184,15 +184,15 @@ TOOLS = [
                     "type": "string",
                     "description": "Text to synthesize (required for action=speak)"
                 },
-                # vits2-zh-en only; every other engine ignores it. A plain string,
+                # VITS2/Kokoro Multi accept this per-utterance hint. A plain string,
                 # not an enum: the canvas debug panel preselects an enum's first
                 # value, which would force a reading on every test speak instead of auto.
                 "reading_language": {
                     "type": "string",
-                    "description": "Optional, action=speak, vits2-zh-en only. Leave empty: "
+                    "description": "Optional, action=speak, vits2-zh-en or kokoro-multi-trt. Leave empty: "
                                    "the default, auto, reads numbers, dates, units and "
                                    "symbols to match the sentence around them, which is "
-                                   "right for normal replies. Set zh or en only when the "
+                                   "right for normal replies. Set a supported code only when the "
                                    "user explicitly asks for numbers to be read in that "
                                    "language. Valid codes: action=support_language"
                 },
@@ -310,6 +310,7 @@ TOOLS = [
 # ── TTS Adapter ──────────────────────────────────────────────────────────────
 
 class TTSAdapter(ABC):
+    reuse_ros_node = False
     # Text _TTSNode.start() synthesizes to prove the model works before declaring
     # `running`. Per-adapter, because a probe is only valid if the adapter's own
     # frontend keeps it: "." is punctuation, and the Thai frontend normalises
@@ -324,6 +325,15 @@ class TTSAdapter(ABC):
     def synthesize_stream(self, text: str):
         """Yield raw PCM bytes as they arrive. Default: collect all."""
         yield self.synthesize(text)
+
+    def new_reading_session(self):
+        return None
+
+    def synthesize_stream_for_session(self, text, session, reading_language=None):
+        yield from self.synthesize_stream(text)
+
+    def commit_reading_session(self, session):
+        pass
 
     def warmup(self) -> int:
         """Pay the first-inference cost at load; return the bytes produced.
@@ -1340,8 +1350,29 @@ def _validate_kokoro_manifest(model_dir: str) -> dict:
     return manifest
 
 
+KOKORO_TRT_ENGINE = "kokoro-multi-trt"
+_KOKORO_TRT_LANGUAGES = ("zh", "en", "ja", "ru", "de", "fr", "es", "th")
+_KOKORO_TRT_CARD_FIELDS = {
+    "kokoro_trt_device": ("device", {
+        "type": "string", "enum": ["gpu"], "default": "gpu",
+        "title": "Inference device",
+    }),
+    "kokoro_trt_speaker_id": ("speaker_id", {
+        "type": "integer", "enum": [0], "default": 0,
+        "title": "Speaker ID",
+    }),
+    "kokoro_trt_language": ("tts_language", {
+        "type": "string", "enum": ["auto", *_KOKORO_TRT_LANGUAGES], "default": "auto",
+        "description": "Pronunciation language for kokoro-multi-trt. Auto detects each utterance.",
+    }),
+}
+
+
+def _kokoro_trt_available():
+    return os.environ.get("KOKORO_MULTI_BUILT_FOR_JP") in ("511", "61")
+
+
 def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
-    import os
     from utils.onnx_provider import normalize_device
     engine = str(cfg.get('engine', '')).lower()
     default_dir = ENGINE_MODEL_DIRS.get(engine, '/models/sherpa-onnx/tts')
@@ -1355,6 +1386,12 @@ def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
         cfg.get('device') or ENGINE_DEVICE_DEFAULTS.get(engine),
         cfg.get('hw_provider'),
     )
+    if engine == KOKORO_TRT_ENGINE:
+        from plugins.kokoro_multi_tts import KokoroMultiTTSAdapter, prepare_model
+        return KokoroMultiTTSAdapter(
+            prepare_model(cfg.get('model_dir'), on_status=on_status), speaker_id, speed, device,
+            language=cfg.get('tts_language') or cfg.get('language') or 'auto',
+            on_status=on_status, benchmark=bool(cfg.get('benchmark', False)))
     if engine == 'mms-th':
         return MmsThaiTTSAdapter(
             model_dir, speaker_id, speed, device,
@@ -1390,6 +1427,7 @@ class _TTSNode(Node):
         self._input_topic  = input_topic or ''
         self._output_topic = f"{input_topic}/tts" if input_topic else '/perception/tts'
         self._adapter      = adapter
+        self._reading_session = adapter.new_reading_session() if adapter else None
         self.state         = "idle"
         self._text_queue   = queue.Queue()
         self._worker_thread: Optional[threading.Thread] = None
@@ -1439,6 +1477,7 @@ class _TTSNode(Node):
         self._complete_discarded_actions()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
+        self._reading_session = self._adapter.new_reading_session() if self._adapter else None
         self.state = "idle"
         return {"state": "idle"}
 
@@ -1481,7 +1520,25 @@ class _TTSNode(Node):
         with self._interrupt_lock:
             return self._interrupt_gen
 
-    def enqueue(self, text: str, trace_id: str = '', action_id: str = ''):
+    def _wait_for_audio_subscriber(self, matched_at=None):
+        """Match the existing VITS2 rule before the first Kokoro PCM frame."""
+        deadline = time.monotonic() + 5.5
+        while not self._stop_event.is_set() and not self._interrupt_flag.is_set():
+            now = time.monotonic()
+            if self._pub.get_subscription_count() > 0:
+                if matched_at is None:
+                    matched_at = now
+                if now - matched_at >= 0.5:
+                    return
+            else:
+                matched_at = None
+            if now >= deadline:
+                raise RuntimeError(f"No stable TTS audio subscriber on {self._output_topic}")
+            time.sleep(0.01)
+        raise RuntimeError("TTS subscriber wait cancelled")
+
+    def enqueue(self, text: str, trace_id: str = '', action_id: str = '',
+                reading_language=None):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
         # One queue item = one utterance = one EOF = one ACP action. The 280-char
@@ -1489,7 +1546,7 @@ class _TTSNode(Node):
         # segment on the queue as its own utterance, so a long text emitted an
         # EOF and reset the pacing clock every 280 characters, and the gap
         # between segments was a full synthesis with no audio flowing at all.
-        self._text_queue.put((text, trace_id, action_id, self._current_gen()))
+        self._text_queue.put((text, trace_id, action_id, self._current_gen(), reading_language))
 
     @staticmethod
     def _split_text(text: str, max_chars: int = 280) -> list:
@@ -1533,7 +1590,10 @@ class _TTSNode(Node):
             # formats. A missing gen means "cannot be stale", so such an item is
             # always played rather than silently dropped.
             _gen = None
+            _reading_language = None
             if isinstance(item, tuple):
+                if len(item) >= 5:
+                    _reading_language = item[4]
                 if len(item) >= 4:
                     text, _trace_id, _action_id, _gen = item[:4]
                 elif len(item) == 3:
@@ -1564,6 +1624,7 @@ class _TTSNode(Node):
             # would wedge that thread forever. Bound before the try so the
             # finally can always reach it.
             utterance_abort = threading.Event()
+            reading_session = self._reading_session
             try:
                 t_start = _time.monotonic()
                 t_start_wall = _time.time()  # wall-clock for perf span
@@ -1571,7 +1632,10 @@ class _TTSNode(Node):
                 total = 0
                 buf = b''
                 t0 = None  # monotonic start of the pacing schedule
+                subscriber_matched_at = None
+                wait_for_subscriber = getattr(self._adapter, "wait_for_audio_subscriber", False)
                 frames_sent = 0
+                frame_interval = getattr(self._adapter, 'frame_interval_s', FRAME_INTERVAL_S)
                 prebuf = []   # pre-buffer queue
 
                 def publish(frame: bytes) -> None:
@@ -1587,14 +1651,16 @@ class _TTSNode(Node):
                     """Pace and publish one frame; latches the clock on the first."""
                     nonlocal t0, t0_wall
                     if t0 is None:
+                        if getattr(self._adapter, 'wait_for_audio_subscriber', False):
+                            self._wait_for_audio_subscriber(subscriber_matched_at)
                         # Backdate by the frames already in the prebuffer so all
                         # of them are due in the past and go out in one burst —
                         # the consumer then starts holding PREBUF_FRAMES of audio.
                         now = _time.monotonic()
-                        t0 = now - max(0, len(prebuf) - 1) * FRAME_INTERVAL_S
+                        t0 = now - max(0, len(prebuf) - 1) * frame_interval
                         t0_wall = _time.time()
                         fire_hook("on_speaking")
-                    target = t0 + frames_sent * FRAME_INTERVAL_S
+                    target = t0 + frames_sent * frame_interval
                     now = _time.monotonic()
                     if now < target:
                         _time.sleep(target - now)
@@ -1610,7 +1676,8 @@ class _TTSNode(Node):
                 # 分段：超过 280 字按标点切分，避免超长合成导致延迟或失败。分段是
                 # 合成的实现细节 —— pacing/prebuffer/EOF 都跨段延续，下游看到的
                 # 仍然是一句完整的话。
-                segments = self._split_text(text, max_chars=280)
+                segments = ([text] if getattr(self._adapter, "handles_text_chunking", False)
+                            else self._split_text(text, max_chars=280))
                 if len(segments) > 1:
                     log.info(f"[tts] split {len(text)} chars into {len(segments)} segments")
 
@@ -1640,7 +1707,8 @@ class _TTSNode(Node):
                     pending = b''
                     try:
                         for seg in segments:
-                            for raw_chunk in self._adapter.synthesize_stream(seg):
+                            for raw_chunk in self._adapter.synthesize_stream_for_session(
+                                    seg, reading_session, _reading_language):
                                 pending += raw_chunk
                                 synth_state["total"] += len(raw_chunk)
                                 while len(pending) >= CHUNK_BYTES:
@@ -1664,8 +1732,15 @@ class _TTSNode(Node):
                     if self._stop_event.is_set() or self._interrupt_flag.is_set():
                         interrupted = True
                         break
+                    if t0 is None and wait_for_subscriber:
+                        now = _time.monotonic()
+                        if self._pub.get_subscription_count() > 0:
+                            if subscriber_matched_at is None:
+                                subscriber_matched_at = now
+                        else:
+                            subscriber_matched_at = None
                     try:
-                        frame = frame_queue.get(timeout=0.1)
+                        frame = frame_queue.get(timeout=0.01 if t0 is None and wait_for_subscriber else 0.1)
                     except queue.Empty:
                         continue
                     if frame is _SYNTH_DONE:
@@ -1692,8 +1767,10 @@ class _TTSNode(Node):
 
                 # flush remainder
                 if buf and not cancelled:
+                    if t0 is None and getattr(self._adapter, 'wait_for_audio_subscriber', False):
+                        self._wait_for_audio_subscriber(subscriber_matched_at)
                     if t0 is not None:
-                        target = t0 + frames_sent * FRAME_INTERVAL_S
+                        target = t0 + frames_sent * frame_interval
                         now = _time.monotonic()
                         if now < target:
                             _time.sleep(target - now)
@@ -1702,7 +1779,7 @@ class _TTSNode(Node):
                 # Capture before clearing: reading the flag after the clear below
                 # made this always False, so an interrupted utterance reported ACP
                 # "completed" instead of "cancelled".
-                was_interrupted = self._interrupt_flag.is_set()
+                was_interrupted = self._interrupt_flag.is_set() or self._stop_event.is_set()
                 # 这里刻意不再 clear()。flag 的装载/解除只在出队时、_interrupt_lock
                 # 下进行；在这条路径上也清一次会和并发的 interrupt() 抢跑，把信号
                 # 丢给下一句。
@@ -1713,6 +1790,12 @@ class _TTSNode(Node):
 
                 # 发布 EOF 标记：告知下游 Speaker 当前 utterance 已结束
                 self._publish_eof()
+                with self._interrupt_lock:
+                    delivered = (not self._stop_event.is_set()
+                                 and not self._interrupt_flag.is_set()
+                                 and (_gen is None or _gen == self._interrupt_gen))
+                    if delivered and frames_sent and reading_session is self._reading_session:
+                        self._adapter.commit_reading_session(reading_session)
                 # 上报 TTS perf spans（生成 + 播放）
                 try:
                     import json as _json
@@ -1820,7 +1903,7 @@ def _session_keys(cfg: dict) -> dict:
 class SherpaOnnxTTSPlugin:
     PREFIX = "tts"
 
-    def __init__(self, plugin_cfg: dict, executor):
+    def __init__(self, plugin_cfg: dict, executor, on_status=None):
         self._cfg      = plugin_cfg
         # Normalise the session keys up front so the first `config` that repeats
         # them compares equal instead of rebuilding what was just built.
@@ -1835,7 +1918,7 @@ class SherpaOnnxTTSPlugin:
         try:
             self._adapter  = _build_tts_adapter(
                 plugin_cfg,
-                on_status=lambda text: setattr(self, "_load_status", text))
+                on_status=on_status or (lambda text: setattr(self, "_load_status", text)))
         except Exception as e:
             log.error(f"[tts] failed to load model: {e}", exc_info=True)
             self._adapter = None
@@ -1978,12 +2061,17 @@ class SherpaOnnxTTSPlugin:
                         del self._nodes['_default']
                         self._dispose_node(default_node, '_default')
                 node = self._nodes.get(node_key)
+                if self._adapter.reuse_ros_node:
+                    for key in list(self._nodes):
+                        if key != node_key and self._nodes[key].state == "idle":
+                            self._dispose_node(self._nodes.pop(key), key)
                 if node is None:
                     node = _TTSNode(input_topic or None, self._adapter,
                                     node_suffix=node_key.replace('/', '_').replace('-', '_'))
                     self._executor.add_node(node)
                     self._nodes[node_key] = node
-                elif input_topic and node._input_topic != input_topic:
+                elif node._input_topic != input_topic and (
+                        input_topic or self._adapter.reuse_ros_node and node.state == "idle"):
                     # Input topic changed for existing instance — recreate
                     del self._nodes[node_key]
                     self._dispose_node(node, node_key)
@@ -1995,13 +2083,15 @@ class SherpaOnnxTTSPlugin:
 
         elif action == "stop":
             with self._nodes_lock:
-                if instance_id:
-                    node = self._nodes.pop(instance_id, None)
+                keys = [instance_id] if instance_id else list(self._nodes)
+                for key in keys:
+                    node = self._nodes.get(key)
                     if node is None:
-                        return {"state": "idle"}
-                    return self._dispose_node(node, instance_id)
-                for key in list(self._nodes.keys()):
-                    self._dispose_node(self._nodes.pop(key), key)
+                        continue
+                    if node._adapter.reuse_ros_node and not args.get("_release_nodes"):
+                        node.stop()
+                    else:
+                        self._dispose_node(self._nodes.pop(key), key)
                 return {"state": "idle"}
 
         elif action == "speak":
@@ -2016,11 +2106,10 @@ class SherpaOnnxTTSPlugin:
                 raise ValueError("text is required")
             # Find any existing running node to reuse
             with self._nodes_lock:
-                node = None
-                for n in self._nodes.values():
-                    if n.state == "running":
-                        node = n
-                        break
+                node = (self._nodes.get(instance_id) if instance_id else
+                        next((n for n in self._nodes.values() if n.state == "running"), None))
+                if node is not None and node.state != "running":
+                    node = None
                 if node is None:
                     # No running node — use instance key or fallback
                     node_key = instance_id or '_default'
@@ -2043,7 +2132,8 @@ class SherpaOnnxTTSPlugin:
             # ACP: 生成 action_id
             import uuid as _uuid
             action_id = f"speak-{_uuid.uuid4().hex[:8]}"
-            node.enqueue(text, trace_id=args.get('_trace_id', ''), action_id=action_id)
+            node.enqueue(text, trace_id=args.get('_trace_id', ''), action_id=action_id,
+                         reading_language=args.get('reading_language'))
             return {"status": "queued", "action_id": action_id, "text": text}
 
         elif action == "config":
@@ -2252,6 +2342,7 @@ class TTSPlugin:
         self._impl_engine = ""
         self._building = ""          # engine name while a build is in flight
         self._build_error = None
+        self._load_status = None
         # `start` calls that arrived while a build was in flight, keyed by
         # instance_id, replayed against the new engine once it is resident. Agent
         # Core's contract for a start that answers `state: loading` is that the
@@ -2273,6 +2364,11 @@ class TTSPlugin:
         # to the configured engine; every other engine gets its own default.
         self._configured_engine = engine
         self._configured_model_dir = self._cfg.get("model_dir") or ""
+        if engine == KOKORO_TRT_ENGINE:
+            # Let MCP serve `info` while the pinned archive downloads and unpacks.
+            self._building = engine
+            self._build_async(engine)
+            return
         # Built inline at startup so info/start are immediately truthful, and so
         # a misconfigured engine shows up in the boot log rather than on the
         # first utterance. Runtime switches take the background path below.
@@ -2296,7 +2392,8 @@ class TTSPlugin:
         # everything downstream — _build, ENGINE_MODEL_DIRS, the `engine` field in
         # info — sees only the current name.
         engine = ENGINE_ALIASES.get(engine, engine)
-        if engine not in TTS_ENGINES:
+        if engine not in TTS_ENGINES and not (
+                engine == KOKORO_TRT_ENGINE and _kokoro_trt_available()):
             raise ValueError(f"Unsupported TTS engine: {engine}")
         return engine
 
@@ -2308,9 +2405,20 @@ class TTSPlugin:
     def _build(self, engine: str):
         cfg = dict(self._cfg)
         cfg["engine"] = engine
-        cfg["model_dir"] = self._model_dir_for(engine)
-        impl = (self._build_vits2(cfg) if engine == "vits2-zh-en"
-                else SherpaOnnxTTSPlugin(cfg, self._executor))
+        if engine != self._configured_engine:
+            cfg.pop("backend", None)
+        if engine == KOKORO_TRT_ENGINE:
+            configured = engine == self._configured_engine
+            cfg["model_dir"] = (self._configured_model_dir or None) if configured else None
+            for field, (setting, schema) in _KOKORO_TRT_CARD_FIELDS.items():
+                cfg[setting] = cfg.get(field, schema["default"])
+            if configured and "kokoro_trt_language" not in cfg:
+                cfg["tts_language"] = cfg.get("language") or cfg["tts_language"]
+            impl = SherpaOnnxTTSPlugin(cfg, self._executor, on_status=self._report_kokoro_load_status)
+        else:
+            cfg["model_dir"] = self._model_dir_for(engine)
+            impl = (self._build_vits2(cfg) if engine == "vits2-zh-en"
+                    else SherpaOnnxTTSPlugin(cfg, self._executor))
         # An implementation may swallow its own model-load failure and come back
         # as an object that reports error through info (sherpa does exactly
         # that). Installing it would make the facade claim ready and let a start
@@ -2322,6 +2430,11 @@ class TTSPlugin:
                 or f"engine {engine} reported an error after construction"
             )
         return impl
+
+    def _report_kokoro_load_status(self, text: str) -> None:
+        with self._lock:
+            if self._building == KOKORO_TRT_ENGINE:
+                self._load_status = text
 
     def _build_vits2(self, cfg: dict):
         from plugins.vits2_tts import Vits2TTSPlugin
@@ -2386,7 +2499,33 @@ class TTSPlugin:
         threading.Thread(target=_run, name=f"tts-engine-{engine}", daemon=True).start()
 
     def get_tools(self) -> list:
-        return TOOLS
+        if not _kokoro_trt_available():
+            return TOOLS
+        from copy import deepcopy
+        tools = deepcopy(TOOLS)
+        props = tools[0]["configSchema"]["properties"]
+        props["tts_engine"]["enum"].append(KOKORO_TRT_ENGINE)
+        props["tts_engine"]["description"] += (
+            " Additional Jetson option: kokoro-multi-trt (eight-language TensorRT, GPU).")
+        props["speaker_id"]["x-hide-when"] = {"tts_engine": [KOKORO_TRT_ENGINE]}
+        for key in ("tts_language", "device", "speaker_id"):
+            props[key]["x-keep-when-hidden"] = True
+
+        # The card renders in schema order. Put each TRT field by its counterpart.
+        trt_fields = {setting: (field, schema)
+                      for field, (setting, schema) in _KOKORO_TRT_CARD_FIELDS.items()}
+        ordered_props = {}
+        for key, prop in props.items():
+            ordered_props[key] = prop
+            if key in trt_fields:
+                field, schema = trt_fields[key]
+                ordered_props[field] = {
+                    **schema, "scope": "shared",
+                    "x-show-when": {"tts_engine": [KOKORO_TRT_ENGINE]},
+                    "x-keep-when-hidden": True,
+                }
+        tools[0]["configSchema"]["properties"] = ordered_props
+        return tools
 
     # ── dispatch ────────────────────────────────────────────────────────
 
@@ -2397,13 +2536,16 @@ class TTSPlugin:
         if action == "support_language":
             with self._lock:
                 engine = self._engine
-            return {"engine": engine, "languages": list(ENGINE_LANGUAGES[engine])}
+            languages = (_KOKORO_TRT_LANGUAGES if engine == KOKORO_TRT_ENGINE
+                         else ENGINE_LANGUAGES[engine])
+            return {"engine": engine, "languages": list(languages)}
 
         with self._lock:
             impl = self._impl
             building = self._building
             error = self._build_error
             engine = self._engine
+            load_status = self._load_status
         if impl is not None:
             result = impl.dispatch(name, args)
             if isinstance(result, dict) and action == "info":
@@ -2425,7 +2567,7 @@ class TTSPlugin:
             result = {
                 "name": "TTS", "manufacture": "Embodied", "model": engine,
                 "engine": engine, "state": state,
-                "desc": (f"Switching to the {building} engine..." if building
+                "desc": (load_status or f"Switching to the {building} engine..." if building
                          else f"Engine {engine} failed to load: {error}"),
             }
             if state == "error" and error:
@@ -2486,14 +2628,24 @@ class TTSPlugin:
     def _config(self, name: str, args: dict) -> dict:
         """Apply shared config, switching engines when tts_engine changes."""
         requested = args.get("tts_engine") or args.get("engine")
+        requested_engine = self._select_engine(requested) if requested else None
         forwarded = {k: v for k, v in args.items()
                      if k not in ("tts_engine", "engine")}
-        for key in SHARED_CONFIG_KEYS:
-            if key in args:
-                self._cfg[key] = args[key]
+        trt_config = {field: forwarded.pop(field) for field in _KOKORO_TRT_CARD_FIELDS
+                      if field in forwarded}
+        with self._lock:
+            kokoro_trt = (requested_engine or self._engine) == KOKORO_TRT_ENGINE
+            self._cfg.update(trt_config)
+            if kokoro_trt:
+                for setting, _ in _KOKORO_TRT_CARD_FIELDS.values():
+                    forwarded.pop(setting, None)
+            self._cfg.update({key: forwarded[key] for key in SHARED_CONFIG_KEYS if key in forwarded})
+        if kokoro_trt:
+            forwarded.update({_KOKORO_TRT_CARD_FIELDS[field][0]: value
+                              for field, value in trt_config.items()})
 
-        if requested:
-            engine = self._select_engine(requested)
+        if requested_engine:
+            engine = requested_engine
             with self._lock:
                 already_building = self._building == engine
                 switching = not already_building and (
@@ -2505,6 +2657,7 @@ class TTSPlugin:
                     self._cfg["engine"] = engine
                     self._building = engine
                     self._build_error = None
+                    self._load_status = None
             if switching:
                 # Stop the old engine's nodes before the new one publishes on
                 # the same topics — two live TTS publishers on one topic is the
@@ -2567,7 +2720,7 @@ class TTSPlugin:
 def _dispose_impl(impl) -> None:
     """Stop every node an engine implementation owns before dropping it."""
     try:
-        impl.dispatch("tts", {"action": "stop"})
+        impl.dispatch("tts", {"action": "stop", "_release_nodes": True})
     except Exception:
         log.error("[tts] failed to stop the outgoing engine", exc_info=True)
     # Kokoro's Japanese path may own a worker process. Dropping the impl does not
