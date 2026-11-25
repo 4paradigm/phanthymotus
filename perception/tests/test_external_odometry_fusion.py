@@ -970,3 +970,35 @@ def test_gravity_variance_preserves_heading_uncertainty_without_copying_it_into_
     expected = np.diag([0., bound, heading_var]) + np.outer(forward, forward) * bound / np.cos(pitch)**2
     covariance = np.reshape(engine.output()['pose']['covariance'], (6, 6))
     np.testing.assert_allclose(covariance[3:, 3:], expected, atol=1e-10)
+
+
+@pytest.mark.parametrize('boundary', ['continuous', 'origin', 'reset', 'expired'])
+def test_short_gravity_gap_transports_body_rotation_only_within_one_reference(boundary):
+    from dataclasses import replace
+    from plugins.external_odometry_fusion import pose_matrix
+
+    def tilted(degrees):
+        c, s = np.cos(np.deg2rad(degrees)), np.sin(np.deg2rad(degrees))
+        T = np.eye(4)
+        T[1:3, 1:3] = [[c, -s], [s, c]]
+        return T
+
+    engine = ExternalOdometry(body_frame='body')
+    for t, angle in ((.1, 12.), (.8 if boundary == 'expired' else .2, 15.)):
+        item = dict(packet(t, x=t, frame='other' if t > .1 and boundary == 'origin' else 'external'),
+                    motion_model='planar')
+        if t == .1:
+            item['vendor'] = dict(body_gravity=dict(frame_id='body', stamp_ns=item['stamp_ns'],
+                                                    up=[0., 0., 1.]))
+        stamp, motion = decode_motion(item, 1)
+        engine.raw_motion[stamp] = replace(motion, reset=t > .1 and boundary == 'reset')
+        state = replace(engine.current, stamp=stamp, transform=tilted(angle), last_update='external',
+                        motion_model=motion.model, mask=motion.mask)
+        out = engine.output(state)
+        if t == .1:
+            assert pose_matrix(out['pose'])[2, :3] == pytest.approx([0., 0., 1.])
+    expected = tilted(3. if boundary == 'continuous' else 15.)
+    assert pose_matrix(out['pose'])[2, :3] == pytest.approx(expected[2, :3])
+    assert 'body_gravity_stamp_ns' not in out['vendor']['external_fusion']
+    covariance = np.array(out['pose']['covariance']).reshape(6, 6)
+    assert np.linalg.eigvalsh(covariance).min() >= -1.e-9
