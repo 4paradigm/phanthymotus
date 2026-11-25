@@ -20,14 +20,18 @@ import os
 import pathlib
 import sys
 import tempfile
+import time
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
 
 from api import config as config_api  # noqa: E402
+from api import canvas, motus_stream  # noqa: E402
 
 TTS_OLD = {'id': 'card_mt4rkb752py8', 'mcpId': 'mcp-1', 'toolName': 'tts'}
 TTS_NEW = {'id': 'card_mt8rck6q87qd', 'mcpId': 'mcp-1', 'toolName': 'tts'}
@@ -131,3 +135,74 @@ def test_none_layouts_are_tolerated(calls):
     assert _run(None, None) == 0
     assert _run(None, [TTS_NEW]) == 0
     assert calls == []
+
+
+@pytest.fixture
+def mixed_layout(monkeypatch):
+    tools = [
+        {'name': 'imu', 'type': 'sensor', 'multiInstance': False},
+        {'name': 'battery', 'type': 'sensor'},
+        {'name': 'ext_camera', 'type': 'sensor', 'multiInstance': True},
+        {'name': 'tts', 'type': 'processor', 'multiInstance': True},
+        {'name': 'loco', 'type': 'actuator', 'multiInstance': False},
+        'legacy',
+    ]
+    cards = [{'id': name, 'mcpId': 'mcp-1', 'toolName': name}
+             for name in ('imu', 'battery', 'ext_camera', 'tts', 'loco', 'legacy', 'unknown')]
+    monkeypatch.setattr(config_api.config, 'main', {
+        'services': {'mcp': [{'id': 'mcp-1', 'tools': tools}]},
+        'canvas_layout': {'cards': cards},
+        'core': {'project_running': False},
+    })
+    monkeypatch.setattr(canvas, '_editor_session', 'editor')
+    monkeypatch.setattr(canvas, '_editor_last_seen', time.monotonic())
+    monkeypatch.setattr(canvas, '_layout_rev', 0)
+    events = []
+    monkeypatch.setattr(canvas, '_broadcast', events.append)
+
+    async def push_event(event):
+        events.append(event)
+
+    monkeypatch.setattr(motus_stream, 'push_event', push_event)
+    app = FastAPI()
+    app.include_router(canvas.router)
+    with TestClient(app) as client:
+        yield client, cards, events
+
+
+@pytest.mark.parametrize('keep', [[], ['tts'], ['imu']])
+def test_layout_endpoint_reclaims_instances_but_preserves_shared_sensors(calls, mixed_layout, keep):
+    client, cards, events = mixed_layout
+    remaining = [c for c in cards if c['id'] in keep]
+    response = client.post('/canvas/layout', json={'session_id': 'editor', 'cards': remaining})
+    assert response.status_code == 200
+    assert response.json() == {'code': 200}
+    assert config_api.config.main['canvas_layout']['cards'] == remaining
+    assert config_api.config.main['core']['project_running'] is False
+    expected = {'ext_camera', 'tts', 'loco', 'legacy', 'unknown'} - set(keep)
+    assert {c[2]['instance_id'] for c in calls} == expected
+    assert all(c[2]['action'] == 'stop' for c in calls)
+    assert len(calls) == len(expected)
+    assert events == [{'type': 'canvas_layout', 'payload': {'editor': 'editor', 'rev': 1}}]
+
+
+def test_layout_endpoint_rejects_another_editor_without_stopping_anything(calls, mixed_layout):
+    client, cards, events = mixed_layout
+    response = client.post('/canvas/layout', json={'session_id': 'other', 'cards': []})
+    assert response.status_code == 403
+    assert config_api.config.main['canvas_layout']['cards'] == cards
+    assert calls == events == []
+
+
+def test_project_stop_preserves_shared_sensors_and_still_stops_actuators(calls, mixed_layout):
+    _, cards, events = mixed_layout
+    config_api.config.main['core']['project_running'] = True
+    results = asyncio.run(config_api._do_stop_project())
+    assert config_api.config.main['core']['project_running'] is False
+    assert {c[2]['instance_id'] for c in calls} == {'ext_camera', 'tts', 'loco', 'legacy', 'unknown'}
+    assert all(c[2]['action'] == 'stop' for c in calls)
+    assert len(results) == len(cards)
+    assert all(r['ok'] for r in results)
+    assert events[0] == {'type': 'project_state', 'payload': {'running': False}}
+    assert events[-1]['type'] == 'project_stop_done'
+    assert events[-1]['payload']['failed'] == []

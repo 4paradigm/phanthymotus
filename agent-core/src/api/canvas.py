@@ -355,10 +355,10 @@ async def save_layout(layout: CanvasLayout):
     save_data.pop('session_id', None)
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
     config.main['canvas_layout'] = save_data
-    # Clearing the canvas must not change device lifecycles.
-    if save_data.get('cards'):
-        from api.config import stop_removed_cards
-        await stop_removed_cards(old_cards, save_data.get('cards', []))
+    # A card that leaves the layout is unreachable afterwards — stop-project only
+    # walks the saved cards — so its plugin instance would keep running forever.
+    from api.config import stop_removed_cards
+    await stop_removed_cards(old_cards, save_data.get('cards', []))
     notify_layout_changed(session_id or '')
     return {'code': 200}
 

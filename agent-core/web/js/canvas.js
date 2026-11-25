@@ -998,6 +998,8 @@ async function _removeCard(id) {
   // until perception exits — publishing to a topic no card accounts for.
   // `stop` is idempotent, so doing this to a card that was never started is fine.
   _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
+  if (removed.toolName === 'remote_camera') stopCameraStream();
+  if (removed.toolName === 'remote_mic') stopMicStream();
   removed.el.remove();
   _cards.splice(idx, 1);
   // Trigger stop for connections where this card was the source
@@ -1068,7 +1070,9 @@ async function _clearCanvas() {
     } else {
       // A 403 has already reloaded the server's layout in _writeLayout.
       if (!_isEditor) { _showToast('编辑权已被其他会话获取，画布未清空'); return; }
-      // A lost response does not mean the empty layout was not saved.
+      // The server persists the layout first and only then stops each removed
+      // instance, so a slow teardown outlasts the timeout after the clear has
+      // in fact happened. Ask the server instead of reporting a failure.
       await _reloadLayout();
       if (_cards.length) {
         _showToast('未能确认画布是否清空，请检查网络后重试');
@@ -1076,8 +1080,12 @@ async function _clearCanvas() {
       }
     }
 
-    // Only remove the cards; services and browser sources keep running.
+    // The server stops the removed instances as part of the layout write.
+    // Browser-owned sources live in this tab and have to be stopped here —
+    // including when a reload above has already taken their cards off screen.
     for (const card of doomed) {
+      if (card.toolName === 'remote_camera') stopCameraStream();
+      if (card.toolName === 'remote_mic') stopMicStream();
       card.el.remove();
     }
     if (_cards === doomed) {
@@ -2517,6 +2525,9 @@ function _initAutoStartToggle() {
 }
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
+  const tool = _allMcps.find(m => m.id === mcpId)?.tools?.find(t => t.name === toolName);
+  // Single-instance sensors belong to the device, not to the canvas card.
+  if (action === 'stop' && tool?.type === 'sensor' && !tool.multiInstance) return;
   try {
     const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
       method: 'POST',

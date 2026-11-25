@@ -1120,7 +1120,7 @@ STOP_CARD_TIMEOUT_S = 5.0
 
 
 async def _stop_cards(cards, progress: bool = False) -> list[dict]:
-    """Send `stop` to each card's instance. Returns one result per card.
+    """Stop card-owned instances, preserving shared sensors. One result per card.
 
     `stop` is idempotent — a plugin that is already idle returns
     `{"state": "idle"}` — so this is safe to call on cards that were never
@@ -1148,9 +1148,13 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
         tool_name = card.get('toolName', '')
         entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
                  'card_id': card.get('id', ''), 'ok': False, 'error': ''}
-        rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
+        tool = find_tool(card.get('mcpId', ''), tool_name)
+        rules = stop_rules(tool)
         try:
             async def stop_and_confirm():
+                # Single-instance sensors are always-on services, not card-owned nodes.
+                if tool.get('type') == 'sensor' and not tool.get('multiInstance'):
+                    return
                 action = 'stop'
                 while True:
                     result = await mcp_call_tool(card.get('mcpId', ''), MCPCallRequest(
