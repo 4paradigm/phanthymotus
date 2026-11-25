@@ -538,3 +538,55 @@ def test_import_rejects_oversized_xlsx_media_before_inflating(tmp_path, monkeypa
     assert reply["ok"] is False and reply["reason"] == "too_large" and reply["written"] == 0
     assert opened_media == []
     assert _call(card, "tables")["count"] == 0
+
+
+def test_over_budget_xlsx_export_refuses_before_reading_blobs(tmp_path, monkeypatch):
+    """Preflight rejects an XLSX export whose BLOB sizes exceed max_cache_bytes
+    without calling store.read_files() or materializing media in memory."""
+    big_png = PNG_BYTES + b"\x00" * 4096
+    p1 = _write(tmp_path, "a.png", big_png)
+    p2 = _write(tmp_path, "b.png", big_png + b"1")
+    card = _card(tmp_path, max_cache_bytes=5000)
+    _call(card, "create_table", table="photos", columns="k,img:BLOB")
+    assert _call(card, "insert", table="photos", values=[
+        {"k": "1", "img": p1},
+        {"k": "2", "img": p2},
+    ])["ok"] is True
+
+    read_calls = []
+    orig_read_files = card._store.read_files
+
+    def spy_read_files(fids):
+        read_calls.append(list(fids))
+        return orig_read_files(fids)
+
+    monkeypatch.setattr(card._store, "read_files", spy_read_files)
+    reply = _call(card, "export", table="photos", format="xlsx")
+    assert reply["ok"] is False and reply["reason"] == "too_large"
+    assert read_calls == []
+
+
+def test_deleted_blob_freelist_pages_are_reused_under_max_db_bytes(tmp_path):
+    """After deleting a BLOB row, SQLite freelist pages are subtracted from the
+    file size check so subsequent writes can reuse reclaimed space."""
+    blob_a = b"\x89PNG\r\n\x1a\n" + os.urandom(80 * 1024)
+    blob_b = b"\x89PNG\r\n\x1a\n" + os.urandom(80 * 1024)
+    p1 = _write(tmp_path, "a.png", blob_a)
+    p2 = _write(tmp_path, "b.png", blob_b)
+
+    card = _card(tmp_path)
+    _call(card, "create_table", table="t", columns="k,f:BLOB")
+    base_size = card._store.db_bytes()
+    # Fits one 80 KiB BLOB, not two simultaneously.
+    card._store.limits.max_db_bytes = base_size + 150 * 1024
+
+    ins1 = _call(card, "insert", table="t", values=[{"k": "1", "f": p1}])
+    assert ins1["ok"] is True
+    # Second simultaneous BLOB exceeds max_db_bytes.
+    ins2_full = _call(card, "insert", table="t", values=[{"k": "2", "f": p2}])
+    assert ins2_full["ok"] is False and ins2_full["reason"] == "too_large"
+
+    # Delete row 1 -> BLOB pages move to SQLite freelist -> row 2 now fits!
+    assert _call(card, "delete", table="t", where={"rowid": ins1["rowids"][0]})["deleted"] == 1
+    ins2_after = _call(card, "insert", table="t", values=[{"k": "2", "f": p2}])
+    assert ins2_after["ok"] is True

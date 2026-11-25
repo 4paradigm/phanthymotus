@@ -304,14 +304,18 @@ class TableStore:
             finally:
                 conn.close()
 
-    def _check_size(self, extra: int) -> None:
+    def _check_size(self, conn: sqlite3.Connection, extra: int) -> None:
         path = self.db_path()
         size = sum(os.path.getsize(part) for part in (path, path + "-wal", path + "-shm")
                    if os.path.exists(part))
+        # Subtract SQLite freelist pages that subsequent writes can reuse in place.
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        effective = max(0, size - page_size * freelist)
         projected = extra + max(4096, extra // 10) if extra > 0 else 0
-        if size + projected > self.limits.max_db_bytes:
-            raise TableDbError("too_large", "数据库文件已有 %d 字节，再写入约 %d 字节会超过上限 %d"
-                               % (size, projected, self.limits.max_db_bytes))
+        if effective + projected > self.limits.max_db_bytes:
+            raise TableDbError("too_large", "数据库有效占用约 %d 字节，再写入约 %d 字节会超过上限 %d"
+                               % (effective, projected, self.limits.max_db_bytes))
 
     def db_bytes(self) -> int:
         path = self.db_path()
@@ -623,7 +627,7 @@ class TableStore:
                 elif isinstance(value, str):
                     extra += len(value.encode("utf-8"))
         with self._write() as conn:
-            self._check_size(extra)
+            self._check_size(conn, extra)
             if create_columns is not None:
                 tid, cols = self._create_in(conn, table, create_columns)
             else:
@@ -743,7 +747,7 @@ class TableStore:
             for v in changes.values()
         )
         with self._write() as conn:
-            self._check_size(extra)
+            self._check_size(conn, extra)
             tid, cols = self._meta(conn, table)
             clause, wparams = self._where(cols, where)
             matched = [row[0] for row in conn.execute(

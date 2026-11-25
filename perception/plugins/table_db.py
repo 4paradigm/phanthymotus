@@ -874,27 +874,51 @@ class TableDbPlugin:
             limit=self._store.limits.max_rows,
         )
         headers = [col.name for col in cols]
-        blob_fids = [
-            row[col.name]["_fid"]
-            for row in rows
-            for col in cols
-            if col.type == BLOB and isinstance(row.get(col.name), dict) and "_fid" in row[col.name]
-        ]
-
         if fmt == "csv":
             csv_rows: List[List[Any]] = []
+            est_bytes = sum(len(h.encode("utf-8")) + 2 for h in headers)
             for row in rows:
                 out_row = []
                 for col in cols:
                     val = row.get(col.name)
                     if col.type == BLOB and isinstance(val, dict):
-                        out_row.append(self._blob_url(table, row["rowid"], col.name))
+                        cell_val = self._blob_url(table, row["rowid"], col.name)
+                        est_bytes += len(cell_val.encode("utf-8")) + 2
+                        out_row.append(cell_val)
                     else:
+                        if val is not None:
+                            est_bytes += len(str(val).encode("utf-8")) + 2
                         out_row.append(val)
+                if est_bytes > self._max_cache_bytes:
+                    raise TableDbError(
+                        "too_large",
+                        "本次导出预计超过缓存上限 %d 字节；请用 where 分批导出"
+                        % self._max_cache_bytes,
+                    )
                 csv_rows.append(out_row)
             payload = write_csv(headers, csv_rows)
         else:
-            blobs = self._store.read_files(blob_fids) if blob_fids else {}
+            # Preflight total image/text bytes BEFORE reading BLOB contents into RAM.
+            image_fids: List[int] = []
+            est_bytes = sum(len(h.encode("utf-8")) for h in headers)
+            for row in rows:
+                for col in cols:
+                    val = row.get(col.name)
+                    if col.type == BLOB and isinstance(val, dict) and "_fid" in val:
+                        if val.get("mime") in _IMAGE_MIMES:
+                            est_bytes += int(val.get("size") or 0)
+                            image_fids.append(val["_fid"])
+                        else:
+                            est_bytes += len(str(val.get("name") or "").encode("utf-8"))
+                    elif val is not None:
+                        est_bytes += len(str(val).encode("utf-8"))
+            if est_bytes > self._max_cache_bytes:
+                raise TableDbError(
+                    "too_large",
+                    "本次导出预计至少 %d 字节，超过缓存上限 %d 字节；请用 where 分批导出"
+                    % (est_bytes, self._max_cache_bytes),
+                )
+            blobs = self._store.read_files(image_fids) if image_fids else {}
             xlsx_rows: List[List[Any]] = []
             images: Dict[Tuple[int, int], Tuple[bytes, str]] = {}
             for r_idx, row in enumerate(rows, 2):
@@ -902,17 +926,13 @@ class TableDbPlugin:
                 for c_idx, col in enumerate(cols, 1):
                     val = row.get(col.name)
                     if col.type == BLOB and isinstance(val, dict) and "_fid" in val:
-                        entry = blobs.get(val["_fid"])
-                        if entry is not None:
-                            fname, mime, raw_bytes = entry
-                            img_ext = _IMAGE_MIMES.get(mime)
-                            if img_ext:
-                                images[(r_idx, c_idx)] = (raw_bytes, img_ext)
-                                out_row.append(None)
-                            else:
-                                out_row.append(fname)
-                        else:
+                        img_ext = _IMAGE_MIMES.get(val.get("mime", ""))
+                        entry = blobs.get(val["_fid"]) if img_ext else None
+                        if entry is not None and img_ext:
+                            images[(r_idx, c_idx)] = (entry[2], img_ext)
                             out_row.append(None)
+                        else:
+                            out_row.append(val.get("name"))
                     else:
                         out_row.append(val)
                 xlsx_rows.append(out_row)
