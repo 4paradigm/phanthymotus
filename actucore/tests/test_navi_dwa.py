@@ -853,24 +853,6 @@ def test_clear_near_equivalent_arc_retains_checked_chassis_command():
     assert guarded is not None and guarded.command != previous
 
 
-def test_recheck_targets_a_remembered_cell_only_if_it_blocks_a_checked_candidate():
-    from types import SimpleNamespace
-    from plugins.navi.motion import FootprintSpec
-    side = local_path.ObstacleSquares(np.array([[.32, .10]]), 0.)
-    context = dwa.MotionContext((.1, 0., 0.), (.1, 0., 0.), 1., 0., _geometry(),
-                                FootprintSpec(.3, .3, .2, .02), (), (side,), None, None, 0.)
-    budget = dwa.CandidateBudget(64)
-    view = dict(forward_m=.32, right_m=.10, source_id=37)
-    scan = SimpleNamespace(memory_recheck=lambda: view, near_projection=SimpleNamespace(squares=side))
-    command = (.1, 0., 0.)
-    budget.for_context(context)[command] = context.check(command)
-    assert policy._blocking_memory_view(scan, context, budget) == view
-    from dataclasses import replace
-    observed = replace(context, occupied=(side,))
-    budget.for_context(observed)[command] = observed.check(command)
-    assert policy._blocking_memory_view(scan, observed, budget) is None
-
-
 @pytest.mark.parametrize("case", ["open", "short", "bend", "obstacle", "shadow", "lower_limit"])
 def test_straight_tracking_speed_handoff(case):
     route = ((0., 0.), (2., 0.))
@@ -911,25 +893,39 @@ def test_timed_route_keeps_only_a_verified_prefix_when_scoring_runs_out(monkeypa
         assert choice is not None and choice.command == predictions[0] and choice.check.accepted
 
 
-def test_route_cost_prefers_a_longer_path_when_turns_take_longer():
-    straight = ((0., 0.), (1., 0.))
-    shortcut = ((0., 0.), (.3, .3), (.6, 0.))
-    uphill = ((0., 0.), (.3, -.3), (.6, 0.))
-    assert local_path.route_time_s(shortcut, (0., .5), (0., 0.), (-.5, 1.)) > (
-        local_path.route_time_s(straight, (0., .5), (0., 0.), (-.5, 1.)))
-    assert local_path.route_time_s(shortcut, (0., .5), (0., 0.), (-.5, 1.)) < (
-        local_path.route_time_s(uphill, (0., .5), (0., 0.), (-.5, 1.)))
+def test_route_velocity_cost_prefers_keeping_forward_speed_to_a_shorter_turn():
+    limits = ((0., .5), (0., 0.), (-.7, .7))
+    previous = (.5, 0., 0.)
+    straight = ((0., 0.), (1.8, 0.))
+    shorter = ((0., 0.), (.35, .25), (.9, 0.))
+    cost = local_path.route_velocity_change
+    assert cost(straight, *limits, previous) == pytest.approx(0.)
+    assert cost(shorter, *limits, previous) > 0.
+    assert cost(((0., 0.), (.4, 0.), (1.8, 0.)), *limits, previous) == cost(straight, *limits, previous)
 
 
-def test_route_cost_credits_simultaneous_translation_when_lateral_axis_is_declared():
-    diagonal = ((0., 0.), (.6, .2))
-    assert local_path.route_time_s(diagonal, (0., .5), (-.25, .4), (0., 0.)) == pytest.approx(1.2)
-    assert math.isinf(local_path.route_time_s(diagonal, (0., .5), (0., .4), (0., 0.)))
+def test_route_velocity_cost_preserves_declared_lateral_motion():
+    limits = ((0., .5), (-.25, .4), (0., 0.))
+    previous = (.4, -.2, 0.)
+    steady = ((0., 0.), (.6, .3), (1.2, .6))
+    reversal = ((0., 0.), (.6, -.3), (1.2, 0.))
+    cost = local_path.route_velocity_change
+    assert cost(steady, *limits, previous) < cost(reversal, *limits, previous)
+    assert math.isinf(cost(steady, (0., .5), (0., .4), (0., 0.), previous))
 
 
-def test_alternate_references_with_the_same_visible_prefix_rank_by_arrival_time():
-    slow = ((0., 0.), (.7, 0.), (.8, .2), (1.3, 0.))
-    fast = ((0., 0.), (.7, 0.), (1.3, 0.))
-    choice = _run(slow, alternate_routes=(fast,), yaw_limits=(-.15, .15), target=(2., 0.))
+def test_alternate_references_with_the_same_visible_prefix_rank_by_velocity_change():
+    # The same visible prefix can lead to either a zigzag or a straight continuation.
+    shortcut = ((0., 0.), (.7, 0.), (.85, .2), (1.05, 0.), (1.3, 0.))
+    steady = ((0., 0.), (.7, 0.), (1.3, 0.))
+    choice = _run(shortcut, alternate_routes=(steady,), yaw_limits=(-.15, .15), target=(3., 0.))
     assert choice is not None and choice.check.accepted
     assert choice.reference_index == 1
+
+
+def test_route_ranking_does_not_override_collision_checks():
+    straight = ((0., 0.), (1.8, 0.))
+    turn = ((0., 0.), (.4, .32), (1.5, .42))
+    guarded = _run(straight, alternate_routes=(turn,), previous=(.3, 0., 0.),
+                   validate_candidate=lambda cmd, *_: dwa.CandidateCheck(cmd[2] < 0, "blocked_lane"))
+    assert guarded is not None and guarded.check.accepted and guarded.command[2] < 0.

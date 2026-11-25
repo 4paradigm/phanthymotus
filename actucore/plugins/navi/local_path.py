@@ -58,30 +58,48 @@ def allowed_centers(grid, start, half_cells, allow_unknown=False):
     return np.pad(blocked_count == 0, ((rear, front), (dc, dc)), constant_values=False)
 
 
-def route_time_s(points, x_limit, y_limit, yaw_limit):
-    """Estimate forward/turn or fixed-heading travel using signed chassis rates.
+def route_velocity_change(points, x_limit, y_limit, yaw_limit, previous):
+    """Estimate total normalized twist variation along a geometric reference.
 
-    A differential chassis must align with each tangent. A strafe-capable
-    chassis can hold its starting heading and translate on both axes at once.
-    This ranks references only; the motion model still admits every command.
+    Score fixed-heading translation and forward steering using the available
+    chassis axes. Each corner contributes a yaw correction and its release.
     """
-    def axis_time(displacement, limits):
-        if abs(displacement) < 1e-8:
-            return 0.
-        speed = limits[1] if displacement > 0. else -limits[0]
-        return abs(displacement) / speed if speed > 0. else math.inf
+    def rate(value, limits):
+        return limits[1] if value >= 0. else -limits[0]
 
-    heading = aligned = fixed = 0.
+    x_scale, y_scale = max(.1, *map(abs, x_limit)), max(.1, *map(abs, y_limit))
+    heading = 0.
+    prior_yaw = previous[2] / max(.2, rate(previous[2], yaw_limit))
+    aligned = abs(x_limit[1] - previous[0]) / x_scale + abs(previous[1]) / y_scale
+    fixed = abs(prior_yaw)
+    vx, vy = previous[:2]
     for (f, r), (next_f, next_r) in zip(points, points[1:]):
-        dx, dy = next_f - f, next_r - r
-        length = math.hypot(dx, dy)
-        if length < 1e-8:
+        dx, dy = next_f - f, r - next_r
+        if math.hypot(dx, dy) < 1e-8:
             continue
         tangent = math.atan2(dy, dx)
-        aligned += axis_time(length, x_limit) + axis_time(math.remainder(heading - tangent, math.tau), yaw_limit)
-        fixed += max(axis_time(dx, x_limit), axis_time(-dy, y_limit))
+        turn = math.remainder(tangent - heading, math.tau)
+        if abs(turn) >= 1e-8:
+            yaw = rate(turn, yaw_limit)
+            if yaw <= 0.:
+                aligned = math.inf
+            else:
+                # Compare yaw demand over a common one-second steering interval.
+                demand = turn / max(.2, yaw)
+                aligned += abs(demand - prior_yaw) + abs(demand)
+            prior_yaw = 0.
         heading = tangent
-    return min(aligned, fixed)
+        x_rate, y_rate = rate(dx, x_limit), rate(dy, y_limit)
+        if (abs(dx) >= 1e-8 and x_rate <= 0.) or (abs(dy) >= 1e-8 and y_rate <= 0.):
+            fixed = math.inf
+        elif math.isfinite(fixed):
+            interval = max(abs(dx) / x_rate if abs(dx) >= 1e-8 else 0.,
+                           abs(dy) / y_rate if abs(dy) >= 1e-8 else 0.)
+            if interval:
+                current_vx, current_vy = dx / interval, dy / interval
+                fixed += abs(current_vx - vx) / x_scale + abs(current_vy - vy) / y_scale
+                vx, vy = current_vx, current_vy
+    return min(aligned + abs(prior_yaw), fixed) if x_limit[1] > 0. else fixed
 
 
 def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None, steps=STEPS,
@@ -1506,12 +1524,13 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
                   reachable_prefix=reachable_prefix, topology=topology)
 
 
-def opening_route(frame, occupied, geometry, half_width, plane, target, allow_detour=False, travel_limits=None):
+def opening_route(frame, occupied, geometry, half_width, plane, target, allow_detour=False, travel_limits=None,
+                  previous=(0., 0., 0.)):
     """Propose a measured opening; checked detours may leave the direct goal ray."""
     if (plane <= geometry.front or target is None or target[0] <= plane
             or geometry.horizontal is None or geometry.vertical is None or geometry.base_from_optical[0, 2] <= 0.):
         return None
-    route = _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour, travel_limits)
+    route = _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour, travel_limits, previous)
     if route is not None or not allow_detour:
         return route
     # The nearest obstacle determines braking. Its depth can be the edge of a
@@ -1520,13 +1539,13 @@ def opening_route(frame, occupied, geometry, half_width, plane, target, allow_de
     nearby = depths[(depths >= plane + RESOLUTION)
                     & (depths < min(target[0], plane + 1.5))]
     for probe in nearby[::2]:
-        route = _opening_at_plane(frame, occupied, geometry, half_width, probe, target, True, travel_limits)
+        route = _opening_at_plane(frame, occupied, geometry, half_width, probe, target, True, travel_limits, previous)
         if route is not None:
             return route
     return None
 
 
-def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour, travel_limits):
+def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allow_detour, travel_limits, previous):
     band = occupied & (abs(FORWARD - plane) <= .10)
     cols = np.flatnonzero(band.any(axis=0))
     if allow_detour:
@@ -1539,7 +1558,7 @@ def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allo
             midpoint = (plane, sum(gap) / 2)
             if travel_limits is None:
                 return math.hypot(*midpoint) + math.dist(midpoint, target)
-            return route_time_s(((0., 0.), midpoint, target), *travel_limits)
+            return route_velocity_change(((0., 0.), midpoint, target), *travel_limits, previous)
 
         gaps.sort(key=opening_cost)
     else:

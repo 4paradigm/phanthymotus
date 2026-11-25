@@ -39,11 +39,11 @@ class CandidateScore:
     smooth: float
     heading: float
     goal: float
-    arrival: float = 0.
+    route_change: float = 0.
 
     @property
     def total(self):
-        return self.path + self.progress + self.obstacle + self.smooth + self.heading + self.goal + self.arrival
+        return self.path + self.progress + self.obstacle + self.smooth + self.heading + self.goal
 
 
 @dataclass(frozen=True)
@@ -573,17 +573,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         return None
     translation_speed = math.hypot(x_speed, y_speed)
     progress_scale = max(.2, min(1.0, translation_speed * horizon))
-    arrival_costs = (0.,) * len(routes)
-    # An unfinished reference may still need an unseen detour. Compare
-    # arrival times once each choice reaches the target standoff.
-    if len(routes) > 1 and target is not None and all(
-            abs(math.dist(ref[-1], target) - stop_distance) <= local_path.RESOLUTION for ref in routes):
-        speed = max(.1, translation_speed)
-        times = tuple(local_path.route_time_s(ref, *limits) for ref in routes)
-        fastest = min(times)
-        if math.isfinite(fastest):
-            # Convert seconds into the existing normalized tracking cost.
-            arrival_costs = tuple((eta - fastest) * speed / progress_scale for eta in times)
+    route_costs = (0.,) if len(routes) == 1 else tuple(
+        local_path.route_velocity_change(ref, *limits, previous) for ref in routes)
     nominal = min(max(x_speed, y_speed), .35)
     preferred = tuple(_preferred_command(ref, nominal, horizon, yaw_limit,
                                          differential=guidance and not y_speed and footprint_mode == "body")
@@ -653,7 +644,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         poses = prediction.camera_poses if footprint_mode == "camera_approx" else prediction.body_poses
         if validate_candidate is not None and not validate_candidate(command, poses, prediction.duration).accepted:
             return choice
-        components = replace(components, obstacle=_obstacle_score(check))
+        components = replace(components, obstacle=_obstacle_score(check),
+                             route_change=choice.components.route_change)
         diag["entry_arc_selected" if entry_yaw else "handoff_yaw_interpolated"] = True
         diag["admissible_candidates"] += 1
         return Choice(command, poses[:prediction.moving_count], components.total, progress,
@@ -711,7 +703,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     outcomes = budget.for_context(context)
     straight = (x_speed, 0., 0.)
     continuing = previous == straight
-    straight_reference = (candidate_budget is not None and target is not None and target[0] > 0.
+    straight_reference = (route_costs[0] == min(route_costs) and candidate_budget is not None and target is not None and target[0] > 0.
                           and abs(math.atan2(target[1], target[0])) <= .1
                           and all(f >= 0. and abs(r) <= (max(1e-8, min(local_path.RESOLUTION / 2, .1 * f))
                                                          if continuing else 1e-8)
@@ -805,8 +797,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 progress_scale=progress_scale, target=target, segments=segments_by_reference[index],
                 initial_position=initial_positions[index], guidance=guidance)
             if components is not None:
-                if arrival_costs[index]:
-                    components = replace(components, arrival=arrival_costs[index])
+                components = replace(components, route_change=route_costs[index])
                 scores.append((components, progress, index))
             else:
                 rejection = reason
@@ -830,7 +821,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 straight_check = checked
             obstacle = _obstacle_score(check)
             components, progress, index = (scores[0] if preferred_check and not early_translation
-                                           else min(scores, key=lambda item: item[0].total))
+                                           else min(scores, key=lambda item: (item[0].route_change, item[0].total)))
             components = replace(components, obstacle=obstacle)
             choice = Choice(cmd, poses[:prediction.moving_count], components.total, progress,
                             check.min_clearance_m, prediction, check, components, index)
@@ -843,7 +834,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 first_checked = choice
         if retaining_speed:
             continue  # Ordinary detour ranking only admits speeds inside its cap.
-        lower = min(((score.total, index, ordinal) for score, _, index in scores), default=(math.inf, 0, ordinal))
+        lower = min(((score.route_change, score.total, index, ordinal) for score, _, index in scores),
+                    default=(math.inf, math.inf, 0, ordinal))
         entries.append((lower, ordinal, cmd, scores, rejection))
 
     if not diag["considered_candidates"]:
@@ -853,14 +845,14 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             diag["reason"] = "sample_budget_exhausted" if slots == 0 else "no_legal_commands"
         return None
 
-    # Collision cost is nonnegative. With the original tie order included,
-    # no remaining lower bound can beat an already physically admitted winner.
+    # Collision cost is nonnegative. Only skip when neither route smoothness
+    # nor the tracking score can beat an already physically admitted winner.
     score_band = local_path.RESOLUTION / progress_scale
     def ranking_bound(entry):
-        (score, index, ordinal), _, cmd, _, _ = entry
+        (route_change, score, index, ordinal), _, cmd, _, _ = entry
         if cmd == previous and cmd[0] > 0. and (cmd[1] or cmd[2]):
             score -= score_band
-        return guidance and not any(cmd[:2]), score, index, ordinal
+        return guidance and not any(cmd[:2]), route_change, score, index, ordinal
 
     if bounded:
         entries.sort(key=ranking_bound)
@@ -886,7 +878,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             components = replace(components, obstacle=obstacle)
             # Follow an admissible forward arc on the route before falling back
             # to a stationary heading change.
-            key = (guidance and not any(cmd[:2]), components.total, index, ordinal)
+            key = (guidance and not any(cmd[:2]), components.route_change, components.total, index, ordinal)
             if (cmd == previous and cmd[0] > 0. and (cmd[1] or cmd[2]) and obstacle == 0.
                     and (retained is None or components.total < retained.score)):
                 retained = Choice(cmd, poses[:prediction.moving_count], components.total, progress,

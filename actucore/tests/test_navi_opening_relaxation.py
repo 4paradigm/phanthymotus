@@ -135,7 +135,7 @@ def test_offset_opening_reference_is_centred_while_body_overlaps_jambs():
     assert max(crossing) - min(crossing) < 1e-8
 
 
-def test_equal_distance_openings_rank_by_declared_turn_time():
+def test_equal_distance_openings_rank_by_incoming_angular_velocity():
     frame, geometry, plane, _ = _scene(body=False)
     frame.fill(5.)
     occupied = np.zeros(local_path.SHAPE, dtype=bool)
@@ -143,7 +143,9 @@ def test_equal_distance_openings_rank_by_declared_turn_time():
     edges = (-.65, -.20, .20, .65)
     for right in edges:
         occupied[row, local_path.START[1] + round(right / local_path.RESOLUTION)] = True
-    route = local_path.opening_route(frame, occupied, geometry, .18, plane, (3., 0.), True,
-                                     travel_limits=((0., .5), (0., 0.), (-.10, .80)))
-    assert route is not None
-    assert route.passage_exit[0][1] > 0.
+    limits = ((0., .5), (0., 0.), (-.8, .8))
+    for yaw in (-.20, .20):
+        route = local_path.opening_route(frame, occupied, geometry, .18, plane, (3., 0.), True,
+                                         travel_limits=limits, previous=(.35, 0., yaw))
+        assert route is not None
+        assert route.passage_exit[0][1] * yaw < 0.

@@ -784,19 +784,16 @@ def test_opening_connects_to_visible_corridor_without_turning_inside_jambs():
     assert all(f >= through[-1][0] - 1e-8 for f, _ in joined.points[len(through):])
 
 
-def test_opening_handoff_tracker_stops_for_new_collision_without_reversing():
+def test_opening_handoff_tracker_keeps_positive_drive():
     from plugins.navi import policy
 
     geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
     config = policy.Config(half_width_m=.2, stop_distance_m=.34)
     route = replay.Detour(None, ((-.1, 0.), (.5, 0.), (.9, .20), (1., .55)), geometry)
-    occupied = np.zeros(replay.SHAPE, dtype=bool)
     motion = (0., 0., 0.)
-    args = config, (2., .65), .30, motion, motion, .02, .08
-    command = policy.camera_route_command(route, occupied, *args, require_turn=False)
+    command = policy.camera_route_command(route, config, (2., .65), .30, motion, motion, .08,
+                                          require_turn=False)
     assert command is not None and command[0] > 0.
-    occupied[(.27 < replay.FORWARD) & (replay.FORWARD < .39) & (abs(replay.RIGHT) < .40)] = True
-    assert policy.camera_route_command(route, occupied, *args, require_turn=False) is None
 
 
 def test_corner_needs_two_distinct_travel_directions():
@@ -810,8 +807,7 @@ def test_corner_with_no_target_still_bounds_the_complete_stop_to_the_route():
 
     geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
     config = policy.Config(half_width_m=.20)
-    occupied = np.zeros(replay.SHAPE, dtype=bool)
-    args = geometry, config, occupied, None, (.2, 0., 0.), (.2, 0., 0.), (.2, 0., 0.), 0., .1
+    args = geometry, config, (.2, 0., 0.), (.2, 0., 0.), (.2, 0., 0.), .1
     assert policy.camera_arc_clear(*args, route_room=.8)
     assert not policy.camera_arc_clear(*args, route_room=.04)
 

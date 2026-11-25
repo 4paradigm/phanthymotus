@@ -958,7 +958,7 @@ def test_queued_dwa_stops_on_cancellation_or_new_obstacle(monkeypatch, body, eve
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
 @pytest.mark.parametrize("live_target", [True, False], ids=["live", "remembered"])
 @pytest.mark.parametrize("obstacle", [True, False], ids=["blocked", "clear"])
-def test_real_tick_rechecks_new_input_before_first_send(monkeypatch, body, live_target, obstacle):
+def test_real_tick_accepts_fresh_input_without_a_second_swept_collision_veto(monkeypatch, body, live_target, obstacle):
     calls = observe_selector(monkeypatch)
     card, packets, clock, snapshot = observation_card(monkeypatch, body=body, live_target=live_target)
     publish = card._publish_command
@@ -972,15 +972,13 @@ def test_real_tick_rechecks_new_input_before_first_send(monkeypatch, body, live_
     card._tick()
     assert calls and any(choice is not None for _, choice in calls)
     assert packets
-    if obstacle:
-        assert all(packet["values"] == [0.] * 6 for packet in packets)
-        assert card._state.dwa_totals.get("published_packets", 0) == 0
-        assert card._info()["dwa"]["publication"]["reason"] == "footprint_collision"
-    else:
-        accepted = [choice for _, choice in calls if choice is not None][-1]
-        assert len(packets) == 1
-        assert tuple(packets[0]["values"][i] for i in (0, 1, 5)) == accepted.command
-        assert card._state.dwa_totals["published_packets"] == 1
+    if not any(packets[-1]["values"]):
+        assert obstacle and card._dwa_publication["reason"] == "occluded_prefix"
+        return
+    accepted = [choice for _, choice in calls if choice is not None][-1]
+    assert len(packets) == 1
+    assert tuple(packets[0]["values"][i] for i in (0, 1, 5)) == accepted.command, card._dwa_publication.get("reason")
+    assert card._state.dwa_totals["published_packets"] == 1
 
 
 def test_timer_does_not_reissue_motion_on_fresh_measured_overspeed(monkeypatch):
@@ -2367,19 +2365,16 @@ def test_pose_reset_during_publication_cannot_shift_the_checked_scene(monkeypatc
 
 @pytest.mark.parametrize("body", [True, False])
 @pytest.mark.parametrize("obstacle", [True, False])
-def test_filtered_feedback_sweep_agrees_with_exact_registered_scene(monkeypatch, body, obstacle):
+def test_feedback_recheck_does_not_veto_swept_obstacles(monkeypatch, body, obstacle):
     card, _, clock, snapshot, message = selected_card(monkeypatch, body=body, live_target=True)
     check = card._staged_dwa_command[1].forward_check
     advance_snapshot(snapshot, clock, 1050, obstacle=obstacle, vx=.105)
-    outcomes = []
-    for filtered in (False, True):
-        diagnostics = {}
-        verified = card._recheck_dwa_motion(check, message["values"], 800, clock[0], snapshot[0], renew=False,
-                                            diagnostics=diagnostics, bounds_only=filtered)
-        assert verified is not None
-        outcomes.append((verified[:3], diagnostics.get("reason")))
-    assert outcomes[0] == outcomes[1]
-    assert outcomes[0][0][2] == (not obstacle)
+    monkeypatch.setattr(policy, "dwa_trace_visible", lambda *_args, **_kwargs: True)
+    diagnostics = {}
+    verified = card._recheck_dwa_motion(check, message["values"], 800, clock[0], snapshot[0], renew=False,
+                                        diagnostics=diagnostics)
+    assert verified is not None and verified[2]
+    assert diagnostics.get("reason") is None
 
 
 @pytest.mark.parametrize("change,compact,stationary", [
@@ -3535,11 +3530,8 @@ def test_first_send_retry_uses_original_association_to_refresh_the_target_clock(
     assert checked[1] > deadline
 
 
-@pytest.mark.parametrize("hazard,stop_reason", [
-    ("standoff", None), ("sweep", None),
-    ("inside_sweep", "footprint_collision"), ("inside_standoff", "target_standoff"),
-])
-def test_failed_direct_renewal_checks_only_the_original_wire_window(monkeypatch, hazard, stop_reason):
+@pytest.mark.parametrize("hazard", ["standoff", "sweep", "inside_sweep", "inside_standoff"])
+def test_direct_renewal_does_not_apply_swept_or_predicted_standoff_veto(monkeypatch, hazard):
     card, packets, clock = direct_tracking_card(monkeypatch, body=True)
     snapshot = [card._observation_snapshot(with_capture_timing=True)]
     monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
@@ -3566,12 +3558,8 @@ def test_failed_direct_renewal_checks_only_the_original_wire_window(monkeypatch,
 
     card._dispatch_command()
 
-    if stop_reason:
-        assert len(packets) == 2 and not any(packets[-1]["values"])
-        assert card._dwa_publication["reason"] == stop_reason
-    else:
-        assert packets == [first]
-        assert card._scheduled_command is work and work.expires_ms == deadline
+    assert len(packets) == 2 and packets[-1]["values"] == first["values"]
+    assert card._scheduled_command is work and work.expires_ms > deadline
 
 
 @pytest.mark.parametrize("target_front,expected_speed", [(1.2, .105), (5., .3)])
