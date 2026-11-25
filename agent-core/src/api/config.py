@@ -349,7 +349,6 @@ def stop_rules(tool_obj: dict) -> dict:
         'failed': _STOP_FAILED_STATES | names('failed_states'),
         'pending': _STOP_PENDING_STATES | names('pending_states'),
         'flags': {k: v for k, v in flags.items() if isinstance(k, str)} if isinstance(flags, dict) else {},
-        'keep_running': declared.get('keep_running') is True,
     }
 
 
@@ -1121,7 +1120,7 @@ STOP_CARD_TIMEOUT_S = 5.0
 
 
 async def _stop_cards(cards, progress: bool = False) -> list[dict]:
-    """Stop instances unless the tool explicitly opts out. One result per card.
+    """Send `stop` to each card's instance. Returns one result per card.
 
     `stop` is idempotent — a plugin that is already idle returns
     `{"state": "idle"}` — so this is safe to call on cards that were never
@@ -1148,7 +1147,7 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
     async def stop_one(card: dict) -> dict:
         tool_name = card.get('toolName', '')
         entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
-                 'card_id': card.get('id', ''), 'ok': False, 'error': '', 'status': 'error'}
+                 'card_id': card.get('id', ''), 'ok': False, 'error': ''}
         rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
         try:
             async def stop_and_confirm():
@@ -1182,11 +1181,7 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
             # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
             # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
             # GIL 握死的线程),而停止这条路径的要求是「无论挂在哪都要能回来」。
-            if rules['keep_running']:
-                entry['status'] = 'kept_running'
-            else:
-                await _aio.wait_for(stop_and_confirm(), STOP_CARD_TIMEOUT_S)
-                entry['status'] = 'stopped'
+            await _aio.wait_for(stop_and_confirm(), STOP_CARD_TIMEOUT_S)
             entry['ok'] = True
         except _aio.TimeoutError:
             # 这条消息会被操作者读到，所以说的是**后果**，不是异常类名：一张没能停
@@ -1199,7 +1194,7 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
                 await push_event({'type': 'project_stop_item', 'payload': {
                     'tool': entry['tool'], 'mcp_id': entry['mcp_id'],
                     'card_id': entry['card_id'],
-                    'status': entry['status'],
+                    'status': 'stopped' if entry['ok'] else 'error',
                     'message': entry['error'],
                 }})
             except Exception as error:  # noqa: BLE001 - 显示失败不影响停止
@@ -1230,7 +1225,7 @@ async def stop_removed_cards(old_cards, new_cards) -> int:
     if not removed:
         return 0
     results = await _stop_cards(removed)
-    count = sum(1 for r in results if r['status'] == 'stopped')
+    count = sum(1 for r in results if r.get('ok'))
     print(f'[layout] stopped {count}/{len(results)} instance(s) for removed '
           f'card(s): {", ".join(c.get("id", "") for c in removed)}')
     return count
@@ -1291,17 +1286,14 @@ async def _do_stop_project_teardown() -> list[dict]:
     }})
     results = await _stop_cards(cards, progress=True)
     failed = [r for r in results if not r.get('ok')]
-    stopped = sum(r['status'] == 'stopped' for r in results)
-    kept_running = sum(r['status'] == 'kept_running' for r in results)
     await push_event({'type': 'project_stop_done', 'payload': {
-        'stopped': stopped,
-        'kept_running': kept_running,
+        'stopped': len(results) - len(failed),
         'total': len(results),
         'failed': [{'tool': r['tool'], 'card_id': r['card_id'],
                     'message': r['error']} for r in failed],
     }})
-    print(f'[stop-project] teardown done: {stopped}/'
-          f'{len(results)} stopped, {kept_running} kept running'
+    print(f'[stop-project] teardown done: {len(results) - len(failed)}/'
+          f'{len(results)} stopped'
           + (f', failed: {", ".join(r["tool"] for r in failed)}' if failed else ''))
     return results
 

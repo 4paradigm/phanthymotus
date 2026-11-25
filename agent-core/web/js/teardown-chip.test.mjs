@@ -107,26 +107,3 @@ test('空卡片列表不炸', () => {
   assert.equal(chipLabel(s).tone, 'ok');
   assert.equal(detailHtml(s), '');
 });
-
-test('明确保持运行的卡不显示停止成功或失败，也不提供重试', () => {
-  const s = newTeardown([{ tool: 'imu', mcp_id: 'robot', card_id: 'imu' }]);
-  applyItem(s, { card_id: 'imu', status: 'kept_running' });
-  applyDone(s);
-  assert.equal(s.items[0].status, 'kept_running');
-  assert.deepEqual(failedItems(s), []);
-  assert.equal(chipLabel(s).text, '设备已收尾，1 台保持运行');
-  const html = detailHtml(s);
-  assert.match(html, /保持运行（未发送 stop）/);
-  assert.doesNotMatch(html, /✓|已停止|teardown-retry/);
-});
-
-test('保持运行的卡不掩盖其他卡停止失败', () => {
-  const s = newTeardown(CARDS);
-  applyItem(s, { card_id: 'c-mic', status: 'kept_running' });
-  applyItem(s, { card_id: 'c-asr', status: 'stopped' });
-  applyItem(s, { card_id: 'c-tts', status: 'error' });
-  applyDone(s);
-  assert.equal(chipLabel(s).text, '1 台设备未停止');
-  assert.equal(autoHideMs(s), 0);
-  assert.equal((detailHtml(s).match(/teardown-retry/g) || []).length, 1);
-});

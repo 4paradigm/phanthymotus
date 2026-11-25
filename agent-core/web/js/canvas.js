@@ -998,8 +998,6 @@ async function _removeCard(id) {
   // until perception exits — publishing to a topic no card accounts for.
   // `stop` is idempotent, so doing this to a card that was never started is fine.
   _triggerAction(removed.mcpId, removed.toolName, 'stop', { instance_id: removed.id });
-  if (removed.toolName === 'remote_camera') stopCameraStream();
-  if (removed.toolName === 'remote_mic') stopMicStream();
   removed.el.remove();
   _cards.splice(idx, 1);
   // Trigger stop for connections where this card was the source
@@ -2525,9 +2523,6 @@ function _initAutoStartToggle() {
 }
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
-  const tool = _allMcps.find(m => m.id === mcpId)?.tools?.find(t => t.name === toolName);
-  // Multiplicity does not determine whether a tool has resources to release.
-  if (action === 'stop' && tool?.inputSchema?.['x-stop']?.keep_running === true) return;
   try {
     const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
       method: 'POST',

@@ -23,7 +23,7 @@ export function newTeardown(cards) {
       tool: c.tool || '',
       mcpId: c.mcp_id || '',
       cardId: c.card_id || '',
-      status: 'pending',          // pending | stopped | kept_running | error
+      status: 'pending',          // pending | stopped | error
       message: '',
     })),
     done: false,
@@ -36,7 +36,7 @@ export function applyItem(state, payload) {
   const item = state.items.find((i) => i.cardId && i.cardId === p.card_id)
     || state.items.find((i) => i.tool === p.tool && i.mcpId === p.mcp_id);
   if (!item) return state;
-  item.status = ['stopped', 'kept_running'].includes(p.status) ? p.status : 'error';
+  item.status = p.status === 'stopped' ? 'stopped' : 'error';
   item.message = p.message || '';
   return state;
 }
@@ -72,12 +72,11 @@ export function chipLabel(state) {
   const total = state.items.length;
   const settled = state.items.filter((i) => i.status !== 'pending').length;
   const failed = failedItems(state).length;
-  const kept = state.items.filter((i) => i.status === 'kept_running').length;
   if (!state.done) {
     return { icon: '⏳', text: `设备收尾 ${settled}/${total}`, tone: 'busy' };
   }
   if (failed === 0) {
-    return { icon: '✓', text: `设备已收尾${kept ? `，${kept} 台保持运行` : ''}`, tone: 'ok' };
+    return { icon: '✓', text: '设备已收尾', tone: 'ok' };
   }
   return { icon: '⚠', text: `${failed} 台设备未停止`, tone: 'warn' };
 }
@@ -98,18 +97,16 @@ function _esc(str) {
  * 里，唯一需要操作的那一项不该要人去扫一遍列表才找到。
  */
 export function detailHtml(state) {
-  const order = { error: 0, pending: 1, kept_running: 2, stopped: 3 };
+  const order = { error: 0, pending: 1, stopped: 2 };
   const rows = [...state.items]
     .sort((a, b) => order[a.status] - order[b.status])
     .map((i) => {
-      const icon = i.status === 'kept_running' ? '↻'
-        : i.status === 'stopped' ? '✓' : (i.status === 'error' ? '✗' : '·');
+      const icon = i.status === 'stopped' ? '✓' : (i.status === 'error' ? '✗' : '·');
       const retry = i.status === 'error'
         ? `<button class="teardown-retry" data-card-id="${_esc(i.cardId)}"
              data-tool="${_esc(i.tool)}" data-mcp-id="${_esc(i.mcpId)}">重试</button>`
         : '';
-      const note = i.status === 'kept_running' ? '<span class="teardown-note">保持运行（未发送 stop）</span>'
-        : i.status === 'error' && i.message
+      const note = i.status === 'error' && i.message
         ? `<span class="teardown-note">${_esc(i.message)}</span>` : '';
       return `<div class="teardown-row ${i.status}">`
         + `<span class="teardown-row-icon">${icon}</span>`

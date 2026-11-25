@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 // Exercise the actual canvas handlers with a small DOM and controllable network.
-const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+const source = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
 // By function name, as config-topic-refresh.test.mjs does — slicing between
 // comment strings broke on unrelated comment edits.
 function code(name) {
@@ -18,7 +18,7 @@ function code(name) {
 }
 const handlers = ['_ensureEdit', '_projectEditLockReason', '_editLockReason', '_refuseEdit',
   '_editsLocked', '_clearCanvas', '_debouncedSave', '_saveLayout', '_writeLayout',
-  '_syncEmptyState', '_removeCard', '_triggerAction'].map(code).join('\n');
+  '_syncEmptyState'].map(code).join('\n');
 
 function fixture({ confirmed = true, editor = true, running = false, known = true } = {}) {
   const removed = [], toasts = [], calls = [], stopped = [];
@@ -30,7 +30,6 @@ function fixture({ confirmed = true, editor = true, running = false, known = tru
   let confirms = 0, reloads = 0;
   const ctx = {
     _cards: cards,
-    _allMcps: [{ id: 'device', tools: cards.map(c => ({ name: c.toolName, type: 'sensor' })) }],
     _connections: [{ fromCardId: 'card-0', toCardId: 'card-1' }],
     _execConnections: [{ fromCardId: 'card-1', toCardId: 'card-2' }],
     _isEditor: editor, _currentEditor: editor ? 'this-tab' : null,
@@ -45,14 +44,13 @@ function fixture({ confirmed = true, editor = true, running = false, known = tru
     },
     _showToast: message => toasts.push(message),
     _logActivity() {}, _updateEditorUI() {}, _syncGeometryObservers() {}, _scheduleRedraw() {},
-    _resolveAllTopics() {}, _autoStopOnDisconnect() {},
     _reloadLayout: async () => { reloads++; },
     _syncProjectState: async () => true,
     stopMicStream: () => stopped.push('mic'),
     stopCameraStream: () => stopped.push('camera'),
     setTimeout, clearTimeout, AbortController,
   };
-  const api = runInNewContext(`${handlers}\n({ _clearCanvas, _removeCard, _saveLayout, _ensureEdit, _debouncedSave, _syncEmptyState })`, ctx);
+  const api = runInNewContext(`${handlers}\n({ _clearCanvas, _saveLayout, _ensureEdit, _debouncedSave, _syncEmptyState })`, ctx);
   return { ctx, api, removed, toasts, calls, stopped, clearButton,
     confirms: () => confirms, reloads: () => reloads };
 }
@@ -221,36 +219,4 @@ test('the clear button is disabled while read-only or running', () => {
   const f = fixture({ editor: false });  // nobody holds the lock: clicking claims it
   f.api._syncEmptyState();
   assert.equal(f.clearButton.disabled, false);
-});
-
-test('single-card removal skips stop only for an explicit exemption', async () => {
-  for (const [tool, shouldStop] of [
-    [{ name: 'sensor', type: 'sensor', inputSchema: { 'x-stop': { keep_running: true } } }, false],
-    [{ name: 'sensor', type: 'sensor' }, true],
-    [{ name: 'camera_head', type: 'sensor', multiInstance: false }, true],
-    [{ name: 'sensor', type: 'sensor', multiInstance: true }, true],
-    [{ name: 'sensor', type: 'processor', multiInstance: true }, true],
-    [{ name: 'sensor', type: 'actuator' }, true],
-    ['sensor', true],
-    ...[false, 'true', 1, null].map(keep_running => [
-      { name: 'sensor', type: 'sensor', inputSchema: { 'x-stop': { keep_running } } }, true]),
-  ]) {
-    const f = fixture();
-    f.ctx._cards[0].toolName = typeof tool === 'string' ? tool : tool.name;
-    f.ctx._allMcps[0].tools = [tool];
-    await f.api._removeCard('card-0');
-    const stops = f.calls.filter(c => c.url === '/api/mcp/device/call');
-    assert.deepEqual(stops.map(c => c.body.arguments), shouldStop
-      ? [{ action: 'stop', instance_id: 'card-0' }] : [], JSON.stringify(tool));
-    assert.deepEqual(f.removed, ['sensor']);
-    assert.equal(f.calls.at(-1).body.cards.length, 2);
-  }
-});
-
-test('removing a browser source closes its local stream', async () => {
-  for (const [id, source] of [['card-1', 'mic'], ['card-2', 'camera']]) {
-    const f = fixture();
-    await f.api._removeCard(id);
-    assert.deepEqual(f.stopped, [source]);
-  }
 });
