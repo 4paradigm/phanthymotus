@@ -3323,7 +3323,7 @@ def test_direct_controller_checks_new_target_before_the_old_packet_expires(monke
 
         def late_input(*args, **kwargs):
             result = recheck(*args, **kwargs)
-            if kwargs.get("refresh_direct"):
+            if kwargs.get("refresh_direct") and kwargs.get("outgoing_deadline_ms") is None:
                 assert result and result[2]
                 clock[0] = stamp + 1
                 if update == "obstacle_during_check":
@@ -3380,3 +3380,90 @@ def test_first_send_retry_uses_original_association_to_refresh_the_target_clock(
     assert reason is None and checked[2]
     assert checked[3].target_ms == start
     assert checked[1] > deadline
+
+
+@pytest.mark.parametrize("hazard,stop_reason", [
+    ("standoff", None), ("sweep", None),
+    ("inside_sweep", "footprint_collision"), ("inside_standoff", "target_standoff"),
+])
+def test_failed_direct_renewal_checks_only_the_original_wire_window(monkeypatch, hazard, stop_reason):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=True)
+    snapshot = [card._observation_snapshot(with_capture_timing=True)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._command_timer = object()
+    card._config.watchdog_ms = 500
+    card._config.max_depth_age_ms = 1200
+    card._config.stop_distance_m = .6
+    card._config.motion_braking = (.3, .45, 1.)
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    work = card._scheduled_command
+    first, = packets
+    assert first["values"][0] > 0. and work.dwa_origin is None
+    deadline = first["stamp_ms"] + first["ttl_ms"]
+    stamp = deadline - 75
+    advance_snapshot(snapshot, clock, stamp, vx=.46)
+    distance = {"standoff": 1.46, "inside_standoff": .90}.get(hazard, 3.)
+    work.forward_check = replace(work.forward_check, direct_association=None, target_ms=stamp - 200,
+                                 distance_m=distance)
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    if hazard in ("sweep", "inside_sweep"):
+        obstacle = .30 if hazard == "inside_sweep" else 1.10
+        occupied[np.argmin(abs(local_path.FORWARD[:, 0] - obstacle)), local_path.START[1]] = True
+    monkeypatch.setattr(local_path, "project_observation", lambda *args, **kwargs: (~occupied, occupied))
+
+    card._dispatch_command()
+
+    if stop_reason:
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+        assert card._dwa_publication["reason"] == stop_reason
+    else:
+        assert packets == [first]
+        assert card._scheduled_command is work and work.expires_ms == deadline
+
+
+@pytest.mark.parametrize("target_front,expected_speed", [(1.2, .105), (5., .3)])
+def test_published_detour_uses_the_target_approach_speed(monkeypatch, target_front, expected_speed):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    first = card.next_command()
+    assert card._stage_command(first, card._output_epoch)
+    advance_snapshot(snapshot, clock, 1100, vx=first["values"][0])
+    snapshot[0][1]["map"].fill(5.)
+    card._config.k_fwd = .025
+    origin = card._wire_dwa_origin
+    guard = replace(origin.acceptance.motion_guard, measured_target=((target_front, 0.), 0.))
+    origin = replace(origin, acceptance=replace(origin.acceptance, motion_guard=guard))
+    card._scheduled_command.dwa_origin = card._wire_dwa_origin = origin
+
+    following = card.next_command()
+
+    assert card._state.dwa_trace.get("retained_route")
+    assert following["values"][0] == pytest.approx(expected_speed, abs=.001)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_route_renewal_standoff_rechecks_the_actual_packet(monkeypatch, blocked):
+    card, packets, _, snapshot, feed = tracked_route_card(monkeypatch)
+    work = card._scheduled_command
+    first, = packets
+    window = work.expires_ms, work.expires_at, work.repeat_until
+    image = snapshot[0][1]["map"].copy()
+    if blocked:
+        image[220:370, 302:338] = .10
+    feed(1100, .1, frame=image)
+
+    def reject_renewal(*args, **kwargs):
+        diagnostics = args[6]
+        diagnostics["reason"] = "target_standoff"
+        return (1100, 1200, False, work.forward_check), args[0].acceptance.command
+
+    monkeypatch.setattr(card, "_check_route_control", reject_renewal)
+
+    card._dispatch_command()
+
+    if blocked:
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+    else:
+        assert packets == [first]
+        assert card._scheduled_command is work
+        assert (work.expires_ms, work.expires_at, work.repeat_until) == window

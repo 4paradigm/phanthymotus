@@ -3759,7 +3759,8 @@ def _use_dwa(state, proposal, side):
     return (*proposal.command, AVOIDING, "局部规划：DWA沿已验证绕行轨迹运动")
 
 
-def _follow_published_route(depth, config, state, geometry, distance, bearing, *, foreground, corner_only=False):
+def _follow_published_route(depth, config, state, geometry, distance, bearing, *,
+                            foreground, corner_only=False, approach_speed=None):
     previous = state.published_dwa_route
     if _dwa_unavailable_reason(depth, config, state):
         return None
@@ -3785,7 +3786,16 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
         return None
     route = Detour(None, tuple(map(tuple, transform.points(previous.route_points))), geometry,
                    passage_exit=exit_line, corridor_corner=previous.corridor_corner)
-    proposal = _dwa_detour(depth, config, state, route, distance, bearing,
+    # Once the target enters the full-speed stopping envelope, carry the
+    # normal approach speed into the route and its publisher-side pursuit.
+    speed_limit = None
+    if approach_speed and guard.measured_target is not None:
+        point, error = guard.measured_target
+        (floor, limit), _ = _local_velocity_limits(config, 1.)
+        travel = limit * (guard.prediction_horizon_s + limit / (2 * config.motion_braking[0]))
+        if math.hypot(*point) - error <= config.stop_distance_m + travel:
+            speed_limit = max(floor, approach_speed)
+    proposal = _dwa_detour(depth, config, state, route, distance, bearing, speed_limit=speed_limit,
                            follow_published=True, route_error=transform.error(math.hypot(*previous.route_points[-1])),
                            corner_only=corner_only)
     if proposal is None:
@@ -4454,7 +4464,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                  or not config.use_obstacle_history) and geometry is not None
             and may_scan and target_distance is not None and target_bearing is not None):
         following = _follow_published_route(depth, config, state, geometry, target_distance, target_bearing,
-                                            foreground=foreground)
+                                            foreground=foreground, approach_speed=desired_forward)
         if following is not None:
             return following
     path_clear = None
