@@ -3007,6 +3007,7 @@ class NaviPlugin:
                 # Let the policy take its normal stop-and-refresh path immediately.
                 depth["capture_invalid"] = True
         input_revision, selection_constraints, admission_ms = None, None, 0
+        dwa_time_left = None
         epoch, action_id = self._output_epoch, self._acp_action_id
         if self._config.local_controller == "dwa":
             input_revision = _motion_inputs(objects, depth, odom)
@@ -3028,6 +3029,13 @@ class NaviPlugin:
                 if corner and not any(target_objects(objects, self._state.target, self._config)):
                     target_stamp = planning_ms
                 admission_deadline = min(admission_deadline, min(capture, feedback, target_stamp) + planning_age)
+                depth_room_ms = capture + min(planning_age, self._config.depth_age_limit_ms) - planning_ms
+                if (depth and depth.get("capture_ms") and not depth.get("capture_invalid")
+                        and 0 < depth_room_ms <= 2000 * control_period_s and admission_deadline > planning_ms):
+                    # Leave part of a tick for first-write validation and publishing.
+                    reserve_s = min(control_period_s / 4, (admission_deadline - planning_ms) / 4000)
+                    cutoff = time.monotonic() + (admission_deadline / 1000 - time.time()) - reserve_s
+                    dwa_time_left = lambda: cutoff - time.monotonic()
             admission_ms = max(0, int(admission_deadline - planning_ms))
         previous_twist = self._state.commanded
         was_moving = any(previous_twist)
@@ -3045,7 +3053,7 @@ class NaviPlugin:
                                    config=self._config, state=self._state,
                                    dt=dt, control_period_s=control_period_s, command_dt_s=coverage,
                                    command_interrupted=bool(deadline and tick > deadline), dwa_admission_ms=admission_ms,
-                                   objects_ms=objects_ms)
+                                   objects_ms=objects_ms, dwa_time_left=dwa_time_left)
         now = time.time()
         scan = self._state.active_scan
         self._last_decision = decision

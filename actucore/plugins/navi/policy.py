@@ -1341,7 +1341,8 @@ def camera_odometry_inputs(config, state, depth, odom):
 
 def step(*, detections, depth, odom, config: Config, state: State,
          dt: float, control_period_s: float | None = None, command_dt_s: float | None = None,
-         command_interrupted: bool = False, dwa_admission_ms: int = 0, objects_ms: int = 0) -> Decision:
+         command_interrupted: bool = False, dwa_admission_ms: int = 0, objects_ms: int = 0,
+         dwa_time_left=None) -> Decision:
     depth, odom = camera_odometry_inputs(config, state, depth, odom)
     state.dwa_admission_ms = dwa_admission_ms
     state.dwa_odom = odom if config.local_controller == "dwa" else None
@@ -1361,7 +1362,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
     state.dwa_motion_guard = None
     state.decision_id += 1
     state.dwa_budget = (dwa.CandidateBudget(min(config.dwa_samples, dwa.MAX_SEARCH_CANDIDATES),
-                                          predictions=state.dwa_predictions)
+                                          predictions=state.dwa_predictions, time_left=dwa_time_left)
                         if config.local_controller == "dwa" else None)
     state.dwa_trace = dict(decision_id=state.decision_id, controller_requested=config.local_controller,
                            controller_used="legacy", eligible=False, branch=None, geometry_mode=None,
@@ -3554,6 +3555,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     limit = min(config.dwa_samples, dwa.MAX_SEARCH_CANDIDATES)
     if state.dwa_budget is None:
         state.dwa_budget = dwa.CandidateBudget(limit, predictions=state.dwa_predictions)
+    if state.dwa_budget.expired():
+        return unavailable("search_deadline")
     target = (None if visual or corner_only else local_path.target_in_grid(geometry, target_distance * math.cos(target_bearing),
                                                             target_distance * math.sin(target_bearing)))
     (floor_x, limit_x), _ = _local_velocity_limits(config, 1.)
@@ -4176,14 +4179,14 @@ def camera_route_command(route, occupied, config, target, nominal, previous, res
     for scale in (1., .75, .5, .25):
         tracked = dwa.track_route(route.points, nominal * scale, config.dwa_horizon_s,
                                   yaw_limits, body_origin=(0., 0.), lateral=config.use_lateral,
-                                  lookahead_m=lookahead)
+                                  lookahead_m=lookahead, yaw_floor=config.floor_wz_moving)
         if tracked is None:
             break
         command, room = tracked
         cx, cy, yaw = command
         (floor_y, max_y) = _local_velocity_limits(config, -1. if cy > 0. else 1.)[1]
         if (cx <= 0. or cx < floor_x or (cy and not floor_y <= abs(cy) <= max_y)
-                or (yaw and abs(yaw) < config.floor_wz_moving) or (require_turn and not (cy or yaw))):
+                or (yaw and not yaw_limits[0] <= yaw <= yaw_limits[1]) or (require_turn and not (cy or yaw))):
             continue
         if camera_arc_clear(geometry, config, occupied, target, command, previous, residual, age_s, admission,
                             route_room=room if target is None else None):

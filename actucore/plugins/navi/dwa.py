@@ -187,9 +187,13 @@ class CandidateBudget:
     remaining: int
     outcomes: dict = field(default_factory=dict)
     predictions: PredictionCache | None = None
+    time_left: Callable[[], float] | None = None
 
     def for_context(self, context):
         return self.outcomes.setdefault(context.key(), {})
+
+    def expired(self):
+        return self.time_left is not None and self.time_left() <= 0.
 
 
 def _predict(command, measured, *, horizon, dt, acceleration, braking, stop):
@@ -389,7 +393,7 @@ def remaining_route_length(points, *, segments=None):
     return segments[-1].walked + segments[-1].length - max(0., progress)
 
 
-def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None):
+def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None, yaw_floor=0.):
     """Track the finite visible polyline in the current forward/right grid."""
     segments = _route_segments(points)
     remaining = remaining_route_length(points, segments=segments)
@@ -409,8 +413,11 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
         # Preserve the requested curvature at a tight bend when yaw saturates.
         yaw_cap = -yaw_limit[0] if r > 0. else yaw_limit[1]
         speed = min(speed, yaw_cap * (f * f + r * r) / (2. * abs(r)))
-    command = _preferred_command(((0., 0.), (f, r)), speed, horizon, yaw_limit, differential=not lateral)
-    return command, remaining
+    vx, vy, wz = _preferred_command(((0., 0.), (f, r)), speed, horizon, yaw_limit, differential=not lateral)
+    if 0. < abs(wz) < yaw_floor:
+        # Quantize before the caller sweeps the actual executable twist.
+        wz = math.copysign(yaw_floor, wz) if abs(wz) >= yaw_floor / 2 else 0.
+    return (vx, vy, wz), remaining
 
 
 def _obstacle_score(check):
@@ -550,6 +557,9 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                       for ref in references)
 
     budget = candidate_budget if candidate_budget is not None else CandidateBudget(max_candidates)
+    if budget.expired():
+        diag["reason"] = "search_deadline"
+        return None
     slots = min(budget.remaining, max_candidates)
     # Only reserve work for an abrupt release of an ongoing turn. Smaller
     # tracking corrections already use the regular route score and Driver ramp.
@@ -562,7 +572,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                             terminal_boundary, motion_frame, measured_target)
 
     def interpolate(choice, room=math.inf):
-        if not transition_slot or choice is None or not any(choice.command[:2]):
+        if not transition_slot or choice is None or not any(choice.command[:2]) or budget.expired():
             return choice
         vx, vy, wz = choice.command
         delta = wz - previous[2]
@@ -604,8 +614,11 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         lookahead = max(.45, x_speed * horizon)
         segments = _route_segments(points)
         for scale in (1., .75, .5)[:min(slots, 3 - int(transition_slot))]:
+            if budget.expired():
+                break
             tracked = track_route(points, x_speed * scale, horizon, yaw_limit,
-                                  body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead)
+                                  body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
+                                  yaw_floor=floors[3])
             if tracked is None:
                 break
             command, room = tracked
@@ -618,6 +631,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             if prediction.body_travel_m + prediction.delay_travel_error > room - route_error:
                 rejected["insufficient_room"] = rejected.get("insufficient_room", 0) + 1
                 continue
+            if budget.expired():
+                break
             diag["physical_evaluations"] += 1
             check = context.evaluate(prediction)
             if not check.accepted:
@@ -638,7 +653,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             choice = Choice(command, poses[:prediction.moving_count], components.total, progress,
                             check.min_clearance_m, prediction, check, components)
             return interpolate(choice, room - route_error)
-        diag["reason"] = "no_admissible_candidates"
+        diag["reason"] = "search_deadline" if budget.expired() else "no_admissible_candidates"
         return None
     outcomes = budget.for_context(context)
     straight = (x_speed, 0., 0.)
@@ -679,6 +694,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     def admissible(cmd):
         prediction, check = outcomes[cmd]
         if check is None:
+            if budget.expired():
+                return None
             check = context.evaluate(prediction)
             outcomes[cmd] = prediction, check
             diag["physical_evaluations"] += 1
@@ -702,6 +719,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     entries = []
     straight_check = None
     for ordinal, cmd in enumerate(commands()):
+        if budget.expired():
+            break
         if cmd in outcomes:
             prediction, check = outcomes[cmd]
             diag["cached_candidates"] += 1
@@ -740,16 +759,19 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         retaining_speed = try_handoff and cmd == handoff
         capped_straight = (ordinal == 0 and straight_reference and cmd == straight
                            and (continuing or (not any(previous) and x_speed == nominal)))
-        if (retaining_speed or capped_straight) and scores and scores[0][2] == 0:
+        early_translation = budget.time_left is not None and any(cmd[:2]) and not retaining_speed
+        if scores and ((retaining_speed or capped_straight) and scores[0][2] == 0 or early_translation):
             checked = admissible(cmd)
             if checked is None:
                 continue
             prediction, check, poses = checked
-            if not retaining_speed:
+            if capped_straight:
                 straight_check = checked
-            if _obstacle_score(check) == 0. and (not retaining_speed or all(
-                    0. <= f <= route[-1][0] and abs(r) <= local_path.RESOLUTION / 2 for f, r, _ in poses)):
-                components, progress, index = scores[0]
+            obstacle = _obstacle_score(check)
+            if early_translation or (obstacle == 0. and (not retaining_speed or all(
+                    0. <= f <= route[-1][0] and abs(r) <= local_path.RESOLUTION / 2 for f, r, _ in poses))):
+                components, progress, index = min(scores, key=lambda item: item[0].total) if early_translation else scores[0]
+                components = replace(components, obstacle=obstacle)
                 diag.update(admissible_candidates=1, reference_scores=sum(scores_by_reference),
                             scores_by_reference=scores_by_reference, reason=None)
                 choice = Choice(cmd, poses[:prediction.moving_count], components.total, progress,
@@ -761,7 +783,10 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         entries.append((lower, ordinal, cmd, scores, rejection))
 
     if not diag["considered_candidates"]:
-        diag["reason"] = "sample_budget_exhausted" if slots == 0 else "no_legal_commands"
+        if budget.expired():
+            diag["reason"] = "search_deadline"
+        else:
+            diag["reason"] = "sample_budget_exhausted" if slots == 0 else "no_legal_commands"
         return None
 
     # Collision cost is nonnegative. With the original tie order included,
@@ -778,6 +803,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     best_key = None
     retained = None
     for position, entry in enumerate(entries):
+        if budget.expired():
+            break
         _, ordinal, cmd, scores, rejection = entry
         if bounded and best_key is not None and ranking_bound(entry) >= best_key:
             diag["bound_skips"] += len(entries) - position
@@ -812,5 +839,6 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         best = retained
     diag["reference_scores"] = sum(scores_by_reference)
     diag["scores_by_reference"] = scores_by_reference
-    diag["reason"] = None if best is not None else "no_admissible_candidates"
+    diag["reason"] = None if best is not None else (
+        "search_deadline" if budget.expired() else "no_admissible_candidates")
     return interpolate(best)

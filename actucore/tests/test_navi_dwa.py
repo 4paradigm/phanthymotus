@@ -71,6 +71,43 @@ def test_command_deadband_not_lifted_after_collision_check():
     assert wz == 0. or abs(wz) >= .04
 
 
+@pytest.mark.parametrize("right,yaw", [(.02, 0.), (.06, -.08), (-.06, .08)])
+def test_retained_route_sweeps_an_executable_yaw_when_pursuit_falls_below_the_floor(right, yaw):
+    choice = _run(((0., 0.), (1.6, right)), follow_published=True,
+                  floors=(.12, .08, .3, .08))
+
+    assert choice is not None and choice.check.accepted
+    assert choice.command == pytest.approx((.5, 0., yaw))
+    assert choice.check.reason is None
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_short_window_checks_the_preferred_motion_before_fanning_out(monkeypatch, blocked):
+    previous = (.2, 0., -.12)
+    remaining = [.07]
+    budget = dwa.CandidateBudget(64, time_left=lambda: remaining[0])
+    evaluate = dwa.MotionContext.evaluate
+
+    def finish_one_sweep(context, prediction):
+        checked = evaluate(context, prediction)
+        remaining[0] = -.001
+        return checked
+
+    monkeypatch.setattr(dwa.MotionContext, "evaluate", finish_one_sweep)
+    diagnostics = {}
+    choice = _run(((0., 0.), (.5, .10), (1.4, .20)), previous=previous,
+                  grid=_grid(obstacles=[(.35, 0.)] if blocked else []),
+                  candidate_budget=budget, diagnostics=diagnostics)
+
+    assert diagnostics["sampled_candidates"] == diagnostics["physical_evaluations"] == 1
+    if blocked:
+        assert choice is None
+        assert diagnostics["rejected"]["footprint_collision"] == 1
+    else:
+        assert choice is not None and choice.check.accepted
+        assert choice.command == previous
+
+
 def test_missing_feedback_and_invalid_route_do_not_start_dwa():
     assert _run(((0.,0.),(.4,0.)), measured=None) is None
     assert _run(((0.,0.),)) is None

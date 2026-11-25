@@ -1931,6 +1931,29 @@ def test_first_send_cannot_renew_superseded_evidence(monkeypatch, change):
     assert reason and checked is None
 
 
+@pytest.mark.parametrize("depth_age_ms,short_window", [(700, False), (850, True), (1000, False)])
+def test_only_a_usable_short_depth_window_bounds_dwa_search(monkeypatch, depth_age_ms, short_window):
+    card, _, clock, snapshot = observation_card(monkeypatch, live_target=True)
+    card._descriptor["rate"]["max_obs_age_ms"] = 1000
+    card._config.max_depth_age_ms = 1200
+    advance_snapshot(snapshot, clock, 1500)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = (objects, dict(depth, capture_ms=1500 - depth_age_ms), odom, 1500)
+
+    def step(**kwargs):
+        time_left = kwargs["dwa_time_left"]
+        if short_window:
+            assert time_left() == pytest.approx(.125)
+            clock[0] += 125
+            assert time_left() == pytest.approx(0.)
+        else:
+            assert time_left is None
+        return policy.Decision(None, policy.SEARCHING)
+
+    monkeypatch.setattr(policy, "step", step)
+    assert card.next_command() is None
+
+
 @pytest.mark.parametrize("update", ["new_depth", "obstacle", "unchanged"])
 def test_route_expiring_during_planning_rechecks_only_fresh_inputs(monkeypatch, update):
     card, packets, clock, snapshot = observation_card(monkeypatch, live_target=True)
