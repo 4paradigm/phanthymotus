@@ -45,6 +45,19 @@ class _FakeModel:
         return [self._output], LetterboxMeta(1.0, 0, 0, w, h)
 
 
+class _FakeDenseModel(_FakeModel):
+    """B6 output plus the metadata stored in its TensorRT engine header."""
+
+    metadata = {"detection_layout": "yolo_dense_v1", "num_classes": 220,
+                "nms_iou": .7, "max_det": 300}
+
+    def __init__(self):
+        super().__init__()
+        self._output = np.zeros((1, 224, 8400), dtype=np.float32)
+        self._output[0, :4, :2] = [[150, 150], [25, 25], [100, 100], [50, 50]]
+        self._output[0, 5, :2] = [.9, .8]
+
+
 def _plugin(cfg=None, model=None):
     executor = _FakeExecutor()
     plugin = vop_plugin.VideoObjectPerceptionPlugin(cfg or {}, "testns", executor)
@@ -57,12 +70,15 @@ def _plugin(cfg=None, model=None):
 # ── model name aliasing ──────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("configured,expected", [
-    ("yolov8s-worldv2", "yoloe-26s-seg"),
-    ("yolov8s-worldv2.pt", "yoloe-26s-seg"),
-    ("yolov8s-world", "yoloe-26s-seg"),
-    ("yoloe-26s", "yoloe-26s-seg"),
-    ("yoloe-26s-seg", "yoloe-26s-seg"),
-    ("", "yoloe-26s-seg"),
+    ("yolov8s-worldv2", "yoloe-26m-det"),
+    ("yolov8s-worldv2.pt", "yoloe-26m-det"),
+    ("yolov8s-world", "yoloe-26m-det"),
+    ("yoloe-26s", "yoloe-26m-det"),
+    ("yoloe-26s-seg", "yoloe-26m-det"),
+    ("yoloe-26m", "yoloe-26m-det"),
+    ("yoloe-26m-seg", "yoloe-26m-det"),
+    ("yoloe-26m-det", "yoloe-26m-det"),
+    ("", "yoloe-26m-det"),
 ])
 def test_legacy_model_names_still_resolve(configured, expected):
     """A card saved before the model switch must not become state: error."""
@@ -412,6 +428,29 @@ def test_recognize_by_photo_honours_a_per_call_confidence(tmp_path):
     assert loose["count"] == 1
     assert strict["count"] == 0
     assert strict["confidence_threshold"] == 0.8
+
+
+@pytest.mark.parametrize("delivery", ["photo", "stream"])
+def test_b6_engine_metadata_reaches_the_decoder(tmp_path, delivery):
+    plugin, executor = _photo_plugin(tmp_path, confidence=.35)
+    plugin._model = _FakeDenseModel()
+    if delivery == "photo":
+        payload = plugin.dispatch("vop", {
+            "action": "recognize_by_photo", "image_path": _write_frame(tmp_path),
+        })
+        assert payload["ok"] is True
+    else:
+        node = _node_with(plugin, executor)
+        try:
+            node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+            pub = node.publishers[0]
+            assert _wait_until(lambda: bool(pub.messages))
+            payload = json.loads(pub.messages[0])
+        finally:
+            plugin.dispatch("vop", {"action": "stop"})
+    assert len(payload["objects"]) == 1
+    assert payload["objects"][0]["name"] == "door"
+    assert payload["objects"][0]["bbox"] == [100.0, 0.0, 200.0, 50.0]
 
 
 def test_recognize_by_photo_falls_back_to_the_card_confidence(tmp_path):
