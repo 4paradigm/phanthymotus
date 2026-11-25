@@ -1,0 +1,6 @@
+# Standalone API and native interactive simulation. The GPU image installs the
+# pinned upstream repositories, which select their compatible MuJoCo version.
+numpy>=2.0,<3
+mujoco>=3.3.7,<4
+onnxruntime>=1.23,<2
+Pillow>=11,<13

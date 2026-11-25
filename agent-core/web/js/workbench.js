@@ -32,6 +32,81 @@ async function invoke(target, args) {
   return parsed;
 }
 
+// A workbench may edit its own declared shared string settings through the
+// existing Canvas store. Saved credentials stay in this host, never the iframe.
+async function configureTool(target, spec, args) {
+  if (!Array.isArray(spec.config) || !spec.config.length || !spec.actions.includes('config'))
+    throw new Error('工作台未声明配置能力');
+  if (!args || typeof args !== 'object' || Array.isArray(args) ||
+      Object.keys(args).some(key => key !== 'values')) throw new Error('无效配置请求');
+  const tools = await api(`/api/mcp/${encodeURIComponent(target.mcp)}/tools`);
+  const tool = (Array.isArray(tools) ? tools : tools.tools || []).find(item => item.name === target.tool);
+  const props = tool?.configSchema?.properties || {};
+  const fields = [...new Set(spec.config)].filter(key => typeof key === 'string' &&
+    Object.hasOwn(props, key) && props[key].scope !== 'instance' && props[key].type === 'string');
+  const sensitive = key => props[key]['x-sensitive'] || props[key].format === 'password';
+  const path = `/api/canvas/tool-config/${encodeURIComponent(target.mcp)}/${encodeURIComponent(target.tool)}`;
+  const saved = await api(path) || {};
+  const sharedTarget = {...target, instanceId: ''};
+  const state = await invoke(sharedTarget, {action: 'info'});
+  if (!Object.hasOwn(args, 'values')) {
+    const values = {}, secret_set = {}, runtime_secret_set = {};
+    for (const key of fields) {
+      if (sensitive(key)) {
+        secret_set[key] = !!saved[key];
+        runtime_secret_set[key] = state.config_secrets?.[key] === true;
+      } else values[key] = saved[key] ?? state.config_values?.[key] ?? props[key].default ?? '';
+    }
+    return {values, secret_set, runtime_secret_set};
+  }
+  const values = args.values;
+  if (!values || typeof values !== 'object' || Array.isArray(values) ||
+      Object.entries(values).some(([key, value]) => !fields.includes(key) || typeof value !== 'string' ||
+        (props[key].enum && !props[key].enum.includes(value)))) throw new Error('配置字段或值无效');
+  const {ensureEdit, isProjectRunning} = await import('./canvas.js');
+  if (isProjectRunning()) throw new Error('请先停止项目，再修改配置');
+  if (!(await ensureEdit())) throw new Error('请先取得画布编辑权');
+  if (state.busy) throw new Error('请等待当前操作完成，再修改配置');
+  const merged = {...saved, ...values};
+  const apply = async config => {
+    const result = await invoke(sharedTarget, {action: 'config',
+      ...Object.fromEntries(fields.filter(key => Object.hasOwn(config, key)).map(key => [key, config[key]]))});
+    if (result.state === 'error' || result.adapter_ok === false)
+      throw new Error(result.message || '配置未通过检查');
+  };
+  await apply(merged); // Invalid or unsafe connections must never be persisted.
+  try {
+    const response = await fetch(path, {method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(merged)});
+    const result = await response.json();
+    if (!response.ok || result.code !== 200) throw new Error('保存失败');
+  } catch {
+    // A lost PUT response may follow a committed write. Read it back before
+    // reporting failure or rolling back a connection that was actually saved.
+    let observed;
+    try { observed = await api(path) || {}; }
+    catch { throw new Error('连接已应用，但无法确认保存结果，请重试保存'); }
+    const same = (a, b) => Object.keys(a).length === Object.keys(b).length &&
+      Object.entries(a).every(([key, value]) => Object.hasOwn(b, key) && JSON.stringify(b[key]) === JSON.stringify(value));
+    if (!same(observed, merged)) {
+      // Environment-only credentials cannot be recovered from public info.
+      // Roll back only a complete saved configuration matching the old state,
+      // and only if another writer has not changed the Canvas row meanwhile.
+      const complete = fields.length && fields.every(key => typeof saved[key] === 'string' &&
+        (sensitive(key) ? state.config_secrets?.[key] === !!saved[key] : state.config_values?.[key] === saved[key]));
+      if (same(observed, saved) && complete) {
+        try { await apply(saved); }
+        catch { throw new Error('连接已应用但保存失败，恢复原连接也未成功，请重试保存'); }
+        throw new Error('保存失败，已恢复原连接，请重试保存');
+      }
+      throw new Error('连接已应用但保存失败，请重试保存');
+    }
+  }
+  const {getToolConfigs} = await import('./sidebar.js');
+  getToolConfigs()[`${target.mcp}:${target.tool}`] = merged;
+  return {saved: true};
+}
+
 /**
  * 不经过画布，直接打开一个工具的运维页。
  *
@@ -133,11 +208,18 @@ export async function openWorkbench(target, spec, ui, onClose) {
         if (request.method === 'context') {
           reply.postMessage({id: request.id, result: await conversationContext(target)}); return;
         }
+        if (request.method === 'config') {
+          if (busy) throw new Error('上一项操作尚未完成');
+          mutation = busy = true;
+          reply.postMessage({id: request.id, result: await configureTool(target, spec, request.args || {})}); return;
+        }
         if (!['call', 'save'].includes(request.method)) throw new Error('不支持的工作台请求');
         const args = request.args;
         if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('无效参数');
         const action = request.method === 'save' ? 'save' : args.action;
         if (!spec.actions.includes(action)) throw new Error('此工作台未声明该操作');
+        if (request.method === 'call' && action === 'config' && Array.isArray(spec.config))
+          throw new Error('请使用工作台配置接口');
         if (request.method === 'call' && action === 'save') throw new Error('请使用技能保存接口');
         if (request.method === 'save' && spec.kind !== 'skill-authoring') throw new Error('此工作台未声明技能保存能力');
         const isMutation = !['info', 'check', 'inspect', 'stop'].includes(action);

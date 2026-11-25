@@ -20,10 +20,17 @@ actucore:
   volumes:
     - /dev:/dev
     - /opt/embodied/models:/models
+    # Private environment references and session bindings survive container replacement.
+    - ${MOTION_STATE_HOST_DIR:-/opt/embodied/motion-workbench}:/var/lib/phanthymotus/motion
     # DDS profile 只读挂载。必须与其它 DDS 容器加载同一份，
     # 否则本容器会与本机其余部分失联。
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
+    - MOTION_SERVICE_URL=${MOTION_SERVICE_URL:-}
+    - MOTION_API_TOKEN=${MOTION_API_TOKEN:-}
+    - MOTION_ENVIRONMENT_URL=${MOTION_ENVIRONMENT_URL:-}
+    - MOTION_ENVIRONMENT_TOKEN=${MOTION_ENVIRONMENT_TOKEN:-}
+    - MOTION_WORKBENCH_STATE_DIR=/var/lib/phanthymotus/motion
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
