@@ -42,6 +42,7 @@ function loadModelSandbox() {
   };
   const method = runInNewContext(`({ ${methodSource('_loadModel')} })`, context)._loadModel;
   const renderer = {
+    _setModelStatus() {},
     _parseAndBuild(urdf) { this.urdf = urdf; },
     _buildFallbackSkeleton() { this.fallback = true; },
     _buildQuadrupedSkeleton() { this.quadruped = true; },
