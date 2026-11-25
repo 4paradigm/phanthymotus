@@ -28,7 +28,17 @@ export const KvLatestRenderer = {
       // Same second-layer decode the log view does: a field holding a JSON
       // string becomes the object it encodes, so its fields get their own
       // cells instead of one cell full of escaped source text.
-      const flat = _flatten(decodeNestedJson(json));
+      const decoded = decodeNestedJson(json);
+      const flat = _flatten(decoded);
+      for (const key of Object.keys(this._cells)) {
+        // An explicitly replaced parent also replaces its flattened children.
+        const parent = key.split('.')[0];
+        if (key.includes('.') && Object.prototype.hasOwnProperty.call(decoded, parent)
+            && !Object.prototype.hasOwnProperty.call(flat, key)) {
+          this._cells[key].el.remove();
+          delete this._cells[key];
+        }
+      }
       for (const [key, value] of Object.entries(flat)) {
         this._updateCell(key, value);
       }
