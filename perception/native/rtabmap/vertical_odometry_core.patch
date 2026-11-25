@@ -1,0 +1,27 @@
+--- a/corelib/src/Rtabmap.cpp
++++ b/corelib/src/Rtabmap.cpp
+@@ -1681,6 +1681,24 @@
+ 		else
+ 		{
+ 			newPose = _mapCorrection * signature->getPose();
++			const auto & links = signature->getLinks();
++			if(_memory->isIncremental() && !_optimizeFromGraphEnd && !_graphOptimizer->isSlam2d() &&
++			   !rehearsedId && externalStats.count("Motus/GravityAlignedOdometry/") &&
++			   !links.empty() && links.begin()->second.type() == Link::kNeighbor)
++			{
++				const int previousId = links.begin()->second.to();
++				const auto anchor = _optimizedPoses.find(previousId);
++				if(anchor != _optimizedPoses.end())
++				{
++					const Signature * previous = _memory->getSignature(previousId);
++					UASSERT(previous != 0);
++					// Keep the optimized anchor height and propagate the measured vertical
++					// increment without rotating horizontal odometry into map z.
++					const float z = anchor->second.z() + (signature->getPose().z() - previous->getPose().z());
++					_mapCorrection.data()[11] += z - newPose.z();
++					newPose.data()[11] = z;
++				}
++			}
+ 		}
+ 
+ 		// Get statistics about the closest node in the graph

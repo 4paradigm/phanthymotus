@@ -81,7 +81,8 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     },
   };
   const api = runInNewContext(
-    (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
+    code('_withSlamRgbInput') + code('_removeRetiredDepthInputs')
+    + (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
     + (revalidate ? code('_inputTopicsFor') + code('_revalidateDerivedTopics') : '')
     + code('_parseMcpCallResult') + code('_fetchTopicsFromDriver') + code('_refreshConfiguredTopics')
     + code('updateCanvasMcps') + code('_resolveAllTopics') + code('_addCard') + code('_saveLayout') + code('_writeLayout') + code('_reloadLayout')
@@ -285,4 +286,115 @@ test('restored processors revalidate saved output provenance once per page', asy
   p.resolve();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(reads, 1, 'successful same-input verification stays cached');
+});
+
+
+function slamMetadata(withRgb = true) {
+  return [{ id: 'robot', tools: [{ name: 'pointcloud_slam', type: 'processor', multiInstance: false,
+    topic_in: [{ format: 'state/odom' }, { format: 'sensor/pointcloud2' },
+      ...(withRgb ? [{ format: 'image/jpeg', optional: true }] : [])],
+    topic_out: [{ topic: '/pointcloud_slam/map', format: 'sensor/mapping' }] }] }];
+}
+const slamInputs = [
+  { topic: '/tracking/odom', format: 'state/odom' },
+  { topic: '/measured/cloud', format: 'sensor/pointcloud2' },
+];
+const inputPorts = card => Array.from(card.el.querySelectorAll('.canvas-port.in'));
+
+test('restored VO and pointcloud cards drop retired float depth ports and retain zlib wiring', async () => {
+  const zlib = { format: 'image/depth-zlib' };
+  const raw = { format: 'image/depth-f32' };
+  const compressed = { format: 'image/depth-f32-zlib' };
+  const voInputs = [{ format: 'image/jpeg' }, zlib, { format: 'sensor/imu' }, { format: 'state/odom' }];
+  const metadata = [{ id: 'robot', tools: [
+    { name: 'pointcloud', multiInstance: true, topic_in: [zlib] },
+    { name: 'rgbd_odometry', multiInstance: true, topic_in: voInputs },
+  ] }];
+  const depthWire = { id: 'depth', fromCardId: 'camera', fromPortIdx: '0', toCardId: 'cloud', toPortIdx: '0' };
+  const retiredWire = { ...depthWire, id: 'float', fromPortIdx: '1', toPortIdx: '1' };
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [depthWire, retiredWire],
+    { dom: true, metadata });
+  p.add({ id: 'camera', mcpId: 'robot', toolName: 'camera', topicOut: [
+    { ...zlib, topic: '/camera/depth' }, { ...raw, topic: '/camera/float_depth' },
+  ] }, false);
+  p.add({ id: 'cloud', mcpId: 'robot', toolName: 'pointcloud', topicIn: [zlib, raw, compressed] }, false);
+  p.add({ id: 'vo', mcpId: 'robot', toolName: 'rgbd_odometry', topicIn: [...voInputs, compressed] }, false);
+
+  await p.save();
+  await p.reload();
+  const [, cloud, vo] = p.cards();
+  assert.deepEqual(inputPorts(cloud).map(port => port.dataset.format), [zlib.format]);
+  assert.deepEqual(inputPorts(vo).map(port => port.dataset.format), voInputs.map(port => port.format));
+  assert.equal(inputPorts(cloud)[0].dataset.topic, '/camera/depth');
+  await p.save();
+  assert.deepEqual(p.persisted().connections.map(wire => wire.id), [depthWire.id]);
+});
+
+test('restored SLAM inputs append the optional RGB port and retain saved required wire indices', async () => {
+  const metadata = slamMetadata();
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [],
+    { dom: true, metadata });
+  p.add({ id: 'slam', mcpId: 'robot', toolName: 'pointcloud_slam', topicIn: [...slamInputs] }, false);
+  const c = p.cards()[0];
+  assert.deepEqual(inputPorts(c).map(port => [port.dataset.idx, port.dataset.format, port.dataset.topic]), [
+    ['0', 'state/odom', '/tracking/odom'], ['1', 'sensor/pointcloud2', '/measured/cloud'],
+    ['2', 'image/jpeg', ''],
+  ]);
+  await p.save();
+  assert.deepEqual(p.persisted().cards[0].topicIn, [
+    ...slamInputs, { format: 'image/jpeg', optional: true },
+  ]);
+});
+
+test('metadata polling adds the optional RGB port to an existing saved SLAM card', () => {
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [],
+    { dom: true, metadata: slamMetadata(false) });
+  p.add({ id: 'slam', mcpId: 'robot', toolName: 'pointcloud_slam', topicIn: [...slamInputs] }, false);
+  assert.equal(inputPorts(p.cards()[0]).length, 2);
+  p.poll(slamMetadata());
+  assert.deepEqual(inputPorts(p.cards()[0]).map(port => port.dataset.format),
+    ['state/odom', 'sensor/pointcloud2', 'image/jpeg']);
+});
+
+test('configured RGB input survives saved-card restoration and metadata/config refresh without duplicates', async () => {
+  const metadata = slamMetadata();
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 200,
+    data: { topic_out: metadata[0].tools[0].topic_out } }) }), [], { dom: true, metadata });
+  p.add({ id: 'slam', mcpId: 'robot', toolName: 'pointcloud_slam', topicIn: [
+    ...slamInputs, { topic: '/connected/color', format: 'image/jpeg' },
+  ] }, false);
+  p.poll(metadata);
+  await p.config({ mcp_id: 'robot', tool: 'pointcloud_slam' });
+  assert.deepEqual(Array.from(p.cards()[0].topicIn, port => [port.format, port.topic]), [
+    ['state/odom', '/tracking/odom'], ['sensor/pointcloud2', '/measured/cloud'],
+    ['image/jpeg', '/connected/color'],
+  ]);
+  assert.equal(inputPorts(p.cards()[0]).length, 3);
+});
+
+test('SLAM input migration leaves unrelated saved cards unchanged', () => {
+  const metadata = slamMetadata();
+  metadata[0].tools[0].name = 'unrelated_processor';
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [],
+    { dom: true, metadata });
+  p.add({ id: 'other', mcpId: 'robot', toolName: 'unrelated_processor', topicIn: [...slamInputs] }, false);
+  p.poll(metadata);
+  assert.deepEqual(inputPorts(p.cards()[0]).map(port => port.dataset.format),
+    ['state/odom', 'sensor/pointcloud2']);
+  assert.equal(p.cards()[0].topicIn.length, 2);
+});
+
+test('schema-declared SLAM consumers migrate only the optional JPEG input', () => {
+  const metadata = slamMetadata();
+  const tool = metadata[0].tools[0];
+  tool.name = 'renamed_mapper';
+  tool.inputSchema = { 'x-slam-input-contract': 'motus.slam_input/1' };
+  tool.topic_in.push({ format: 'text', optional: true });
+  const p = refreshHarness([], async () => ({ json: async () => ({ code: 503 }) }), [],
+    { dom: true, metadata });
+  p.add({ id: 'slam', mcpId: 'robot', toolName: tool.name, topicIn: [...slamInputs] }, false);
+  p.poll(metadata);
+  assert.deepEqual(inputPorts(p.cards()[0]).map(port => port.dataset.format),
+    ['state/odom', 'sensor/pointcloud2', 'image/jpeg']);
+  assert.equal(p.cards()[0].topicIn.length, 3);
 });

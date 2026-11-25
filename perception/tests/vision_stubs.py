@@ -61,11 +61,15 @@ class _FakeNode:
         self._name = name
         self.publishers = []
         self.subscriptions = []
+        self._topic_types = {}
         self.destroyed = False
         _FakeNode.instances.append(self)
 
     def get_name(self):
         return self._name
+
+    def get_namespace(self):
+        return '/'
 
     def create_publisher(self, msg_type, topic, qos):
         publisher = _FakePublisher(topic)
@@ -76,6 +80,10 @@ class _FakeNode:
         subscription = _FakeSubscription(topic, callback, qos)
         self.subscriptions.append(subscription)
         return subscription
+
+    def get_publishers_info_by_topic(self, topic):
+        return [types.SimpleNamespace(topic_type=kind)
+                for kind in self._topic_types.get(topic, [])]
 
     def destroy_subscription(self, subscription):
         # Plugins drop the subscription on stop() and recreate it on the next
@@ -88,6 +96,14 @@ class _FakeNode:
 
     def get_clock(self):
         return _FakeClock()
+
+    def create_timer(self, interval, callback):
+        timer = types.SimpleNamespace(interval=interval, callback=callback, cancelled=False)
+        timer.cancel = lambda: setattr(timer, 'cancelled', True)
+        return timer
+
+    def destroy_timer(self, timer):
+        timer.cancel()
 
 
 class _FakeClock:
@@ -108,20 +124,38 @@ class _FakeExecutor:
     def remove_node(self, node):
         self.nodes.remove(node)
 
+    def spin(self):
+        pass
+
+    def shutdown(self, timeout_sec=None):
+        pass
+
 
 class _FakeString:
     def __init__(self):
         self.data = ""
 
 
+class _FakeUInt8MultiArray:
+    """Stands in for std_msgs.msg.UInt8MultiArray (pointcloud binary packets)."""
+
+    def __init__(self):
+        self.data = b""
+
+
 class _FakeHeader:
     """`stamp` is the only field anything here sets, but the attribute has to
     exist: a publisher that stamps its outgoing frames (pose's overlay) would
     otherwise fail inside its own try/except and publish nothing, which looks
-    like a disabled feature rather than a missing stub."""
+    like a disabled feature rather than a missing stub.
+
+    `stamp` defaults to None so a consumer can tell "publisher did not stamp
+    this" from "stamped at time 0"; stereo pair selection relies on that
+    distinction (it falls back to arrival time only for unstamped frames)."""
+    _UNSET = object()
 
     def __init__(self):
-        self.stamp = 0
+        self.stamp = None
         self.frame_id = ""
 
 
@@ -133,6 +167,31 @@ class _FakeCompressedImage:
         self.data = data
         self.format = fmt
         self.header = _FakeHeader()
+
+
+class _FakeImage:
+    """Stands in for sensor_msgs.msg.Image (raw, e.g. 16UC1 depth)."""
+
+    def __init__(self, data=b"", encoding="", width=0, height=0, step=0, is_bigendian=0):
+        self.data = data
+        self.encoding = encoding
+        self.width = width
+        self.height = height
+        self.step = step
+        self.is_bigendian = is_bigendian
+        self.header = _FakeHeader()
+
+
+class _FakePointCloud2:
+    def __init__(self):
+        self.header = _FakeHeader()
+
+
+class _FakePointField:
+    FLOAT32 = 7
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 class _FakeAudioChunk:
@@ -178,9 +237,13 @@ def _install_fake_ros():
     sensor_msgs = types.ModuleType("sensor_msgs")
     sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
     sensor_msgs_msg.CompressedImage = _FakeCompressedImage
+    sensor_msgs_msg.Image = _FakeImage
+    sensor_msgs_msg.PointCloud2 = _FakePointCloud2
+    sensor_msgs_msg.PointField = _FakePointField
     std_msgs = types.ModuleType("std_msgs")
     std_msgs_msg = types.ModuleType("std_msgs.msg")
     std_msgs_msg.String = _FakeString
+    std_msgs_msg.UInt8MultiArray = _FakeUInt8MultiArray
     audio_msgs = types.ModuleType("audio_msgs")
     audio_msgs_msg = types.ModuleType("audio_msgs.msg")
     audio_msgs_msg.AudioChunk = _FakeAudioChunk

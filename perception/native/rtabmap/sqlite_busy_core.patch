@@ -1,0 +1,10 @@
+--- a/corelib/src/DBDriverSqlite3.cpp
++++ b/corelib/src/DBDriverSqlite3.cpp
+@@ -368,4 +368,7 @@
+ 		return false;
+ 	}
++
++	// A briefly contended rollback journal must not abort the native writer.
++	sqlite3_busy_timeout(_ppDb, 5000);
+ 
+ 	if(_dbInMemory && dbFileExist)

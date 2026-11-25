@@ -476,6 +476,7 @@ export async function initCanvas(initialMcps) {
     _execConnections = (layoutJson.data?.execConnections || []).filter(
       c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId)
     );
+    updateCanvasMcps(_allMcps);
     _resolveAllTopics();
     _scheduleRedraw();
 
@@ -584,6 +585,37 @@ export async function initCanvas(initialMcps) {
   _syncEmptyState();
 }
 
+function _withSlamRgbInput(topics, declarations, tool) {
+  const ports = topics || [];
+  if (tool?.inputSchema?.['x-slam-input-contract'] !== 'motus.slam_input/1' &&
+      tool?.name !== 'pointcloud_slam') return ports;
+  // Expose RGB on older SLAM cards without changing saved topics or wire indices.
+  const missing = (declarations || []).filter(port => port.optional && port.format === 'image/jpeg' &&
+    !ports.some(saved => saved.format === port.format));
+  return missing.length ? [...ports, ...missing] : ports;
+}
+
+function _removeRetiredDepthInputs(card, declarations) {
+  if (!['pointcloud', 'rgbd_odometry'].includes(card.toolName) || !card.topicIn?.length ||
+      !declarations?.some(port => port.format === 'image/depth-zlib')) return false;
+  const formats = new Set(declarations.map(port => port.format));
+  const previous = card.topicIn;
+  const retained = previous.filter(port => formats.has(port.format) ||
+    !['image/depth-f32', 'image/depth-f32-zlib'].includes(port.format));
+  if (retained.length === previous.length) return false;
+
+  // Keep each surviving wire on its original port after the saved list changes.
+  _connections = _connections.filter(conn => {
+    if (conn.toCardId !== card.id || !previous[conn.toPortIdx]) return true;
+    const index = retained.indexOf(previous[conn.toPortIdx]);
+    if (index < 0) return false;
+    if (index !== Number(conn.toPortIdx)) conn.toPortIdx = String(index);
+    return true;
+  });
+  card.topicIn = retained;
+  return true;
+}
+
 export function updateCanvasMcps(mcps) {
   _allMcps = mcps || [];
   // This runs on a 10s poll and can replace card elements wholesale. Doing that
@@ -608,6 +640,7 @@ export function updateCanvasMcps(mcps) {
     // Tool-schema-level data from pings must NOT overwrite instance-specific topics.
     const liveTopicIn  = typeof toolObj === 'object' ? toolObj.topic_in  : null;
     const liveTopicOut = typeof toolObj === 'object' ? toolObj.topic_out : null;
+    if (_removeRetiredDepthInputs(card, liveTopicIn)) topicsChanged = true;
     if (typeof toolObj === 'object' && toolObj.multiInstance) {
       // (skip topic update — fall through to configSchema check below)
     } else {
@@ -615,6 +648,8 @@ export function updateCanvasMcps(mcps) {
         // Don't overwrite dynamic instance topics with static empty-topic values from MCP tool definition
         if (liveTopicIn.some(t => t.topic) || !card.topicIn?.some(t => t.topic)) { card.topicIn  = liveTopicIn;  topicsChanged = true; }
       }
+      const mergedTopicIn = _withSlamRgbInput(card.topicIn, liveTopicIn, toolObj);
+      if (mergedTopicIn !== card.topicIn) { card.topicIn = mergedTopicIn; topicsChanged = true; }
       if (card.topicOutFrom === undefined && liveTopicOut && liveTopicOut.length && JSON.stringify(liveTopicOut) !== JSON.stringify(card.topicOut)) {
         if (liveTopicOut.some(t => t.topic) || !card.topicOut?.some(t => t.topic)) { card.topicOut = liveTopicOut; topicsChanged = true; }
       }
@@ -955,15 +990,14 @@ function _addCard(data, save = true) {
   // Restore or initialize persisted topic data
   let topicInData  = data.topicIn  || [];
   let topicOutData = data.topicOut || [];
-  if (!topicInData.length || !topicOutData.length) {
-    // Try to initialize from current MCP tool data (for newly dropped cards)
-    const _mcp = _allMcps.find(m => m.id === mcpId);
-    const _tools = _mcp?.tools || [];
-    const _toolObj = _tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
-    if (typeof _toolObj === 'object') {
-      if (!topicInData.length  && _toolObj.topic_in)  topicInData  = _toolObj.topic_in;
-      if (topicOutFrom === undefined && !topicOutData.length && _toolObj.topic_out) topicOutData = _toolObj.topic_out;
-    }
+  // Initialize new cards and append the RGB input absent from older SLAM layouts.
+  const _mcp = _allMcps.find(m => m.id === mcpId);
+  const _tools = _mcp?.tools || [];
+  const _toolObj = _tools.find(t => (typeof t === 'string' ? t : t.name) === toolName);
+  if (typeof _toolObj === 'object') {
+    if (!topicInData.length  && _toolObj.topic_in)  topicInData  = _toolObj.topic_in;
+    topicInData = _withSlamRgbInput(topicInData, _toolObj.topic_in, _toolObj);
+    if (topicOutFrom === undefined && !topicOutData.length && _toolObj.topic_out) topicOutData = _toolObj.topic_out;
   }
 
   const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData, topicOutFrom };
@@ -1132,7 +1166,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   const staticOutHasReal = toolTopicOut?.some(t => t.topic);
   const savedInHasReal = savedTopicIn?.some(t => t.topic);
   const staticInHasReal = toolTopicIn?.some(t => t.topic);
-  const topicIn  = (savedInHasReal  ? savedTopicIn  : null) || (staticInHasReal  ? toolTopicIn  : null) || (savedTopicIn?.length  ? savedTopicIn  : null) || (toolTopicIn?.length  ? toolTopicIn  : (toolType || isBundleMcp ? [] : mcp?.topic_in  || []));
+  const topicIn = _withSlamRgbInput((savedInHasReal ? savedTopicIn : null) || (staticInHasReal ? toolTopicIn : null) || (savedTopicIn?.length ? savedTopicIn : null) || (toolTopicIn?.length ? toolTopicIn : (toolType || isBundleMcp ? [] : mcp?.topic_in || [])), toolTopicIn, toolObj);
   const topicOut = topicOutFrom !== undefined ? (savedTopicOut || []) : (savedOutHasReal ? savedTopicOut : null) || (staticOutHasReal ? toolTopicOut : null) || (savedTopicOut?.length ? savedTopicOut : null) || (toolTopicOut?.length ? toolTopicOut : (toolType || isBundleMcp ? [] : mcp?.topic_out || []));
   const effectiveType = toolType || (topicIn.length && topicOut.length ? 'processor' : topicOut.length ? 'sensor' : topicIn.length ? 'actuator' : '');
 
@@ -2937,15 +2971,23 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 
 async function _executeCard(el, mcpId, toolName, instanceId) {
   const btn = el.querySelector('.canvas-exec-btn');
-  btn.disabled = true;
-  btn.textContent = '执行中…';
+  if (btn.disabled) return;
+
+  const mcp = _allMcps.find(m => m.id === mcpId);
+  const tool = mcp?.tools?.find(t => (typeof t === 'string' ? t : t.name) === toolName);
+  const schema = tool?.inputSchema;
+  const props = schema?.properties || {};
+  const action = el.querySelector('.canvas-field-input[data-key="action"]')?.value.trim();
+  const params = schema?.['x-action-params']?.[action]?.params;
 
   const args = {};
   el.querySelectorAll('.canvas-field-input').forEach(input => {
     const key = input.dataset.key;
+    if (Array.isArray(params) && key !== 'action' && !params.includes(key)) return;
     const val = input.value.trim();
     if (val !== '') {
       if (input.type === 'number') args[key] = Number(val);
+      else if (props[key]?.type === 'string') args[key] = val;
       else if (val === 'true') args[key] = true;
       else if (val === 'false') args[key] = false;
       else args[key] = val;
@@ -2958,11 +3000,8 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
   // Auto-inject resolved topics from connected ports (based on schema, not DOM fields)
   const inPorts = [...el.querySelectorAll('.canvas-port.in')];
   const outPorts = [...el.querySelectorAll('.canvas-port.out')];
-  const _mcp = _allMcps.find(m => m.id === mcpId);
-  const _toolObj = _mcp?.tools?.find(t => (typeof t === 'string' ? t : t.name) === toolName);
-  const _schemaProps = (typeof _toolObj === 'object' ? _toolObj.inputSchema : null)?.properties || {};
   let inIdx = 0, outIdx = 0;
-  for (const key of Object.keys(_schemaProps)) {
+  for (const key of Object.keys(props)) {
     if (args[key]) continue;
     if (/input.*topic|topic.*in/i.test(key) && inPorts[inIdx]) {
       const t = inPorts[inIdx++].dataset.topic;
@@ -2973,6 +3012,14 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     }
   }
 
+  const confirmation = schema?.['x-action-lifecycle']?.actions?.[action]?.confirm;
+  if (typeof confirmation === 'string' && confirmation) {
+    const target = (params || []).map(key => args[key]).filter(value => value != null);
+    if (!confirm([confirmation, ...target].join('\n'))) return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '执行中…';
   _logActivity('mcp_call', `${toolName} @ ${mcpId}`);
 
   try {
@@ -2984,7 +3031,7 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     const json = await res.json();
 
     if (json.code === 200) {
-      const spec = _toolObj?.inputSchema?.['x-workbench'];
+      const spec = schema?.['x-workbench'];
       if (spec?.protocol === 'motus.workbench/1' && args.action === spec.entry) {
         const { openWorkbench } = await import('./workbench.js');
         await openWorkbench({mcp: mcpId, tool: toolName, instanceId: instanceId || el.dataset.cardId},
@@ -3436,6 +3483,7 @@ async function _reloadLayout() {
     const cardIds = new Set(_cards.map(c => c.id));
     _connections = (layoutJson.data?.connections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
     _execConnections = (layoutJson.data?.execConnections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
+    updateCanvasMcps(_allMcps);
     _resolveAllTopics();
     _scheduleRedraw();
     _syncEmptyState();

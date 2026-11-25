@@ -1,0 +1,79 @@
+diff --git a/corelib/include/rtabmap/core/Parameters.h b/corelib/include/rtabmap/core/Parameters.h
+index 9ddc4f3..b71c1e4 100644
+--- a/corelib/include/rtabmap/core/Parameters.h
++++ b/corelib/include/rtabmap/core/Parameters.h
+@@ -726,6 +726,7 @@ class RTABMAP_CORE_EXPORT Parameters
+     RTABMAP_PARAM(Vis, CorFlowIterations,         int,   30,    uFormat("[%s=1] See cv::calcOpticalFlowPyrLK(). Used for optical flow approach.", kVisCorType().c_str()));
+     RTABMAP_PARAM(Vis, CorFlowEps,                float, 0.01,  uFormat("[%s=1] See cv::calcOpticalFlowPyrLK(). Used for optical flow approach.", kVisCorType().c_str()));
+     RTABMAP_PARAM(Vis, CorFlowMaxLevel,           int,   3,     uFormat("[%s=1] See cv::calcOpticalFlowPyrLK(). Used for optical flow approach.", kVisCorType().c_str()));
++    RTABMAP_PARAM(Vis, CorFlowPyramidWithGuess,     bool, false, "Use the configured optical-flow pyramid when tracking from a projected motion guess.");
+     RTABMAP_PARAM(Vis, CorFlowGpu,                bool,  false, uFormat("[%s=1] Enable GPU version of the optical flow approach (only available if OpenCV is built with CUDA).", kVisCorType().c_str()));
+ #if defined(RTABMAP_G2O) || defined(RTABMAP_ORB_SLAM)
+     RTABMAP_PARAM(Vis, BundleAdjustment,          int,   1,     "Optimization with bundle adjustment: 0=disabled, 1=g2o, 2=cvsba, 3=Ceres.");
+diff --git a/corelib/include/rtabmap/core/RegistrationVis.h b/corelib/include/rtabmap/core/RegistrationVis.h
+index 3e13d8b..ac435ba 100644
+--- a/corelib/include/rtabmap/core/RegistrationVis.h
++++ b/corelib/include/rtabmap/core/RegistrationVis.h
+@@ -91,6 +91,7 @@ private:
+ 	float _flowEps;
+ 	int _flowMaxLevel;
+ 	bool _flowGpu;
++	bool _flowPyramidWithGuess;
+ 	float _nndr;
+ 	int _nnType;
+ 	bool _gmsWithRotation;
+diff --git a/corelib/src/RegistrationVis.cpp b/corelib/src/RegistrationVis.cpp
+index 84f0101..adca8fd 100644
+--- a/corelib/src/RegistrationVis.cpp
++++ b/corelib/src/RegistrationVis.cpp
+@@ -84,6 +84,7 @@ RegistrationVis::RegistrationVis(const ParametersMap & parameters, Registration
+ 		_flowEps(Parameters::defaultVisCorFlowEps()),
+ 		_flowMaxLevel(Parameters::defaultVisCorFlowMaxLevel()),
+ 		_flowGpu(Parameters::defaultVisCorFlowGpu()),
++		_flowPyramidWithGuess(Parameters::defaultVisCorFlowPyramidWithGuess()),
+ 		_nndr(Parameters::defaultVisCorNNDR()),
+ 		_nnType(Parameters::defaultVisCorNNType()),
+ 		_gmsWithRotation(Parameters::defaultGMSWithRotation()),
+@@ -145,6 +146,7 @@ void RegistrationVis::parseParameters(const ParametersMap & parameters)
+ 	Parameters::parse(parameters, Parameters::kVisCorFlowEps(), _flowEps);
+ 	Parameters::parse(parameters, Parameters::kVisCorFlowMaxLevel(), _flowMaxLevel);
+ 	Parameters::parse(parameters, Parameters::kVisCorFlowGpu(), _flowGpu);
++	Parameters::parse(parameters, Parameters::kVisCorFlowPyramidWithGuess(), _flowPyramidWithGuess);
+ 	Parameters::parse(parameters, Parameters::kVisCorNNDR(), _nndr);
+ 	Parameters::parse(parameters, Parameters::kVisCorNNType(), _nnType);
+ 	Parameters::parse(parameters, Parameters::kGMSWithRotation(), _gmsWithRotation);
+@@ -305,7 +307,7 @@ RegistrationVis::~RegistrationVis()
+ Transform RegistrationVis::computeTransformationImpl(
+ 			Signature & fromSignature,
+ 			Signature & toSignature,
+-			Transform guess, // (flowMaxLevel is set to 0 when guess is used)
++			Transform guess,
+ 			RegistrationInfo & info) const
+ {
+ 	UDEBUG("%s=%d", Parameters::kVisMinInliers().c_str(), _minInliers);
+@@ -576,6 +578,7 @@ Transform RegistrationVis::computeTransformationImpl(
+ 				cv::KeyPoint::convert(kptsFrom, cornersFrom);
+ 				std::vector<cv::Point2f> cornersTo;
+ 				bool guessSet = !guess.isIdentity() && !guess.isNull();
++				const int flowLevel = guessSet && !_flowPyramidWithGuess ? 0 : _flowMaxLevel;
+ 				if(guessSet)
+ 				{
+ 					if(toSignature.sensorData().cameraModels().size() == 1 || toSignature.sensorData().stereoCameraModels().size() == 1)
+@@ -652,7 +655,7 @@ Transform RegistrationVis::computeTransformationImpl(
+ 					UDEBUG("cv::cuda::SparsePyrLKOpticalFlow transfer host to device end");
+ 					cv::cuda::GpuMat d_status;
+ 					cv::Ptr<cv::cuda::SparsePyrLKOpticalFlow> d_pyrLK_sparse = cv::cuda::SparsePyrLKOpticalFlow::create(
+-						cv::Size(_flowWinSize, _flowWinSize), guessSet ? 0 : _flowMaxLevel, _flowIterations, guessSet);
++						cv::Size(_flowWinSize, _flowWinSize), flowLevel, _flowIterations, guessSet);
+ 
+ 					UDEBUG("cv::cuda::SparsePyrLKOpticalFlow calc begin");
+ 					d_pyrLK_sparse->calc(d_imageFrom, d_imageTo, d_cornersFrom, d_cornersTo, d_status);
+@@ -682,7 +685,7 @@ Transform RegistrationVis::computeTransformationImpl(
+ 						status,
+ 						err,
+ 						cv::Size(_flowWinSize, _flowWinSize),
+-						guessSet ? 0 : _flowMaxLevel,
++						flowLevel,
+ 						cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, _flowIterations, _flowEps),
+ 						cv::OPTFLOW_LK_GET_MIN_EIGENVALS | (guessSet ? cv::OPTFLOW_USE_INITIAL_FLOW : 0), 1e-4);
+ 					UDEBUG("cv::calcOpticalFlowPyrLK() end");

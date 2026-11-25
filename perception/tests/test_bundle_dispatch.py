@@ -179,3 +179,11 @@ def test_get_all_tools_prefixes_sub_tools_only(bundle_cls):
     assert names == {"face_recognition", "asr", "asr_start"}
     for name in names:
         assert bundle.owns(name), name
+
+
+def test_rgbd_card_is_listed_and_routed_by_real_bundle(bundle_cls):
+    from plugins.rgbd_odometry import RgbdOdometryPlugin
+    card = RgbdOdometryPlugin({}, object())
+    bundle = _bundle(bundle_cls, card)
+    assert {tool['name'] for tool in bundle.get_all_tools()} == {'rgbd_odometry'}
+    assert bundle.dispatch('rgbd_odometry', {'action': 'info'})['state'] == 'idle'

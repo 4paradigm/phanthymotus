@@ -4,7 +4,8 @@
  * Receives full map snapshots at 1Hz from the driver (voxel-deduplicated).
  * Binary protocol (v2, 17-byte header):
  *   [float32 robot_x, robot_y, robot_yaw] (12 bytes)
- *   [uint8 flags]                          (1 byte: bit0=full_map, bit1=has_z)
+ *   [uint8 flags]                          (1 byte: bit0=full_map, bit1=has_z, bit2=last_mapped,
+ *    bit3=camera_optical, bit4=body, bit5=heading_unavailable)
  *   [uint32 num_points]                    (4 bytes)
  *   Body: [float32 x, y, z] × N           (if has_z, 12 bytes/point)
  *      or [float32 x, y] × N              (if !has_z, 8 bytes/point, z=0)
@@ -238,15 +239,23 @@ export const MappingRenderer = {
 
     // Update geometry
     const geo = this._points.geometry;
-    geo.attributes.position.needsUpdate = true;
-    geo.attributes.color.needsUpdate = true;
+    if (count > 0) {
+      for (const attribute of [geo.attributes.position, geo.attributes.color]) {
+        attribute.clearUpdateRanges();
+        attribute.addUpdateRange(0, count * 3);
+        attribute.needsUpdate = true;
+      }
+    }
     geo.setDrawRange(0, count);
 
     // Update robot position and orientation
     // Coordinate mapping: robot at (robotX, 0.2, -robotY)
     // Yaw: in original frame yaw=0 is +X, yaw=pi/2 is +Y
     // In Three.js: +X stays +X, +Y maps to -Z → rotation around Y axis = -yaw
+    const camera = (flags & 8) !== 0, body = (flags & 16) !== 0;
+    const unavailable = (flags & 32) !== 0 || (camera && body);
     if (this._robotMesh) {
+      this._robotMesh.visible = !unavailable && [robotX, robotY, robotYaw].every(Number.isFinite);
       this._robotMesh.position.set(robotX, 0.2, -robotY);
       this._robotMesh.rotation.set(0, -robotYaw, 0);
       this._robotPos.set(robotX, 0.2, -robotY);

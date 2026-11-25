@@ -45,3 +45,12 @@ def test_an_unknown_format_still_returns_none():
     """Declining is right for a format nobody can decode; the bug was the set
     of formats, not the declining."""
     assert ros2_bridge._resolve_msg_type("application/x-nonsense") is None
+
+
+def test_native_pointcloud2_is_not_misread_as_string():
+    """PointCloud2 is consumed directly by Perception, not the Core inspector."""
+    assert ros2_bridge._resolve_msg_type("sensor/pointcloud2") is None
+    # Existing low-bandwidth display/mapping formats still use binary frames.
+    assert ros2_bridge._resolve_msg_type("sensor/pointcloud") is _msg.UInt8MultiArray
+    assert ros2_bridge._resolve_msg_type("sensor/mapping") is _msg.UInt8MultiArray
+    assert ros2_bridge._resolve_msg_type("state/odom") is _msg.String

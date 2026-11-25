@@ -5,10 +5,8 @@ was never added to a RENDERERS array fails silently and looks exactly like the
 feature not being written: the topic falls through to ActivityRenderer or the KV
 panel and shows a `values` array as one long line of numbers.
 
-Three views each keep their own array — detail-panel, dashboard,
-monitor-dashboard — and the one that gets forgotten is the one nobody had open
-while testing. This is a text check rather than a real DOM test because a text
-check is what catches that.
+The detail panel, dashboard and monitor dashboard can declare their own array
+or import a shared one. Check the array each view actually uses.
 
 The ordering assertion matters as much as the membership one: `RENDERERS.find`
 takes the first match, and TextRenderer answers to a broad enough hint that a
@@ -24,6 +22,14 @@ WEB = pathlib.Path(__file__).resolve().parents[1] / 'web' / 'js'
 VIEWS = ('detail-panel.js', 'dashboard.js', 'monitor-dashboard.js')
 
 
+def _renderer_source(view: str) -> str:
+    path = WEB / view
+    source = path.read_text()
+    shared = re.search(r"""^import\s*\{\s*RENDERERS\s*\}\s*from\s*['"]([^'"]+)['"]""",
+                       source, re.M)
+    return (path.parent / shared.group(1)).read_text() if shared else source
+
+
 def _renderers_array(source: str) -> list:
     match = re.search(r'const RENDERERS = \[(.*?)\]', source, re.S)
     if not match:
@@ -32,21 +38,25 @@ def _renderers_array(source: str) -> list:
 
 
 class ControlRendererRegistration(unittest.TestCase):
-    def test_every_view_imports_and_lists_it(self):
+    def test_every_view_registers_it(self):
         for view in VIEWS:
-            source = (WEB / view).read_text()
             with self.subTest(view=view):
-                self.assertIn('renderers/control.js', source,
-                              f'{view} does not import ControlRenderer')
+                source = _renderer_source(view)
+                self.assertRegex(
+                    source,
+                    r"""(?m)^import\s*\{\s*ControlRenderer\s*\}\s*from\s*"""
+                    r"""['"]\./(?:renderers/)?control\.js['"]""",
+                    f'{view} renderer list does not import ControlRenderer',
+                )
                 self.assertIn('ControlRenderer', _renderers_array(source),
-                              f'{view} imports ControlRenderer but never lists it, '
-                              f'so control/* still falls through')
+                              f'{view} renderer list omits ControlRenderer')
 
     def test_it_is_tried_before_the_catch_all_renderers(self):
         """`find` takes the first match; a broad renderer ahead of it wins."""
         for view in VIEWS:
-            names = _renderers_array((WEB / view).read_text())
             with self.subTest(view=view):
+                names = _renderers_array(_renderer_source(view))
+                self.assertIn('ControlRenderer', names, f'{view} renderer list omits ControlRenderer')
                 index = names.index('ControlRenderer')
                 for catch_all in ('TextRenderer', 'ActivityRenderer'):
                     if catch_all in names:

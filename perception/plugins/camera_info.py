@@ -36,6 +36,9 @@ fitted through, while the depth map reported clear.
 """
 from __future__ import annotations
 
+from copy import deepcopy
+from math import isfinite
+
 SCHEMA = "motus.camera/1"
 
 
@@ -93,29 +96,28 @@ def inherit(upstream: dict, *, topic: str, fmt: str, stage: str,
             width: int = None, height: int = None) -> list:
     """This port's declaration, derived from what fed it. `[]` if nothing did.
 
-    **An empty list when the upstream declared nothing, rather than an entry
-    full of nulls.** The format requires a non-empty `id`, and this stage has no
-    way to invent one — the camera's identity is not derivable from a topic
-    name. A consumer seeing no entry falls back conservatively and says so,
-    which is exactly right; a consumer seeing an entry with a made-up `id` would
-    compare it against another made-up one and conclude two different lenses
-    are the same.
+    Preserve usable numeric parameters when the producer omits its camera ID.
+    Empty inputs still produce no declaration, and no ID is synthesized.
 
     `width`/`height` default to the upstream's when this stage does not resize.
     """
     if not isinstance(upstream, dict) or not upstream:
         return []
-    if upstream.get("schema") != SCHEMA:
+    if upstream.get("schema") not in (None, SCHEMA):
         return []
     ident = str(upstream.get("id") or "")
+    K = upstream.get("K")
     if not ident:
-        return []
+        try:
+            if len(K) != 9 or not all(isfinite(float(value)) for value in K):
+                return []
+        except (TypeError, ValueError):
+            return []
 
     src_w, src_h = upstream.get("width"), upstream.get("height")
     out_w = width if width is not None else src_w
     out_h = height if height is not None else src_h
 
-    K = upstream.get("K")
     if K is not None and (out_w != src_w or out_h != src_h):
         K = _rescale_K(K, (src_w, src_h), (out_w, out_h))
 
@@ -130,11 +132,22 @@ def inherit(upstream: dict, *, topic: str, fmt: str, stage: str,
     if upstream.get("half_fov_rad") is not None or K is not None:
         source = "inherited"
 
+    # `stereo_peer` 走透传（`motus.camera/1` 的立体扩展字段）：左右图
+    # 中间过了 resize 时 K 会被逐边缩放，但 R/T 描述的是两个相机坐标系
+    # 之间的刚体关系，跟图像处理无关，原样继承。左右互换的端口不该
+    # 继续声明别人家的 peer —— 由本卡的几何处理决定，这一层没有可
+    # 以"弄丢"的东西，有就带着走。
+    stereo_peer = upstream.get("stereo_peer")
+    if not (isinstance(stereo_peer, dict) and stereo_peer.get("id")
+            and stereo_peer.get("R") is not None
+            and stereo_peer.get("T") is not None):
+        stereo_peer = None
+
     return [{
         "schema": SCHEMA,
         "topic": topic,
         "format": fmt,
-        "id": ident,
+        **({"id": ident} if ident else {}),
         "width": out_w,
         "height": out_h,
         "distortion_model": upstream.get("distortion_model") or "unknown",
@@ -144,10 +157,13 @@ def inherit(upstream: dict, *, topic: str, fmt: str, stage: str,
         # docstring. A crop would have to recompute this.
         "half_fov_rad": upstream.get("half_fov_rad"),
         "half_fov_v_rad": upstream.get("half_fov_v_rad"),
+        "stereo_peer": stereo_peer,
         "source": source,
         "measured_on": upstream.get("measured_on") or "",
         "pipeline": pipeline,
-        "vendor": dict(upstream.get("vendor") or {}),
+        "vendor": deepcopy(upstream.get("vendor") or {}),
+        **{key: deepcopy(upstream[key]) for key in ('color_from_depth', 'depth_scale_m', 'body_from_camera')
+           if key in upstream},
     }]
 
 

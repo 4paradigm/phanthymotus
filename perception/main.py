@@ -10,6 +10,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   measure          物体可见宽高测量（VOP + 深度 + camera_info）
+  pointcloud       点云（一路深度图反投影）
   ocr              文字识别（RapidOCR + TensorRT）
   barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
   table_db         表格数据库（导入 xlsx/csv，增删改查与计数，SQLite，只用标准库）
@@ -49,10 +50,16 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 from pathlib import Path
 
+# External odometry runs frequent small matrix operations alongside ROS callbacks.
+# Set the process-wide OpenBLAS limit before ROS or any plugin can load NumPy.
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
 import yaml
 
 import rclpy
 import rclpy.executors
+
+from utils.dds_transport import receive_buffer_profile
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
@@ -234,6 +241,43 @@ class PerceptionBundle:
             self._plugins.append(MeasurePlugin(plugins_cfg["measure"], executor))
             log.info("MeasurePlugin loaded")
 
+        from plugins.spatial_input import InputAdapterRegistry
+        self._spatial_inputs = InputAdapterRegistry(executor)
+        pcl_cfg = plugins_cfg.get("pointcloud") or {}
+        if pcl_cfg.get("enabled", False):
+            import re, socket
+            namespace = pcl_cfg.get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.pointcloud import PointCloudPerceptionPlugin
+            # Guarded like visual_depth: the stereo/mono path pulls in cv2 and
+            # the mono engine only lazily, but a bad config must still not take
+            # the rest of the stack down. The card simply does not appear.
+            try:
+                self._plugins.append(
+                    PointCloudPerceptionPlugin(pcl_cfg, namespace, executor, input_registry=self._spatial_inputs)
+                )
+                log.info("PointCloudPerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("PointCloudPerceptionPlugin failed to load; continuing without pointcloud",
+                          exc_info=True)
+
+        if plugins_cfg.get("rgbd_odometry", {}).get("enabled", False):
+            from plugins.rgbd_odometry import RgbdOdometryPlugin
+            self._plugins.append(RgbdOdometryPlugin(plugins_cfg["rgbd_odometry"], executor, input_registry=self._spatial_inputs))
+            log.info("RgbdOdometryPlugin loaded")
+
+        slam_cfg = plugins_cfg.get("pointcloud_slam") or {}
+        if slam_cfg.get("enabled", False):
+            try:
+                from plugins.pointcloud_slam_plugin import PointCloudSlamPlugin
+                plugin = PointCloudSlamPlugin(slam_cfg, executor, input_registry=self._spatial_inputs)
+                plugin.start()
+                self._plugins.append(plugin)
+                log.info("PointCloudSlamPlugin loaded (RTAB-Map point-cloud mapping)")
+            except Exception:
+                log.error("PointCloudSlamPlugin failed to load; continuing without SLAM", exc_info=True)
+
         if plugins_cfg.get("pose", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["pose"].get("namespace", "").strip()
@@ -360,6 +404,9 @@ class PerceptionBundle:
                     shutdown()
                 except Exception:
                     log.exception("plugin shutdown failed: %s", plugin.PREFIX)
+        registry = getattr(self, "_spatial_inputs", None)
+        if registry is not None:
+            registry.close()
 
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
@@ -748,6 +795,7 @@ def _start_registration(mcp_port: int, name: str, category: str):
     threading.Thread(target=_run, daemon=True, name="register").start()
 
 
+@receive_buffer_profile()
 def main():
     global _bundle
 

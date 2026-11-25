@@ -1,0 +1,107 @@
+diff --git a/corelib/include/rtabmap/core/Rtabmap.h b/corelib/include/rtabmap/core/Rtabmap.h
+--- a/corelib/include/rtabmap/core/Rtabmap.h
++++ b/corelib/include/rtabmap/core/Rtabmap.h
+@@ -225,6 +225,7 @@
+ 			bool filterScans = false);
+ 	int refineLinks();
+ 	bool addLink(const Link & link);
++	bool addLink(const Link & link, bool preserveVerifiedLeaf);
+ 	cv::Mat getInformation(const cv::Mat & covariance) const;
+ 	void addNodesToRepublish(const std::vector<int> & ids);
+ 
+diff --git a/corelib/src/Rtabmap.cpp b/corelib/src/Rtabmap.cpp
+--- a/corelib/src/Rtabmap.cpp
++++ b/corelib/src/Rtabmap.cpp
+@@ -6099,6 +6099,11 @@
+ 
+ bool Rtabmap::addLink(const Link & link)
+ {
++	return addLink(link, false);
++}
++
++bool Rtabmap::addLink(const Link & link, bool preserveVerifiedLeaf)
++{
+ 	const Transform & t = link.transform();
+ 	if(!_rgbdSlamMode)
+ 	{
+@@ -6135,6 +6140,64 @@
+ 			return false;
+ 		}
+ 
++		std::map<int, Transform> poses = _optimizedPoses;
++		std::multimap<int, Link> links;
++		const Signature * tip = _memory->getSignature(link.to());
++		const bool isolated = preserveVerifiedLeaf && link.type() == Link::kGlobalClosure &&
++				link.to() == getLastLocationId() && isInSTM(link.to()) &&
++				tip->getLinks().empty() && tip->getLandmarks().empty();
++		const auto completeHistory = [&]()
++		{
++			// There is exactly one measurement for the new session's first pose.
++			// Its rigid solution leaves every existing residual unchanged. Require
++			// the entire connected history, including both directions of every edge.
++			const auto history = _memory->getNeighborsId(link.from(), 0, 0, true);
++			if(!poses.count(link.to()) || history.count(link.to()) ||
++					poses.size() != history.size()+1 || !history.count(link.from()))
++				return false;
++			for(const auto & id : history)
++			{
++				if(!poses.count(id.first) || !cv::checkRange(poses.at(id.first).dataMatrix()) ||
++						!poses.at(id.first).isInvertible())
++					return false;
++				for(const auto & entry : _memory->getLinks(id.first, false, true))
++				{
++					const Link & edge = entry.second;
++					if(!edge.isValid() || !cv::checkRange(edge.transform().dataMatrix()) ||
++							!cv::checkRange(edge.infMatrix()) || edge.from() != id.first || edge.from() == edge.to() ||
++							!history.count(edge.to()) || edge.type() == Link::kVirtualClosure)
++						return false;
++					links.emplace(edge.from(), edge);
++				}
++			}
++			if(links.size() != _constraints.size()*2)
++				return false;
++			for(const auto & entry : _constraints)
++			{
++				const Link & e = entry.second;
++				if(graph::findLink(links, e.from(), e.to(), false, e.type()) == links.end() ||
++				   graph::findLink(links, e.to(), e.from(), false, e.type()) == links.end())
++					return false;
++			}
++			return true;
++		};
++		const bool leaf = isolated && completeHistory();
++		if(leaf)
++		{
++			poses.at(link.to()) = poses.at(link.from()) * link.transform();
++			links.emplace(link.from(), link);
++			links.emplace(link.to(), link.inverse());
++			float linear, angular, linearError, angularError;
++			graph::computeMaxGraphErrors(poses, links, linear, angular, linearError, angularError);
++			if(!std::isfinite(linear) || !std::isfinite(angular) || linear < 0 || angular < 0 ||
++					(_optimizationMaxError > 0 && (linear > _optimizationMaxError || angular > _optimizationMaxError)))
++				return false; // Reject before changing native links, node weights or the map.
++		}
++		else
++		{
++			links.clear(); // E.g. history resident in LTM needs the normal native optimizer.
++		}
++
+ 		// add temporary the link
+ 		if(!_memory->addLink(link))
+ 		{
+@@ -6143,10 +6206,11 @@
+ 		}
+ 
+ 		// optimize with new link
+-		std::map<int, Transform> poses = _optimizedPoses;
+-		std::multimap<int, Link> links;
+-		cv::Mat covariance;
+-		optimizeCurrentMap(this->getLastLocationId(), false, poses, covariance, &links);
++		if(!leaf)
++		{
++			cv::Mat covariance;
++			optimizeCurrentMap(this->getLastLocationId(), false, poses, covariance, &links);
++		}
+ 
+ 		if(poses.find(link.from()) == poses.end())
+ 		{

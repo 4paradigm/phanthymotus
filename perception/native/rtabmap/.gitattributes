@@ -1,0 +1,3 @@
+# Unified patches retain upstream context/CRLF. Check the applied changes with
+# git apply --check --whitespace=error against the pinned source instead.
+*.patch -whitespace

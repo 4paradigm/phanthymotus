@@ -1,0 +1,45 @@
+--- a/rtabmap_slam/include/rtabmap_slam/CoreWrapper.h
++++ b/rtabmap_slam/include/rtabmap_slam/CoreWrapper.h
+@@ -305,6 +305,9 @@
+ 	rtabmap::Rtabmap rtabmap_;
+ 	std::unique_ptr<motus::VisualRecovery> visualRecovery_;
+ 	bool paused_;
++	int motusPreviewMaxPoints_ = 0;
++	double motusPreviewInterval_ = 1.;
++	int64_t lastMotusPreviewStamp_ = -1;
+ 
+ 	UMutex lastPoseMutex_;
+ 	rtabmap::Transform lastPose_;
+--- a/rtabmap_slam/src/CoreWrapper.cpp
++++ b/rtabmap_slam/src/CoreWrapper.cpp
+@@ -623,6 +623,9 @@
+ 
+ 	mapsManager_.setParameters(parameters_);
+ 
++	motusPreviewMaxPoints_ = std::clamp<int64_t>(this->declare_parameter("motus_preview_max_points", 0), 0, 80000);
++	motusPreviewInterval_ = std::max(0.05, this->declare_parameter("motus_preview_interval", 1.));
++
+ 	// Init RTAB-Map
+ 	rtabmap_.init(parameters_, databasePath_);
+ 	if(this->declare_parameter("motus_visual_recovery", false))
+@@ -2407,7 +2410,19 @@
+ 
+ 				timeUpdateMaps = timer.ticks();
+ 
+-				mapsManager_.publishMaps(filteredPoses, stamp, mapFrameId_);
++				// Publish a matched, bounded preview even when the native cloud cache is latched.
++				const auto previewStamp = stamp.nanoseconds();
++				const bool refreshPreview = motusPreviewMaxPoints_ > 0 &&
++						!rtabmap_.getLocalOptimizedPoses().empty() &&
++						(lastMotusPreviewStamp_ < 0 ||
++						 (previewStamp-lastMotusPreviewStamp_)*1e-9 >= motusPreviewInterval_);
++				mapsManager_.publishMaps(filteredPoses, stamp, mapFrameId_,
++						motusPreviewMaxPoints_, refreshPreview);
++				if(refreshPreview)
++				{
++					lastMotusPreviewStamp_ = previewStamp;
++					graphLatched_ = false; // Match the exact stamp of this cloud.
++				}
+ 
+ 				// Publish local graph, info
+ 				this->publishStats(stamp);
