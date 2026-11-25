@@ -20,7 +20,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
-SOURCE_SHA = 'a46bd6826d1074b93bc7a17379966d88005cd248136acd24aab4b6883e689bb0'
+SOURCE_SHA = '440346a39553bccbe65b1afe10bbc1b8f8b9fa9ce2e9fe23902578d44b9243b7'
 
 FRONTEND_FILE = 'frontend/phonemizer.py'
 FRONTEND_SHA = 'e11045eeda1ed090dfa907f454a941ac2a1305454f5ffa2e169389ae890ac8ea'
@@ -49,27 +49,27 @@ VOCAB_SHA = '248ee3192acfc27a9907180354a0efaa63389047a6ff78c3f75e2e19466d0b76'
 
 CONFIG_SHA = '5abb01e2403b072bf03d04fde160443e209d7a0dad49a423be15196b9b43c17f'
 
-GLOBAL_STEP = 26523
+GLOBAL_STEP = 50195
 
 VOICE_ID = '01yuewen'
 
-NATIVE_WEIGHTS_SHA = 'f33dcf83714f3c42cbdad5c85a6ec09d1e69bec29e6c173992bff429f72852f9'
+NATIVE_WEIGHTS_SHA = '9e9e01ac451018269a7ee371e8ac186ad7d7458b1f92713700787362e9f40d07'
 
 # The published archive records the pre-merge excitation source.
 PHASE_DSP_SHA = '82e542dc0d002ff5214779ae568b66407cd0f2770495bb7614fc58bc3804a4b4'
 SYNTHESIS_SOURCE_SHA = '435c10ace9cc5d27e6a14d65fae19791cda7ebb6f400f7d66e53770eb1d253fd'
 
-STYLE_FILE_SHA = '1c0c128370aa247bbf3eb77bf798c0f7d4d4583074f9d582e314c4a0570ca13c'
+STYLE_FILE_SHA = 'd6ee65a6740975b2d289e6427be1ce54b629d9af55214f5e2a1d7e1ec745a571'
 
-STYLE_RAW_SHA = '1aba56cb2955bc9940de8e3a9c68241acbfc79e126bc63b1386cd9953a05667f'
+STYLE_RAW_SHA = '654b411021bb18f83c49c68701f11aaa49199d784b7a5850f8ad71cbcd704b67'
 
-GRAPH_SHAS = {'acoustic': 'b60ba59980a0a9d8c0c67d531944158c7bed56361384d738a7db168b260100f2',
- 'encoder': 'ffdbd9dacf30ad951466a51a7b4f364aa83f1f5a52aa5a6ebe7005d0d64b0702',
- 'vocoder': 'adabfa70659495c2fc592e3cbe57851eeeb854c4332ce9b7bee29c16e6257995'}
+GRAPH_SHAS = {'acoustic': '4934fe01f188c3b8958996d5c5b9b857b19312553f88b02ce28f21a704fb779f',
+ 'encoder': '6db844eb75ff6e523ed4844d1bca0aac43adc30f7c85796c58142a0ccaff193f',
+ 'vocoder': 'f524a67bf359ce87938723549a67502aa30d775275633f27b3cab8a8178a8d68'}
 
-PLAN_SHAS = {'acoustic': 'efe5b8747d41404f6262e648ed23f0da89fd6025e0019361a14837121c5b869e',
- 'encoder': '15dc4462470f6990191437cb6f683582b726ba6ed5683090febe3530b899aef9',
- 'vocoder': '152e650b0a0dce455845840815afcadabfac8d76da7bb2d4722a0a506806d91d'}
+PLAN_SHAS = {'acoustic': '718a3340da8ccbc460a5e16209e77556e6916f31acd9dd40a31d052a8b9df84b',
+ 'encoder': 'd0f61501c8fc8d5e4bae73f6c92b8cfeed7ce67d7b097add4b86bf355a237dff',
+ 'vocoder': '432953b40f087cc50ac989ec3478bd28266951a0f9ca52ab90ec9a26b2d069b8'}
 
 EXPECTED_PROFILES = {'acoustic': {'d': [[1, 640, 3], [1, 640, 128], [1, 640, 512]],
               'indices': [[3], [512], [832]],
@@ -78,32 +78,30 @@ EXPECTED_PROFILES = {'acoustic': {'d': [[1, 640, 3], [1, 640, 128], [1, 640, 512
  'encoder': {'speed': [[1], [1], [1]],
              'style': [[1, 256], [1, 256], [1, 256]],
              'tokens': [[1, 3], [1, 128], [1, 512]]},
- 'vocoder': {'excitation_noise': [[1, 1800, 9], [1, 307200, 9], [1, 438000, 9]],
-             'f0': [[1, 6], [1, 1024], [1, 1460]],
-             'features': [[1, 512, 6], [1, 512, 1024], [1, 512, 1460]],
-             'source_phase': [[1, 1800, 9], [1, 307200, 9], [1, 438000, 9]],
+ 'vocoder': {'excitation_noise': [[1, 1800, 9], [1, 153600, 9], [1, 438000, 9]],
+             'f0': [[1, 6], [1, 512], [1, 1460]],
+             'features': [[1, 512, 6], [1, 512, 512], [1, 512, 1460]],
+             'source_phase': [[1, 1800, 9], [1, 153600, 9], [1, 438000, 9]],
              'style': [[1, 256], [1, 256], [1, 256]]}}
 
-JP5_GRAPH_SHAS = {
-    'encoder': 'fbcfb0f93773cef8541cbf04a43d5b5353cf2da1df5bc17224cf675d9692ec52',
-    'acoustic': 'a6e590f9ac3942cab50eb23f3b632b13d10b68d604c2b520eb2d0636f2847fca',
-    'vocoder': '7c38408246d43abb7698ff26a0e1b389feb4e927a6d73f9feb7c7d093f99d889',
-}
-JP5_PLAN_SHAS = {
-    'encoder': 'b98e45118d390d9f6d3dfcd53ed7279c3a3a9eb2b4652f0aa9c4ca6acceb232f',
-    'acoustic': 'd671e12ce1b6b25d92695b90b9a7d6ac9d52bba41805bd3fe0c17ac7e93bc15b',
-    'vocoder': '129e83b74e448e0a508f8036c8b751085d99e86845f61da63a6854ff79bda33c',
-}
-JP5_EXPECTED_PROFILES = {
-    **EXPECTED_PROFILES,
-    'vocoder': {
-        **EXPECTED_PROFILES['vocoder'],
-        'excitation_noise': [[1, 1800, 9], [1, 153600, 9], [1, 438000, 9]],
-        'f0': [[1, 6], [1, 512], [1, 1460]],
-        'features': [[1, 512, 6], [1, 512, 512], [1, 512, 1460]],
-        'source_phase': [[1, 1800, 9], [1, 153600, 9], [1, 438000, 9]],
-    },
-}
+JP5_GRAPH_SHAS = {'acoustic': '2c5ff484e0e5c5d5f46a237cfc7a4509612837b1ed00c4a2d39e8c04281aaec1',
+ 'encoder': '5ab1c3cfe10c4db5fd1bb7c401434e6347d266cbe3afaa4d19580a1eaf57ef34',
+ 'vocoder': 'acbf05eb2fb0949d5d4bdc7b2c2b12253f4b577368a47d4beb021d9a1bc9335d'}
+JP5_PLAN_SHAS = {'acoustic': '020732b58e5f6d62d6669209d132fb32c4685efeba222620268c80b0788bc1a6',
+ 'encoder': '0a65d7719aeb08a487a9aef81edba2f0549fc66423b3a7614e1017a2f8f2c6cb',
+ 'vocoder': 'c996b39d196844919c0db13b39a83395e50ce57d68d7e1616b0635bf28cf29d0'}
+JP5_EXPECTED_PROFILES = {'acoustic': {'d': [[1, 640, 3], [1, 640, 128], [1, 640, 512]],
+              'indices': [[3], [512], [832]],
+              'style': [[1, 256], [1, 256], [1, 256]],
+              't_en': [[1, 512, 3], [1, 512, 128], [1, 512, 512]]},
+ 'encoder': {'speed': [[1], [1], [1]],
+             'style': [[1, 256], [1, 256], [1, 256]],
+             'tokens': [[1, 3], [1, 128], [1, 512]]},
+ 'vocoder': {'excitation_noise': [[1, 1800, 9], [1, 153600, 9], [1, 438000, 9]],
+             'f0': [[1, 6], [1, 512], [1, 1460]],
+             'features': [[1, 512, 6], [1, 512, 512], [1, 512, 1460]],
+             'source_phase': [[1, 1800, 9], [1, 153600, 9], [1, 438000, 9]],
+             'style': [[1, 256], [1, 256], [1, 256]]}}
 TRT_VERSION_PREFIX = {5: '8.5.2', 6: '10.4'}
 
 STREAM_POLICY = {'activation_allocation': {'default': 'fixed',
@@ -190,23 +188,19 @@ MANIFEST = 'runtime_manifest.json'
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_BUNDLE_BYTES = 2 * 1024 * 1024 * 1024
 
-_MODEL_RELEASE = {
-    'runtime_manifest_sha256': '6ab5f8c88da8d936d6de7eff116e8b1bc4ed3189236d89faf9aca1cc1ac81aff',
-    'modelscope_repo': 'lanxijiang/xiaoyou01',
-    'modelscope_revision': '534e18652ab25eb0066a5312e73d54a9ad6bd1f3',
-    'modelscope_file': '01yuewen-jp6-fp32-compact-26523-20261118-v1.tar.gz',
-    'asset_bytes': 326806879,
-    'asset_sha256': 'e9f205945ce40e3c6a674ad444f08c0707ff0e40c9816add6f494f12a00755f6',
-}
+_MODEL_RELEASE = {'asset_bytes': 318220890,
+ 'asset_sha256': '5c22ae5407c125afb6a780265d5b3373af074cb678d475506b7698331971c644',
+ 'modelscope_file': '01yuewen-jp6-fp32-50195-20261125-v1.tar.gz',
+ 'modelscope_repo': 'lanxijiang/xiaoyou01',
+ 'modelscope_revision': '8fab2acf1b99296f7d152b9a1d23a7f0b2660958',
+ 'runtime_manifest_sha256': '7f35ca329602852609f072dfb00c23881aa0aebd342dbb6ae3d95bed73e73521'}
 
-_JP5_MODEL_RELEASE = {
-    'runtime_manifest_sha256': '778cfdc20f0e4a640eb5d5f1d8bed1c6d06c02118096873aecbf2f8c6d44a0a8',
-    'modelscope_repo': 'lanxijiang/xiaoyou01',
-    'modelscope_revision': 'be27411cd0f94abec598c9f905a0ea90054b78dd',
-    'modelscope_file': '01yuewen-jp511-fp32-native-norm-26523-20261119-v1.tar.gz',
-    'asset_bytes': 318656022,
-    'asset_sha256': '4b6d94452492b34fdd2e26a932a5491949751e6ea20b0a998facbd23334d406f',
-}
+_JP5_MODEL_RELEASE = {'asset_bytes': 318416119,
+ 'asset_sha256': 'cd7cf76cae81d196ae3ead00b92c208a4b521bbcf69f155ed7e1c690cc3b3af6',
+ 'modelscope_file': '01yuewen-jp511-fp32-50195-20261125-v1.tar.gz',
+ 'modelscope_repo': 'lanxijiang/xiaoyou01',
+ 'modelscope_revision': '0498b3238fe60e1b2f8cc51ac77bbea4e5a3528d',
+ 'runtime_manifest_sha256': 'd87d4834c79a63ee8202d4c5e21237c1f869aa22bc2dea807161e1764dea882e'}
 
 
 def detect_jetpack_major():
