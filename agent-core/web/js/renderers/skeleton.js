@@ -48,6 +48,7 @@ export const SkeletonRenderer = {
   _rootGroup: null,  // Z-up → Y-up coordinate transform
   _pelvisGroup: null, // IMU orientation applied here
   _loaded: false,
+  _pendingFrame: null,
   _mcpId: null,
 
   mount(container, mcpId, topicPath) {
@@ -55,6 +56,7 @@ export const SkeletonRenderer = {
     this._joints = {};
     this._links = {};
     this._loaded = false;
+    this._pendingFrame = null;
     this._el = document.createElement('div');
     this._el.className = 'renderer-skeleton';
     container.appendChild(this._el);
@@ -106,6 +108,7 @@ export const SkeletonRenderer = {
       this._buildFallbackSkeleton();
       return;
     }
+    const scene = this._scene;
     try {
       const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
         method: 'POST',
@@ -116,6 +119,8 @@ export const SkeletonRenderer = {
         body: JSON.stringify({ tool: 'model', arguments: topicPath ? { topic: topicPath } : {} }),
       });
       const json = await res.json();
+      // The preview may have closed while the model was loading.
+      if (this._scene !== scene) return;
       // API returns { code, data } where data is the content array
       const content = json.data?.[0]?.text ?? json.result?.content?.[0]?.text;
       if (!content) { this._buildFallbackSkeleton(); return; }
@@ -128,8 +133,15 @@ export const SkeletonRenderer = {
         this._buildFallbackSkeleton();
       }
     } catch (e) {
+      if (this._scene !== scene) return;
       console.warn('[skeleton] Failed to load URDF model:', e);
       this._buildFallbackSkeleton();
+    } finally {
+      if (this._scene === scene && this._loaded && this._pendingFrame) {
+        const frame = this._pendingFrame;
+        this._pendingFrame = null;
+        this.onData(frame);
+      }
     }
   },
 
@@ -503,7 +515,11 @@ export const SkeletonRenderer = {
   },
 
   onData(buffer, fmt) {
-    if (!this._loaded) return;
+    if (!this._loaded) {
+      // The bus can replay its latest snapshot before the URDF request finishes.
+      if (this._scene) this._pendingFrame = buffer;
+      return;
+    }
     try {
       const text = new TextDecoder().decode(buffer);
       const data = JSON.parse(text);
@@ -583,5 +599,6 @@ export const SkeletonRenderer = {
     this._raf = null;
     this._ro = null;
     this._loaded = false;
+    this._pendingFrame = null;
   },
 };
