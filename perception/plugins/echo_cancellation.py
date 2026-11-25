@@ -87,7 +87,7 @@ import numpy as np
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import NodeLifecycle
 
 log = logging.getLogger(__name__)
 
@@ -1546,6 +1546,8 @@ class EchoCancellationPlugin:
         self._nodes: Dict[str, _EchoCancellationNode] = {}
         self._instance_configs: Dict[str, Dict[str, Any]] = {}
         self._state_lock = threading.RLock()
+        self._lifecycle = NodeLifecycle(executor, self._nodes, self._state_lock, label=self.PREFIX)
+        self._draining_nodes = self._lifecycle.draining
         log.info("[echo_cancellation] plugin init: robot_voice_topic=%s, "
                  "strength=%s, mute_tail=%s, tts_handle=%s",
                  self._plugin_cfg.get("robot_voice_topic", DEFAULT_ROBOT_VOICE_TOPIC),
@@ -1625,7 +1627,19 @@ class EchoCancellationPlugin:
 
     # ── MCP dispatch ─────────────────────────────────────────────────────
 
-    def dispatch(self, name: str, args: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    def dispatch(self, name, args):
+        action = args.get("action", name)
+        if action == "config":
+            with self._lifecycle.configuration():
+                result = self._dispatch(name, args)
+        else:
+            result = self._dispatch(name, args)
+        if action in ("start", "stop", "info", "config") and isinstance(result, dict):
+            return self._lifecycle.annotate(result, args.get("instance_id", ""),
+                                            scoped_info=action == "info")
+        return result
+
+    def _dispatch(self, name: str, args: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         action = str(args.get("action", name))
         instance_id = str(args.get("instance_id", "") or "")
         input_topic = str(args.get("input_topic", "") or "")
@@ -1678,7 +1692,7 @@ class EchoCancellationPlugin:
         for key, input_topic in rebuild:
             log.info("[echo_cancellation] robot_voice_topic changed, rebuilding %s", key)
             self._do_stop(key)
-            self._do_start(key, input_topic)
+            self._do_start(key, input_topic, configuring=True)
 
         result = {"status": "configured"}
         if instance_id:
@@ -1699,85 +1713,20 @@ class EchoCancellationPlugin:
                                  or DEFAULT_REMOVAL_STRENGTH),
         )
 
-    def _dispose(self, node_key: str, node: _EchoCancellationNode) -> None:
-        try:
-            node.retire()
-        finally:
-            dispose_node(self._executor, node, label=f"echo_cancellation/{node_key}")
-        log.info("[echo_cancellation] node disposed: %s", node_key)
+    def _dispose(self, node_key, node) -> dict:
+        return self._lifecycle.retire(node_key, node, node.retire)
 
-    def _do_start(self, instance_id: str, input_topic: str) -> Dict[str, Any]:
-        node_key = instance_id or input_topic or _DEFAULT_INSTANCE
+    def _do_start(self, instance_id: str, input_topic: str, *, configuring=False) -> dict:
+        key = instance_id or input_topic or _DEFAULT_INSTANCE
+        request, blocked = self._lifecycle.begin(key, input_topic, configuring=configuring)
+        if blocked:
+            return blocked
+        return self._lifecycle.start(
+            key, request, lambda: self._create_node(key, input_topic),
+            self._lifecycle.retire_node)
 
-        retired = None
-        with self._state_lock:
-            existing = self._nodes.get(node_key)
-            if existing is not None and existing._input_topic != input_topic:
-                # Topics are fixed at construction; rebind the key.
-                retired = self._nodes.pop(node_key)
-        if retired is not None:
-            self._dispose(node_key, retired)
-
-        with self._state_lock:
-            existing = self._nodes.get(node_key)
-        if existing is not None:
-            return existing.start()        # idempotent re-start
-
-        node = self._create_node(node_key, input_topic)
-        # Registered under the lock *before* being started, so a concurrent stop
-        # can always find it. A started-but-unregistered node keeps a live
-        # subscription and a publisher nothing can reach for the life of the
-        # process.
-        with self._state_lock:
-            current = self._nodes.get(node_key)
-            registered = False
-            if current is None:
-                try:
-                    self._executor.add_node(node)
-                except Exception as error:  # noqa: BLE001
-                    log.error("[echo_cancellation] failed to register instance %r: %s",
-                              node_key, error)
-                else:
-                    self._nodes[node_key] = node
-                    registered = True
-        if not registered:
-            try:
-                node.destroy_node()   # never started, never registered
-            except Exception:  # noqa: BLE001
-                pass
-            if current is not None:
-                return current.start()
-            return {"state": "idle", "input": input_topic}
-        try:
-            result = node.start()
-        except Exception:
-            with self._state_lock:
-                if self._nodes.get(node_key) is node:
-                    del self._nodes[node_key]
-            self._dispose(node_key, node)
-            raise
-        with self._state_lock:
-            still_ours = self._nodes.get(node_key) is node
-        if not still_ours:
-            # A concurrent stop retired it while start() ran; its dispose did
-            # the teardown — make sure this start left nothing running.
-            node.stop()
-            return {"state": "idle", "input": input_topic}
-        return result
-
-    def _do_stop(self, instance_id: str) -> Dict[str, Any]:
-        to_dispose: List[Tuple[str, _EchoCancellationNode]] = []
-        with self._state_lock:
-            if instance_id:
-                node = self._nodes.pop(instance_id, None)
-                if node is not None:
-                    to_dispose.append((instance_id, node))
-            else:
-                to_dispose.extend(self._nodes.items())
-                self._nodes = {}
-        for node_key, node in to_dispose:
-            self._dispose(node_key, node)
-        return {"state": "idle"}
+    def _do_stop(self, instance_id: str) -> dict:
+        return self._lifecycle.stop(instance_id or None)
 
     # ── info ─────────────────────────────────────────────────────────────
 
@@ -1877,6 +1826,10 @@ class EchoCancellationPlugin:
             # same instance changing its mind.
             result["diagnostics"]["instance_id"] = chosen_key
         return result
+
+    def shutdown(self) -> dict:
+        """Cancel pending creation and retain failed cleanup for explicit retry."""
+        return self._lifecycle.shutdown()
 
 
 __all__ = ["EchoCancellationPlugin", "TOOLS", "AUDIO_FORMAT", "OUTPUT_SUFFIX"]

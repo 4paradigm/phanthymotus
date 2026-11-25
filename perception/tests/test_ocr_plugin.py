@@ -69,6 +69,7 @@ def _make_plugin(monkeypatch, builder=None, cfg=None):
     builder = builder or _BuilderProbe()
     monkeypatch.setattr(ocr_plugin, "_build_ocr_adapter", builder)
     executor = _FakeExecutor()
+    executor.get_nodes = lambda: list(executor.nodes)
     plugin = ocr_plugin.OCRPlugin(dict(cfg or {"provider": "rapidocr"}), executor)
     return plugin, executor, builder
 

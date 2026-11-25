@@ -55,7 +55,7 @@ from utils.cv2_compat import load_cv2
 from utils.latest_frame import LatestFrame
 from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import NodeLifecycle
 
 from plugins import image_input as _img
 # Shared with vop and ocr, which grew the same *_by_photo / *_by_url
@@ -1135,8 +1135,10 @@ class FaceRecognitionPlugin:
         self._plugin_cfg = dict(plugin_cfg)
         self._executor = executor
 
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._nodes: dict[str, _FaceNode] = {}
+        self._lifecycle = NodeLifecycle(executor, self._nodes, self._state_lock, label=self.PREFIX)
+        self._draining_nodes = self._lifecycle.draining
         self._instance_configs: dict[str, dict] = {}
         self._pending_starts: dict[str, str] = {}
         self._engine: _FaceEngine | None = None
@@ -1209,55 +1211,18 @@ class FaceRecognitionPlugin:
                 if generation != self._load_generation or not self._pending_starts:
                     return
                 node_key, input_topic = next(iter(self._pending_starts.items()))
-            try:
-                node = self._create_node(node_key, input_topic, engine)
-            except Exception as error:  # noqa: BLE001 - keep serving others
-                log.error("[face] failed to build instance %r on %r: %s",
-                          node_key, input_topic, escape_log_text(error))
-                with self._state_lock:
-                    if self._pending_starts.get(node_key) == input_topic:
-                        del self._pending_starts[node_key]
-                continue
-            registered = False
+                request = self._lifecycle.current(node_key)
+            self._activate_node(node_key, input_topic, engine, request)
             with self._state_lock:
-                still_wanted = (
-                    generation == self._load_generation
-                    and self._pending_starts.get(node_key) == input_topic
-                )
-                if still_wanted:
-                    try:
-                        self._executor.add_node(node)
-                    except Exception as error:  # noqa: BLE001
-                        log.error("[face] failed to register instance %r: %s",
-                                  node_key, escape_log_text(error))
-                        del self._pending_starts[node_key]
-                    else:
-                        self._nodes[node_key] = node
-                        del self._pending_starts[node_key]
-                        registered = True
-            if not registered:
-                try:
-                    node.destroy_node()
-                except Exception:  # noqa: BLE001
-                    pass
-                continue
-            try:
-                node.start()
-            except Exception as error:  # noqa: BLE001
-                log.error("[face] failed to start instance %r: %s",
-                          node_key, escape_log_text(error))
-                with self._state_lock:
-                    if self._nodes.get(node_key) is node:
-                        del self._nodes[node_key]
-                self._dispose(node_key, node)
-                continue
-            with self._state_lock:
-                still_ours = self._nodes.get(node_key) is node
-            if not still_ours:
-                node.stop()
+                if (generation == self._load_generation
+                        and self._lifecycle.current(node_key) is request
+                        and self._pending_starts.get(node_key) == input_topic):
+                    self._pending_starts.pop(node_key, None)
 
-    def _merged_cfg(self, node_key: str) -> dict:
-        return {**self._plugin_cfg, **self._instance_configs.get(node_key, {})}
+    def _activate_node(self, key, topic, engine, request):
+        return self._lifecycle.start(
+            key, request, lambda: self._create_node(key, topic, engine),
+            self._lifecycle.retire_node)
 
     def _create_node(
         self, node_key: str, input_topic: str, engine: _FaceEngine
@@ -1271,12 +1236,8 @@ class FaceRecognitionPlugin:
             detect_interval_s=detect_interval(cfg),
         )
 
-    def _dispose(self, node_key: str, node: _FaceNode) -> None:
-        try:
-            node.retire()
-        finally:
-            dispose_node(self._executor, node, label=f"face/{node_key}")
-        log.info("[face] node disposed: %s", node_key)
+    def _dispose(self, node_key: str, node: _FaceNode) -> dict:
+        return self._lifecycle.retire(node_key, node, node.retire)
 
     def _instance_state_locked(self, node_key: str) -> str:
         node = self._nodes.get(node_key)
@@ -1288,7 +1249,19 @@ class FaceRecognitionPlugin:
 
     # ── MCP dispatch ──────────────────────────────────────────────────────
 
-    def dispatch(self, name: str, args: dict) -> dict | None:
+    def dispatch(self, name, args):
+        action = args.get("action", name)
+        if action == "config":
+            with self._lifecycle.configuration():
+                result = self._dispatch(name, args)
+        else:
+            result = self._dispatch(name, args)
+        if action in ("start", "stop", "info", "config") and isinstance(result, dict):
+            return self._lifecycle.annotate(result, args.get("instance_id", ""),
+                                            scoped_info=action == "info")
+        return result
+
+    def _dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name == self.PREFIX else name
         instance_id = args.get("instance_id", "")
 
@@ -1644,107 +1617,28 @@ class FaceRecognitionPlugin:
     def _do_start(self, instance_id: str, args: dict) -> dict:
         input_topic = args.get("input_topic")
         if not input_topic:
-            raise ValueError("input_topic is required for start action")
-        node_key = instance_id or input_topic
-
-        retired = None
+            raise ValueError("input_topic is required for start")
+        key = instance_id or input_topic or _DEFAULT_INSTANCE
+        request, blocked = self._lifecycle.begin(key, input_topic)
+        if blocked:
+            return blocked
         with self._state_lock:
-            existing = self._nodes.get(node_key)
-            if existing is not None and existing._input_topic != input_topic:
-                retired = self._nodes.pop(node_key)
-        if retired is not None:
-            self._dispose(node_key, retired)
-
-        with self._state_lock:
-            existing = self._nodes.get(node_key)
-            if existing is not None:
-                start_node = existing            # idempotent re-start
-            else:
-                start_node = None
-                # Claim the key before leaving the lock so a concurrent stop
-                # always finds the instance in _pending_starts or _nodes, never
-                # in an invisible in-between state.
-                self._pending_starts[node_key] = input_topic
-                if self._engine_state != "ready":
-                    if self._engine_state in ("idle", "error"):
-                        self._spawn_loader_locked()
-                    return {
-                        "state": "loading",
-                        "input": input_topic,
-                        "output": _face_output_topic(input_topic),
-                    }
-            engine = self._engine
-            generation = self._load_generation
-
-        if start_node is not None:
-            return start_node.start()
-
-        node = self._create_node(node_key, input_topic, engine)
-        with self._state_lock:
-            claimed = self._pending_starts.get(node_key) == input_topic
-            current = self._nodes.get(node_key)
-            fresh = generation == self._load_generation
-            registered = False
-            if claimed and current is None and fresh:
-                try:
-                    self._executor.add_node(node)
-                except Exception as error:  # noqa: BLE001
-                    log.error("[face] failed to register instance %r: %s",
-                              node_key, escape_log_text(error))
-                    del self._pending_starts[node_key]
-                else:
-                    self._nodes[node_key] = node
-                    del self._pending_starts[node_key]
-                    registered = True
-            elif claimed and not fresh:
-                # A config change invalidated the engine mid-start; leave the
-                # claim so the loader it spawned brings this instance up.
-                pass
-            elif claimed:
-                del self._pending_starts[node_key]
-        if not registered:
-            try:
-                node.destroy_node()
-            except Exception:  # noqa: BLE001
-                pass
-            if current is not None:
-                return current.start()
-            if claimed and not fresh:
-                return {"state": "loading", "input": input_topic,
+            if self._engine_state != "ready":
+                self._pending_starts[key] = input_topic
+                if self._engine_state in ("idle", "error"):
+                    self._spawn_loader_locked()
+                return {"state": "loading", "input": input_topic or "",
                         "output": _face_output_topic(input_topic)}
-            return {"state": "idle", "input": input_topic,
-                    "output": _face_output_topic(input_topic)}
-        try:
-            result = node.start()
-        except Exception:
-            with self._state_lock:
-                if self._nodes.get(node_key) is node:
-                    del self._nodes[node_key]
-            self._dispose(node_key, node)
-            raise
-        with self._state_lock:
-            still_ours = self._nodes.get(node_key) is node
-        if not still_ours:
-            node.stop()
-            return {"state": "idle", "input": input_topic,
-                    "output": _face_output_topic(input_topic)}
-        return result
+            engine = self._engine
+        return self._activate_node(key, input_topic, engine, request)
 
     def _do_stop(self, instance_id: str) -> dict:
-        to_dispose: list[tuple[str, _FaceNode]] = []
         with self._state_lock:
             if instance_id:
                 self._pending_starts.pop(instance_id, None)
-                node = self._nodes.pop(instance_id, None)
-                if node is not None:
-                    to_dispose.append((instance_id, node))
             else:
                 self._pending_starts.clear()
-                to_dispose.extend(self._nodes.items())
-                self._nodes = {}
-        for node_key, node in to_dispose:
-            self._dispose(node_key, node)
-        return {"state": "idle"}
+        return self._lifecycle.stop(instance_id or None)
 
     # Per-instance because one camera may want a different cadence from
     # another; everything else (thresholds, the model, the database) is
@@ -1776,6 +1670,13 @@ class FaceRecognitionPlugin:
                 node.apply_config(merged)
             return {"status": "configured", "instance_id": instance_id}
 
+        with self._state_lock:
+            rebuild = _engine_signature({**self._plugin_cfg, **cfg}) != _engine_signature(self._plugin_cfg)
+        if rebuild:
+            stopped = self._lifecycle.stop()
+            if stopped["state"] != "idle":
+                return stopped
+
         evicted = 0
         with self._state_lock:
             updated = {**self._plugin_cfg, **cfg}
@@ -1794,10 +1695,10 @@ class FaceRecognitionPlugin:
                 nodes_live = self._engine is not None
             else:
                 self._load_generation += 1
+                for key, topic in self._pending_starts.items():
+                    self._lifecycle.begin(key, topic, configuring=True)
                 stale_engine = self._engine
                 self._engine = None
-                disposed = list(self._nodes.items())
-                self._nodes = {}
                 if self._pending_starts:
                     self._spawn_loader_locked()
                 else:
@@ -1820,8 +1721,6 @@ class FaceRecognitionPlugin:
                 )
             return result
 
-        for node_key, node in disposed:
-            self._dispose(node_key, node)
         if stale_engine is not None:
             _close_quietly(stale_engine)
         return {"status": "configured", "engine_loaded": False, "reused": False}
@@ -2486,6 +2385,14 @@ class FaceRecognitionPlugin:
             if not forgotten:
                 result["reason"] = REASON_BAD_INPUT
         return result
+
+    def _merged_cfg(self, node_key: str) -> dict:
+        return {**self._plugin_cfg, **self._instance_configs.get(node_key, {})}
+
+    def shutdown(self) -> dict:
+        """Cancel pending creation and retain failed cleanup for explicit retry."""
+        return self._lifecycle.shutdown()
+
 
 
 __all__ = [
