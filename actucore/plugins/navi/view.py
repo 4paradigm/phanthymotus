@@ -352,7 +352,7 @@ def _dashed_line(frame, a, b, colour):
 
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
            measured=None, box_last_seen=False, rgb_jpeg=None, blend: float = 0.5,
-           ground=None, detour=None, executing=None, project_detour=True,
+           ground=None, detour=None, executing=None, project_detour=True, project_executing=True,
            width: int = 640, height: int = 480):
     """One frame. Every input may be absent — the overlay still draws.
 
@@ -385,6 +385,8 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                                interpolation=cv2.INTER_NEAREST)
 
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
+    if executing is not None:
+        detour = None
     lines = (route_lines(depth_m, ground, detour.geometry, detour.points, None, keep,
                          width, height, stop_distance_m=config.stop_distance_m)
              if detour is not None and project_detour else ())
@@ -395,8 +397,10 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
             projected.append(np.asarray((a, b), dtype=np.int32))
     execution_visible = False
     if executing is not None:
-        for a, b, _ in route_lines(depth_m, ground, executing.geometry, executing.points, None,
-                                  keep, width, height, stop_distance_m=config.stop_distance_m):
+        execution_lines = (route_lines(depth_m, ground, executing.geometry, executing.points, None,
+                                       0., width, height, stop_distance_m=config.stop_distance_m)
+                           if project_executing else ())
+        for a, b, _ in execution_lines:
             visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
             if visible:
                 _line(frame, a, b, _EXECUTING_ROUTE, thickness=3)
@@ -417,7 +421,7 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     edges = corridor_edges(clearance, config, width)
     if edges:
         colour = _WARN if clearance <= config.obstacle_stop_m else _CORRIDOR
-        if detour is None:
+        if detour is None and executing is None:
             for far, near in zip(edges, corridor_edges(clearance * .5, config, width)):
                 visible, a, b = cv2.clipLine((0, 0, width, height),
                                             (far, int(height * .62)), (near, height - 1))

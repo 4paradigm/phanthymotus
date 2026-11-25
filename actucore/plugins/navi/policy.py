@@ -91,6 +91,8 @@ BLIND = "blind"          # no usable observation — distinct from "nothing seen
 FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
 DEPTH_CAPTURE_STALE = "等待新的有效深度"
+FEEDBACK_STALE = "运动反馈已到期，停车等待新速度"
+FEEDBACK_SWITCH = "运动反馈来源已切换，等待底盘停稳"
 
 
 class LocalHold(Enum):
@@ -763,6 +765,8 @@ class State:
     dwa_proposal: DwaProposal | DwaTurn | None = None
     published_dwa_route: DwaAcceptance | None = None
     published_camera_passage: CameraPassage | None = None
+    committed_route: DwaAcceptance | None = None
+    route_in_view: Detour | None = None
     dwa_handoff_yaw_step: float = 0.
     dwa_motion_guard: DwaMotionGuard | None = None
     dwa_association: tuple[AssociationSnapshot, PlanarPose] | None = None
@@ -912,6 +916,7 @@ class Decision:
     k_yaw_effective: float | None = None
     dwa_acceptance: DwaAcceptance | None = None
     hold_search: bool = False
+    predicted_search: bool = False
 
     @property
     def publishes(self) -> bool:
@@ -1503,7 +1508,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
         # Do not carry an increased approach gain through a hold, search or
         # blocked corridor and release it as a jump on the next approach.
         state.adaptive_fwd_scale = 1.0
-    if not decision.hold_search:
+    if not decision.predicted_search:
         feedback = planar_feedback(odom)
         sample = odom or {}
         speed_ms = sample.get("received_speed_ms", sample.get("stamp_ms", sample.get("received_ms")))
@@ -1777,7 +1782,7 @@ def _continue_search_without_speed(depth, config, state, dt, odom):
     stamp = (depth or {}).get("control_ms")
     last_speed = state.search_feedback_ms
     yaw = state.commanded[2]
-    if (stamp is None or last_speed is None or not 0 <= stamp - last_speed < config.max_feedback_gap_ms
+    if (stamp is None or last_speed is None or stamp < last_speed
             or not yaw or any(state.commanded[:2]) or not state.command_dt_s or state.feedback_guard_s
             or config.use_obstacle_history or previous_scan.active or previous_scan.result_frame
             or state.detour_leg is not None or state.published_dwa_route is not None
@@ -1795,9 +1800,10 @@ def _continue_search_without_speed(depth, config, state, dt, odom):
     if _search_turn_stop(depth, config, state, requested_yaw=yaw, scan=scan) is not None:
         return None
     decision = _search(config, state, dt, odom, requested_yaw=yaw)
-    decision.hold_search = bool(decision.values and decision.values[5])
-    if decision.hold_search:
-        decision.reason = "原地搜索：速度暂缺，维持已检查的转向"
+    decision.predicted_search = bool(decision.values and decision.values[5])
+    if decision.predicted_search:
+        decision.hold_search = stamp - last_speed < config.max_feedback_gap_ms
+        decision.reason = "原地搜索：速度暂缺，沿同一方向通过最新深度扫掠"
         # Restart measured registration when speed returns. Estimated motion
         # is used only for the search, never added to the measured pose history.
         previous_scan.invalidate()
@@ -1980,14 +1986,20 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     feedback = planar_feedback(odom) if config.local_planning else None
     if config.local_planning and config.local_geometry is not None:
+        speed_missing = (feedback is None or speed_stale
+                         or (state.uses_received_speed and (odom or {}).get("received_speed_ms") is None))
         if (config.local_controller == "dwa" and anchor is None
-                and (feedback is None or speed_stale
-                     or (state.uses_received_speed and (odom or {}).get("received_speed_ms") is None))
+                and speed_missing
                 and (track is None or not track.observed) and detections is not None
                 and not any(target_objects(detections, state.target, config))):
             continued = _continue_search_without_speed(depth, config, state, dt, ego_odom)
             if continued is not None:
                 return continued
+        if (config.local_controller == "dwa" and speed_missing and state.published_dwa_route is not None
+                and any(state.commanded[:2])):
+            # Leave the selected frame intact while the publisher checks the
+            # motion already issued. No replacement route has been selected.
+            return Decision(_twist(0., 0., 0.), AVOIDING, FEEDBACK_STALE)
         if odom and all(odom.get(axis) is not None for axis in ("vx", "vy", "wz")):
             state.uses_received_speed = "received_speed_ms" in odom
         motion_pose = (odom or {}).get("motion_pose")
@@ -2035,13 +2047,13 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 state.feedback_guard_s = 0.
         if state.feedback_guard_s > 0.:
             state.feedback_guard_s = max(0., state.feedback_guard_s - dt)
-            return Decision(_twist(0, 0, 0), AVOIDING, "运动反馈来源已切换，等待底盘停稳")
+            return Decision(_twist(0, 0, 0), AVOIDING, FEEDBACK_SWITCH)
         if config.local_controller == "dwa" and state.uses_received_speed:
             speed_ms = (odom or {}).get("received_speed_ms")
             now_ms = (depth or {}).get("control_ms") or (odom or {}).get("received_ms")
             if (feedback is None or speed_ms is None or now_ms is None
                     or not 0 <= now_ms - speed_ms <= config.max_feedback_gap_ms):
-                return Decision(_twist(0., 0., 0.), AVOIDING, "运动反馈已到期，停车等待新速度")
+                return Decision(_twist(0., 0., 0.), AVOIDING, FEEDBACK_STALE)
         if any(state.commanded):
             state.command_tail = state.commanded
             state.command_tail_s = (config.watchdog_ms + 50) / 1000
@@ -3859,6 +3871,9 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
                            follow_published=True, route_error=transform.error(math.hypot(*previous.route_points[-1])),
                            corner_only=corner_only)
     if proposal is None:
+        if (dwa.remaining_route_length(route.points) > 2 * local_path.RESOLUTION
+                and state.dwa_trace.get("fallback_reason") == "search_deadline"):
+            state.dwa_trace["wait_for_committed_route"] = True
         return None
     state.dwa_trace["retained_route"] = True
     return _use_dwa(state, proposal, state.escape_side)
@@ -4537,6 +4552,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                                             foreground=foreground, approach_speed=desired_forward)
         if following is not None:
             return following
+        if state.dwa_trace.get("wait_for_committed_route"):
+            return 0., 0., 0., AVOIDING, NO_LOCAL_ROUTE
     path_clear = None
     if (config.local_controller == "dwa" and may_scan and geometry is not None and scan is not None
             and not scan.has_result and not scan.attempted and target_distance is not None

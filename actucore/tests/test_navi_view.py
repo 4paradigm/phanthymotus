@@ -500,8 +500,10 @@ def test_executing_segment_is_visibly_distinct_from_candidate():
     active = Detour(None, ((0., 0.), (.8, -.15)), geometry)
     preview = _render(depth_m=depth, ground=ground, detour=candidate)
     executing = _render(depth_m=depth, ground=ground, detour=candidate, executing=active)
+    published_only = _render(depth_m=depth, ground=ground, executing=active)
     assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
     assert (executing == V._EXECUTING_ROUTE).all(axis=2).any()
+    assert np.array_equal(executing, published_only)
 
 
 @needs_cv2

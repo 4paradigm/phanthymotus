@@ -156,7 +156,7 @@ def test_lost_received_speed_holds_after_source_guard_expires(monkeypatch, late_
     assert not any(card._last_decision.values)
 
 
-@pytest.mark.parametrize("event", ["clear", "obstacle", "long_gap", "target"])
+@pytest.mark.parametrize("event", ["clear", "source_switch", "obstacle", "long_gap", "target"])
 def test_search_turn_uses_its_checked_window_through_a_speed_miss(monkeypatch, event):
     card, packets, clock, snapshot = observation_card(monkeypatch)
     card._command_timer = object()
@@ -177,7 +177,7 @@ def test_search_turn_uses_its_checked_window_through_a_speed_miss(monkeypatch, e
     window = card._scheduled_command
     assert state.search_feedback_ms == 1000
 
-    stamp = 1300 if event == "long_gap" else 1100
+    stamp = {"source_switch": 1310, "long_gap": 1450}.get(event, 1100)
     clock[0] = stamp
     frame = clear.copy()
     if event == "obstacle":
@@ -200,6 +200,11 @@ def test_search_turn_uses_its_checked_window_through_a_speed_miss(monkeypatch, e
         snapshot[0] = objects, dict(depth, map=clear, control_ms=1200), normal, stamp
         card._tick()
         assert len(packets) == 2 and packets[-1]["values"] == first["values"]
+    elif event == "source_switch":
+        assert len(packets) == 2 and packets[-1]["values"] == first["values"]
+        assert state.motion_source == "measured"
+        assert state.feedback_guard_s == 0.
+        assert packets[-1]["ttl_ms"] <= config.max_feedback_gap_ms
     else:
         assert len(packets) == 2 and not any(packets[-1]["values"])
 
@@ -278,6 +283,24 @@ def test_latest_only_detour_can_keep_its_checked_route_after_the_obstacle_leaves
     assert packets[-1]["values"][0] > 0.
 
 
+def test_retained_route_budget_does_not_start_searching_alternate_paths(monkeypatch):
+    card, _, clock, snapshot, first = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(first, card._output_epoch)
+    advance_snapshot(snapshot, clock, 1100, vx=first["values"][0])
+    attempted = []
+
+    def timeout(depth, config, state, route, *args, **kwargs):
+        attempted.append(kwargs.get("follow_published", False))
+        state.dwa_trace["fallback_reason"] = "search_deadline"
+        return None
+
+    monkeypatch.setattr(policy, "_dwa_detour", timeout)
+    candidate = card.next_command()
+    assert attempted == [True]
+    assert card._state.dwa_trace["wait_for_committed_route"]
+    assert not any(candidate["values"])
+
+
 @pytest.mark.parametrize("next_depth", ["expired", "clear", "obstacle"])
 def test_expired_depth_leaves_the_sent_packet_until_its_original_deadline(monkeypatch, next_depth):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
@@ -337,8 +360,47 @@ def test_view_prefers_the_wire_route_over_the_latest_preview(monkeypatch):
 
     card._publish_view()
     snapshot = card._view_queue.get_nowait()
-    assert snapshot["detour"].points == original
-    assert not snapshot["project_detour"]
+    assert snapshot["executing"].points == original
+    assert snapshot["detour"] is None
+    assert not snapshot["project_executing"]
+
+    # A planner gap or a stop does not turn a rejected preview into the route.
+    card._scheduled_command = None
+    card._wire_moving = False
+    card._view_next_at = 0.
+    card._publish_view()
+    gap = card._view_queue.get_nowait()
+    assert gap["executing"].points == original
+    assert gap["detour"] is None
+
+    card._last_decision = policy.Decision(None, policy.FAILED)
+    card._view_next_at = 0.
+    card._publish_view()
+    assert card._view_queue.get_nowait()["executing"] is None
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_speed_gap_checks_previous_route_by_prediction(monkeypatch, blocked):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    packet = card.next_command()
+    assert card._stage_command(packet, card._output_epoch)
+    initial, = packets
+    work = card._scheduled_command
+    expiry = work.expires_ms
+    advance_snapshot(snapshot, clock, 1080, obstacle=blocked)
+    objects, depth, odom, receipt = snapshot[0]
+    snapshot[0] = objects, depth, dict(odom, vx=None, vy=None, wz=None), receipt
+
+    card._tick()
+
+    if blocked:
+        assert packets[-1]["values"] == [0.] * 6
+    else:
+        assert packets == [initial]
+        assert card._scheduled_command is work
+        assert work.expires_ms == expiry
+        assert card._wire_twist == (initial["values"][0], initial["values"][1], initial["values"][5])
 
 
 @pytest.mark.parametrize("target_missing", [False, True])
