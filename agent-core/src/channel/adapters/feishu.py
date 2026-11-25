@@ -306,7 +306,7 @@ class FeishuAdapter(ChannelAdapter):
         """轻量 API 探测（bot info），结果缓存 _PROBE_TTL 秒。
 
         探测同时覆盖：凭据是否有效（换 token）+ 网络是否通 + 应用是否已发布。
-        应用没开 bot info 权限时不算故障——token 换到了就说明凭据没问题。
+        群聊过滤和补图关联都依赖 bot.open_id，无法获取身份时不能报告健康。
         """
         if not force and time.time() - self._probe_ts < _PROBE_TTL:
             return self._probe_ok, self._probe_err
@@ -316,16 +316,15 @@ class FeishuAdapter(ChannelAdapter):
             if self._bot_open_id:
                 self._missing_bot_id_drops = 0
                 self._missing_bot_id_log_ts = 0.0
-            if self.config.get('bot_to_bot_enabled') and not self._bot_open_id:
+            if not self._bot_open_id:
                 self._probe_ok = False
-                self._probe_err = 'bot-to-bot is enabled but /bot/v3/info returned no bot.open_id'
+                self._probe_err = (
+                    '/bot/v3/info returned no bot.open_id; group message handling '
+                    'requires the bot identity. Enable the bot and publish the app.'
+                )
             else:
                 self._probe_ok, self._probe_err = True, ''
-        except FeishuError as e:
-            if e.code == 99991672 and not self.config.get('bot_to_bot_enabled'):
-                self._probe_ok, self._probe_err = True, ''
-            else:
-                self._probe_ok, self._probe_err = False, str(e)
+
         except Exception as e:
             self._probe_ok, self._probe_err = False, str(e)
         self._probe_ts = time.time()
@@ -629,13 +628,13 @@ class FeishuAdapter(ChannelAdapter):
             if self._is_duplicate(raw['message_id']):
                 return
 
+            content = _message_content(raw)
             human_group = not is_bot and raw.get('chat_type') == 'group'
             mentions_self = bool(self._bot_open_id) and any(
                 mention.get('open_id') == self._bot_open_id
                 for mention in raw.get('mentions', [])
             )
             related_request = {}
-            request_context = None
             if human_group:
                 now = time.monotonic()
                 self._image_requests = {
@@ -647,16 +646,18 @@ class FeishuAdapter(ChannelAdapter):
                     return
                 if not mentions_self:
                     request = self._image_requests.get(key)
-                    if not request or not request['text'] or not _has_image(raw):
+                    if not request or not request['text'] or not _has_image(raw, content):
                         return  # 全量群消息权限下，无关消息在下载附件之前过滤。
                     # 在下载之前取快照，避免下载期间新的 @ 改写本张图的上下文。
                     related_request = {
                         'message_id': request['message_id'], 'text': request['text'],
                     }
                 else:
-                    # 先占住最新消息的位置，较早图文的慢下载不能覆盖后来的要求。
+                    # 下载前缓存文字；慢下载既不能漏掉补图，也不能覆盖后来的要求。
+                    request_text = _request_text(raw['message_type'], content)
                     request_context = {
-                        'message_id': raw['message_id'], 'text': '',
+                        'message_id': raw['message_id'],
+                        'text': request_text if request_text.strip() else '',
                         'expires_at': now + _IMAGE_FOLLOWUP_TTL,
                     }
                     self._image_requests.pop(key, None)
@@ -664,12 +665,9 @@ class FeishuAdapter(ChannelAdapter):
                     if len(self._image_requests) > _IMAGE_FOLLOWUP_MAX:
                         self._image_requests.pop(next(iter(self._image_requests)))
 
-            text, attachments = await self._parse_content(raw)
+            text, attachments = await self._parse_content(raw, content)
             if not text and not attachments:
                 return
-
-            if request_context is not None and raw['message_type'] in ('text', 'post'):
-                request_context['text'] = text if text.strip() else ''
 
             expect_reply = None
             if is_bot:
@@ -707,12 +705,11 @@ class FeishuAdapter(ChannelAdapter):
         except Exception as e:
             print(f'[feishu] process event failed: {e}')
 
-    async def _parse_content(self, raw: dict) -> tuple[str, list[Attachment]]:
+    async def _parse_content(self, raw: dict,
+                             content: dict | None = None) -> tuple[str, list[Attachment]]:
         msg_type = raw['message_type']
-        try:
-            content = json.loads(raw['content'] or '{}')
-        except json.JSONDecodeError:
-            content = {}
+        if content is None:
+            content = _message_content(raw)
 
         message_id = raw['message_id']
         attachments: list[Attachment] = []
@@ -804,17 +801,43 @@ class FeishuAdapter(ChannelAdapter):
                                 name=name, mime=mime, fallback_ext=fallback_ext)
 
 
-def _has_image(raw: dict) -> bool:
+def _message_content(raw: dict) -> dict:
+    """同一消息的文字关联、图片过滤和附件下载复用解析后的内容。"""
+    try:
+        content = json.loads(raw.get('content') or '{}')
+    except (TypeError, ValueError):
+        return {}
+    return content if isinstance(content, dict) else {}
+
+
+def _request_text(msg_type: str, content: dict) -> str:
+    """只提取原要求的文字，附件占位符不能成为后续图片的指令上下文。"""
+    if msg_type == 'text':
+        return content.get('text', '')
+    if msg_type != 'post':
+        return ''
+    parts = []
+    for block in content.get('content', []) or []:
+        for el in block or []:
+            tag = el.get('tag', '')
+            if tag == 'text':
+                parts.append(el.get('text', ''))
+            elif tag == 'a':
+                parts.append(f'{el.get("text", "")}({el.get("href", "")})')
+        parts.append('\n')
+    title = content.get('title', '')
+    return (f'{title}\n' if title else '') + ''.join(parts).strip()
+
+
+def _has_image(raw: dict, content: dict | None = None) -> bool:
     """识别无 @ 的图片补充消息；不下载普通文件、语音或表情。"""
     if raw.get('message_type') == 'image':
         return True
     if raw.get('message_type') != 'post':
         return False
-    try:
-        content = json.loads(raw.get('content') or '{}')
-    except (TypeError, ValueError):
-        return False
-    return isinstance(content, dict) and any(
+    if content is None:
+        content = _message_content(raw)
+    return any(
         isinstance(el, dict) and el.get('tag') == 'img'
         for block in (content.get('content') or []) if isinstance(block, list)
         for el in block
