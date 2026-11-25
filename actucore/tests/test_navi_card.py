@@ -228,6 +228,7 @@ def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypa
     monkeypatch.setattr(card, "_publish_command", publish)
     card._depth_ms, card._depth_map = 1000, np.ones((4, 4))
     scan = card._state.active_scan
+    card._config.max_feedback_gap_ms = scan.max_feedback_gap_ms = 250
     scan.receipt_only = scan.buffered_odom = scan.issued_yaw = True
     scan.phase, scan.advance_m, scan.directions = "turn", 1., (-1.,)
     scan.turn_angle, scan.turn_yaw = .25, .6
@@ -367,7 +368,7 @@ def test_late_local_translation_rechecks_new_depth_without_restamping_target(mon
     import numpy as np
     from plugins.navi import local_path, policy
 
-    card = _card(local_planning=True, max_depth_age_ms=800, watchdog_ms=600)
+    card = _card(local_planning=True, max_depth_age_ms=800, watchdog_ms=600, max_feedback_gap_ms=250)
     card._config.local_geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
     card._descriptor = {"rate": {"max_obs_age_ms": 800}}
     card._ttl_ms = 400
@@ -1331,6 +1332,25 @@ def test_it_starts_without_a_downstream_card():
                                                   "/cam/visual_depth"]})
     assert out["state"] == "running"
     assert any("不会驱动任何硬件" in note for note in out["degraded"])
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_navi_owns_feedback_and_obstacle_history_defaults(monkeypatch, configured):
+    settings = {"max_feedback_gap_ms": 350, "use_obstacle_history": True} if configured else {}
+    card = _card(**settings)
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(card, "_node", _FakeNode()))
+    descriptor = _descriptor()
+    descriptor["rate"]["max_feedback_gap_ms"] = 250
+    descriptor["navigation"] = {"use_obstacle_history": not configured}
+    try:
+        started = card.dispatch("navi", {"action": "start", "control_interface": descriptor,
+                                          "input_topics": ["/cam/objects", "/cam/visual_depth"]})
+        assert started["state"] == "running"
+        effective = card._info()["config"]
+        assert effective["max_feedback_gap_ms"] == (350 if configured else 300)
+        assert effective["use_obstacle_history"] is configured
+    finally:
+        card._stop()
 
 
 def test_an_unbound_card_says_so_in_info():

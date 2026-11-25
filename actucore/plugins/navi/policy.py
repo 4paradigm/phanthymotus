@@ -67,7 +67,8 @@ import numpy as np
 
 from .camera import HorizontalIntrinsics
 from .camera import half_fov as _resolve_half_fov
-from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, CAMERA_OCCUPANCY_MEMORY_RANGE_M, MAP_AGE_MS, ODOM_GAP_MS,
+from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, CAMERA_OCCUPANCY_MEMORY_RANGE_M,
+                          DEFAULT_FEEDBACK_GAP_MS, MAP_AGE_MS, ODOM_GAP_MS,
                           NearProjection, SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW,
                           TURN_SPEED_REDUCTION, confirmed_square_coverage, relative_pose_at)
 from .depth import has_valid_returns, observation_ms
@@ -257,8 +258,8 @@ class Config:
     max_depth_age_ms: int | None = None
     scan_odom_linear_tolerance_mps: float = SCAN_ODOM_LINEAR_TOLERANCE_MPS
     gap_speed_bounds: tuple | None = None
-    use_obstacle_history: bool = True
-    max_feedback_gap_ms: int = ODOM_GAP_MS
+    use_obstacle_history: bool = False
+    max_feedback_gap_ms: int = DEFAULT_FEEDBACK_GAP_MS
     watchdog_ms: float = 300
     stuck_window_s: float = 3.0
     stuck_speed_ratio: float = 0.2
@@ -1085,17 +1086,11 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     """
     notes: list[str] = []
     notes.extend(_adopt_footprint(config, descriptor))
-    navigation = (descriptor or {}).get("navigation")
-    if isinstance(navigation, dict) and type(navigation.get("use_obstacle_history")) is bool:
-        config.use_obstacle_history = navigation["use_obstacle_history"]
     rate = (descriptor or {}).get("rate") or {}
     watchdog = rate.get("watchdog_ms")
     if (isinstance(watchdog, (int, float)) and not isinstance(watchdog, bool)
             and math.isfinite(watchdog) and watchdog > 0):
         config.watchdog_ms = watchdog
-    feedback_gap = rate.get("max_feedback_gap_ms")
-    if type(feedback_gap) is int and feedback_gap > 0:
-        config.max_feedback_gap_ms = min(feedback_gap, int(config.watchdog_ms))
     max_age = rate.get("max_obs_age_ms")
     if (isinstance(max_age, (int, float)) and not isinstance(max_age, bool)
             and math.isfinite(max_age) and max_age > 0

@@ -25,7 +25,7 @@ def observation_case(*, controller="dwa", body=True, attempted=True):
                            use_lateral=False, local_geometry=geometry,
                            scan_geometry=geometry if body else None,
                            half_width_m=.20, vx_max=.30, max_depth_age_ms=800,
-                           watchdog_ms=500)
+                           watchdog_ms=500, max_feedback_gap_ms=250, use_obstacle_history=True)
     state = policy.State(target="person", motion_source="measured",
                          commanded=(.10, 0., 0.), goal_anchor=policy.DetourGoal(3., 0.))
     state.active_scan.receipt_only = True
@@ -139,7 +139,8 @@ def advance_case(*, body):
                 if body else camera)
     config = policy.Config(local_controller="dwa", local_planning=True, use_lateral=False,
                            local_geometry=geometry, scan_geometry=geometry if body else None,
-                           half_width_m=.20, vx_max=.30, max_depth_age_ms=500, watchdog_ms=300)
+                           half_width_m=.20, vx_max=.30, max_depth_age_ms=500, watchdog_ms=300,
+                           use_obstacle_history=True)
     rows = np.arange(height)[:, None] - 60.
     floor_depth = .35 * 72. / np.maximum(rows, 1.)
     image = np.broadcast_to(np.minimum(floor_depth, 5.), (height, width)).copy()
@@ -934,9 +935,11 @@ def test_clearance_route_keeps_every_original_turn_node_as_its_topology(monkeypa
     assert ref.topology == raw and ref.geometry is geometry
 
 
-def test_descriptor_latest_depth_only_executes_a_visible_detour(monkeypatch):
+def test_default_latest_depth_only_executes_a_visible_detour(monkeypatch):
     config, state, depth, odom = observation_case(body=False, attempted=False)
-    policy.adopt_limits(config, {"navigation": {"use_obstacle_history": False}})
+    defaults = policy.Config()
+    config = replace(config, use_obstacle_history=defaults.use_obstacle_history,
+                     max_feedback_gap_ms=defaults.max_feedback_gap_ms)
     scan = state.active_scan
     scan.near_obstacles.frame = ("navi_relative", scan.motion_frame)
     scan.near_obstacles.cells.add((4, -3))

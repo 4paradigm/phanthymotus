@@ -14,6 +14,7 @@ from test_navi_dwa_opening_integration import _case
 ])
 def test_blocked_route_retries_a_cell_of_advance_with_full_braking(room, side_post, lateral, expected):
     config, state, depth, geometry, _ = _case(True, "dwa")
+    config.use_obstacle_history = True
     config.vx_max, config.floor_vx, config.dwa_horizon_s = .6, 0., 2.25
     config.wz_max = 0.
     config.use_lateral, config.vy_max = lateral, .03
@@ -103,6 +104,7 @@ def test_direct_prefix_cannot_turn_or_move_laterally_towards_the_reference():
 ])
 def test_doorway_distinguishes_initial_memory_overlap_from_later_sweep(forward, right, reason):
     config, state, depth, geometry, _ = _case(False, "dwa")
+    config.use_obstacle_history = True
     assert geometry.front == 0.
     config.vx_max = config.floor_vx = .15
     config.vy_max = config.wz_max = 0.

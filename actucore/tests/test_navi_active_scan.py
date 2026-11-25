@@ -29,7 +29,7 @@ def _setup(monkeypatch):
     visible = np.ones_like(blocked)
     monkeypatch.setattr(scan, "observe",
                         lambda *args: (visible.copy(), blocked.copy()))
-    lookout = scan.ActiveScan()
+    lookout = scan.ActiveScan(max_feedback_gap_ms=250)
     geometry = Geometry(None, None, np.eye(4), .23, .23, None)
     return lookout, geometry, visible, blocked
 
@@ -476,9 +476,7 @@ def test_route_turn_checks_the_direction_of_measured_forward_motion(monkeypatch,
 def test_tianyi_buffered_turn_tolerates_a_short_feedback_gap():
     from plugins.navi import policy
 
-    config = policy.Config()
-    policy.adopt_limits(config, {"rate": {"watchdog_ms": 500, "max_feedback_gap_ms": 350}})
-    assert config.max_feedback_gap_ms == 350
+    config = policy.Config(max_feedback_gap_ms=350)
     look = scan.ActiveScan(max_feedback_gap_ms=config.max_feedback_gap_ms,
                            receipt_only=True, buffered_odom=True, phase="turn", issued_yaw=True)
     look.poses.append((1000, look.pose, 0.))

@@ -20,6 +20,7 @@ STILL_LINEAR = .05
 SCAN_ODOM_LINEAR_TOLERANCE_MPS = .08
 STILL_YAW = .04
 ODOM_GAP_MS = 250
+DEFAULT_FEEDBACK_GAP_MS = 300
 MAP_AGE_MS = 2500
 FREE_MEMORY_RADIUS_CELLS = round(6. / RESOLUTION)
 FREE_MEMORY_SHIFT_CELLS = round(1. / RESOLUTION)
@@ -414,7 +415,7 @@ class ActiveScan:
     motion_frame: object = field(default_factory=object)
     motion: tuple = (0., 0., 0.)
     odom_linear_tolerance_mps: float = SCAN_ODOM_LINEAR_TOLERANCE_MPS
-    max_feedback_gap_ms: int = ODOM_GAP_MS
+    max_feedback_gap_ms: int = DEFAULT_FEEDBACK_GAP_MS
     poses: deque = field(default_factory=lambda: deque(maxlen=32))
     views: deque = field(default_factory=lambda: deque(maxlen=40))
     observed_vantages: deque = field(default_factory=lambda: deque(maxlen=32))

@@ -217,7 +217,7 @@ def test_turn_checks_original_subcell_obstacle_at_its_exposure(mode, source, rig
     geometry = local_path.Geometry(None, None, np.eye(4), 0. if camera else .2,
                                    .4 if camera else .2, None)
     config = policy.Config(half_width_m=.20, scan_geometry=None if camera else geometry,
-                           local_geometry=geometry)
+                           local_geometry=geometry, use_obstacle_history=True)
     state = policy.State()
     scan = state.active_scan
     origin = PlanarPose(1000, ("odom",), 0., 0., 0.)
@@ -245,7 +245,8 @@ def test_turn_checks_original_subcell_obstacle_at_its_exposure(mode, source, rig
 def test_rolling_source_age_and_confirmed_free_boundaries():
     from plugins.navi.odom import PlanarPose
 
-    config = policy.Config(half_width_m=.20, scan_geometry=GEOMETRY, local_geometry=GEOMETRY)
+    config = policy.Config(half_width_m=.20, scan_geometry=GEOMETRY, local_geometry=GEOMETRY,
+                           use_obstacle_history=True)
     state = policy.State()
     scan = state.active_scan
     empty = np.zeros(local_path.SHAPE, bool)
@@ -296,7 +297,7 @@ def test_registered_camera_view_keeps_its_exposure_offset():
 
     old = local_path.Geometry(None, None, np.eye(4), 0., .40, None)
     current = local_path.Geometry(None, None, np.eye(4), 0., .60, None)
-    config = policy.Config(scan_geometry=None, local_geometry=current, half_width_m=.20)
+    config = policy.Config(use_obstacle_history=True, scan_geometry=None, local_geometry=current, half_width_m=.20)
     state = policy.State()
     scan = state.active_scan
     scan.keep_physical_views = True

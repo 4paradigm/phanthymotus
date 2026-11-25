@@ -425,7 +425,7 @@ def timed_feedback_card(monkeypatch):
 @pytest.mark.parametrize("gap_ms", [250, 300])
 def test_new_feedback_after_285_ms_can_only_resume_with_the_larger_gap(timed_feedback_card, gap_ms):
     card, packets, clock, snapshot = timed_feedback_card
-    policy.adopt_limits(card._config, {"rate": {"watchdog_ms": 1000, "max_feedback_gap_ms": gap_ms}})
+    card._config.max_feedback_gap_ms = gap_ms
     card._stage_command(card.next_command(), card._output_epoch)
     assert packets[-1]["values"][0] > 0.
     scan = card._state.active_scan
@@ -445,7 +445,7 @@ def test_new_feedback_after_285_ms_can_only_resume_with_the_larger_gap(timed_fee
 @pytest.mark.parametrize("gap_ms", [250, 300])
 def test_missing_feedback_caps_wire_ttl_even_with_fresh_depth(timed_feedback_card, gap_ms):
     card, packets, clock, snapshot = timed_feedback_card
-    policy.adopt_limits(card._config, {"rate": {"watchdog_ms": 1000, "max_feedback_gap_ms": gap_ms}})
+    card._config.max_feedback_gap_ms = gap_ms
     card._stage_command(card.next_command(), card._output_epoch)
     assert packets[-1]["values"][0] > 0.
     deadline = 1000 + gap_ms

@@ -3692,7 +3692,7 @@ def test_legacy_remembered_wall_allows_the_same_checked_approach(monkeypatch, re
 
     geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .2)
     config = _legacy_cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
-                  use_lateral=False, wz_max=0., half_width_m=.2)
+                         use_lateral=False, wz_max=0., half_width_m=.2, use_obstacle_history=True)
     state = _state(motion_source="measured")
     wall = np.isclose(local_path.FORWARD, 1.25)
     monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~wall, wall))
@@ -3753,7 +3753,7 @@ def test_memory_can_use_the_command_only_scan_without_a_motion_pose_history(monk
 
     geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .2)
     config = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
-                  use_lateral=False, wz_max=0., half_width_m=.2)
+                  use_lateral=False, wz_max=0., half_width_m=.2, use_obstacle_history=True)
     state = _state(motion_source="command")
     wall = np.isclose(local_path.FORWARD, 1.25)
     monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~wall, wall))
@@ -4443,7 +4443,8 @@ def test_legacy_visible_foreground_triggers_detour_before_slowdown_then_survives
     from plugins.navi.camera import HorizontalIntrinsics
 
     geom = local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
-    cfg = _legacy_cfg(scan_geometry=geom, local_geometry=geom, local_planning=True, use_lateral=False, slow_distance_m=1.5)
+    cfg = _legacy_cfg(scan_geometry=geom, local_geometry=geom, local_planning=True,
+                      use_lateral=False, slow_distance_m=1.5, use_obstacle_history=True)
     state = _state()
     scan = state.active_scan
     visible = np.zeros(local_path.SHAPE, dtype=bool)
@@ -4537,7 +4538,7 @@ def test_foreground_in_bottom_of_depth_image_is_remembered_before_it_disappears(
     from plugins.navi.odom import PlanarPose
 
     geom = local_path.camera_square(HorizontalIntrinsics(64, 50., 32.), (48, 50., 24.), .275)
-    cfg = _cfg(local_planning=True, local_geometry=geom, scan_geometry=geom)
+    cfg = _cfg(use_obstacle_history=True, local_planning=True, local_geometry=geom, scan_geometry=geom)
     state = _state()
     scan = state.active_scan
     pose = PlanarPose(1100, ("room",), 0., 0., 0.)
@@ -5101,7 +5102,7 @@ def test_target_search_uses_a_directional_sweep_for_retained_obstacles(monkeypat
     from plugins.navi.camera import HorizontalIntrinsics
 
     geometry = P.local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .23)
-    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.23,
+    config = _cfg(use_obstacle_history=True, local_planning=True, local_geometry=geometry, half_width_m=.23,
                   search_rate=.6, lost_frames=1, max_depth_age_ms=800)
     state = _state(motion_source="measured")
     scan = state.active_scan
@@ -5131,7 +5132,7 @@ def test_stationary_search_checks_the_requested_arc_inside_the_turn_circle(monke
     g = P.local_path
     geometry = g.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20, half_length=.45)
     config = _cfg(local_planning=True, local_geometry=geometry, scan_geometry=geometry,
-                  half_width_m=.20, search_rate=.20, lost_frames=1)
+                  half_width_m=.20, search_rate=.20, lost_frames=1, use_obstacle_history=True)
     state = _state(motion_source="measured")
     hits = np.isclose(g.FORWARD, 0.) & np.isclose(g.RIGHT, obstacle_right)
     assert hits.any() and not state.active_scan.clear_sweep(geometry, .20, 0., occupied=hits)
@@ -5674,7 +5675,7 @@ def test_dwa_search_absolute_pose_handoff_retains_original_limits(local_planning
 
 @pytest.mark.parametrize("broken", [False, True])
 def test_continuous_velocity_history_counts_between_slow_ticks(broken):
-    cfg = _cfg(local_controller="dwa", idle_timeout_s=.38)
+    cfg = _cfg(max_feedback_gap_ms=250, local_controller="dwa", idle_timeout_s=.38)
     scene = _depth(map_=_solid_depth(4.))
     state = seed(_state(), _detections(_obj()), scene, cfg)
     history = []
@@ -5806,7 +5807,7 @@ def test_replanned_directions_require_net_body_displacement(monkeypatch, turns_c
 def test_slow_measured_pose_and_velocity_share_one_progress_interval(stream):
     from plugins.navi.odom import PlanarPose
 
-    cfg = _cfg(local_controller="dwa", idle_timeout_s=.85)
+    cfg = _cfg(max_feedback_gap_ms=250, local_controller="dwa", idle_timeout_s=.85)
     scene = _depth(map_=_solid_depth(5.))
     state = seed(_state(), _detections(_obj()), scene, cfg)
     history = []
@@ -5918,7 +5919,7 @@ def test_absolute_pose_dropout_requires_registered_travel(speed, covered):
 def test_returning_world_fix_after_local_velocity_progress_only_rebaselines():
     from plugins.navi.odom import PlanarPose
 
-    cfg = _cfg(local_controller="dwa", idle_timeout_s=.8)
+    cfg = _cfg(max_feedback_gap_ms=250, local_controller="dwa", idle_timeout_s=.8)
     scene = _depth(map_=_solid_depth(5.))
     state = seed(_state(), _detections(_obj()), scene, cfg)
     history, credits = [], []
