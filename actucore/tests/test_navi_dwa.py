@@ -149,6 +149,27 @@ def test_dwa_is_default_and_has_bounded_configuration():
 STRAIGHT = ((0., 0.), (.8, 0.))
 
 
+@pytest.mark.parametrize("follow_published", [False, True])
+@pytest.mark.parametrize("allow_transition", [False, True])
+def test_moving_arc_handoff_sweeps_interpolated_yaw(follow_published, allow_transition):
+    checked = []
+
+    def visible(command, poses, duration):
+        yaw = command[2]
+        checked.append(yaw)
+        return dwa.CandidateCheck(yaw == 0. or (allow_transition and yaw == pytest.approx(-.4)), "blocked")
+
+    budget = dwa.CandidateBudget(32)
+    choice = _run(STRAIGHT, previous=(.2, 0., -.5), measured=(.2, 0., -.02),
+                  x_limit=(0., .22), horizon=.8, candidate_budget=budget,
+                  follow_published=follow_published, handoff_yaw_step=.1,
+                  validate_candidate=visible)
+    assert choice.command[0] > 0.
+    assert -.4 in checked
+    assert choice.command[2] == pytest.approx(-.4 if allow_transition else 0.)
+    assert budget.remaining >= 0
+
+
 def test_guard_rejects_fast_candidate_but_accepts_slow_candidate():
     geometry = _geometry()
     grid = _grid(obstacles=[(.60, .40)])

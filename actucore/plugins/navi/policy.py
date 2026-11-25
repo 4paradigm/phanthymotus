@@ -757,6 +757,9 @@ class State:
     checked_prefix: bool = False
     dwa_selected: bool = False
     dwa_proposal: DwaProposal | DwaTurn | None = None
+    published_dwa_route: DwaAcceptance | None = None
+    published_camera_passage: CameraPassage | None = None
+    dwa_handoff_yaw_step: float = 0.
     dwa_motion_guard: DwaMotionGuard | None = None
     dwa_association: tuple[AssociationSnapshot, PlanarPose] | None = None
     dwa_admission_ms: int = 0
@@ -879,6 +882,8 @@ class DwaAcceptance:
     motion_guard: DwaMotionGuard | None = None
     angle_controlled: bool = False
     route_points: tuple = ()
+    followed_route: bool = False
+    passage_exit: tuple | None = None
 
     @property
     def target_observed(self):
@@ -1509,7 +1514,9 @@ def step(*, detections, depth, odom, config: Config, state: State,
             decision.dwa_acceptance = DwaAcceptance(
                 state.decision_id, proposal.command, trace["guard_horizon_s"],
                 state.dwa_motion_guard, isinstance(proposal, DwaTurn),
-                proposal.reference.points if isinstance(proposal, DwaProposal) and proposal.branch != "visual_probe" else ())
+                proposal.reference.points if isinstance(proposal, DwaProposal) and proposal.branch != "visual_probe" else (),
+                followed_route=bool(trace.get("retained_route")),
+                passage_exit=proposal.reference.passage_exit if isinstance(proposal, DwaProposal) else None)
             trace.update(controller_used="dwa", accepted_twist=proposal.command, fallback_reason=None)
         else:
             if state.dwa_selected:
@@ -3478,7 +3485,8 @@ def _visual_approach(depth, config, state, geometry, track, feedback, objects_ms
 
 def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
                 branch="route", motion=None, speed_limit=None,
-                candidate_commands=(), shadow=None, recovery=False, alternates=(), guidance=False):
+                candidate_commands=(), shadow=None, recovery=False, alternates=(), guidance=False,
+                follow_published=False, route_error=0.):
     """Select a finite swept footprint on a local navigation reference."""
     if config.local_controller != "dwa":
         return None
@@ -3518,6 +3526,9 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     inputs, grid = _dwa_motion_inputs(depth, config, state, geometry, target, motion)
     if inputs is None:
         return unavailable(grid)
+    if follow_published:
+        reachable_vx = max(0., inputs.measured[0]) + config.motion_acceleration[0] * config.dwa_horizon_s
+        limit_x = min(limit_x, reachable_vx)
     if shadow is None and scan.receipt_only and not config.use_lateral and not visual:
         shadow = scan.occlusion(geometry)
 
@@ -3554,7 +3565,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         candidate_commands=candidate_commands, validate_candidate=visible if shadow is not None else None,
         diagnostics=diagnostics, alternate_routes=tuple(ref.points for ref in alternates),
         candidate_budget=state.dwa_budget, motion_frame=(scan.motion_frame, inputs.pose), guidance=guidance,
-        measured_target=inputs.measured_target)
+        measured_target=inputs.measured_target, follow_published=follow_published, route_error=route_error,
+        handoff_yaw_step=state.dwa_handoff_yaw_step if not visual else 0.)
     for key in ("sampled_candidates", "cached_candidates", "considered_candidates", "physical_evaluations", "bound_skips", "response_reuse",
                 "admissible_candidates", "reference_scores"):
         trace[key] = trace.get(key, 0) + diagnostics[key]
@@ -3562,7 +3574,7 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         trace["rejected"][key] = trace["rejected"].get(key, 0) + value
     trace["attempts"].append(dict(branch=branch, geometry_mode=mode, **diagnostics))
     if proposed is None:
-        if (scan.dwa_failures >= 2 and not scan.attempted and "memory_recheck" not in trace
+        if (not follow_published and scan.dwa_failures >= 2 and not scan.attempted and "memory_recheck" not in trace
                 and diagnostics["rejected"].get("remembered_obstacle")):
             context = _dwa_context(inputs, geometry, config, scan.motion_frame)
             view = _blocking_memory_view(scan, context, state.dwa_budget)
@@ -3601,6 +3613,37 @@ def _use_dwa(state, proposal, side):
     return (*proposal.command, AVOIDING, "局部规划：DWA沿已验证绕行轨迹运动")
 
 
+def _follow_published_route(depth, config, state, geometry, distance, bearing, *, foreground):
+    previous = state.published_dwa_route
+    if _dwa_unavailable_reason(depth, config, state):
+        return None
+    scan, guard = state.active_scan, previous.motion_guard
+    track = state.tracker.track
+    now = depth.get("control_ms") or scan.control_ms or scan.current_frame
+    current = dwa_grid_pose(scan, geometry, now, state.dwa_odom)
+    if (guard.target_name != state.target or guard.generation != (track.generation if track else None)
+            or current is None or not 0 <= now - current.stamp_ms < config.max_feedback_gap_ms
+            or (guard.footprint.front, guard.footprint.rear) != (geometry.front, geometry.rear)):
+        return None
+    try:
+        transform = dwa_registration(guard.pose, current, guard.checked_ms, now, geometry,
+                                     (scan.motion, state.commanded), reference=dwa_pose_reference(scan, state.dwa_odom))
+    except DwaFrameMismatch:
+        return None
+    exit_line = (tuple(map(tuple, transform.points(previous.passage_exit)))
+                 if previous.passage_exit is not None else None)
+    if not foreground and not local_path.passage_ahead(exit_line):
+        return None
+    route = Detour(None, tuple(map(tuple, transform.points(previous.route_points))), geometry,
+                   passage_exit=exit_line)
+    proposal = _dwa_detour(depth, config, state, route, distance, bearing,
+                           follow_published=True, route_error=transform.error(math.hypot(*previous.route_points[-1])))
+    if proposal is None:
+        return None
+    state.dwa_trace["retained_route"] = True
+    return _use_dwa(state, proposal, state.escape_side)
+
+
 def _route_rank(plan, target):
     residual = math.dist(plan.points[-1], local_path.target_in_grid(plan.geometry, *target))
     length = sum(math.dist(a, b) for a, b in zip(plan.points, plan.points[1:]))
@@ -3617,7 +3660,7 @@ def _dwa_route_reference(plan, visible, target, stop, tolerance):
     complete = (not plan.reachable_prefix
                 and stop - 1e-9 <= residual <= stop + max(tolerance, local_path.RESOLUTION) + 1e-9)
     ref = Detour(None, points[:visible], plan.geometry, points if visible < len(points) else (),
-                 reachable_prefix=not complete, topology=topology)
+                 reachable_prefix=not complete, topology=topology, passage_exit=plan.passage_exit)
     return ("route" if complete else "reachable_prefix"), ref
 
 
@@ -3668,6 +3711,19 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
 
     opening = (local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target)
                if not closest or dwa_only else None)
+    detour_opening = (local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target, True)
+                      if config.local_controller == "dwa" and (not closest or dwa_only) else None)
+    if detour_opening is not None:
+        joined = local_path.extend_passage(detour_opening, grid, keep, target, config.stop_distance_m)
+        if joined is not detour_opening:
+            visible = local_path.visible_prefix(joined.points, shadow) if shadow is not None else len(joined.points)
+            if visible > len(detour_opening.points):
+                branch, ref = _dwa_route_reference(joined, visible, target, config.stop_distance_m, config.stop_tolerance_m)
+                proposal = _dwa_detour(depth, config, state, ref, target_distance, target_bearing,
+                                       branch=branch, shadow=shadow, recovery=dwa_only, guidance=True,
+                                       follow_published=True)
+                if proposal is not None:
+                    return _use_dwa(state, proposal, math.copysign(1., detour_opening.points[-1][1]))
 
     if dwa_only and target is not None and depth.get("ground") is not None:
         previous = ()
@@ -3748,8 +3804,6 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
     if config.local_controller == "dwa":
         route_candidates = tuple(route_candidates)
         dwa_candidates = route_candidates
-        detour_opening = (local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target, True)
-                          if not closest or dwa_only else None)
         if detour_opening is not None and not any(
                 plan.points == detour_opening.points for plan, _, _ in route_candidates):
             # Preserve existing reference seeds and the legacy fallback. An
@@ -4014,7 +4068,58 @@ def camera_arc_clear(geometry, config, occupied, target, command, previous, resi
     return check.accepted
 
 
-def _camera_detour(depth, config, state, geometry, vx, distance, bearing):
+@dataclass(frozen=True)
+class CameraPassage:
+    route: Detour
+    occupied: np.ndarray
+    capture_ms: int
+    generation: int | None
+
+    def register(self, config, geometry, occupied, capture_ms):
+        delta = capture_ms - self.capture_ms
+        if (not 0 <= delta <= min(config.max_feedback_gap_ms, config.depth_age_limit_ms)
+                or (geometry.front, geometry.rear) != (self.route.geometry.front, self.route.geometry.rear)
+                or not np.array_equal(geometry.base_from_optical, self.route.geometry.base_from_optical)):
+            return None
+        if delta == 0:
+            return self.route
+        travel = math.hypot(config.vx_max, config.vy_max if config.use_lateral else 0.) * delta / 1000
+        turn = config.wz_max * delta / 1000
+        pivot = -geometry.half_length if geometry.front == 0. else 0.
+        exit_line = self.route.passage_exit
+        points = local_path.register_passage_route(self.route.points + (exit_line or ()), self.occupied, occupied,
+                                                   travel, turn, pivot=pivot)
+        if points is None:
+            return None
+        return (Detour(None, points[:-2], geometry, passage_exit=points[-2:]) if exit_line
+                else Detour(None, points, geometry))
+
+
+def camera_route_command(route, occupied, config, target, nominal, previous, residual, age_s, admission,
+                         *, require_turn):
+    geometry = route.geometry
+    (floor_x, max_x), _ = _local_velocity_limits(config, 1.)
+    yaw_limits = (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
+    nominal = min(nominal, max_x)
+    lookahead = max(.45, nominal * config.dwa_horizon_s)
+    for scale in (1., .75, .5, .25):
+        tracked = dwa.track_route(route.points, nominal * scale, config.dwa_horizon_s,
+                                  yaw_limits, body_origin=(0., 0.), lateral=config.use_lateral,
+                                  lookahead_m=lookahead)
+        if tracked is None:
+            break
+        command, _ = tracked
+        cx, cy, yaw = command
+        (floor_y, max_y) = _local_velocity_limits(config, -1. if cy > 0. else 1.)[1]
+        if (cx <= 0. or cx < floor_x or (cy and not floor_y <= abs(cy) <= max_y)
+                or (yaw and abs(yaw) < config.floor_wz_moving) or (require_turn and not (cy or yaw))):
+            continue
+        if camera_arc_clear(geometry, config, occupied, target, command, previous, residual, age_s, admission):
+            return command
+    return None
+
+
+def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *, ahead=None):
     scan = state.active_scan
     control_ms = depth.get("control_ms") or scan.current_frame
     capture_ms = depth.get("capture_ms") or scan.current_frame
@@ -4025,38 +4130,41 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing):
     if target[0] <= 0.:
         return None
     grid = scan.observed_grid()
-    route = local_path.clearance_route(grid, geometry, _keepout_m(config), target,
-                                       config.stop_distance_m, (0., 0.))
-    if route is None:
-        return None
-    (floor_x, max_x), _ = _local_velocity_limits(config, 1.)
-    yaw_limits = (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
     admission = state.dwa_admission_ms / 1000
-    nominal = min(vx, max_x)
-    lookahead = max(.45, nominal * config.dwa_horizon_s)
-    for scale in (1., .75, .5, .25):
-        tracked = dwa.track_route(route.points, nominal * scale, config.dwa_horizon_s,
-                                  yaw_limits, body_origin=(0., 0.), lateral=config.use_lateral,
-                                  lookahead_m=lookahead)
-        if tracked is None:
-            continue
-        command, _ = tracked
-        cx, cy, yaw = command
-        (floor_y, max_y) = _local_velocity_limits(config, -1. if cy > 0 else 1.)[1]
-        if (cx <= 0. or cx < floor_x or (cy and not floor_y <= abs(cy) <= max_y)
-                or (yaw and abs(yaw) < config.floor_wz_moving) or not (cy or yaw)):
-            continue
-        if camera_arc_clear(geometry, config, grid[1], target, command, state.commanded,
-                            state.command_tail, age_s, admission):
-            if scan.active or scan.result_frame:
-                scan.retire_motion()
-            state.camera_arc_selected = True
-            state.view_detour = route
-            state.avoidance_yaw_override = True
-            state.dwa_trace.update(branch="camera_arc", reference=route.points,
-                                   proposed_twist=command, fallback_reason=None)
-            return *command, AVOIDING, "局部规划：沿当前视野的制动校验弧线绕行"
-    return None
+    keep = state.published_camera_passage
+    track = state.tracker.track
+    generation = track.generation if track else None
+    route = keep.register(config, geometry, grid[1], capture_ms) if keep and keep.generation == generation else None
+    if ahead is None and (route is None or not local_path.passage_ahead(route.passage_exit)):
+        return None
+    command = (camera_route_command(route, grid[1], config, target, vx, state.commanded,
+                                    state.command_tail, age_s, admission, require_turn=False) if route else None)
+    retained = command is not None
+    if command is None:
+        width = _keepout_m(config)
+        offset = geometry.base_from_optical
+        opening = (local_path.opening_route(depth["map"], grid[1], geometry, width,
+                                            ahead * offset[0, 2] + offset[0, 3], target, True)
+                   if ahead is not None else None)
+        if opening is not None:
+            route = local_path.extend_passage(opening, grid, width, target, config.stop_distance_m)
+            command = camera_route_command(route, grid[1], config, target, vx, state.commanded,
+                                           state.command_tail, age_s, admission, require_turn=False)
+        if command is None:
+            route = local_path.clearance_route(grid, geometry, width, target, config.stop_distance_m, (0., 0.))
+            if route is not None:
+                command = camera_route_command(route, grid[1], config, target, vx, state.commanded,
+                                               state.command_tail, age_s, admission, require_turn=True)
+        if command is None:
+            return None
+    if scan.active or scan.result_frame:
+        scan.retire_motion()
+    state.camera_arc_selected = True
+    state.view_detour = route
+    state.avoidance_yaw_override = True
+    state.dwa_trace.update(branch="camera_arc", reference=route.points, retained_route=retained,
+                           proposed_twist=command, fallback_reason=None)
+    return *command, AVOIDING, "局部规划：沿当前视野的制动校验弧线绕行"
 
 
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
@@ -4104,6 +4212,13 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 ahead = obstacle if ahead is None else min(ahead, obstacle)
             foreground = plan_obstacle = True
             state.last_clearance = ahead
+    if (scan is not None and state.published_dwa_route is not None
+            and (foreground or state.published_dwa_route.passage_exit is not None) and geometry is not None
+            and may_scan and target_distance is not None and target_bearing is not None):
+        following = _follow_published_route(depth, config, state, geometry, target_distance, target_bearing,
+                                            foreground=foreground)
+        if following is not None:
+            return following
     stop = config.obstacle_stop_m
     check_distance = config.approach_check_distance_m
     depth_age_s = config.depth_age_limit_ms / 1000
@@ -4124,8 +4239,10 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
     if (config.local_controller == "dwa" and not config.odom_expected and scan is not None
             and scan.command_only and not state.dwa_progress.requires_feedback and scan.current_frame
             and geometry is not None and may_scan and vx > 0. and target_distance is not None
-            and target_bearing is not None and foreground and approaching):
-        arc = _camera_detour(depth, config, state, geometry, vx, target_distance, target_bearing)
+            and target_bearing is not None and ((foreground and approaching)
+                                                 or state.published_camera_passage is not None)):
+        arc = _camera_detour(depth, config, state, geometry, vx, target_distance, target_bearing,
+                             ahead=ahead if foreground and approaching else None)
         if arc is not None:
             return arc
     if scan is not None and scan.ready and scan.advance_m is not None:

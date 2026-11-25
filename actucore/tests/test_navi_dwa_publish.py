@@ -1,6 +1,7 @@
 """DWA provenance at the actual JSON publisher, including queued renewals."""
 import json
 import logging
+import queue
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
@@ -193,6 +194,81 @@ def test_admitted_arc_finishes_before_new_target_or_hold_takes_the_wire(monkeypa
     assert card._stage_command(hold, card._output_epoch)
     assert packets[-1]["values"] == [0.] * 6
     assert len(packets) == 2
+
+
+def test_followup_prefers_the_already_published_route(monkeypatch):
+    card, packets, clock, snapshot, first = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(first, card._output_epoch)
+    assert len(packets) == 1
+    original = card._wire_dwa_origin.acceptance
+    advance_snapshot(snapshot, clock, 1100, vx=first["values"][0])
+    next_message = card.next_command()
+    assert card._state.dwa_trace.get("retained_route")
+    assert card._state.dwa_trace["select_calls"] == 1
+    assert card._state.dwa_trace["sampled_candidates"] <= 3
+    assert next_message["values"][0] > 0.
+    assert len(card._last_decision.dwa_acceptance.route_points) == len(original.route_points)
+
+
+def test_view_prefers_the_wire_route_over_the_latest_preview(monkeypatch):
+    card, packets, _, _, message = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(message, card._output_epoch)
+    assert len(packets) == 1
+    original = card._wire_dwa_origin.acceptance.route_points
+    card._state.dwa_selected = False
+    card._state.view_detour = local_path.Detour(None, ((0., 0.), (.3, -.2)), card._config.local_geometry)
+    card._view_queue = queue.Queue(maxsize=1)
+    card._view_hz = 10
+
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["detour"].points == original
+    assert not snapshot["project_detour"]
+
+
+def test_camera_successor_uses_the_registered_path_with_no_odom(monkeypatch):
+    card, _, _, _, first = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(first, card._output_epoch)
+    check = card._scheduled_command.forward_check
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    row, col = local_path.START
+    occupied[row+24:row+56, col-20] = True
+    occupied[row+45, col-20:col+12] = True
+    route = local_path.Detour(None, ((0., 0.), (.65, 0.), (1.1, .08), (1.4, .25)), check.geometry)
+    check = replace(check, mount_frame=None, target_source=None, target_receipt_ms=1000, frame_id=1000,
+                    direct_association=(SimpleNamespace(reference_ms=1000), None),
+                    camera_passage=policy.CameraPassage(route, occupied, 1000, None))
+    current = np.roll(occupied, -1, axis=0)
+    monkeypatch.setattr(local_path, "project_observation", lambda *a, **kw: (~current, current))
+    monkeypatch.setattr(plugin, "match_observation", lambda *a, **kw: SimpleNamespace(point=(2., 0.), range_m=2.))
+    card._wire_twist = (.18, 0., -.05)
+    snapshot = ({"timestamp": 1.1}, {"frame_id": 1100, "capture_ms": 1100}, None, 1100)
+
+    _, deadline, renewed, values = card._plan_camera_successor(
+        check, [.18, 0., 0., 0., 0., -.05], 1200, 1100, snapshot=snapshot)
+
+    assert deadline > 1100 and values[0] > 0.
+    assert renewed.camera_passage.capture_ms == 1100
+    assert renewed.camera_passage.route.points[-1] == pytest.approx((1.35, .25), abs=.06)
+
+
+def test_reused_route_can_repeat_within_its_original_deadline(monkeypatch):
+    card, packets, clock, _, message = selected_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms
+    assert card._stage_command(message, card._output_epoch)
+    active = card._scheduled_command
+    assert active.repeat_until is not None
+    origin = replace(active.dwa_origin, acceptance=replace(active.dwa_origin.acceptance, followed_route=True))
+    active.dwa_origin = card._wire_dwa_origin = origin
+    active.preparing_successor = True
+    clock[0] = packets[0]["stamp_ms"] + packets[0]["ttl_ms"] - 50
+
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: pytest.fail("repeated arc ran another sweep"))
+    card._dispatch_command()
+    first, repeat = packets
+    assert repeat["values"] == first["values"]
+    assert repeat["obs_stamp_ms"] == first["obs_stamp_ms"]
+    assert repeat["stamp_ms"] + repeat["ttl_ms"] == first["stamp_ms"] + first["ttl_ms"]
 
 
 def test_next_arc_is_ready_at_the_cutoff_without_an_intermediate_zero(monkeypatch):

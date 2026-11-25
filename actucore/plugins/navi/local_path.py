@@ -554,6 +554,54 @@ class Detour:
     preview: tuple[tuple[float, float], ...] = ()
     reachable_prefix: bool = False
     topology: tuple[tuple[float, float], ...] = ()  # original ordered nodes, in the observed grid
+    passage_exit: tuple[tuple[float, float], tuple[float, float]] | None = None
+
+
+def passage_ahead(exit_line):
+    if exit_line is None:
+        return False
+    (forward, right), (end_forward, end_right) = exit_line
+    return (end_right - right) * forward - (end_forward - forward) * right > 0.
+
+
+def register_passage_route(route, previous, current, travel_m, turn_rad, *, pivot=0.):
+    """Transfer a reference between two nearby depth grids with observable motion."""
+    cells = np.argwhere(previous)
+    if len(cells) < 12 or np.count_nonzero(current) < 12:
+        return None
+    if len(cells) > 144:
+        cells = cells[::math.ceil(len(cells) / 144)]
+    points = cells - START
+    # One-cell neighbours tolerate changes in voxel assignment between views.
+    padded = np.pad(current, 1)
+    support = current.astype(float)
+    for dr, dc in CARDINAL_STEPS:
+        support = np.maximum(support, .5 * padded[1+dr:1+dr+SHAPE[0], 1+dc:1+dc+SHAPE[1]])
+    extent = math.ceil(travel_m / RESOLUTION)
+    steps = np.arange(-extent, extent + 1)
+    shifts = np.stack(np.meshgrid(steps, steps), axis=-1).reshape(-1, 2)
+    shifts = shifts[np.hypot(*shifts.T) <= extent]
+    angles = np.linspace(-turn_rad, turn_rad, 2 * math.ceil(turn_rad / .025) + 1)
+    scores = []
+    for angle in angles:
+        c, s = math.cos(angle), math.sin(angle)
+        rotation = np.array(((c, s), (-s, c)))
+        transformed = np.rint(points @ rotation).astype(int) + START + shifts[:, None, :]
+        row, col = transformed[..., 0], transformed[..., 1]
+        valid = (0 <= row) & (row < SHAPE[0]) & (0 <= col) & (col < SHAPE[1])
+        matched = support[row.clip(0, SHAPE[0]-1), col.clip(0, SHAPE[1]-1)] * valid
+        scores.append(matched.mean(axis=1))
+    scores = np.stack(scores)
+    yaw, shift = np.unravel_index(scores.argmax(), scores.shape)
+    quality = scores[yaw, shift]
+    distinct = ((abs(angles - angles[yaw])[:, None] > .05)
+                | (np.hypot(*(shifts - shifts[shift]).T)[None, :] >= 1.5))
+    if quality < .65 or np.any(scores[distinct] >= quality - .08):
+        return None
+    c, s = math.cos(angles[yaw]), math.sin(angles[yaw])
+    rotation = np.array(((c, s), (-s, c)))
+    mapped = (np.asarray(route) + (pivot, 0.)) @ rotation + shifts[shift] * RESOLUTION - (pivot, 0.)
+    return tuple(map(tuple, mapped))
 
 
 def target_in_grid(geometry, forward, right):
@@ -1361,8 +1409,32 @@ def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allo
                  and hi - lo - RESOLUTION < 2 * (half_width + geometry.half_length))
         points = tuple((forward, middle * min(1., forward / entry) if align else forward * middle / plane)
                        for forward in np.arange(0., end + 1e-9, RESOLUTION))
-        return Detour(None, points, geometry)
+        exit_line = ((points[-1][0], lo), (points[-1][0], hi))
+        return Detour(None, points, geometry, passage_exit=exit_line)
     return None
+
+
+def extend_passage(opening, grid, half_width, target, stop):
+    """Join a visible exit corridor to a measured opening and preserve its entry."""
+    geometry = opening.geometry
+    forward, right = opening.points[-1]
+    if abs(target[1] - right) <= max(half_width, target[0] - forward) or target[0] < forward - RESOLUTION:
+        return opening
+    row = START[0] + round(forward / RESOLUTION)
+    col = START[1] + round(right / RESOLUTION)
+    start = row, col
+    if not (0 <= row < SHAPE[0] and 0 <= col < SHAPE[1]):
+        return opening
+    footprint = _footprint_cells(geometry, half_width)
+    allowed = allowed_centers(_route_grid(grid), START, footprint, allow_unknown=True)
+    remaining = np.hypot(FORWARD - target[0], RIGHT - target[1])
+    allowed &= remaining >= stop
+    path = shortest_path(allowed, start, start, steps=tuple(step for step in STEPS if step[0] >= 0),
+                         target_cells=grid[0] & (remaining <= stop + RESOLUTION))
+    if not path or len(path) < 2:
+        return opening
+    exit_points = tuple((float(FORWARD[cell]), float(RIGHT[cell])) for cell in path[1:])
+    return Detour(None, opening.points + exit_points, geometry, passage_exit=opening.passage_exit)
 
 
 def _turnable_endpoints(cells, occupied, geometry, half_width):

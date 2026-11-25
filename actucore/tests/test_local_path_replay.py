@@ -730,3 +730,48 @@ def test_pixel_corridor_keeps_extent_when_each_cell_has_only_two_returns(cells, 
         assert grid.ignored_low_pixels.all()
     else:
         assert grid.ignored_low_pixels is None
+def test_depth_passage_transfers_the_same_bend_to_the_next_view():
+    before = np.zeros(replay.SHAPE, dtype=bool)
+    row, col = replay.START
+    before[row+12:row+41, col-13] = True
+    before[row+29, col-13:col+10] = True
+    after = np.roll(before, (-2, 1), axis=(0, 1))
+    route = ((0., 0.), (1., 0.), (1.5, .2), (1.5, 1.))
+    registered = replay.register_passage_route(route, before, after, .14, .04)
+    assert registered is not None
+    np.testing.assert_allclose(registered, np.array(route) + (-.10, .05), atol=.051)
+
+
+def test_depth_passage_does_not_invent_progress_between_parallel_walls():
+    occupied = np.zeros(replay.SHAPE, dtype=bool)
+    row, col = replay.START
+    occupied[:, [col-10, col+10]] = True
+    route = ((0., 0.), (1., 0.), (1.5, .2))
+    assert replay.register_passage_route(route, occupied, occupied, .14, .04) is None
+
+
+def test_opening_connects_to_visible_corridor_without_turning_inside_jambs():
+    geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
+    occupied = ((abs(replay.FORWARD - 1.) < .03) & (abs(replay.RIGHT) > .48))
+    occupied |= replay.FORWARD > 2.35
+    through = ((0., 0.), (.6, 0.), (1., 0.), (1.40, 0.))
+    opening = replay.Detour(None, through, geometry)
+    joined = replay.extend_passage(opening, (~occupied, occupied), .31, (1.85, 1.38), .34)
+    assert joined.points[:len(through)] == through
+    assert joined.points[-1][1] > .8
+    assert all(f >= through[-1][0] - 1e-8 for f, _ in joined.points[len(through):])
+
+
+def test_opening_handoff_tracker_stops_for_new_collision_without_reversing():
+    from plugins.navi import policy
+
+    geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
+    config = policy.Config(half_width_m=.2, stop_distance_m=.34)
+    route = replay.Detour(None, ((-.1, 0.), (.5, 0.), (.9, .20), (1., .55)), geometry)
+    occupied = np.zeros(replay.SHAPE, dtype=bool)
+    motion = (0., 0., 0.)
+    args = config, (2., .65), .30, motion, motion, .02, .08
+    command = policy.camera_route_command(route, occupied, *args, require_turn=False)
+    assert command is not None and command[0] > 0.
+    occupied[(.27 < replay.FORWARD) & (replay.FORWARD < .39) & (abs(replay.RIGHT) < .40)] = True
+    assert policy.camera_route_command(route, occupied, *args, require_turn=False) is None

@@ -305,6 +305,7 @@ class _ForwardCheck:
     direct_vx: float | None = None
     forward_feedback_room_m: float | None = None
     bearing_only: bool = False
+    camera_passage: policy_mod.CameraPassage | None = None
 
     def matches_target_receipt(self, receipt_ms):
         return (self.planning_guard.association is None or self.target_source is not None
@@ -2263,7 +2264,11 @@ class NaviPlugin:
                                  fix is not None and input_revision and motion_guard is not None
                                  and motion_guard.association is not None and target_source is not None
                                  and target_source == motion_guard.association.source) else None,
-                             direct_association)
+                             direct_association,
+                             camera_passage=(policy_mod.CameraPassage(
+                                 state.view_detour, occupied, depth_ms, track.generation if track else None)
+                                 if state.camera_arc_selected and state.view_detour is not None
+                                 and occupied is not None else None))
 
     def _registered_dwa_scene(self, check, depth, odom, now_ms, depth_ms, geometry, twists, *, scan, sources,
                               anchor_changed):
@@ -2882,6 +2887,22 @@ class NaviPlugin:
             return None
         goal = local_path.target_in_grid(geometry, match.point[0], -match.point[1])
         previous = self._wire_twist or check.previous_twist
+        passage = check.camera_passage
+        if passage is not None:
+            route = passage.register(config, geometry, grid[1], capture)
+            if route is not None:
+                command = policy_mod.camera_route_command(
+                    route, grid[1], config, goal, config.vx_max, previous, self._state.command_tail,
+                    (now_ms - capture) / 1000, (deadline - now_ms) / 1000, require_turn=False)
+                if command is not None:
+                    vx, vy, wz = command
+                    candidate = [vx, vy, 0., 0., 0., wz]
+                    if policy_mod.apply_deadband(candidate, self._deadband_for(candidate)) == candidate:
+                        proof = replace(check, previous_twist=previous, frame_id=depth["frame_id"],
+                                        source_id=depth.get("source_frame_id"), depth_ms=capture, target_ms=receipt,
+                                        target_receipt_ms=receipt, target_source=source, distance_m=match.range_m,
+                                        camera_passage=policy_mod.CameraPassage(route, grid[1], capture, passage.generation))
+                        return obs_ms, deadline, proof, candidate
         for scale in (1., .75):
             candidate = [value * scale for value in values]
             if policy_mod.apply_deadband(candidate, self._deadband_for(candidate)) != candidate:
@@ -2913,11 +2934,24 @@ class NaviPlugin:
         with self._output_lock:
             started, deadline = self._command_window
             outgoing_arc = self._scheduled_command
+            self._state.published_dwa_route = None
+            self._state.published_camera_passage = None
+            if (outgoing_arc is not None and outgoing_arc.sent and tick < outgoing_arc.expires_at
+                    and outgoing_arc.camera_arc_end_ms is not None and outgoing_arc.forward_check is not None):
+                self._state.published_camera_passage = outgoing_arc.forward_check.camera_passage
+            if (outgoing_arc is not None and outgoing_arc.sent and tick < outgoing_arc.expires_at
+                    and self._continuing_dwa_output(outgoing_arc.dwa_origin)):
+                accepted = outgoing_arc.dwa_origin.acceptance
+                if accepted.route_points and accepted.motion_guard.pose is not None:
+                    self._state.published_dwa_route = accepted
             if self._config.local_controller == "dwa" and self._wire_twist is not None:
                 # A preview or an expired candidate did not change the chassis
                 # request. Sweep handoff from what was actually published.
                 self._state.commanded = self._wire_twist
                 self._state.commanded_vx = self._wire_twist[0]
+            self._state.dwa_handoff_yaw_step = (
+                min(self._config.motion_acceleration[2], self._config.motion_braking[2]) * control_period_s
+                if self._wire_moving and tick < deadline else 0.)
         coverage = max(0., min(tick, deadline) - max(previous_tick or tick, started))
 
         objects, depth, odom, objects_ms = self._observation_snapshot(
@@ -4361,6 +4395,19 @@ class NaviPlugin:
                     and active.camera_arc_end_ms - now_ms <= 1000 / self._rate_hz):
                 camera_to_prepare = active
             elif executing:
+                origin = active.dwa_origin
+                if (origin is not None and origin.acceptance.followed_route
+                        and active.repeat_until is not None and active.successor is None):
+                    message = active.message
+                    deadline = min(origin.forward_check.motion_guard.deadline_ms, active.expires_ms,
+                                   message["stamp_ms"] + message["ttl_ms"])
+                    period = math.ceil(1000 / self._rate_hz)
+                    if (0 < deadline - now_ms <= period and now_ms - message["stamp_ms"] >= period
+                            and self._dwa_publish_rejection(message, origin, now_ms) is None):
+                        # Repeat this exact sweep within its original admission window.
+                        packet = dict(message)
+                        packet.pop("control_interface", None)
+                        self._send_scheduled(packet, now_ms, deadline - now_ms, dwa_origin=origin)
                 if (active.repeat_until is None or active.successor is not None or active.preparing_successor
                         or active.forward_check.motion_guard.deadline_ms - now_ms > 2000 / self._rate_hz):
                     return
@@ -4952,6 +4999,7 @@ class NaviPlugin:
         scan = self._state.active_scan
         pose = scan.pose
         selected_route = scan.route_segment and scan.phase in ("brake", "turn", "evaluate")
+        wire_route = None
         if self._command_timer is not None:
             with self._output_lock:
                 work = self._scheduled_command
@@ -4959,13 +5007,23 @@ class NaviPlugin:
                     leg = None
                 elif work.leg is not None:
                     leg, pose = work.leg, work.feedback.pose
+                elif self._continuing_dwa_output(work.dwa_origin) and work.dwa_origin.acceptance.route_points:
+                    origin = work.dwa_origin
+                    wire_route = local_path.Detour(None, origin.acceptance.route_points, origin.forward_check.geometry)
+                elif (work.camera_arc_end_ms is not None and work.forward_check is not None
+                      and work.forward_check.camera_passage is not None):
+                    wire_route = work.forward_check.camera_passage.route
         executing = None if leg is None else local_path.Detour(
             None, ((0., 0.), leg.remaining(pose)), leg.geometry)
         project_detour = True
         with self._obs_lock:
             jpeg = self._image_jpeg
             depth, ground = self._depth_map, self._depth_ground
-            if isinstance(proposal, policy_mod.DwaProposal):
+            if wire_route is not None:
+                detour = wire_route
+                # The wire reference still belongs to its original frame.
+                project_detour = False
+            elif isinstance(proposal, policy_mod.DwaProposal):
                 if not self._state.dwa_selected:
                     detour = None
                 elif proposal.branch in ("route", "reachable_prefix"):

@@ -475,7 +475,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            rotation_center: tuple[float, float] | None = None, diagnostics: dict | None = None,
            footprint: FootprintSpec | None = None, latency_s=0., remembered=None,
            supported_region=None, terminal_boundary=None, occupied=None, alternate_routes=(),
-           candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None, guidance=False) -> Choice | None:
+           candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None,
+           guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0.) -> Choice | None:
     """Select a legal target velocity whose complete predicted stop is admissible.
 
     Routes, occupied cells and targets share the current grid frame. Each
@@ -545,10 +546,95 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
 
     budget = candidate_budget if candidate_budget is not None else CandidateBudget(max_candidates)
     slots = min(budget.remaining, max_candidates)
+    # Only reserve work for an abrupt release of an ongoing turn. Smaller
+    # tracking corrections already use the regular route score and Driver ramp.
+    transition_slot = bool(slots > 1 and handoff_yaw_step > 0. and any(previous[:2])
+                           and abs(previous[2]) > 2 * handoff_yaw_step)
+    slots -= int(transition_slot)
     obstacles = local_path.occupied_squares(grid[1]) if occupied is None else occupied
     context = MotionContext(measured, previous, horizon, latency_s, geometry, footprint, obstacles, remembered,
                             supported_region, target, stop_distance, acceleration, braking, rotation_center,
                             terminal_boundary, motion_frame, measured_target)
+
+    def interpolate(choice, room=math.inf):
+        if not transition_slot or choice is None or not any(choice.command[:2]):
+            return choice
+        vx, vy, wz = choice.command
+        delta = wz - previous[2]
+        if abs(wz) >= handoff_yaw_step or abs(delta) <= 2 * handoff_yaw_step:
+            return choice
+        command = vx, vy, previous[2] + math.copysign(handoff_yaw_step, delta)
+        if not _legal_command(command, limits, floors):
+            return choice
+        budget.remaining -= 1
+        diag["sampled_candidates"] += 1
+        diag["considered_candidates"] += 1
+        prediction = context.predict(command)
+        if prediction.body_travel_m + prediction.delay_travel_error > room:
+            return choice
+        reference = points if follow_published else references[choice.reference_index]
+        components, progress, _ = score_candidate(
+            command, prediction, None, reference, previous, half_width=half_width, limits=limits,
+            progress_scale=progress_scale, target=target, guidance=guidance)
+        if components is None or progress < choice.progress - local_path.RESOLUTION / 2:
+            return choice
+        diag["physical_evaluations"] += 1
+        check = context.evaluate(prediction)
+        if not check.accepted:
+            return choice
+        poses = prediction.camera_poses if footprint_mode == "camera_approx" else prediction.body_poses
+        if validate_candidate is not None and not validate_candidate(command, poses, prediction.duration).accepted:
+            return choice
+        components = replace(components, obstacle=_obstacle_score(check))
+        diag["handoff_yaw_interpolated"] = True
+        diag["admissible_candidates"] += 1
+        return Choice(command, poses[:prediction.moving_count], components.total, progress,
+                      check.min_clearance_m, prediction, check, components, choice.reference_index)
+
+    if follow_published:
+        # The existing path has priority. Only these pursuit arcs can renew
+        # it, and each still needs a fresh complete sweep through braking.
+        body_origin = (rotation_center or ((geometry.front - geometry.rear) / 2, 0.)
+                       if footprint_mode == "camera_approx" else (0., 0.))
+        lookahead = max(.45, x_speed * horizon)
+        segments = _route_segments(points)
+        for scale in (1., .75, .5)[:min(slots, 3 - int(transition_slot))]:
+            tracked = track_route(points, x_speed * scale, horizon, yaw_limit,
+                                  body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead)
+            if tracked is None:
+                break
+            command, room = tracked
+            if not any(command[:2]) or not _legal_command(command, limits, floors):
+                continue
+            budget.remaining -= 1
+            diag["sampled_candidates"] += 1
+            diag["considered_candidates"] += 1
+            prediction = context.predict(command)
+            if prediction.body_travel_m + prediction.delay_travel_error > room - route_error:
+                rejected["insufficient_room"] = rejected.get("insufficient_room", 0) + 1
+                continue
+            diag["physical_evaluations"] += 1
+            check = context.evaluate(prediction)
+            if not check.accepted:
+                rejected[check.reason] = rejected.get(check.reason, 0) + 1
+                continue
+            poses = prediction.camera_poses if footprint_mode == "camera_approx" else prediction.body_poses
+            if validate_candidate is not None:
+                visible = validate_candidate(command, poses, prediction.duration)
+                if not visible.accepted:
+                    rejected[visible.reason] = rejected.get(visible.reason, 0) + 1
+                    continue
+            start = _project_to_route(prediction.body_poses[0][:2], points, segments)[0]
+            progress = _project_to_route(prediction.body_poses[prediction.moving_count - 1][:2], points, segments)[0] - start
+            if progress <= 0.:
+                continue
+            components = CandidateScore(0., -progress, _obstacle_score(check), 0., 0., 0.)
+            diag.update(admissible_candidates=1, reference_scores=1, scores_by_reference=[1], reason=None)
+            choice = Choice(command, poses[:prediction.moving_count], components.total, progress,
+                            check.min_clearance_m, prediction, check, components)
+            return interpolate(choice, room - route_error)
+        diag["reason"] = "no_admissible_candidates"
+        return None
     outcomes = budget.for_context(context)
     straight = (x_speed, 0., 0.)
     continuing = previous == straight
@@ -661,8 +747,9 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 components, progress, index = scores[0]
                 diag.update(admissible_candidates=1, reference_scores=sum(scores_by_reference),
                             scores_by_reference=scores_by_reference, reason=None)
-                return Choice(cmd, poses[:prediction.moving_count], components.total, progress,
-                              check.min_clearance_m, prediction, check, components, index)
+                choice = Choice(cmd, poses[:prediction.moving_count], components.total, progress,
+                                check.min_clearance_m, prediction, check, components, index)
+                return interpolate(choice)
         if retaining_speed:
             continue  # Ordinary detour ranking only admits speeds inside its cap.
         lower = min(((score.total, index, ordinal) for score, _, index in scores), default=(math.inf, 0, ordinal))
@@ -721,4 +808,4 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     diag["reference_scores"] = sum(scores_by_reference)
     diag["scores_by_reference"] = scores_by_reference
     diag["reason"] = None if best is not None else "no_admissible_candidates"
-    return best
+    return interpolate(best)
