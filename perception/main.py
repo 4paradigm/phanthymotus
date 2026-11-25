@@ -196,6 +196,10 @@ class PerceptionBundle:
                 log.error("PhanthyMusicPlugin failed to load; continuing without phanthy_music",
                           exc_info=True)
 
+        if plugins_cfg.get("hand_landmarks", {}).get("enabled", False):
+            from plugins.hand_landmarks import HandLandmarksPlugin
+            self._plugins.append(HandLandmarksPlugin(plugins_cfg["hand_landmarks"], executor))
+
         if plugins_cfg.get("vop", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["vop"].get("namespace", "").strip()
