@@ -727,3 +727,22 @@ plugins:
     # 没有 camera_info 时的兜底；留空 = 不猜，只输出距离。
     half_fov_rad: null
     half_fov_v_rad: null
+
+  yunet_lk_mosaic:
+    # 默认注册到 Perception。使用前需征得出镜人员同意。
+    enabled: true
+    model_path: ""  # 默认校验或下载到 /models/yunet_lk_mosaic/
+    consent_acknowledged: false
+    target_fps: 30
+    publish_delay_ms: 0
+    miss_compensation: true
+    adaptive_detection: false
+    detect_every_frames: 4
+    confidence_threshold: 0.28
+    stable_expansion: 0.35
+    unstable_expansion: 0.50
+    max_buffer_frames: 20
+    output_width: 640
+    max_faces: 6
+    jpeg_quality: 72
+    pixelate_block: 24

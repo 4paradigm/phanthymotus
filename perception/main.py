@@ -280,6 +280,15 @@ class PerceptionBundle:
             from plugins.soundevent import SoundEventPlugin
             self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
             log.info("SoundEventPlugin loaded")
+        if plugins_cfg.get("yunet_lk_mosaic", {}).get("enabled", False):
+            try:
+                from plugins.yunet_lk_mosaic.plugin import YuNetLkMosaicPlugin
+
+                self._plugins.append(YuNetLkMosaicPlugin(plugins_cfg["yunet_lk_mosaic"], executor))
+                log.info("YuNetLkMosaicPlugin loaded")
+            except Exception:
+                log.exception("YuNetLkMosaicPlugin failed to load")
+
         if plugins_cfg.get("face_recognition", {}).get("enabled", False):
             from plugins.face import FaceRecognitionPlugin
             # Guarded like TTSPlugin: this plugin needs the standalone
