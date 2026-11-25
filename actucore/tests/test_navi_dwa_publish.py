@@ -3647,7 +3647,7 @@ def test_person_dropout_continues_the_last_wire_twist(monkeypatch, route, expire
     first, = packets
     work = card._scheduled_command
     assert first["values"][0] > 0. and bool(work.dwa_origin) is route
-    stamp = 1000 + round(card._config.max_coast_s * 1000) + 1 if expired else 1180
+    stamp = 1000 + round(card._config.idle_timeout_s * 1000) + 1 if expired else 1180
     advance_snapshot(snapshot, clock, stamp, vx=first["values"][0])
     _, depth, odom, _ = snapshot[0]
     snapshot[0] = {"timestamp": stamp / 1000, "objects": []}, depth, odom, stamp
@@ -3661,6 +3661,89 @@ def test_person_dropout_continues_the_last_wire_twist(monkeypatch, route, expire
         assert packets[-1]["seq"] > first["seq"]
         assert packets[-1]["values"] == first["values"]
         assert card._last_decision.status != policy.SEARCHING
+
+
+
+
+@pytest.mark.parametrize("distance_m", [1.2, 4.], ids=["room_consumed", "room_available"])
+def test_direct_target_loss_uses_remaining_motion_room_after_track_expires(monkeypatch, distance_m):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=False)
+    snapshot = [card._observation_snapshot(with_capture_timing=True)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._config.use_obstacle_history = False
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms
+    card._tick()
+    first, = packets
+    work = card._scheduled_command
+    work.forward_check = replace(work.forward_check, distance_m=distance_m)
+
+    for stamp in range(1100, 2601, 100):
+        advance_snapshot(snapshot, clock, stamp, vx=first["values"][0])
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = {"timestamp": stamp / 1000, "objects": []}, depth, odom, stamp
+        card._tick()
+
+    assert card._state.tracker.track is None
+    if distance_m > 2.:
+        assert card._scheduled_command is work
+        assert packets[-1]["stamp_ms"] == 2600
+        assert all(packet["values"] == first["values"] for packet in packets)
+    else:
+        assert not any(packets[-1]["values"][:2])
+
+
+def test_duplicate_detection_keeps_evidence_for_an_association_miss(monkeypatch):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms
+    card._tick()
+    first, = packets
+
+    advance_snapshot(snapshot, clock, 1030, vx=first["values"][0])
+    card._tick()
+    work = card._scheduled_command
+    retained = packets[-1]
+    assert work.dwa_origin.acceptance.route_points
+    assert not work.dwa_origin.acceptance.target_observed
+
+    advance_snapshot(snapshot, clock, 1180, vx=retained["values"][0])
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = {"timestamp": 1.18, "objects": []}, depth, odom, 1180
+
+    assert card._continue_without_target(work, 1180)
+    assert card._scheduled_command is work
+    assert packets[-1]["seq"] > retained["seq"]
+    assert packets[-1]["values"] == retained["values"]
+
+
+
+@pytest.mark.parametrize("new_depth", [False, True], ids=["same_depth", "new_depth"])
+def test_visible_unassociated_person_does_not_abort_the_admitted_route(monkeypatch, new_depth):
+    card, packets, _, snapshot, feed = tracked_route_card(monkeypatch)
+    work = card._scheduled_command
+    first, = packets
+    window = work.expires_ms, work.expires_at, work.repeat_until
+    frame = snapshot[0][1]["map"] if new_depth else None
+    feed(1100, work.forward_check.motion_guard.measured[0], frame=frame, same_pose=True)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=1.1), depth, odom, 1100
+
+    def reject_association(*args, **kwargs):
+        args[6]["reason"] = "target_missing"
+        return None, None
+
+    monkeypatch.setattr(card, "_check_route_control", reject_association)
+    monkeypatch.setattr(card, "_continue_without_target", lambda *_: False)
+
+    card._dispatch_command()
+
+    if new_depth:
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+    else:
+        assert packets == [first]
+        assert card._scheduled_command is work
+        assert (work.expires_ms, work.expires_at, work.repeat_until) == window
+        assert card._state.reacquire_generation is None
 
 
 def test_route_renews_on_a_new_view_after_the_last_packet_expires(monkeypatch):

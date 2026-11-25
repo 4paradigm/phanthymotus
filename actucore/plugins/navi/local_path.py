@@ -103,7 +103,7 @@ def route_velocity_change(points, x_limit, y_limit, yaw_limit, previous):
 
 
 def route_clearance_cost(points, obstacles, geometry, half_width):
-    """Prefer a gap of one body length from the current occupied cells."""
+    """Prefer a measured passage midpoint or clearance from an isolated edge."""
     if obstacles is None or not len(obstacles.centers):
         return 0.
     route = np.asarray(points, dtype=float)
@@ -123,7 +123,16 @@ def route_clearance_cost(points, obstacles, geometry, half_width):
     longitudinal = np.maximum(np.maximum(df - geometry.front, -df - geometry.rear) - half_cell, 0.)
     lateral = np.maximum(np.abs(dr) - half_width - half_cell, 0.)
     gap = np.hypot(longitudinal, lateral).min(axis=1)
-    return float(np.square(np.minimum(1., np.abs(gap - body_length) / body_length)).mean())
+    left = np.min(np.where((longitudinal == 0.) & (dr < 0.), -dr, np.inf), axis=1)
+    right = np.min(np.where((longitudinal == 0.) & (dr > 0.), dr, np.inf), axis=1)
+    cost = _clearance_shortfall(gap, body_length)
+    passage = np.isfinite(left + right) & (left + right >= 2 * (half_width + half_cell))
+    cost[passage] = np.square((left[passage] - right[passage]) / (left[passage] + right[passage]))
+    return float(cost.mean())
+
+
+def _clearance_shortfall(gap, desired):
+    return np.square(np.maximum(0., 1. - gap / max(RESOLUTION, desired)))
 
 
 def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None, steps=STEPS,
@@ -1453,18 +1462,25 @@ def motion_sweep_clear(grid, geometry, half_width, horizon, velocities):
     return not motion_sweep_hits(grid[1], geometry, half_width, horizon, velocities).any()
 
 
-def segment_obstacle_forwards(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):
-    """Chassis-forward coordinates of occupied cells touched along the segment."""
+def _segment_obstacle_cells(occupied, geometry, half_width, angle, length, *, heading_tolerance=0., origin=0.):
+    rows, cols = np.nonzero(occupied)
     cos, sin = math.cos(angle), math.sin(angle)
-    f, r = FORWARD[occupied], RIGHT[occupied]
+    f, r = FORWARD[rows, cols] - origin, RIGHT[rows, cols]
     forward, right = f * cos + r * sin, -f * sin + r * cos
     cell = RESOLUTION / math.sqrt(2)
     if heading_tolerance:
         # Rotating a cell through the settling tolerance moves it by at most
         # this chord. A fresh grid can also round it into the next cell.
         cell += 2 * np.hypot(f, r) * math.sin(heading_tolerance / 2) + RESOLUTION
-    return f[(forward >= -geometry.rear - cell) & (forward <= length + geometry.front + cell)
-             & (abs(right) <= half_width + cell)]
+    hits = ((forward >= -geometry.rear - cell) & (forward <= length + geometry.front + cell)
+            & (abs(right) <= half_width + cell))
+    return rows[hits], cols[hits]
+
+
+def segment_obstacle_forwards(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):
+    """Chassis-forward coordinates of occupied cells touched along the segment."""
+    return FORWARD[_segment_obstacle_cells(occupied, geometry, half_width, angle, length,
+                                          heading_tolerance=heading_tolerance)]
 
 
 def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tolerance=0.):
@@ -1472,13 +1488,74 @@ def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tole
                                          heading_tolerance=heading_tolerance).size
 
 
-def clearance_route(grid, geometry, half_width, target, stop, approach_origin, previous=()):
+def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half_width, start):
+    """Weight the measured corridor midpoint or the tangent of a compact blocker."""
+    cols = np.arange(occupied.shape[1])
+    left = np.maximum.accumulate(np.where(occupied, cols, -1), axis=1)
+    right = np.minimum.accumulate(np.where(occupied, cols, len(cols))[:, ::-1], axis=1)[:, ::-1]
+    opening = ((left >= 0) & (right < len(cols))
+               & ((right - left - 1) * RESOLUTION >= 2 * half_width - 1e-9))
+    midline_error = abs(cols - (left + right) / 2) * RESOLUTION
+    cost = np.where(opening, 8. * np.square(midline_error / half_width), cost)
+    if not len(blockers[0]):
+        return cost
+    pivot = (geometry.front - geometry.rear) / 2
+    nearest = np.hypot(FORWARD[blockers] - pivot, RIGHT[blockers]).argmin()
+    row, col = (int(axis[nearest]) for axis in blockers)
+    # A measured opening beside the blocker is more informative than a circle
+    # around a jamb or wall. Its traversability is still decided by the caller.
+    if (opening[row, :] & (abs(cols - col) * RESOLUTION <= 3 * half_width)).any():
+        return cost
+    remaining = set(zip(*np.nonzero(occupied)))
+    remaining.remove((row, col))
+    component = [(row, col)]
+    for row, col in component:
+        for dr, dc in STEPS:
+            neighbor = row + dr, col + dc
+            if neighbor in remaining:
+                remaining.remove(neighbor)
+                component.append(neighbor)
+    low, high = np.min(component, axis=0), np.max(component, axis=0)
+    if (low == 0).any() or (high == np.array(occupied.shape) - 1).any():
+        return cost
+    span = (high - low + 1) * RESOLUTION
+    body_width = 2 * body_half_width
+    if max(span) > 3 * body_width:
+        return cost
+    center = ((low + high) / 2 - START) * RESOLUTION
+    forward, lateral = center[0] - pivot, center[1]
+    distance = math.hypot(forward, lateral)
+    # Circumscribe the occupied cell squares, then add one full chassis width.
+    radius = math.hypot(*span) / 2 + body_width
+    if distance <= radius:
+        return cost
+    bearing = math.atan2(lateral, forward)
+    offset = math.asin(radius / distance)
+    tangents = [angle for angle in (bearing - offset, bearing + offset) if abs(angle) <= math.pi / 2]
+    if not tangents:
+        return cost
+    f = FORWARD - FORWARD[start]
+    r = RIGHT - RIGHT[start]
+    travel = np.hypot(f, r)
+    heading = np.arctan2(r, f)
+    error = np.minimum.reduce([np.square(heading - angle) for angle in tangents])
+    entry_length = max(.45, geometry.front + geometry.rear)
+    weight = np.clip((entry_length + RESOLUTION - travel) / RESOLUTION, 0., 1.)
+    return np.where(opening, cost, (1. - weight) * cost + weight * 8. * error)
+
+
+def clearance_route(grid, geometry, half_width, target, stop, approach_origin, previous=(), *,
+                    body_half_width=None):
     """Find a clearance-weighted reference about the body pivot, on either side of the goal line."""
     free, occupied = grid
     if not free.any() or not occupied.any() or target is None:
         return None
     remaining = np.hypot(FORWARD-target[0], RIGHT-target[1])
     goal = (remaining >= stop) & (remaining <= stop + RESOLUTION)
+    pivot = -geometry.half_length if geometry.front == 0. else 0.
+    angle = math.atan2(target[1], target[0] - pivot)
+    blockers = _segment_obstacle_cells(occupied, geometry, half_width, angle,
+                                      max(0., math.hypot(target[0] - pivot, target[1]) - stop), origin=pivot)
     reachable_prefix = not goal.any()
     if reachable_prefix:
         # Plan around a visible blocker before the true standoff ring enters
@@ -1498,7 +1575,6 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     lateral = np.minimum(columns - low, high - columns)
     row_dist = np.subtract.outer(np.arange(rows), np.arange(rows)) ** 2
     clearance = np.sqrt((row_dist[:, :, None] + lateral[None, :, :] ** 2).min(axis=1)) * RESOLUTION
-    pivot = -geometry.half_length if geometry.front == 0. else 0.
     start = (START[0] + round(pivot / RESOLUTION), START[1])
     radius = math.ceil(half_width / RESOLUTION)
     if not 0 <= start[0] < rows or 2*radius >= min(rows, cols):
@@ -1508,20 +1584,20 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     # occupied squares and the complete oriented footprint to a stop.
     allowed = clearance > half_width - RESOLUTION
     allowed[start] = True
-    preferred_extra = 4 * RESOLUTION
-    desired = half_width + preferred_extra
-    cost = 3. * np.square(np.maximum(0., desired - clearance) / preferred_extra)
-    if previous:
-        distance = np.full_like(clearance, np.inf)
-        for f, r in previous:
-            np.minimum(distance, (FORWARD - pivot - f)**2 + (RIGHT - r)**2, out=distance)
-        cost += .5 * np.minimum(1., np.sqrt(distance) / max(.1, half_width))
+    desired = geometry.front + geometry.rear
+    cost = 3. * _clearance_shortfall(np.maximum(0., clearance - half_width), desired)
     # Rejoin the original approach line when the obstruction ends. Otherwise
     # any point on the standoff circle, even far to the side, is equally good.
     dx, dy = target[0] - (approach_origin[0] + pivot), target[1] - approach_origin[1]
     length = max(RESOLUTION, math.hypot(dx, dy))
     lateral = abs((FORWARD-target[0])*dy - (RIGHT-target[1])*dx) / length
     cost += .5 * lateral / max(.15, half_width)
+    cost = _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half_width or half_width, start)
+    if previous:
+        distance = np.full_like(clearance, np.inf)
+        for f, r in previous:
+            np.minimum(distance, (FORWARD - pivot - f)**2 + (RIGHT - r)**2, out=distance)
+        cost += .5 * np.minimum(1., np.sqrt(distance) / max(.1, half_width))
     # A single visible centre can lie next to an unseen obstacle face. Prefer
     # a path with measured floor under the whole chassis while remaining able
     # to approach the boundary of an occluded region for the next view.

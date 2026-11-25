@@ -3899,7 +3899,7 @@ class NaviPlugin:
             if (not target_pending or association is None or check.distance_m is None or diagnostic is None
                     or diagnostic.epoch != self._output_epoch or diagnostic.state_id != id(state)
                     or diagnostic.action_id != self._acp_action_id or diagnostic.target != state.target
-                    or (track is not None and track.generation != association[0].generation)
+                    or (track is not None and track.observed and track.generation != association[0].generation)
                     or policy_mod.apply_deadband(work.message["values"], self._deadband_for(work.message["values"]))
                         != work.message["values"]):
                 return None
@@ -3911,18 +3911,23 @@ class NaviPlugin:
         coast_end_ms = None
         target_ms = objects_ms
         if target_pending:
-            # A miss cannot refresh the last matched detector receipt.
-            if state.target != "person" or not check.target_ms or check.target_ms > now_ms:
-                return None
-            coast_end_ms = check.target_ms + round(config.max_coast_s * 1000)
+            # A duplicate or missed detection cannot renew the receipt of the
+            # last range-confirmed target. A newly swept route may omit that receipt.
             target_ms = check.target_ms
+            receipt = state.dwa_target_receipt
+            if not target_ms and origin is not None and receipt is not None and receipt[0] == origin.generation:
+                target_ms = receipt[1]
+            if state.target != "person" or not target_ms or target_ms > now_ms:
+                return None
+            # Tracker expiry stops target extrapolation. The issued command may
+            # still use its independently bounded route or last measured goal.
+            coast_end_ms = target_ms + round(config.idle_timeout_s * 1000)
         elif (track is None or not track.observed or objects is None):
             return None
         depth_ms = depth_mod.observation_ms(depth)
         max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or config.max_obs_age_ms
         if (depth_ms is None or not 0 <= now_ms - depth_ms < min(config.depth_age_limit_ms, max_age)
-                or not 0 <= now_ms - target_ms < (config.max_coast_s * 1000 if target_pending
-                                                 else min(config.max_obs_age_ms, max_age))):
+                or (not target_pending and not 0 <= now_ms - target_ms < min(config.max_obs_age_ms, max_age))):
             return None
         mount = depth.get("body_from_optical")
         if check.mount_frame is not None:
@@ -3957,12 +3962,18 @@ class NaviPlugin:
         if guard is not None:
             rates += (guard.measured,)
         bounds = tuple(tuple(bound(axis) for axis in zip(*rates)) for bound in (min, max))
+        speed = max(math.hypot(*v[:2]) for v in rates)
+        unobserved_travel = 0.
+        if target_pending:
+            # A slowing feedback sample cannot add back distance that could
+            # already have been travelled before this check.
+            speed_cap = math.hypot(config.vx_max, config.vy_max if config.use_lateral else 0.)
+            unobserved_travel = (now_ms - target_ms) * max(speed, speed_cap) / 1000
+        motion_room = policy_mod.MAX_PREDICTED_DETOUR_TRAVEL_M - unobserved_travel
         if direct:
-            elapsed = (now_ms - target_ms) / 1000
-            speed = max(math.hypot(*v[:2]) for v in rates)
             travel = speed * (config.watchdog_ms + deadline_ms - now_ms + 50) / 1000
             travel += speed ** 2 / (2 * config.motion_braking[0])
-            room = check.distance_m - config.stop_distance_m - elapsed * speed
+            room = min(check.distance_m - config.stop_distance_m - unobserved_travel, motion_room)
             obstacle = policy_mod.projected_forward_clearance(grid[1], geometry, config)
             if travel >= room or (obstacle is not None and
                     obstacle + policy_mod.FORWARD_CLEARANCE_MARGIN_M < check.distance_m and obstacle <= travel):
@@ -3987,8 +3998,10 @@ class NaviPlugin:
             return None
         # Consume the unseen translation from the original path. Camera
         # frames can refresh collision evidence, but cannot reset this room.
-        room = dwa.remaining_route_length(route) - elapsed * max(math.hypot(*v[:2]) for v in rates)
+        room = dwa.remaining_route_length(route) - elapsed * speed
         room -= anchor.error(math.hypot(*route[-1]))
+        if target_pending:
+            room = min(room, motion_room)
         if room <= 0.:
             return None
         if renew:
@@ -4622,6 +4635,15 @@ class NaviPlugin:
                         return
                 if (reason in ("target_missing", "target_range_unavailable")
                         and self._continue_without_target(work, now_ms)):
+                    return
+                if (reason == "target_missing" and not fixed_arc and now_ms < cutoff
+                        and time.monotonic() < cutoff_at and any(target_objects(snapshot[0], origin.target, self._config))
+                        and self._repeat_feedback_admitted(
+                            origin, check, (*revision[:2], check.input_revision[2]), work.message["values"], gap)
+                        and _only_expired_views(check.memory_revision, policy_mod.dwa_memory_revision(
+                            self._state.active_scan, now_ms), now_ms)):
+                    # The visible detector update alone cannot revoke this
+                    # packet's admitted motion. Wait for the next checked view.
                     return
                 if (diagnostics.get("reason") == "target_missing" and isinstance(snapshot[0], dict)
                         and revision[0] == check.input_revision[0]

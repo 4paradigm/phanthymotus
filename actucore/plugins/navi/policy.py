@@ -771,6 +771,7 @@ class State:
     dwa_handoff_yaw_step: float = 0.
     dwa_motion_guard: DwaMotionGuard | None = None
     dwa_association: tuple[AssociationSnapshot, PlanarPose] | None = None
+    dwa_target_receipt: tuple[int, int] | None = None
     dwa_admission_ms: int = 0
     dwa_odom: dict | None = None
     dwa_projection: local_path.DepthProjection | None = None
@@ -1896,6 +1897,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                receipt_ms=objects_ms if recovering and state.target == "person" else 0)
     if (config.local_controller == "dwa" and isinstance(track, Track) and track.observed
             and track.accepted_detection and track.range_known and track.source is not None):
+        if track.measured_range_m is not None and track.navigation_range_known and objects_ms:
+            state.dwa_target_receipt = track.generation, objects_ms
         stamp = (depth or {}).get("control_ms")
         pose = target_body_pose(stamp, odom, ego, depth.get("obstacle_capture_pose")) if stamp is not None else None
         if pose is not None:
@@ -3939,7 +3942,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             origin = saved.approach_origin
             reference_start = c*(origin[0]-f) + s*(origin[1]-r), -s*(origin[0]-f) + c*(origin[1]-r)
             previous = tuple((c*(x-f) + s*(y-r), -s*(x-f) + c*(y-r)) for x, y in saved.waypoints)
-        guidance = local_path.clearance_route(grid, geometry, keep, target, config.stop_distance_m, reference_start, previous)
+        guidance = local_path.clearance_route(grid, geometry, keep, target, config.stop_distance_m,
+                                              reference_start, previous, body_half_width=config.half_width_m)
         if guidance is not None:
             points = guidance.points
             visible = local_path.visible_prefix(points, shadow) if shadow is not None else len(points)
@@ -4426,7 +4430,8 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
             command = camera_route_command(route, config, target, vx, state.commanded,
                                            state.command_tail, admission, require_turn=False)
         if command is None:
-            route = local_path.clearance_route(grid, geometry, width, target, config.stop_distance_m, (0., 0.))
+            route = local_path.clearance_route(grid, geometry, width, target, config.stop_distance_m,
+                                               (0., 0.), body_half_width=config.half_width_m)
             if route is not None:
                 command = camera_route_command(route, config, target, vx, state.commanded,
                                                state.command_tail, admission, require_turn=True)

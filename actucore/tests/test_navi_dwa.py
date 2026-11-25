@@ -931,7 +931,7 @@ def test_route_ranking_does_not_override_collision_checks():
     assert guarded is not None and guarded.check.accepted and guarded.command[2] < 0.
 
 
-def test_clearance_cost_is_lowest_at_one_body_length():
+def test_clearance_cost_has_no_attraction_outside_one_body_length():
     geometry = _geometry()
     wall = local_path.ObstacleSquares(np.column_stack((np.linspace(.4, 2.4, 41), np.full(41, 1.))), 0.)
     near = ((.5, .6), (2., .6))
@@ -940,7 +940,7 @@ def test_clearance_cost_is_lowest_at_one_body_length():
     gap_cost = local_path.route_clearance_cost
     assert gap_cost(preferred, wall, geometry, .275) == pytest.approx(0.)
     assert gap_cost(near, wall, geometry, .275) > gap_cost(preferred, wall, geometry, .275)
-    assert gap_cost(far, wall, geometry, .275) > gap_cost(preferred, wall, geometry, .275)
+    assert gap_cost(far, wall, geometry, .275) == pytest.approx(0.)
     assert gap_cost(far, None, geometry, .275) == 0.
 
 
@@ -950,3 +950,41 @@ def test_equal_velocity_change_routes_prefer_a_body_length_from_the_wall():
     wall = _grid(obstacles=[(f, .65) for f in np.linspace(1.05, 1.8, 16)])
     choice = _run(near, grid=wall, alternate_routes=(clear,), occupied=(), target=(3., 0.))
     assert choice is not None and choice.reference_index == 1
+
+
+def test_isolated_blocker_detour_enters_on_expanded_circle_tangent():
+    f, r = local_path.FORWARD, local_path.RIGHT
+    box = (abs(f - 1.95) <= .201) & (abs(r) <= .251)
+    route = local_path.clearance_route((~box, box), _geometry(), .30, (3.05, 0.), .60, (0., 0.),
+                                       body_half_width=.25)
+    radius = math.hypot(.225, .275) + .50
+    angle = math.asin(radius / 1.95)
+    forward, right = route.points[1]
+    assert abs(math.atan2(right, forward)) == pytest.approx(angle, abs=.09)
+
+
+@pytest.mark.parametrize("jambs_only", [False, True])
+def test_two_observed_boundaries_center_the_passing_route(jambs_only):
+    f, r = local_path.FORWARD, local_path.RIGHT
+    if jambs_only:
+        walls = (abs(f - 1.40) < .026) & ((r <= .001) | (r >= .749))
+        midpoint = .375
+    else:
+        walls = (f >= .45) & (np.isclose(r, -.65) | np.isclose(r, 1.15))
+        midpoint = .25
+    route = local_path.clearance_route((~walls, walls), _geometry(), .27, (2.8, .81), .55,
+                                       (0., 0.))
+    assert route is not None
+    passage = next(right for forward, right in route.topology if forward >= 1.39)
+    assert passage == pytest.approx(midpoint, abs=local_path.RESOLUTION)
+
+
+def test_wide_corridor_scores_its_midline_below_both_offsets():
+    r = local_path.RIGHT
+    walls = local_path.occupied_squares(np.isclose(r, -.85) | np.isclose(r, 1.35))
+    center = ((.5, .25), (2., .25))
+    score = local_path.route_clearance_cost
+    assert score(center, walls, _geometry(), .27) == pytest.approx(0.)
+    for offset in (-.15, .15):
+        shifted = ((.5, .25 + offset), (2., .25 + offset))
+        assert score(shifted, walls, _geometry(), .27) > 0.
