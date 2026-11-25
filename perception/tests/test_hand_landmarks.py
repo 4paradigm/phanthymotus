@@ -104,3 +104,48 @@ def test_documented_canvas_port_contract_matches_topic_out():
     outs = p.get_tools()[0]['topic_out']
     assert any(o['format'] == FLEX_FORMAT for o in outs)
     assert not any(o['format'] == 'data/json' for o in outs)
+
+
+def test_camera_dropout_does_not_republish_stale_frame(bundle):
+    """A stopped camera must not be held alive by re-published old frames.
+
+    _tick() runs on a timer. If the camera stops publishing, self._frame still
+    holds the last image; re-inferring it each tick with a freshly generated
+    stamp_ms/seq would make downstream think fresh commands keep arriving and
+    defeat the driver watchdog. One frame callback -> exactly one keypoint
+    message, no matter how many ticks follow.
+    """
+    from sensor_msgs.msg import CompressedImage
+    [tool] = bundle.get_all_tools()
+    name = tool['name']
+    def call(action, **args):
+        return bundle.dispatch(name, {'action': action, **args})
+    call('config', backend='mock', mock_pose='open')
+    assert call('start', input_topic='/camera')['state'] == 'running'
+    node = bundle._plugins[0].node
+    view, points = node.publishers
+    before = len(points.messages)
+
+    msg = CompressedImage(frame_bytes())
+    msg.header.stamp = SimpleNamespace(sec=123, nanosec=456000000)
+    node.subscriptions[0].callback(msg)
+
+    # First tick consumes the frame and publishes once.
+    node.tick()
+    assert len(points.messages) == before + 1
+    first = json.loads(points.messages[-1])
+
+    # Camera goes silent: many timer ticks, no new callback. No new commands.
+    for _ in range(8):
+        node.tick()
+    assert len(points.messages) == before + 1, "stale frame was re-published"
+
+    # A genuinely new frame resumes publishing.
+    msg2 = CompressedImage(frame_bytes())
+    msg2.header.stamp = SimpleNamespace(sec=124, nanosec=0)
+    node.subscriptions[0].callback(msg2)
+    node.tick()
+    assert len(points.messages) == before + 2
+    second = json.loads(points.messages[-1])
+    assert second['seq'] > first['seq']
+    call('pause')

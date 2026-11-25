@@ -52,6 +52,12 @@ class HandLandmarksPlugin:
         self._frame_lock = threading.Lock()
         self._tick_lock = threading.Lock()
         self._frame = None
+        # Identity of the last frame actually consumed by _tick(). A camera
+        # dropout leaves the last frame in self._frame; without this guard the
+        # timer would re-run inference and re-publish it every 1/rate_hz with
+        # a FRESH stamp_ms/seq for up to the 2 s stale-frame window, keeping
+        # downstream commands artificially alive after the camera went away.
+        self._last_processed_frame = None
         self.node = self.backend = None
         self._attached = False
         self.state = 'idle'
@@ -253,6 +259,13 @@ class HandLandmarksPlugin:
             if not sample or time.monotonic() - sample[2] > 2:
                 self.hand_present = False
                 return
+            # Consume each frame once. sample[2] is the arrival monotonic time
+            # assigned in the subscription callback — unique per frame. If the
+            # camera stops, self._frame keeps pointing at this same tuple, so
+            # skip re-inference/re-publish instead of emitting fresh-stamped
+            # copies of an old observation.
+            if self._last_processed_frame == sample[2]:
+                return
             try:
                 frame = self._decode(sample[0])
             except Exception as exc:
@@ -284,3 +297,6 @@ class HandLandmarksPlugin:
                     self.view_error = ''
                 except Exception as exc:
                     self.view_error = str(exc)
+            # Mark consumed only after a full pass (keypoints + view), so a
+            # decode/inference exception does not permanently skip this frame.
+            self._last_processed_frame = sample[2]
