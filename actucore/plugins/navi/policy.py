@@ -89,6 +89,7 @@ STUCK = "stuck"
 BLIND = "blind"          # no usable observation — distinct from "nothing seen"
 FAILED = "failed"        # terminal, and the caller is owed this answer
 IDLE = "idle"
+DEPTH_CAPTURE_STALE = "深度采集时间已过期或无效；保持停车"
 
 
 class LocalHold(Enum):
@@ -2130,7 +2131,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
     if depth is None or (detections is None and anchor is None):
         if stale_capture:
-            return Decision(_twist(0., 0., 0.), BLIND, "深度采集时间已过期或无效；保持停车")
+            return Decision(_twist(0., 0., 0.), BLIND, DEPTH_CAPTURE_STALE)
         if invalid_depth:
             state.recovery = True
             state.escape_side = 0.0

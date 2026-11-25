@@ -212,6 +212,53 @@ def test_followup_prefers_the_already_published_route(monkeypatch):
     assert len(card._last_decision.dwa_acceptance.route_points) == len(original.route_points)
 
 
+@pytest.mark.parametrize("next_depth", ["expired", "clear", "obstacle"])
+def test_expired_depth_leaves_the_sent_packet_until_its_original_deadline(monkeypatch, next_depth):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._descriptor["rate"].update(watchdog_ms=card._config.watchdog_ms, max_obs_age_ms=100)
+    first = card.next_command()
+    assert card._stage_command(first, card._output_epoch)
+    work = card._scheduled_command
+    assert work.sent and work.repeat_until is not None
+    original = packets[0].copy()
+    original_expiry = work.expires_ms, work.expires_at, work.repeat_until
+
+    advance_snapshot(snapshot, clock, 1100, vx=first["values"][0])
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = (dict(objects, timestamp=1.1), dict(depth, frame_id=1000, capture_ms=1000, source_frame_id=1000),
+                   odom, 1100)
+    stale = card.next_command()
+    assert not any(stale["values"]) and card._last_decision.status == policy.BLIND
+    if next_depth == "obstacle":
+        advance_snapshot(snapshot, clock, 1110, vx=first["values"][0], obstacle=True)
+        snapshot[0][1].pop("capture_invalid", None)
+
+    assert card._stage_command(stale, card._output_epoch)
+
+    if next_depth == "obstacle":
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+        return
+    assert packets == [original]
+    assert card._scheduled_command is work
+    assert (work.expires_ms, work.expires_at, work.repeat_until) == original_expiry
+    card._dispatch_command()
+    assert packets == [original]
+
+    if next_depth == "clear":
+        advance_snapshot(snapshot, clock, 1110, vx=first["values"][0])
+        objects, depth, odom, _ = snapshot[0]
+        depth.pop("capture_invalid", None)
+        snapshot[0] = dict(objects, timestamp=1.11), depth, odom, 1110
+        resumed = card.next_command()
+        assert any(resumed["values"])
+        assert card._stage_command(resumed, card._output_epoch)
+        assert len(packets) == 2 and any(packets[-1]["values"])
+        return
+    clock[0] = work.expires_ms
+    card._dispatch_command()
+    assert packets == [original] and card._scheduled_command is None
+
+
 def test_view_prefers_the_wire_route_over_the_latest_preview(monkeypatch):
     card, packets, _, _, message = selected_card(monkeypatch, body=False, live_target=True)
     assert card._stage_command(message, card._output_epoch)

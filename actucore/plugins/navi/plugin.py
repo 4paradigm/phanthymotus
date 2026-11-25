@@ -3960,6 +3960,18 @@ class NaviPlugin:
             if not any(message["values"]):
                 if diagnostic is not None and diagnostic.discarded_proposal:
                     return True
+                if (active is not None and active.repeat_until is not None and self._last_decision is not None
+                        and self._last_decision.reason == policy_mod.DEPTH_CAPTURE_STALE):
+                    # The already written command was swept through its watchdog
+                    # window. Expired depth cannot authorize another write.
+                    _, depth, _, _ = self._observation_snapshot(with_capture_timing=True)
+                    now_ms = int(time.time() * 1000)
+                    max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+                    fresh = (depth is not None and not depth.get("capture_invalid")
+                             and 0 <= now_ms - (depth.get("capture_ms") or depth["frame_id"]) < max_age)
+                    if not fresh and self._retain_checked_route(active, now_ms):
+                        self._last_decision.reason = "等待有效深度，当前指令保留到原截止时间"
+                        return True
                 if command_only and (not self._wire_moving
                                      or (self._last_decision is not None
                                          and self._last_decision.status == policy_mod.BLIND)):
