@@ -337,3 +337,20 @@ def test_longitudinal_delivery_error_preserves_side_clearance(packed):
         assert check(trace, remembered=side, prepared_layers=layers).accepted is accepted
     front = local_path.ObstacleSquares(np.array([[.46, 0.]]), 0.)
     assert not check(trace, occupied=front).accepted
+
+
+@pytest.mark.parametrize("turn", [0., .2])
+def test_dense_uniform_heading_layers_keep_the_packed_clearance_check(monkeypatch, turn):
+    trace = predict((.20, 0., turn))
+    rng = np.random.default_rng(44)
+    observed = local_path.ObstacleSquares(rng.uniform((.25, .27), (2., 1.4), (2400, 2)), -.41)
+    options = dict(occupied=observed, geometry=GEOMETRY, mode="body")
+    expected = check(trace, **options)
+    assert len(trace.body_poses[1:]) * len(observed.centers) > local_path._PREPARED_PAIR_BUDGET
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("uniformly oriented blocks can share the packed exact check")
+
+    monkeypatch.setattr(local_path, "rectangle_clearance", unexpected)
+    actual = check(trace, **options, prepared_layers=local_path.PreparedObstacleLayers(observed, None))
+    assert actual == expected

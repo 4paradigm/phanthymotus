@@ -887,3 +887,25 @@ def test_straight_tracking_speed_handoff(case):
         assert choice.command == (.30, 0., 0.)
     else:
         assert choice is None or choice.command[0] <= .15
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_timed_route_keeps_only_a_verified_prefix_when_scoring_runs_out(monkeypatch, blocked):
+    remaining = [1.]
+    predictions = []
+    predict = dwa.MotionContext.predict
+
+    def predict_with_deadline(context, command):
+        predictions.append(command)
+        if len(predictions) == 2:
+            remaining[0] = 0.
+        return predict(context, command)
+
+    monkeypatch.setattr(dwa.MotionContext, "predict", predict_with_deadline)
+    choice = _run(((0., 0.), (.5, .10), (1.4, .20)), previous=(.2, 0., -.12),
+                  grid=_grid(obstacles=[(.35, 0.)] if blocked else []),
+                  candidate_budget=dwa.CandidateBudget(64, time_left=lambda: remaining[0], early_return_s=.1))
+    if blocked:
+        assert choice is None
+    else:
+        assert choice is not None and choice.command == predictions[0] and choice.check.accepted

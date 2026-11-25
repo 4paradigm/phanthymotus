@@ -2166,14 +2166,23 @@ def _decide(detections, depth, odom, config: Config, state: State,
             and not (state.escape_side or scan.active or scan.result_frame or scan.exhausted)):
         anchor = state.goal_anchor = None
 
+    person_approach = (config.local_planning and config.local_geometry is not None
+                       and config.local_controller == "dwa" and state.target == "person")
+    missing_person = person_approach and not (track is not None and track.observed)
+    if missing_person and track is not None and anchor is None and not (
+            state.published_dwa_route or state.published_camera_passage or scan.active):
+        state.commanded_vx = 0.
+        return _search_for_target(depth, config, state, dt, odom)
+
     if track is None and anchor is None:
         if (state.searched_rad > 0. and state.tracker.track is not None
                 and any(target_objects(detections, state.target, config))):
             return Decision(_twist(0., 0., 0.), ALIGNING, "已看到目标，等待新观测确认")
         return _search_for_target(depth, config, state, dt, odom)
 
-    state.missing_frames = 0
-    if anchor is None:
+    if not missing_person:
+        state.missing_frames = 0
+    if anchor is None and not missing_person:
         state.searching_for_s = 0.0
         state.searched_rad = 0.0
     # Back to the normalised offset the rest of this file is written in.
@@ -2185,7 +2194,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     bearing_rad = (route_fix[1] if route_fix is not None else
                    math.atan2(-anchor.y, anchor.x) if anchor is not None else track.bearing_rad)
     bearing = _clamp(bearing_rad / max(1e-6, config.half_fov_rad), 1.0)
-    state.last_seen_side = 1.0 if bearing >= 0 else -1.0
+    if not missing_person:
+        state.last_seen_side = 1.0 if bearing >= 0 else -1.0
     distance = (route_fix[0] if route_fix is not None else
                 math.hypot(anchor.x, anchor.y) if anchor is not None else
                 track.range_m if track.range_known or getattr(track, "front_fix", None) is not None else None)
@@ -2212,6 +2222,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         distance = target_fix[0]
         bearing = _clamp(target_fix[1] / max(1e-6, config.half_fov_rad), 1.)
     if within:
+        if missing_person:
+            return _search_for_target(depth, config, state, dt, odom)
         observed = live or target_fix is not None or (
             anchor is not None and track is not None and (track.generation == anchor.generation if freeze_goal else track is anchor.track) and track.observed
             and not anchor.target_missing and (
@@ -2276,6 +2288,22 @@ def _decide(detections, depth, odom, config: Config, state: State,
         target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
         aligned=abs(bearing) < config.align_full_stop, odom=odom,
         may_scan=live or anchor is not None, dt=dt)
+    if missing_person and (vx or vy or raw_wz) and not (
+            state.dwa_selected or state.camera_arc_selected or state.executing_leg):
+        state.commanded_vx = 0.
+        return _search_for_target(depth, config, state, dt, odom)
+    if (person_approach and live and distance is not None and status == APPROACHING and vy
+            and abs(bearing) > config.align_tol
+            and not state.dwa_selected and not state.camera_arc_selected and not scan.command_only
+            and scan.views and scan.matches_route_view(depth)):
+        # A lateral prefix fixes the heading. Check a turn towards the visible
+        # person before committing to another sideways step.
+        target = local_path.target_in_grid(geometry, distance * math.cos(bearing_rad), distance * math.sin(bearing_rad))
+        limit = _scan_yaw_rate(config, 1. if tracking_wz < 0. else -1.)
+        yaw = _lift(tracking_wz, config.floor_wz, limit) if limit >= config.floor_wz else 0.
+        if yaw and _check_dwa_turn(depth, config, state, geometry, target, "align", (0., 0., yaw)):
+            state.commanded_vx = 0.
+            return Decision(_twist(0., 0., yaw), ALIGNING, "原地转向当前可见目标", distance_m=distance, bearing=bearing)
     if not state.camera_arc_selected:
         _remember_detour_goal(state, config, track, odom)
     # Legacy uses forward requests and lateral feedback for blockage. DWA
@@ -3997,7 +4025,8 @@ def _dwa_recovery_route(depth, config, state, geometry, ahead, distance, bearing
     if result is not None:
         return result
     reason = state.dwa_trace.get("fallback_reason")
-    if fresh and reason not in ("geometry_mismatch", "stale_observation", "no_feedback", "prediction_horizon"):
+    if fresh and reason not in ("search_deadline", "geometry_mismatch", "stale_observation",
+                                "no_feedback", "prediction_horizon"):
         scan.dwa_failures += 1
     if scan.dwa_failures >= 3:
         if scan.ready:
@@ -4484,7 +4513,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         if needs_detour or continuing_detour:
             motion = planar_feedback(odom) or state.command_tail
             floor = config.floor_wz_moving if vx or vy else config.floor_wz
-            yaw = min(max(abs(wz), floor), _scan_yaw_rate(config, 1. if wz < 0. else -1.)) if wz else 0.
+            limit = _scan_yaw_rate(config, 1. if wz < 0. else -1.)
+            yaw = math.copysign(min(max(abs(wz), floor), limit), wz) if wz else 0.
             corridor_clear = _target_corridor_clear(
                 depth, config, scan, target_distance, target_bearing, (motion, state.commanded, (vx, vy, yaw)))
             needs_detour = not corridor_clear
@@ -5218,10 +5248,11 @@ def _search(config: Config, state: State, dt: float, odom=None, *, requested_yaw
     if requested_yaw is None:
         state.missing_frames += 1
     if requested_yaw is None and state.missing_frames < config.lost_frames:
-        # Briefly occluded — a person walking past. Emitting nothing for a few
-        # frames lets the watchdog hold rather than starting a search for
-        # something that has not actually gone.
-        return Decision(None, SEARCHING,
+        # Wait for confirmation before searching. End a translating person
+        # approach immediately when the target drops out.
+        brake = (config.local_planning and config.local_controller == "dwa" and state.target == "person"
+                 and any(state.commanded[:2]))
+        return Decision(_twist(0., 0., 0.) if brake else None, SEARCHING,
                         f"target briefly out of sight ({state.missing_frames}/{config.lost_frames} frames)")
 
     # ``adopt_limits`` has already established that no yaw command can clear

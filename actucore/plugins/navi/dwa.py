@@ -743,6 +743,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     initial_positions = None
     bounded = candidate_budget is not None
     entries = []
+    first_checked = None
     straight_check = None
     for ordinal, cmd in enumerate(commands()):
         if budget.expired():
@@ -786,7 +787,11 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         capped_straight = (ordinal == 0 and straight_reference and cmd == straight
                            and (continuing or (not any(previous) and x_speed == nominal)))
         early_translation = budget.short_window() and any(cmd[:2]) and not retaining_speed
-        if scores and ((retaining_speed or capped_straight) and scores[0][2] == 0 or early_translation):
+        # Complete one translating candidate before spending the time budget
+        # ranking alternatives. Its braking and visibility checks still apply.
+        seed = budget.time_left is not None and first_checked is None and any(cmd[:2]) and not retaining_speed
+        preferred_check = (retaining_speed or capped_straight) and bool(scores) and scores[0][2] == 0
+        if scores and (preferred_check or early_translation or seed):
             checked = admissible(cmd)
             if checked is None:
                 continue
@@ -794,15 +799,18 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             if capped_straight:
                 straight_check = checked
             obstacle = _obstacle_score(check)
-            if early_translation or (obstacle == 0. and (not retaining_speed or all(
+            components, progress, index = (scores[0] if preferred_check and not early_translation
+                                           else min(scores, key=lambda item: item[0].total))
+            components = replace(components, obstacle=obstacle)
+            choice = Choice(cmd, poses[:prediction.moving_count], components.total, progress,
+                            check.min_clearance_m, prediction, check, components, index)
+            if early_translation or (preferred_check and obstacle == 0. and (not retaining_speed or all(
                     0. <= f <= route[-1][0] and abs(r) <= local_path.RESOLUTION / 2 for f, r, _ in poses))):
-                components, progress, index = min(scores, key=lambda item: item[0].total) if early_translation else scores[0]
-                components = replace(components, obstacle=obstacle)
                 diag.update(admissible_candidates=1, reference_scores=sum(scores_by_reference),
                             scores_by_reference=scores_by_reference, reason=None)
-                choice = Choice(cmd, poses[:prediction.moving_count], components.total, progress,
-                                check.min_clearance_m, prediction, check, components, index)
                 return interpolate(choice)
+            if seed:
+                first_checked = choice
         if retaining_speed:
             continue  # Ordinary detour ranking only admits speeds inside its cap.
         lower = min(((score.total, index, ordinal) for score, _, index in scores), default=(math.inf, 0, ordinal))
@@ -863,6 +871,9 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             and retained.progress >= best.progress - local_path.RESOLUTION / 2
             and retained.score <= best.score + score_band):
         best = retained
+    if best is None and first_checked is not None and budget.expired():
+        best = first_checked
+        diag["admissible_candidates"] += 1
     diag["reference_scores"] = sum(scores_by_reference)
     diag["scores_by_reference"] = scores_by_reference
     diag["reason"] = None if best is not None else (

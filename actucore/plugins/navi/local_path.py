@@ -1098,9 +1098,15 @@ class PreparedObstacleLayers:
     def clearance(self, poses, f, r, yaw, front, rear, width, padding):
         if not self.layers:
             return math.inf, None, None
-        # The native tail switches formulas as a group for each per-layer block.
-        # If it could split any layer into more than one tail block, retain it.
-        if not self.native_shapes or max(self.counts) * (len(f) - 1) > _PREPARED_PAIR_BUDGET:
+        # The scalar evaluator chooses its aligned-distance formula per block.
+        # Splitting a layer only changes that choice if the trace contains both
+        # aligned and rotated samples relative to that particular layer.
+        large = np.asarray(self.counts) * (len(f) - 1) > _PREPARED_PAIR_BUDGET
+        split_mixed = False
+        if large.any():
+            aligned = np.sin(yaw[1:, None] - self.yaws[large]) == 0.
+            split_mixed = (aligned.any(axis=0) & ~aligned.all(axis=0)).any()
+        if not self.native_shapes or split_mixed:
             clearance, first_hit, cause = math.inf, None, None
             for squares, reason in self.layers:
                 distance, hit = rectangle_clearance(

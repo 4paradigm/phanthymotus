@@ -6433,3 +6433,38 @@ def test_pose_only_return_uses_capture_paired_body_measurements(monkeypatch, pai
     else:
         assert i == 64 and result.status == P.APPROACHING and state.idle_for_s < .5
         assert state.dwa_progress.approach_fix.frame == capture.frame
+
+
+@pytest.mark.parametrize("side", [-1., 1.])
+@pytest.mark.parametrize("observed", [True, False], ids=["visible", "lost"])
+def test_person_approach_faces_the_last_visible_side_on_a_clear_floor(monkeypatch, observed, side):
+    from types import SimpleNamespace
+
+    geometry = P.local_path.camera_square(P.HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .2, at_front=True)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.2, floor_wz=.2)
+    state = _state("person", motion_source="measured", last_seen_side=side, commanded=(.2, 0., 0.))
+    track = SimpleNamespace(observed=observed, range_known=True, range_m=2., measured_range_m=2. if observed else None,
+                            bearing_rad=side * .28 * config.half_fov_rad)
+    monkeypatch.setattr(state.tracker, "step", lambda **kw: track)
+    depth = dict(_scene(3.), frame_id=1000, control_ms=1000)
+    decision = P.step(detections=_detections(*([_obj("person", side * .28)] if observed else [])), depth=depth,
+                      odom=dict(vx=0., vy=0., wz=0., received_ms=1000), config=config, state=state, dt=.1)
+    if observed:
+        assert side * decision.values[5] < 0. and decision.values[:2] == [0., 0.]
+    else:
+        assert decision.values[:2] == [0., 0.]
+
+
+def test_incomplete_route_search_does_not_count_as_an_obstructed_view(monkeypatch):
+    config = _cfg(local_planning=True)
+    state = _state()
+    scan = state.active_scan
+    scan.current_frame = 1000
+    monkeypatch.setattr(scan, "new_dwa_view", lambda: True)
+
+    def out_of_time(*args):
+        state.dwa_trace["fallback_reason"] = "search_deadline"
+
+    monkeypatch.setattr(P, "_dwa_route_motion", out_of_time)
+    P._dwa_recovery_route({}, config, state, None, .8, 2., 0.)
+    assert scan.dwa_failures == 0
