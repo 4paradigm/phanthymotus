@@ -640,6 +640,7 @@ COPY perception/native/rtabmap/verified_leaf_core.patch /tmp/rtabmap-verified-le
 # TORO otherwise orders equal-level edges by heap address, so unrelated
 # allocations (such as wall-constraint trial solves) change native maps.
 COPY perception/native/rtabmap/toro_edge_order_core.patch /tmp/rtabmap-toro-edge-order.patch
+COPY perception/native/rtabmap/vertical_odometry_core.patch /tmp/rtabmap-vertical-odometry.patch
 RUN set -e; \
     git -C /tmp/rtabmap-ws/src/rtabmap apply --check /tmp/rtabmap-rotation-core.patch; \
     git -C /tmp/rtabmap-ws/src/rtabmap apply /tmp/rtabmap-rotation-core.patch; \
@@ -648,7 +649,8 @@ RUN set -e; \
     git -C /tmp/rtabmap-ws/src/rtabmap apply /tmp/rtabmap-verified-leaf.patch; \
     git -C /tmp/rtabmap-ws/src/rtabmap apply /tmp/rtabmap-sqlite-busy.patch; \
     git -C /tmp/rtabmap-ws/src/rtabmap apply /tmp/rtabmap-toro-edge-order.patch; \
-    rm /tmp/rtabmap-sqlite-busy.patch /tmp/rtabmap-rotation-core.patch /tmp/rtabmap-flow-pyramid.patch /tmp/rtabmap-last-parameters.patch /tmp/rtabmap-verified-leaf.patch /tmp/rtabmap-toro-edge-order.patch
+    git -C /tmp/rtabmap-ws/src/rtabmap apply /tmp/rtabmap-vertical-odometry.patch; \
+    rm /tmp/rtabmap-sqlite-busy.patch /tmp/rtabmap-rotation-core.patch /tmp/rtabmap-flow-pyramid.patch /tmp/rtabmap-last-parameters.patch /tmp/rtabmap-verified-leaf.patch /tmp/rtabmap-toro-edge-order.patch /tmp/rtabmap-vertical-odometry.patch
 
 # Commit the complete checkout before compiling. A failed build can reuse this
 # source layer; partial object files from the failed RUN are not a Docker cache.

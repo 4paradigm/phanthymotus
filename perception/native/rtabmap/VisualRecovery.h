@@ -467,6 +467,11 @@ public:
                             i<3?positionVariance:angleVariance);
                     auto stats=acceptedStats;
                     stats["Motus/MeasuredExternalContinuity/"]=1.f;
+                    // The same gravity-witnessed run can bridge short gaps in fresh gravity samples.
+                    // A tilted visual alignment would make native odometry z ambiguous.
+                    if(groundHeight_ && externalToNative_.r31()==0.f &&
+                       externalToNative_.r32()==0.f && externalToNative_.r33()>0.f)
+                        stats["Motus/GravityAlignedOdometry/"]=1.f;
                     accepted=map.process(data,odom_,motionCovariance,velocity,stats);
                 }
                 else accepted=map.process(data,odom_,covariance,velocity,acceptedStats);
