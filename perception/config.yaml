@@ -153,6 +153,18 @@ plugins:
     # and Chinese as this model's supported pair, so the rest are best-effort.
     language: en-us
 
+  segment:
+    enabled: true
+    confidence: 0.30
+    fps: 4
+    publish_overlay: true
+    # Each entry is a distinct Dashboard card. Names are frozen in the YOLOE engine.
+    cards:
+      person: [person]
+      car: [car]
+      chair: [chair]
+      traffic: [bicycle, car, motorcycle, bus, truck]
+
   vop:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
