@@ -104,6 +104,56 @@ class TestClassification(_Registry):
         self.assertIn('viewer', why)
 
 
+class TestDeclaredReadOnly(unittest.TestCase):
+    """A perception card that also deletes data says so per action.
+
+    `table_db` sits in the perception layer, which the layer rule takes as
+    read-only — so without the card's own declaration a viewer peer could
+    `drop_table` someone's data with no local LLM in the loop.
+    """
+
+    _TOOL = {
+        'name': 'table_db', 'type': 'processor',
+        'annotations': {'readOnlyHint': False},
+        'inputSchema': {'type': 'object', 'properties': {}, 'x-action-params': {
+            'select':     {'params': [], 'readOnly': True},
+            'drop_table': {'params': [], 'readOnly': False},
+            'legacy':     {'params': []},
+        }},
+    }
+
+    def setUp(self):
+        meta = {f'mcp__db__table_db__{a}': {'type': 'processor',
+                                             'read_only': mcp_client.declared_read_only(self._TOOL, a)}
+                for a in ('select', 'drop_table', 'legacy')}
+        registry = {'db': {'category': 'perception', 'tool_meta': meta,
+                           'tools': ['table_db'], 'tool_groups': {'table_db': list(meta)}}}
+        patch = mock.patch.dict(mcp_client.registry, registry, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_declaration_per_action_wins_over_the_tool_annotation(self):
+        self.assertTrue(mcp_client.declared_read_only(self._TOOL, 'select'))
+        self.assertFalse(mcp_client.declared_read_only(self._TOOL, 'legacy'))   # tool-wide hint
+        self.assertIsNone(mcp_client.declared_read_only({'name': 'x'}))
+
+    def test_a_perception_write_is_not_read_only(self):
+        self.assertTrue(peer_tools.is_read_only('mcp__db__table_db__select'))
+        self.assertFalse(peer_tools.is_read_only('mcp__db__table_db__drop_table'))
+
+    def test_the_bare_name_cannot_route_around_the_split(self):
+        """call_tool accepts `mcp__db__table_db` plus an `action` argument."""
+        self.assertFalse(peer_tools.is_read_only('mcp__db__table_db'))
+
+    def test_a_viewer_is_refused_the_write(self):
+        with mock.patch('peer.store.get', return_value=_peer(role='viewer')):
+            ok, why = peer_tools.check_tool_permission('p1', 'mcp__db__table_db__drop_table')
+            self.assertFalse(ok)
+            self.assertIn('viewer', why)
+            ok, _ = peer_tools.check_tool_permission('p1', 'mcp__db__table_db__select')
+            self.assertTrue(ok)
+
+
 class TestRoleBoundary(_Registry):
     def _check(self, tool, role='operator', tool_filter='*'):
         with mock.patch('peer.store.get', return_value=_peer(role, tool_filter)):

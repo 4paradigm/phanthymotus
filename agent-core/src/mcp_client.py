@@ -462,6 +462,25 @@ def _to_openai_schema(mcp_id: str, tool: dict) -> list[dict]:
     return schemas
 
 
+def declared_read_only(tool: dict, action: str | None = None) -> bool | None:
+    """Whether a tool (or one of its split actions) declares that it only reads.
+
+    `True`/`False` when declared, `None` when not — the caller then falls back on
+    its own rule. An action's `readOnly` in `x-action-params` wins over the
+    tool-wide MCP annotation `annotations.readOnlyHint`.
+
+    The layer rule in `peer/tools.py` takes the whole perception layer as
+    read-only, which stopped being true once a perception card could also delete
+    data: `table_db`'s `drop_table` and `delete` sit beside `select` on one card.
+    """
+    if action is not None:
+        action_def = ((tool.get('inputSchema') or {}).get('x-action-params') or {}).get(action) or {}
+        if isinstance(action_def.get('readOnly'), bool):
+            return action_def['readOnly']
+    hint = (tool.get('annotations') or {}).get('readOnlyHint')
+    return hint if isinstance(hint, bool) else None
+
+
 # ── 连接单个 MCP ───────────────────────────────────────────────────────────────
 
 async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> None:
@@ -501,6 +520,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
                         'has_config_schema': bool(tool.get('configSchema')),
                         'completion': raw_input_schema.get('x-completion'),
                         'resource': parse_resources(raw_input_schema.get('x-resource')),
+                        'read_only': declared_read_only(tool),
                     }
                 else:
                     # 拆分：多个 sub-schemas
@@ -519,6 +539,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
                         }
                         # 解析 action name（最后一段 __）
                         action_name = schema['name'].split('__')[-1]
+                        tool_meta[schema['name']]['read_only'] = declared_read_only(tool, action_name)
                         split_map[schema['name']] = {
                             'tool': tool['name'],
                             'action': action_name,

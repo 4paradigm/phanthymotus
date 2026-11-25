@@ -4600,25 +4600,29 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_
 
 ## `table_db` 卡片
 
-基于 SQLite 的**数据表存储卡片**（单库多表，表为最大一级，无数据库层级）。所有对外 action 严格遵循 SQLite 标准原语与命名，不耦合其它业务卡片：
+基于 SQLite 的**数据表存储卡片**（单库多表，表为最大一级）。调用方主要是 LLM，所以动作和参数贴近 SQL 原语：
 
-| action | SQLite 对应 | 必填参数 | 可选参数 | 说明 |
-|---|---|---|---|---|
-| `tables` | `.tables` / `.schema` | — | — | 查看所有数据表及列结构（`TEXT`/`INTEGER`/`REAL`/`BLOB`）与行数 |
-| `create_table` | `CREATE TABLE` | `table`, `columns` | — | 新建数据表 |
-| `drop_table` | `DROP TABLE` | `table` | — | 删除数据表并回收关联 BLOB |
-| `insert` | `INSERT INTO` | `table`, `values` | `file` | 插入一行或多行；BLOB 列传文件路径（SQLite `readfile` 语义）或 `'$file'` |
-| `select` | `SELECT` | `table` | `columns`, `where`, `group_by`, `order_by`, `limit`, `offset` | 查询、分页、排序、`COUNT(*)` 与 `GROUP BY`；BLOB 列返回 `{type, name, mime, size, url}` |
-| `update` | `UPDATE` | `table`, `where` | `set`, `file` | 按条件更新记录；BLOB 列可传文件路径、`'$file'` 或 `null` 清空，自动回收旧 BLOB |
-| `delete` | `DELETE FROM` | `table`, `where` | — | 按条件删除记录并回收关联 BLOB |
-| `import` | `.import` | `table`, `path` | `mode`, `header_row` | 导入 `.csv` 或 `.xlsx`（含 WPS `DISPIMG` / 浮动图 / Excel 365 单元格图片） |
-| `export` | 导出表格 | `table` | `format`, `where`, `columns`, `order_by` | 导出为 `.xlsx`（自动嵌入图片 BLOB）或 `.csv`，返回 `path` 与下载 `url` |
+| action | SQL 对应 | 必填参数 | 可选参数 |
+|---|---|---|---|
+| `list_tables` | `.tables` | — | — |
+| `describe` | `.schema` | `table` | — |
+| `create_table` | `CREATE TABLE` | `table`, `columns` | — |
+| `add_column` | `ALTER TABLE ADD COLUMN` | `table`, `columns` | — |
+| `drop_table` | `DROP TABLE` | `table`, `confirm: true` | — |
+| `insert` | `INSERT INTO` | `table`, `values` | `file` |
+| `select` | `SELECT` | `table` | `fields`, `where`, `group_by`, `order_by`, `limit`, `offset` |
+| `update` | `UPDATE` | `table`, `where` | `set`, `file` |
+| `delete` | `DELETE FROM` | `table`, `where` | — |
+| `import` | `.import` | `table`, `path` | `mode`, `header_row` |
+| `export` | 导出 | `table` | `format`, `fields`, `where`, `order_by` |
 
-**设计要点**
-- 列类型遵循 SQLite 标准：`TEXT`、`INTEGER`、`REAL`、`BLOB`，行主键为 SQLite `rowid`。
-- 文件仅以 SQLite `BLOB` 存储，替换/清空/删行/删表后自动回收未引用的 `_files`/`_blobs`。
-- 防注入：用户表名、列名仅存元数据表，物理 SQL 使用生成标识符与参数绑定。
+- `where` 是条件数组 `[["金额", ">", 100], ["姓名", "like", "%张%"]]`，支持 `= != > >= < <= like / not like / in / not in / between / is null / is not null`。
+- `fields` 支持 `COUNT/SUM/AVG/MIN/MAX`（可加 `DISTINCT`），配合 `group_by` 做分组统计。
+- BLOB 列：`insert`/`update` 里写本机文件路径即存入，`set` 里写 `null` 即删除文件，`select` 返回下载 `url`。
+- 写操作在 `x-action-params` 里声明 `readOnly: false`，`viewer` 级别的 peer 只能读。
 - 存放位置：`/models/table_db/table_db.db`（宿主挂载目录，重启/升级不丢数据）。各项上限见 `config.yaml` 中 `plugins.table_db`。
+
+完整说明见 [`docs/table-db.md`](docs/table-db.md)。
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_table_db*.py -q

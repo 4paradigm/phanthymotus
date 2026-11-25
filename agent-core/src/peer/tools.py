@@ -121,15 +121,44 @@ def tool_category(full_name: str) -> str:
     return str((entry or {}).get('category') or '')
 
 
+def _declared_read_only(full_name: str) -> bool | None:
+    """The tool's own read-only declaration, or None when it made none.
+
+    A split tool is called by its action's name (`mcp__x__table_db__select`), but
+    `mcp_client.call_tool` also accepts the bare tool name with an `action`
+    argument. The bare name of a split tool has no `tool_meta` entry of its own,
+    so it counts as read-only only when **every** action is declared read-only —
+    otherwise a viewer could reach `drop_table` by not naming it.
+    """
+    info = _mcp_info(full_name)
+    meta = (info.get('tool_meta') or {}).get(full_name)
+    if meta is not None:
+        return meta.get('read_only')
+    short = full_name.split('__', 2)[-1] if full_name.count('__') >= 2 else ''
+    group = (info.get('tool_groups') or {}).get(short)
+    if not group:
+        return None
+    flags = [((info.get('tool_meta') or {}).get(name) or {}).get('read_only') for name in group]
+    if any(flag is False for flag in flags):
+        return False
+    return True if all(flag is True for flag in flags) else None
+
+
 def is_read_only(full_name: str) -> bool:
     """Whether this tool only reads — the set a `viewer` peer may reach.
 
     Layer first, then type: the execution layer acts even when its tools declare
     `processor`, and the perception layer does not act even when it declares one.
     An undeclared type is treated as acting, so a viewer cannot reach it.
+
+    A tool's own declaration (`readOnly` per action, or the MCP annotation
+    `readOnlyHint`) can only narrow this: `False` makes a perception tool acting
+    (a table store's `delete`); `True` never makes an actucore tool read-only.
     """
     category = tool_category(full_name)
     if category in ACTING_CATEGORIES:
+        return False
+    if _declared_read_only(full_name) is False:
         return False
     if tool_type(full_name) in READ_ONLY_TYPES:
         return True

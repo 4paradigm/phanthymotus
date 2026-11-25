@@ -100,34 +100,44 @@ _MIME_BY_MAGIC = (
     (b"ID3", "audio/mpeg", ".mp3"),
 )
 
-# Canvas schema rules:
-# * Dropdown shows bare SQLite action names (`oneOf.const` + `description`, no `title`).
-# * NO ASCII double quote (") in any property description (canvas.js `_esc` does
-#   not escape quotes in placeholder="..." / title="...").
-# * All placeholders use generic notation (`表名`, `列名`, `值`) without domain examples.
+# What the model sees. agent-core splits this card into one tool per
+# `x-action-params` entry (`table_db__select`, ...), each carrying the card
+# description plus its own, and **every action shares one `properties` map** — so
+# a property's description must hold for every action that lists it, and a
+# property used two ways (column definitions vs. columns to return) has to be
+# two properties. Examples are real JSON: canvas.js escapes quotes now.
+#
+# `readOnly` per action: the perception layer is read-only to a `viewer` peer
+# unless the card says otherwise, and this card deletes data.
 
 ACTIONS = [
-    ("tables", "查看当前所有数据表及其列结构与行数（对应 SQLite .tables / .schema）"),
-    ("create_table", "新建数据表并定义列名与 SQLite 类型（对应 CREATE TABLE）"),
-    ("drop_table", "删除数据表及其全部数据（对应 DROP TABLE）"),
-    ("insert", "向表中插入一条或多条记录，BLOB 列可传文件路径（对应 INSERT INTO）"),
-    ("select", "查询记录、条件筛选、分页、排序与分组计数（对应 SELECT）"),
-    ("update", "按条件修改记录，可更新或置空 BLOB 列文件（对应 UPDATE）"),
-    ("delete", "按条件删除记录（对应 DELETE FROM）"),
-    ("import", "导入 .csv 或 .xlsx 表格文件到数据表（对应 .import）"),
-    ("export", "将数据表或查询结果导出为 .csv 或 .xlsx 文件"),
+    ("list_tables", "列出所有数据表及行数（.tables）"),
+    ("describe", "查看一张表的列名和类型（.schema）"),
+    ("create_table", "新建数据表（CREATE TABLE）"),
+    ("add_column", "给已有表加列（ALTER TABLE ADD COLUMN）"),
+    ("drop_table", "删除整张表（DROP TABLE），不可恢复"),
+    ("insert", "插入记录（INSERT INTO）"),
+    ("select", "查询、筛选、排序、分组统计（SELECT）"),
+    ("update", "修改符合条件的记录（UPDATE）"),
+    ("delete", "删除符合条件的记录（DELETE FROM）"),
+    ("import", "导入 .csv / .xlsx 文件为数据表（.import）"),
+    ("export", "把表或查询结果导出为 .xlsx / .csv 文件"),
 ]
+
+_WHERE_DESC = (
+    '筛选条件，多个条件之间是 AND。每个条件写成 [列名, 运算符, 值]。'
+    '运算符：= != > >= < <= like、not like（% 匹配任意字符）、in、not in（值为数组）、'
+    'between（值为 [下限, 上限]）、is null、is not null（不写值）。'
+    '例：[["金额", ">", 100], ["姓名", "like", "%张%"], ["状态", "in", ["待处理", "处理中"]]]。'
+    '行号列名为 rowid。'
+)
 
 TOOLS: List[Dict[str, Any]] = [{
     "name": PREFIX,
     "type": "processor",
     "multiInstance": False,
-    "description": (
-        "SQLite 数据表存储卡片：提供标准 SQLite 表级操作（tables / create_table / drop_table / "
-        "insert / select / update / delete）以及 .csv / .xlsx 数据表导入导出（import / export）。"
-        "列类型遵循 SQLite 标准（TEXT / INTEGER / REAL / BLOB），文件以 BLOB 存储，"
-        "insert/update 可通过文件路径写入 BLOB，select 返回 BLOB 下载链接。"
-    ),
+    "annotations": {"readOnlyHint": False, "destructiveHint": True},
+    "description": "SQLite 数据表：表格数据的增删改查、统计和 .csv/.xlsx 导入导出。不确定表名或列名时先 list_tables / describe。",
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -135,168 +145,160 @@ TOOLS: List[Dict[str, Any]] = [{
                 "type": "string",
                 "enum": ["start", "stop", "info"] + [name for name, _ in ACTIONS],
                 "oneOf": [{"const": name, "description": text} for name, text in ACTIONS],
-                "description": "要执行的 SQLite 操作，各操作说明见 oneOf.description",
+                "description": "要执行的操作",
             },
-            "table": {
-                "type": "string",
-                "description": "表名，例如 table_name；查看现有表请先执行 tables",
-            },
+            "table": {"type": "string", "description": "表名"},
             "columns": {
                 "type": "array",
                 "items": {"type": "object", "properties": {
                     "name": {"type": "string"},
                     "type": {"type": "string", "enum": list(COLUMN_TYPES)},
-                }},
+                }, "required": ["name"]},
                 "description": (
-                    "列定义或查询列：create_table 填 列名1,列名2:INTEGER,列名3:BLOB"
-                    "（类型支持 TEXT/INTEGER/REAL/BLOB，默认 TEXT）；"
-                    "select/export 可填要返回的列名，如 列名1,列名2 或 COUNT(*)"
+                    '列定义，type 取 TEXT（文本，默认）/ INTEGER（整数）/ REAL（小数）/ BLOB（图片或文件）。'
+                    '例：[{"name": "姓名"}, {"name": "金额", "type": "REAL"}, {"name": "照片", "type": "BLOB"}]'
+                ),
+            },
+            "fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    '要返回的列，不填返回全部列。可写聚合 COUNT(*)、COUNT(列)、COUNT(DISTINCT 列)、'
+                    'SUM(列)、AVG(列)、MIN(列)、MAX(列)。例：["类别", "SUM(金额)", "COUNT(*)"]'
                 ),
             },
             "values": {
                 "type": "array",
                 "items": {"type": "object"},
                 "description": (
-                    "插入的行数据：[{'列名1':'值1','列名2':'值2'}] 或单行对象 {'列名':'值'}；"
-                    "BLOB 列填文件路径或 '$file'（配合 file 参数）；一次最多 500 行"
+                    '要插入的行，每行一个对象，未写的列为空；一次最多 500 行。'
+                    'BLOB 列写本机文件路径。例：[{"姓名": "张三", "金额": 12.5, "照片": "/work/photos/a.jpg"}]'
                 ),
             },
             "set": {
                 "type": "object",
                 "description": (
-                    "要更新的列与新值：{'列名':'新值'}；置空写 {'列名':null}；"
-                    "BLOB 列填文件路径或 '$file'（配合 file 参数）"
+                    '要改成的新值。null 表示清空；BLOB 列写新文件路径即替换，写 null 即删除该文件。'
+                    '例：{"状态": "已完成", "照片": null}'
                 ),
             },
-            "where": {
-                "type": "object",
-                "description": (
-                    "筛选条件：{'列名':'值'}；多值 {'列名':['值1','值2']}；"
-                    "为空 {'列名':null}；按行号 {'rowid':1}；单双引号均可"
-                ),
-            },
+            "where": {"type": "array", "items": {"type": "array"}, "description": _WHERE_DESC},
             "group_by": {
-                "type": "string",
-                "description": "分组列名，格式 列名；配合 select 按该列分组并返回 COUNT(*)",
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    '分组列，每组返回一行；fields 里的普通列必须出现在这里，其余写聚合。'
+                    '去重也用它。例：["类别"]'
+                ),
             },
             "order_by": {
-                "type": "string",
-                "description": "排序规则：列名 或 列名 DESC（支持 rowid），多列用逗号分隔",
+                "type": "array",
+                "items": {"type": "string"},
+                "description": '排序，每项写 列名 或 列名 DESC；分组查询可按聚合排序。例：["SUM(金额) DESC", "类别"]',
             },
             "limit": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "最多返回行数，整数；不填默认 20，最大 200",
+                "type": "integer", "minimum": 1, "maximum": MAX_PAGE_ROWS,
+                "description": "最多返回行数，默认 %d，最大 %d；结果里 has_more 为 true 时用 offset 翻页"
+                               % (PAGE_ROWS, MAX_PAGE_ROWS),
             },
-            "offset": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "跳过前几行用于翻页，整数；不填默认 0",
+            "offset": {"type": "integer", "minimum": 0, "description": "跳过前几行，用于翻页，默认 0"},
+            "confirm": {
+                "type": "boolean", "const": True,
+                "description": "确认删除整张表；只在用户明确要求删表时填 true",
             },
             "path": {
                 "type": "string",
                 "format": "file",
                 "accept": _TABLE_FILES,
                 "uploadTo": "mcp",
-                "description": "要导入的表格文件（仅支持 .csv 和 .xlsx）",
+                "description": "要导入的 .csv 或 .xlsx 文件路径",
             },
             "file": {
                 "type": "string",
                 "format": "file",
                 "uploadTo": "mcp",
                 "description": (
-                    "要写入 BLOB 列的文件（配合 insert/update 使用；"
-                    "在 values/set 中填 '$file'，或当表仅有唯一 BLOB 列时自动绑定）"
+                    '画布上传文件用：表里只有一个 BLOB 列时自动写入它，否则在 values/set 里写 "$file"。'
+                    '对话中直接在 values/set 里写文件路径即可'
                 ),
             },
             "mode": {
                 "type": "string",
                 "enum": ["create", "append"],
-                "description": "导入模式：create（建新表，默认）或 append（追加到已有表）",
+                "description": "create：新建表（默认）；append：追加到已有表",
             },
             "header_row": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "表头所在行号（从 1 开始）；不填自动识别；0 表示无表头",
+                "description": "表头在第几行（从 1 开始），不填自动识别，0 表示没有表头",
             },
             "format": {
                 "type": "string",
                 "enum": ["xlsx", "csv"],
-                "description": "导出格式：xlsx（默认，支持嵌入图片 BLOB）或 csv",
+                "description": "导出格式：xlsx（默认，图片嵌入单元格）或 csv",
             },
         },
         "required": ["action"],
         "x-action-params": {
-            "tables": {
-                "params": [],
-                "required": [],
-                "description": "查看当前所有数据表、各表的列定义（TEXT/INTEGER/REAL/BLOB）和行数。",
+            "list_tables": {
+                "params": [], "required": [], "readOnly": True,
+                "description": "列出所有数据表的表名和行数。",
+            },
+            "describe": {
+                "params": ["table"], "required": ["table"], "readOnly": True,
+                "description": "查看一张表的列名、列类型和行数。写 where、fields 前先确认列名。",
             },
             "create_table": {
-                "params": ["table", "columns"],
-                "required": ["table", "columns"],
-                "description": "新建数据表（CREATE TABLE）。列类型支持 TEXT / INTEGER / REAL / BLOB。",
+                "params": ["table", "columns"], "required": ["table", "columns"], "readOnly": False,
+                "description": "新建数据表。",
+            },
+            "add_column": {
+                "params": ["table", "columns"], "required": ["table", "columns"], "readOnly": False,
+                "description": "给已有表加一列或多列，已有行的新列为空。",
             },
             "drop_table": {
-                "params": ["table"],
-                "required": ["table"],
-                "description": "删除数据表及其全部数据和关联 BLOB（DROP TABLE）。",
+                "params": ["table", "confirm"], "required": ["table", "confirm"], "readOnly": False,
+                "description": "删除整张表及其全部数据和文件，不可恢复。只在用户明确要求删表时使用，confirm 填 true。",
             },
             "insert": {
-                "params": ["table", "values", "file"],
-                "required": ["table", "values"],
-                "description": (
-                    "插入一条或多条记录（INSERT INTO，整批事务提交或回滚），返回 rowids。"
-                    "BLOB 列可直接填文件路径、{'readfile':'路径'} 或配合 file 填 '$file'。"
-                ),
+                "params": ["table", "values", "file"], "required": ["table", "values"], "readOnly": False,
+                "description": "插入一行或多行，整批成功或整批失败，返回新行的 rowid。",
             },
             "select": {
-                "params": ["table", "columns", "where", "group_by", "order_by", "limit", "offset"],
-                "required": ["table"],
+                "params": ["table", "fields", "where", "group_by", "order_by", "limit", "offset"],
+                "required": ["table"], "readOnly": True,
                 "description": (
-                    "查询记录（SELECT）。支持条件 where、列选择 columns（含 COUNT(*)）、"
-                    "分组计数 group_by、排序 order_by 和分页 limit/offset；"
-                    "BLOB 列返回 {type, name, mime, size, url}。"
+                    "查询记录。返回 total（符合条件的总行数）、rows 和 has_more。"
+                    "要统计数量、求和、平均就用 fields 里的聚合，不要取出全部行自己算。"
+                    "BLOB 列返回 {name, mime, size, url}。"
                 ),
             },
             "update": {
-                "params": ["table", "where", "set", "file"],
-                "required": ["table", "where"],
-                "description": (
-                    "更新符合 where 条件的记录（UPDATE ... SET ... WHERE ...）。"
-                    "BLOB 列可传文件路径、'$file'（或仅选 file 自动绑定唯一 BLOB 列）或 null 清空。"
-                ),
+                "params": ["table", "set", "where", "file"], "required": ["table", "where"],
+                "readOnly": False,
+                "description": "把符合 where 的记录改成 set 中的值，返回改了几行。where 必填。",
             },
             "delete": {
-                "params": ["table", "where"],
-                "required": ["table", "where"],
-                "description": "删除符合 where 条件的记录（DELETE FROM ... WHERE ...）并回收关联 BLOB。",
+                "params": ["table", "where"], "required": ["table", "where"], "readOnly": False,
+                "description": "删除符合 where 的记录及其文件，返回删了几行。where 必填。",
             },
             "import": {
-                "params": ["table", "path", "mode", "header_row"],
-                "required": ["table", "path"],
-                "description": (
-                    "导入 .csv 或 .xlsx 表格文件到数据表。.xlsx 中的单元格图片自动存为 BLOB 列。"
-                    "mode=create（默认）建新表，mode=append 追加到已有表；整批成功或整批回滚。"
-                ),
+                "params": ["table", "path", "mode", "header_row"], "required": ["table", "path"],
+                "readOnly": False,
+                "description": ".csv 或 .xlsx 导入为数据表，.xlsx 里的图片存为 BLOB 列；整批成功或整批失败。",
             },
             "export": {
-                "params": ["table", "format", "where", "columns", "order_by"],
-                "required": ["table"],
-                "description": (
-                    "将数据表（或按 where/columns/order_by 筛选的结果）导出为 .xlsx 或 .csv 文件，"
-                    "返回本地 path 与 HTTP 下载 url。"
-                ),
-            },
-            "info": {
-                "params": [],
-                "description": "返回数据表概览、容量上限与 SQLite 完整性检查结果。",
+                "params": ["table", "format", "fields", "where", "order_by"], "required": ["table"],
+                "readOnly": True,
+                "description": "把表（或按 fields/where/order_by 筛选后的结果）导出为文件，返回 path 和下载 url。",
             },
         },
     },
 }]
 
-_JSON_PARAMS = ("where", "set", "values", "columns")
+_JSON_PARAMS = ("where", "set", "values", "columns", "fields", "group_by", "order_by")
+# Names a canvas card saved before the rename; still accepted, never advertised.
+_ACTION_ALIASES = {"tables": "list_tables"}
 
 _FULLWIDTH = str.maketrans({
     "，": ",", "：": ":", "“": '"', "”": '"', "‘": "'", "’": "'",
@@ -348,9 +350,12 @@ class TableDbPlugin:
     def dispatch(self, name: str, args: dict) -> Optional[dict]:
         args = args if isinstance(args, dict) else {}
         action = args.get("action") if name == PREFIX else name
+        action = _ACTION_ALIASES.get(action, action)
         handlers = {
-            "tables": self._do_tables,
+            "list_tables": self._do_list_tables,
+            "describe": self._do_describe,
             "create_table": self._do_create_table,
+            "add_column": self._do_add_column,
             "drop_table": self._do_drop_table,
             "insert": self._do_insert,
             "select": self._do_select,
@@ -374,6 +379,8 @@ class TableDbPlugin:
     def _prepare(action: str, args: dict) -> dict:
         out = {key: value for key, value in args.items()
                if not (isinstance(value, str) and not value.strip())}
+        if action in ("select", "export") and "fields" not in out and "columns" in out:
+            out["fields"] = out.pop("columns")   # cards saved before `fields` existed
         for key in _JSON_PARAMS:
             value = out.get(key)
             if not isinstance(value, str):
@@ -529,14 +536,17 @@ class TableDbPlugin:
 
     # ── actions: tables / create_table / drop_table ──────────────────────────
 
-    def _do_tables(self, _args: dict) -> dict:
+    def _do_list_tables(self, _args: dict) -> dict:
         items = self._store.tables()
-        return {
-            "ok": True,
-            "count": len(items),
-            "table_names": [item["table"] for item in items],
-            "tables": items,
-        }
+        return {"ok": True, "count": len(items),
+                "tables": [{"table": item["table"], "rows": item["rows"]} for item in items]}
+
+    def _do_describe(self, args: dict) -> dict:
+        return self._store.describe(check_name(args.get("table"), "表名"))
+
+    def _do_add_column(self, args: dict) -> dict:
+        table = check_name(args.get("table"), "表名")
+        return self._store.add_column(table, check_columns(args.get("columns"), self._store.limits))
 
     def _do_create_table(self, args: dict) -> dict:
         table = check_name(args.get("table"), "表名")
@@ -545,6 +555,9 @@ class TableDbPlugin:
 
     def _do_drop_table(self, args: dict) -> dict:
         table = check_name(args.get("table"), "表名")
+        if args.get("confirm") not in (True, "true", "True"):
+            raise bad_request("删除整张表不可恢复，需要 confirm: true；只删部分行请用 delete",
+                              column="confirm")
         return self._store.drop_table(table)
 
     # ── actions: insert / select / update / delete ───────────────────────────
@@ -589,46 +602,24 @@ class TableDbPlugin:
 
     def _do_select(self, args: dict) -> dict:
         table = check_name(args.get("table"), "表名")
-        raw_cols = args.get("columns")
-        selected_names: Optional[List[str]] = None
-        if raw_cols is not None:
-            if isinstance(raw_cols, list):
-                selected_names = [
-                    (item["name"] if isinstance(item, dict) and "name" in item else str(item))
-                    for item in raw_cols
-                ]
-            else:
-                raise bad_request("columns 格式为 ['列名1','列名2'] 或 '列名1,列名2'",
-                                  column="columns")
-        group_by = args.get("group_by")
-        order_by = args.get("order_by")
         offset = _int_param(args.get("offset"), 0, 0, 10 ** 9, "offset")
         limit = _int_param(args.get("limit"), PAGE_ROWS, 1, MAX_PAGE_ROWS, "limit")
         cols, total, rows, is_agg = self._store.select(
-            table, columns=selected_names, where=args.get("where"),
-            group_by=group_by, order_by=order_by, offset=offset, limit=limit,
+            table, fields=args.get("fields"), where=args.get("where"),
+            group_by=args.get("group_by"), order_by=args.get("order_by"),
+            offset=offset, limit=limit,
         )
-        if is_agg:
-            reply: Dict[str, Any] = {
-                "ok": True,
-                "table": table,
-                "total": total,
-                "count": len(rows),
-                "rows": rows,
-            }
-            if group_by:
-                reply["group_by"] = group_by
-            return reply
-        decorated = self._decorate_rows(table, rows)
+        if not is_agg:
+            rows = self._decorate_rows(table, rows)
         return {
             "ok": True,
             "table": table,
             "columns": [col.describe() for col in cols],
             "total": total,
             "offset": offset,
-            "count": len(decorated),
-            "has_more": offset + len(decorated) < total,
-            "rows": decorated,
+            "count": len(rows),
+            "has_more": offset + len(rows) < total,
+            "rows": rows,
         }
 
     def _do_update(self, args: dict) -> dict:
@@ -853,22 +844,11 @@ class TableDbPlugin:
         if fmt not in ("xlsx", "csv"):
             raise bad_request("format 仅支持 xlsx 或 csv，收到 %r" % fmt, column="format")
 
-        raw_cols = args.get("columns")
-        selected_names: Optional[List[str]] = None
-        if raw_cols is not None:
-            if isinstance(raw_cols, list):
-                selected_names = [
-                    (item["name"] if isinstance(item, dict) and "name" in item else str(item))
-                    for item in raw_cols
-                ]
-            else:
-                raise bad_request("columns 格式为 ['列名1','列名2'] 或 '列名1,列名2'",
-                                  column="columns")
-
-        cols, _, rows, _ = self._store.select(
+        cols, _, rows, is_agg = self._store.select(
             table,
-            columns=selected_names,
+            fields=args.get("fields"),
             where=args.get("where"),
+            group_by=args.get("group_by"),
             order_by=args.get("order_by"),
             offset=0,
             limit=self._store.limits.max_rows,
@@ -1197,10 +1177,10 @@ def _parse_text_param(action: str, key: str, text: str) -> Any:
         quoted = _try_single_quoted_json(folded)
         if quoted is not None:
             return quoted
-    if key == "columns":
+    if key in ("columns", "fields", "group_by", "order_by"):
         items = [part.strip() for part in folded.strip("[]").split(",") if part.strip()]
         if items:
-            if action == "create_table":
+            if key == "columns":
                 return [_split_column_spec(item) for item in items]
             return items
     raise bad_request(_param_hint(action, key, text), column=key)
@@ -1244,17 +1224,17 @@ def _split_column_spec(spec: str) -> dict:
 
 def _param_hint(action: str, key: str, raw: str) -> str:
     shown = raw if len(raw) <= 60 else raw[:57] + "..."
-    if key == "columns":
-        if action == "create_table":
-            return ("columns 格式错误，收到 %r。写法：列名1,列名2:INTEGER,列名3:BLOB"
-                    " 或 [{'name':'列名','type':'TEXT'}]" % shown)
-        return "columns 格式错误，收到 %r。写法：列名1,列名2 或 ['列名1','列名2'] 或 COUNT(*)" % shown
-    if key == "where":
-        return "where 格式错误，收到 %r。写法：{'列名':'值'} 或 {'rowid':1}" % shown
-    if key == "set":
-        return "set 格式错误，收到 %r。写法：{'列名':'新值'}，置空写 null" % shown
-    if key == "values":
-        return "values 格式错误，收到 %r。写法：[{'列名1':'值1','列名2':'值2'}]" % shown
+    hints = {
+        "columns": '[{"name": "列名", "type": "TEXT"}]，或 列名1,列名2:INTEGER',
+        "fields": '["列名", "COUNT(*)"]，或 列名1,SUM(列名2)',
+        "where": '[["列名", "=", "值"], ["列名", ">", 100]]',
+        "set": '{"列名": "新值"}，清空写 null',
+        "values": '[{"列名1": "值1", "列名2": "值2"}]',
+        "group_by": '["列名"]',
+        "order_by": '["列名 DESC"]',
+    }
+    if key in hints:
+        return "%s 格式错误，收到 %r。写法：%s" % (key, shown, hints[key])
     return "%s 格式错误，收到 %r" % (key, shown)
 
 

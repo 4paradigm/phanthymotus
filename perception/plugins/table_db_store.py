@@ -26,6 +26,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -446,47 +447,73 @@ class TableStore:
     # ── WHERE & ORDER BY ─────────────────────────────────────────────────────
 
     def _where(self, columns: List[Column], where: Any) -> Tuple[str, List[Any]]:
-        if where is None or where == {}:
+        """`where` → SQL. A list of conditions `[列, 运算符, 值]`, joined with AND.
+
+        The older object form `{"列": 值}` still works and means equality (a list
+        value means IN, null means IS NULL) — it is what canvases saved before the
+        condition list existed. It could not say >, LIKE or !=, so a model asked
+        for "价格大于 100" fetched a page and filtered it itself, silently wrong
+        once the table outgrew one page.
+        """
+        conditions = normalize_where(where)
+        if not conditions:
             return "", []
-        if not isinstance(where, dict):
-            raise bad_request("where 必须为对象，格式 {'列名':'值'}", column="where")
         parts: List[str] = []
         params: List[Any] = []
-        for key, value in where.items():
-            if key == "rowid":
-                phys, col = "rowid", None
-            else:
-                col = self._column(columns, key)
-                if col.type == BLOB and value is not None:
-                    raise bad_request("BLOB 列「%s」在 where 中仅支持 null（判空）" % key,
-                                      column=key)
-                phys = '"%s"' % col.phys
-            if value is None:
-                parts.append("%s IS NULL" % phys)
-            elif isinstance(value, list):
-                if not value:
-                    parts.append("0")
-                    continue
-                if len(value) > MAX_IN_VALUES:
-                    raise TableDbError("too_large", "where「%s」数组最多 %d 项" % (key, MAX_IN_VALUES),
-                                       column=key)
-                coerced = [self._where_scalar(col, key, item) for item in value]
-                non_null = [item for item in coerced if item is not None]
-                clauses = []
-                if non_null:
-                    clauses.append("%s IN (%s)" % (phys, ",".join("?" * len(non_null))))
-                    params.extend(non_null)
-                if len(non_null) < len(coerced):
-                    clauses.append("%s IS NULL" % phys)
-                parts.append("(%s)" % " OR ".join(clauses))
-            else:
-                coerced = self._where_scalar(col, key, value)
-                if coerced is None:
-                    parts.append("%s IS NULL" % phys)
-                else:
-                    parts.append("%s = ?" % phys)
-                    params.append(coerced)
-        return (" WHERE " + " AND ".join(parts)) if parts else "", params
+        for key, op, value in conditions:
+            sql, values = self._condition(columns, key, op, value)
+            parts.append(sql)
+            params.extend(values)
+        return " WHERE " + " AND ".join(parts), params
+
+    def _condition(self, columns: List[Column], key: str, op: str,
+                   value: Any) -> Tuple[str, List[Any]]:
+        if key.lower() == "rowid":
+            phys, col = "rowid", None
+        else:
+            col = self._column(columns, key)
+            phys = '"%s"' % col.phys
+        if op in ("=", "!=") and value is None:
+            op = "IS NULL" if op == "=" else "IS NOT NULL"
+        if op in ("IS NULL", "IS NOT NULL"):
+            return "%s %s" % (phys, op), []
+        if col is not None and col.type == BLOB:
+            raise bad_request("BLOB 列「%s」在 where 里只能用 IS NULL / IS NOT NULL" % key,
+                              column=key)
+        if op in ("IN", "NOT IN"):
+            if not isinstance(value, list) or not value:
+                raise bad_request("%s 的值必须是非空数组，例如 [\"%s\", \"in\", [\"甲\", \"乙\"]]"
+                                  % (op, key), column=key)
+            if len(value) > MAX_IN_VALUES:
+                raise TableDbError("too_large", "where「%s」数组最多 %d 项" % (key, MAX_IN_VALUES),
+                                   column=key)
+            coerced = [self._where_scalar(col, key, item) for item in value]
+            non_null = [item for item in coerced if item is not None]
+            if op == "NOT IN" and len(non_null) < len(coerced):
+                raise bad_request("NOT IN 的数组里不能有 null；排除空值请另加 [\"%s\", \"is not null\"]"
+                                  % key, column=key)
+            clauses = []
+            if non_null:
+                clauses.append("%s %s (%s)" % (phys, op, ",".join("?" * len(non_null))))
+            if len(non_null) < len(coerced):
+                clauses.append("%s IS NULL" % phys)
+            return "(%s)" % " OR ".join(clauses), non_null
+        if op == "BETWEEN":
+            if not isinstance(value, list) or len(value) != 2:
+                raise bad_request("between 的值必须是 [下限, 上限]", column=key)
+            low, high = (self._where_scalar(col, key, item) for item in value)
+            if low is None or high is None:
+                raise bad_request("between 的上下限不能为空", column=key)
+            return "%s BETWEEN ? AND ?" % phys, [low, high]
+        if op in ("LIKE", "NOT LIKE"):
+            if not isinstance(value, str) or not value:
+                raise bad_request("like 的值必须是字符串，%% 匹配任意字符，例如 \"%%张%%\"",
+                                  column=key)
+            if len(value) > self.limits.max_cell_chars:
+                raise TableDbError("too_large", "like 模式过长", column=key)
+            return "%s %s ?" % (phys, op), [value]
+        coerced = self._where_scalar(col, key, value)
+        return "%s %s ?" % (phys, op), [coerced]
 
     def _where_scalar(self, column: Optional[Column], key: str, value: Any) -> Any:
         if isinstance(value, (dict, list)):
@@ -497,33 +524,18 @@ class TableStore:
         return coerce_value(value, column.type, key, self.limits, "where")
 
     def _order_by(self, columns: List[Column], order_by: Any) -> str:
-        if order_by in (None, ""):
-            return " ORDER BY rowid ASC"
-        if isinstance(order_by, str):
-            raw_terms = [part.strip() for part in order_by.split(",") if part.strip()]
-        elif isinstance(order_by, list):
-            raw_terms = [str(part).strip() for part in order_by if str(part).strip()]
-        else:
-            raise bad_request("order_by 格式为 '列名' 或 '列名 DESC'", column="order_by")
-        if not raw_terms:
+        terms = _order_terms(order_by)
+        if not terms:
             return " ORDER BY rowid ASC"
         sql_terms = []
-        for term in raw_terms:
-            tokens = term.split()
-            if len(tokens) == 1:
-                col_name, direction = tokens[0], "ASC"
-            elif len(tokens) == 2 and tokens[1].upper() in ("ASC", "DESC"):
-                col_name, direction = tokens[0], tokens[1].upper()
-            else:
-                raise bad_request("order_by 项 %r 无效，格式为 '列名' 或 '列名 ASC/DESC'" % term,
-                                  column="order_by")
+        for col_name, direction in terms:
             if col_name.lower() == "rowid":
                 sql_terms.append("rowid %s" % direction)
-            else:
-                col = self._column(columns, col_name)
-                if col.type == BLOB:
-                    raise bad_request("不能按 BLOB 列「%s」排序" % col.name, column="order_by")
-                sql_terms.append('"%s" %s' % (col.phys, direction))
+                continue
+            col = self._column(columns, col_name)
+            if col.type == BLOB:
+                raise bad_request("不能按 BLOB 列「%s」排序" % col.name, column="order_by")
+            sql_terms.append('"%s" %s' % (col.phys, direction))
         return " ORDER BY " + ", ".join(sql_terms)
 
     # ── row formatting ───────────────────────────────────────────────────────
@@ -684,49 +696,40 @@ class TableStore:
             return {"ok": True, "table": table, "inserted": len(stored),
                     "rowids": [item["rowid"] for item in stored]}
 
-    def select(self, table: str, columns: Optional[List[str]] = None,
-               where: Any = None, group_by: Optional[str] = None,
+    def select(self, table: str, fields: Optional[List[str]] = None,
+               where: Any = None, group_by: Any = None,
                order_by: Any = None, offset: int = 0, limit: int = 20
                ) -> Tuple[List[Column], int, List[dict], bool]:
-        """Run SELECT. Returns `(selected_cols, total, rows, is_aggregate)`."""
+        """Run SELECT. Returns `(output_columns, total, rows, is_aggregate)`.
+
+        `fields` takes column names and the aggregates COUNT / SUM / AVG / MIN /
+        MAX (with optional DISTINCT). Any aggregate, or a `group_by`, makes it an
+        aggregate query: one row per group, keyed by the field as written, and
+        `total` counts groups. As in SQL, a plain column there must be grouped.
+        """
         with self._read() as conn:
             tid, all_cols = self._meta(conn, table)
             clause, params = self._where(all_cols, where)
-            total = conn.execute('SELECT COUNT(*) FROM "t_%d"%s' % (tid, clause),
-                                 params).fetchone()[0]
-
-            # GROUP BY aggregation: SELECT <group_by>, COUNT(*) ... GROUP BY <group_by>
-            if group_by not in (None, ""):
-                gcol = self._column(all_cols, group_by)
+            groups = [self._column(all_cols, name) for name in _name_list(group_by, "group_by")]
+            for gcol in groups:
                 if gcol.type == BLOB:
                     raise bad_request("不能按 BLOB 列「%s」分组" % gcol.name, column=gcol.name)
-                rows = conn.execute(
-                    'SELECT "%s", COUNT(*) FROM "t_%d"%s GROUP BY 1 '
-                    'ORDER BY 2 DESC, 1 ASC LIMIT ? OFFSET ?' % (gcol.phys, tid, clause),
-                    params + [min(limit, MAX_GROUPS), offset],
-                ).fetchall()
-                result_rows = [{gcol.name: val, "COUNT(*)": cnt} for val, cnt in rows]
-                return [gcol], total, result_rows, True
+            items = [_parse_field(all_cols, item, self._column) for item in _name_list(fields, "fields")]
+            if groups or any(item.aggregate for item in items):
+                return self._aggregate(conn, tid, all_cols, groups, items, clause, params,
+                                       order_by, offset, limit)
 
-            # SELECT COUNT(*)
-            if columns and len(columns) == 1 and columns[0].strip().upper() == "COUNT(*)":
-                return [], total, [{"COUNT(*)": total}], True
-
-            # Column projection
-            if columns and not (len(columns) == 1 and columns[0].strip() == "*"):
-                selected: List[Column] = []
-                seen = set()
-                for name in columns:
-                    cleaned = name.strip()
-                    if cleaned.lower() == "rowid":
-                        continue
-                    col = self._column(all_cols, cleaned)
-                    if col.name not in seen:
-                        seen.add(col.name)
-                        selected.append(col)
-            else:
-                selected = all_cols
-
+            total = conn.execute('SELECT COUNT(*) FROM "t_%d"%s' % (tid, clause),
+                                 params).fetchone()[0]
+            selected: List[Column] = []
+            for item in items:
+                if item.star:
+                    selected = list(all_cols)
+                    break
+                if item.column is not None and item.column.name not in {c.name for c in selected}:
+                    selected.append(item.column)
+            if not selected:
+                selected = list(all_cols)
             order_sql = self._order_by(all_cols, order_by)
             rows = conn.execute(
                 self._select_sql(tid, selected) + clause + order_sql + " LIMIT ? OFFSET ?",
@@ -734,13 +737,90 @@ class TableStore:
             ).fetchall()
             return selected, total, self._format_rows(conn, selected, rows), False
 
+    def _aggregate(self, conn, tid, all_cols, groups, items, clause, params,
+                   order_by, offset, limit):
+        if not items:
+            items = [_Field(g.name, '"%s"' % g.phys, g) for g in groups]
+            items.append(_Field("COUNT(*)", "COUNT(*)", None, aggregate=True, kind=INTEGER))
+        group_names = {g.name for g in groups}
+        for item in items:
+            if item.star:
+                raise bad_request("聚合查询里不能用 *；列出要返回的分组列和聚合函数", column="fields")
+            if not item.aggregate and item.column.name not in group_names:
+                raise bad_request(
+                    "列「%s」既不在 group_by 里，也没有被聚合；要么加进 group_by，"
+                    "要么写成 MIN(%s) / MAX(%s) 等" % (item.label, item.label, item.label),
+                    column=item.label)
+        group_sql = (" GROUP BY " + ", ".join('"%s"' % g.phys for g in groups)) if groups else ""
+        if groups:
+            total = conn.execute('SELECT COUNT(*) FROM (SELECT 1 FROM "t_%d"%s%s)'
+                                 % (tid, clause, group_sql), params).fetchone()[0]
+        else:
+            total = 1
+        order_sql = self._aggregate_order(all_cols, groups, items, order_by)
+        sql = 'SELECT %s FROM "t_%d"%s%s%s LIMIT ? OFFSET ?' % (
+            ", ".join(item.sql for item in items), tid, clause, group_sql, order_sql)
+        rows = conn.execute(sql, params + [min(limit, MAX_GROUPS), offset]).fetchall()
+        out_cols = [Column(name=item.label, type=item.kind, phys="") for item in items]
+        return out_cols, total, [dict(zip((item.label for item in items), row)) for row in rows], True
+
+    def _aggregate_order(self, all_cols, groups, items, order_by) -> str:
+        terms = _order_terms(order_by)
+        if not terms:
+            return (" ORDER BY " + ", ".join('"%s" ASC' % g.phys for g in groups)) if groups else ""
+        by_label = {item.label: index for index, item in enumerate(items, 1)}
+        sql_terms = []
+        for expr, direction in terms:
+            if expr in by_label:
+                sql_terms.append("%d %s" % (by_label[expr], direction))
+                continue
+            try:
+                label = _parse_field(all_cols, expr, self._column).label
+            except TableDbError:
+                label = None
+            if label in by_label:
+                sql_terms.append("%d %s" % (by_label[label], direction))
+                continue
+            raise bad_request("聚合查询只能按 fields 里已有的项排序（%s），收到 %r"
+                              % ("、".join(by_label), expr), column="order_by")
+        return " ORDER BY " + ", ".join(sql_terms)
+
+    def describe(self, table: str) -> dict:
+        with self._read() as conn:
+            tid, cols = self._meta(conn, table)
+            rows = conn.execute('SELECT COUNT(*) FROM "t_%d"' % tid).fetchone()[0]
+            return {"ok": True, "table": table, "rows": rows,
+                    "columns": [column.describe() for column in cols]}
+
+    def add_column(self, table: str, columns: List[Tuple[str, str]]) -> dict:
+        """ALTER TABLE ... ADD COLUMN, one or more at once; existing rows get null."""
+        with self._write() as conn:
+            tid, cols = self._meta(conn, table)
+            if len(cols) + len(columns) > self.limits.max_columns:
+                raise TableDbError("too_large", "表「%s」已有 %d 列，再加 %d 列会超过上限 %d"
+                                   % (table, len(cols), len(columns), self.limits.max_columns))
+            existing = {col.name for col in cols}
+            pos = conn.execute("SELECT COALESCE(MAX(pos), 0) FROM _columns WHERE table_id=?",
+                               (tid,)).fetchone()[0]
+            for name, kind in columns:
+                if name in existing:
+                    raise TableDbError("column_exists", "列「%s」已存在" % name, column=name)
+                pos += 1
+                phys = "c_%d" % pos
+                conn.execute("INSERT INTO _columns(table_id, pos, name, type, phys) "
+                             "VALUES(?, ?, ?, ?, ?)", (tid, pos, name, kind, phys))
+                conn.execute('ALTER TABLE "t_%d" ADD COLUMN "%s" %s'
+                             % (tid, phys, INTEGER if kind == BLOB else kind))
+                cols.append(Column(name=name, type=kind, phys=phys))
+            return {"ok": True, "table": table, "columns": [column.describe() for column in cols]}
+
     def update(self, table: str, changes: Dict[str, Any], where: Any) -> dict:
         """SQLite UPDATE ... SET ... WHERE ... with BLOB replacement and GC."""
         if not isinstance(changes, dict) or not changes:
             raise bad_request("set 必须为非空对象，格式 {'列名':'新值'}")
-        if not isinstance(where, dict) or not where:
-            raise bad_request("update 必须指定非空 where 条件（例如 {'rowid':1} 或 {'列名':'值'}）",
-                              column="where")
+        if not normalize_where(where):
+            raise bad_request("update 必须指定 where 条件，例如 [[\"rowid\", \"=\", 1]]；"
+                              "要改全表请写 [[\"rowid\", \">\", 0]]", column="where")
         extra = sum(
             len(v.data) if isinstance(v, FileValue)
             else (len(v.encode("utf-8")) if isinstance(v, str) else 0)
@@ -817,9 +897,9 @@ class TableStore:
 
     def delete(self, table: str, where: Any) -> dict:
         """SQLite DELETE FROM ... WHERE ... with immediate BLOB GC."""
-        if not isinstance(where, dict) or not where:
-            raise bad_request("delete 必须指定非空 where 条件（例如 {'rowid':1} 或 {'列名':'值'}）",
-                              column="where")
+        if not normalize_where(where):
+            raise bad_request("delete 必须指定 where 条件，例如 [[\"rowid\", \"=\", 1]]；"
+                              "要改全表请写 [[\"rowid\", \">\", 0]]", column="where")
         with self._write() as conn:
             tid, cols = self._meta(conn, table)
             clause, wparams = self._where(cols, where)
@@ -845,3 +925,127 @@ class TableStore:
                              % (tid, ",".join("?" * len(chunk)),), chunk)
             self._gc_files(conn, old_fids)
             return {"ok": True, "table": table, "deleted": len(matched), "rowids": matched}
+
+
+# ── where / fields / order_by parsing ────────────────────────────────────────
+
+_OPERATORS = {
+    "=": "=", "==": "=", "!=": "!=", "<>": "!=",
+    ">": ">", ">=": ">=", "<": "<", "<=": "<=",
+    "LIKE": "LIKE", "NOT LIKE": "NOT LIKE", "IN": "IN", "NOT IN": "NOT IN",
+    "BETWEEN": "BETWEEN", "IS NULL": "IS NULL", "IS NOT NULL": "IS NOT NULL",
+}
+OPERATOR_NAMES = ("=", "!=", ">", ">=", "<", "<=", "like", "not like",
+                  "in", "not in", "between", "is null", "is not null")
+
+
+def normalize_where(where: Any) -> List[Tuple[str, str, Any]]:
+    """`where` in either accepted shape → `[(列, 运算符, 值)]`."""
+    if where in (None, {}, [], ""):
+        return []
+    if isinstance(where, dict):
+        out = []
+        for key, value in where.items():
+            if value is None:
+                out.append((str(key), "IS NULL", None))
+            elif isinstance(value, list):
+                out.append((str(key), "IN", value))
+            else:
+                out.append((str(key), "=", value))
+        return out
+    if not isinstance(where, list):
+        raise bad_request("where 必须是条件数组，例如 [[\"金额\", \">\", 100]]", column="where")
+    if where and isinstance(where[0], str):
+        where = [where]
+    out = []
+    for item in where:
+        if not isinstance(item, list) or len(item) not in (2, 3) or not isinstance(item[0], str):
+            raise bad_request("where 的每个条件写成 [列名, 运算符, 值]，收到 %s"
+                              % json.dumps(item, ensure_ascii=False), column="where")
+        op = " ".join(str(item[1]).split()).upper()
+        if op not in _OPERATORS:
+            raise bad_request("不支持的运算符 %r；可用：%s" % (item[1], " ".join(OPERATOR_NAMES)),
+                              column="where")
+        op = _OPERATORS[op]
+        if op in ("IS NULL", "IS NOT NULL"):
+            out.append((item[0], op, None))
+            continue
+        if len(item) != 3:
+            raise bad_request("条件 %s 缺少值" % json.dumps(item, ensure_ascii=False),
+                              column="where")
+        out.append((item[0], op, item[2]))
+    return out
+
+
+_AGGREGATE = re.compile(r"^(COUNT|SUM|AVG|MIN|MAX)\s*\(\s*(DISTINCT\s+)?(.*?)\s*\)$", re.I)
+
+
+@dataclass
+class _Field:
+    label: str
+    sql: str
+    column: Optional[Column]
+    aggregate: bool = False
+    star: bool = False
+    kind: str = TEXT
+
+    def __post_init__(self):
+        if self.column is not None and not self.aggregate:
+            self.kind = self.column.type
+
+
+def _parse_field(columns: List[Column], text: Any, lookup) -> _Field:
+    """One entry of `fields`: a column, `*`, or an aggregate over a column."""
+    name = str(text).strip()
+    if name == "*":
+        return _Field("*", "*", None, star=True)
+    for column in columns:
+        if column.name == name:
+            return _Field(name, '"%s"' % column.phys, column)
+    match = _AGGREGATE.match(name)
+    if not match:
+        return _Field(name, "", lookup(columns, name))   # raises unknown_column
+    func, distinct, arg = match.group(1).upper(), bool(match.group(2)), match.group(3).strip()
+    if arg == "*":
+        if func != "COUNT" or distinct:
+            raise bad_request("只有 COUNT 可以写 *：COUNT(*)", column="fields")
+        return _Field("COUNT(*)", "COUNT(*)", None, aggregate=True, kind=INTEGER)
+    column = lookup(columns, arg)
+    if func in ("SUM", "AVG") and column.type not in (INTEGER, REAL):
+        raise bad_request("%s 只能用于 INTEGER / REAL 列，「%s」是 %s 列"
+                          % (func, column.name, column.type), column=column.name)
+    if func != "COUNT" and column.type == BLOB:
+        raise bad_request("BLOB 列「%s」只能 COUNT" % column.name, column=column.name)
+    label = "%s(%s%s)" % (func, "DISTINCT " if distinct else "", column.name)
+    sql = '%s(%s"%s")' % (func, "DISTINCT " if distinct else "", column.phys)
+    kind = INTEGER if func == "COUNT" else REAL if func == "AVG" else column.type
+    return _Field(label, sql, column, aggregate=True, kind=kind)
+
+
+def _name_list(value: Any, what: str) -> List[str]:
+    if value in (None, "", []):
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, dict) and "name" in item:
+                item = item["name"]
+            if not isinstance(item, str):
+                raise bad_request("%s 的每一项必须是字符串，收到 %r" % (what, item), column=what)
+            if item.strip():
+                out.append(item.strip())
+        return out
+    raise bad_request("%s 必须是字符串数组" % what, column=what)
+
+
+def _order_terms(order_by: Any) -> List[Tuple[str, str]]:
+    terms = []
+    for term in _name_list(order_by, "order_by"):
+        expr, _, last = term.rpartition(" ")
+        if expr and last.upper() in ("ASC", "DESC"):
+            terms.append((expr.strip(), last.upper()))
+        else:
+            terms.append((term, "ASC"))
+    return terms

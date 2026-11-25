@@ -81,106 +81,186 @@ def _blob_counts(card: TableDbPlugin):
 
 # ── schema & contract checks ─────────────────────────────────────────────────
 
-def test_schema_exposes_only_standard_sqlite_actions_and_no_db_layer():
-    schema = TOOLS[0]["inputSchema"]
-    props = schema["properties"]
-    assert "db" not in props
-    assert "confirm" not in props
-    assert "profile_columns" not in props
-    assert "name_column" not in props
+def _llm_tools():
+    """The tools agent-core actually hands the model: one per action."""
+    import importlib.util, pathlib, sys as _sys, types as _types
+    src = pathlib.Path(__file__).resolve().parents[2] / "agent-core" / "src" / "mcp_client.py"
+    text = src.read_text(encoding="utf-8")
+    start = text.index("def _to_openai_schema(")
+    end = text.index("\ndef declared_read_only(")
+    scope: dict = {}
+    exec(text[start:end], scope)
+    return {s["name"].rsplit("__", 1)[-1]: s for s in scope["_to_openai_schema"]("m", TOOLS[0])}
 
-    expected_actions = [
-        "tables", "create_table", "drop_table",
-        "insert", "select", "update", "delete",
-        "import", "export",
+
+def test_actions_read_like_sql():
+    props = TOOLS[0]["inputSchema"]["properties"]
+    assert [item["const"] for item in props["action"]["oneOf"]] == [
+        "list_tables", "describe", "create_table", "add_column", "drop_table",
+        "insert", "select", "update", "delete", "import", "export",
     ]
-    visible = [item["const"] for item in props["action"]["oneOf"]]
-    assert visible == expected_actions
-    assert all("title" not in item and item["description"] for item in props["action"]["oneOf"])
+    tools = _llm_tools()
+    # info is the canvas's status poll, not something the model should call.
+    assert "info" not in tools and "start" not in tools
+    assert set(tools["select"]["parameters"]["properties"]) == {
+        "table", "fields", "where", "group_by", "order_by", "limit", "offset"}
+    assert tools["drop_table"]["parameters"]["required"] == ["table", "confirm"]
 
 
-def test_schema_descriptions_have_no_double_quotes_or_domain_jargon():
-    schema = TOOLS[0]["inputSchema"]
-    forbidden = (
-        "张三", "李四", "王五", "借用人", "准考证号", "身份证号",
-        "face_recognition", "register_by_corpus", "ocr", "vop", "飞书",
-    )
-    texts = [TOOLS[0]["description"]]
-    for spec in schema["properties"].values():
-        texts.append(spec.get("description", ""))
-    for spec in schema["x-action-params"].values():
-        texts.append(spec.get("description", ""))
-    for text in texts:
-        assert '"' not in text, text
-        for word in forbidden:
-            assert word not in text, (word, text)
+def test_one_property_one_meaning():
+    """Every action shares one `properties` map, so a property used two ways
+    showed the model create_table's syntax inside select. Column definitions
+    and columns-to-return are now separate properties with consistent types."""
+    props = TOOLS[0]["inputSchema"]["properties"]
+    assert props["columns"]["items"]["type"] == "object"
+    assert props["fields"]["items"]["type"] == "string"
+    assert props["values"]["type"] == "array" and props["where"]["type"] == "array"
+    tools = _llm_tools()
+    assert "columns" not in tools["select"]["parameters"]["properties"]
+    assert "fields" not in tools["create_table"]["parameters"]["properties"]
 
 
-# ── DDL: tables / create_table / drop_table ──────────────────────────────────
+def test_examples_are_real_json():
+    """The canvas used to forbid double quotes (its escaper did not escape them),
+    which left the model reading single-quoted pseudo-JSON."""
+    import json as _json, re as _re
+    props = TOOLS[0]["inputSchema"]["properties"]
+    for key in ("columns", "fields", "values", "set", "where", "group_by", "order_by"):
+        example = _re.search(r"例：(.+?)(?:。|$)", props[key]["description"]).group(1)
+        _json.loads(example)
 
-def test_create_list_and_drop_table_with_sqlite_types(tmp_path):
+
+def test_write_actions_are_not_read_only_to_peers():
+    """Perception is read-only to a viewer peer unless the card says otherwise."""
+    params = TOOLS[0]["inputSchema"]["x-action-params"]
+    reads = {name for name, spec in params.items() if spec["readOnly"]}
+    assert reads == {"list_tables", "describe", "select", "export"}
+    assert TOOLS[0]["annotations"]["readOnlyHint"] is False
+
+
+# ── DDL ──────────────────────────────────────────────────────────────────────
+
+def test_create_describe_add_column_and_drop_table(tmp_path):
     card = _card(tmp_path)
-    empty = _call(card, "tables")
-    assert empty == {"ok": True, "count": 0, "table_names": [], "tables": []}
+    assert _call(card, "list_tables") == {"ok": True, "count": 0, "tables": []}
 
-    created = _call(card, "create_table", table="t1",
-                    columns="c_text,c_int:INTEGER,c_real:REAL,c_blob:BLOB")
+    created = _call(card, "create_table", table="t1", columns=[
+        {"name": "c_text"}, {"name": "c_int", "type": "INTEGER"},
+        {"name": "c_real", "type": "REAL"}, {"name": "c_blob", "type": "BLOB"}])
     assert created["ok"] is True
-    assert created["columns"] == [
-        {"name": "c_text", "type": "TEXT"},
-        {"name": "c_int", "type": "INTEGER"},
-        {"name": "c_real", "type": "REAL"},
-        {"name": "c_blob", "type": "BLOB"},
-    ]
+    assert [c["type"] for c in created["columns"]] == ["TEXT", "INTEGER", "REAL", "BLOB"]
+    _call(card, "insert", table="t1", values=[{"c_text": "x"}])
 
-    listed = _call(card, "tables")
-    assert listed["count"] == 1 and listed["table_names"] == ["t1"]
-    assert listed["tables"][0]["rows"] == 0
+    added = _call(card, "add_column", table="t1", columns=[{"name": "备注"}])
+    assert added["ok"] is True and added["columns"][-1] == {"name": "备注", "type": "TEXT"}
+    described = _call(card, "describe", table="t1")
+    assert described["rows"] == 1 and described["columns"][-1]["name"] == "备注"
+    assert _call(card, "select", table="t1")["rows"][0]["备注"] is None
+    assert _call(card, "add_column", table="t1", columns=[{"name": "备注"}])["reason"] == "column_exists"
+
+    assert _call(card, "list_tables")["tables"] == [{"table": "t1", "rows": 1}]
+    assert _call(card, "tables")["tables"] == [{"table": "t1", "rows": 1}]   # old canvas name
 
     dup = _call(card, "create_table", table="t1", columns="a")
     assert dup["ok"] is False and dup["reason"] == "table_exists" and dup["written"] == 0
+    assert _call(card, "create_table", table="t2", columns="a:file")["reason"] == "bad_request"
 
-    bad_type = _call(card, "create_table", table="t2", columns="a:file")
-    assert bad_type["ok"] is False and bad_type["reason"] == "bad_request"
+    refused = _call(card, "drop_table", table="t1")
+    assert refused["ok"] is False and "confirm" in refused["detail"]
+    assert _call(card, "drop_table", table="t1", confirm=False)["column"] == "confirm"
+    assert _call(card, "drop_table", table="t1", confirm=True) == {
+        "ok": True, "table": "t1", "dropped": True, "rows": 1}
+    assert _call(card, "list_tables")["count"] == 0
 
-    dropped = _call(card, "drop_table", table="t1")
-    assert dropped == {"ok": True, "table": "t1", "dropped": True, "rows": 0}
-    assert _call(card, "tables")["count"] == 0
 
+# ── SELECT ───────────────────────────────────────────────────────────────────
 
-# ── DML: insert / select / update / delete + BLOB readfile & GC ──────────────
-
-def test_insert_select_filter_sort_group_count_and_paging(tmp_path):
+@pytest.fixture
+def orders(tmp_path):
     card = _card(tmp_path)
-    _call(card, "create_table", table="items", columns="label,qty:INTEGER,score:REAL")
+    _call(card, "create_table", table="orders", columns=[
+        {"name": "客户"}, {"name": "类别"}, {"name": "金额", "type": "REAL"},
+        {"name": "数量", "type": "INTEGER"}])
+    assert _call(card, "insert", table="orders", values=[
+        {"客户": "张三", "类别": "书", "金额": 30, "数量": 1},
+        {"客户": "李四", "类别": "书", "金额": 120, "数量": 2},
+        {"客户": "张小明", "类别": "文具", "金额": 15.5, "数量": 5},
+        {"客户": "王五", "类别": "文具", "金额": 200, "数量": "3"},
+        {"客户": "赵六"},
+    ])["rowids"] == [1, 2, 3, 4, 5]
+    return card
 
-    ins = _call(card, "insert", table="items", values=[
-        {"label": "a", "qty": 10, "score": 1.5},
-        {"label": "b", "qty": "20", "score": "2.25"},
-        {"label": "a", "qty": 30, "score": 3.0},
-    ])
-    assert ins["ok"] is True and ins["inserted"] == 3 and ins["rowids"] == [1, 2, 3]
 
-    # Full select + order_by + paging
-    page = _call(card, "select", table="items", order_by="qty DESC", limit=2, offset=0)
-    assert page["total"] == 3 and page["has_more"] is True
-    assert [r["qty"] for r in page["rows"]] == [30, 20]
-    assert page["rows"][0]["rowid"] == 3
+def _rows(card, **args):
+    reply = _call(card, "select", table="orders", **args)
+    assert reply["ok"] is True, reply
+    return reply
 
-    # Column projection + where
-    proj = _call(card, "select", table="items", columns="label,score",
-                 where={"label": "b"})
-    assert proj["total"] == 1
-    assert proj["rows"] == [{"rowid": 2, "label": "b", "score": 2.25}]
 
-    # SELECT COUNT(*)
-    cnt = _call(card, "select", table="items", columns="COUNT(*)", where={"label": "a"})
-    assert cnt["total"] == 2 and cnt["rows"] == [{"COUNT(*)": 2}]
+def test_where_operators(orders):
+    def who(where):
+        return [r["客户"] for r in _rows(orders, where=where, order_by=["rowid"])["rows"]]
+    assert who([["金额", ">", 100]]) == ["李四", "王五"]
+    assert who([["金额", ">=", 30], ["金额", "<", 200]]) == ["张三", "李四"]
+    assert who([["客户", "like", "张%"]]) == ["张三", "张小明"]
+    assert who([["客户", "not like", "%张%"], ["金额", "is not null"]]) == ["李四", "王五"]
+    assert who([["类别", "!=", "书"]]) == ["张小明", "王五"]
+    assert who([["类别", "in", ["书"]]]) == ["张三", "李四"]
+    assert who([["类别", "not in", ["书"]]]) == ["张小明", "王五"]
+    assert who([["金额", "between", [20, 150]]]) == ["张三", "李四"]
+    assert who([["金额", "is null"]]) == ["赵六"]
+    assert who([["rowid", "=", 2]]) == ["李四"]
+    assert who(["客户", "=", "王五"]) == ["王五"]            # a single condition, unwrapped
+    assert who({"类别": "书"}) == ["张三", "李四"]           # old object form: equality
 
-    # SELECT label, COUNT(*) GROUP BY label
-    grouped = _call(card, "select", table="items", group_by="label")
-    assert grouped["total"] == 3
-    assert grouped["rows"] == [{"label": "a", "COUNT(*)": 2}, {"label": "b", "COUNT(*)": 1}]
+
+def test_where_errors_say_how_to_write_it(orders):
+    bad = _call(orders, "select", table="orders", where=[["金额", "≈", 1]])
+    assert bad["reason"] == "bad_request" and "like" in bad["detail"]
+    unknown = _call(orders, "select", table="orders", where=[["价格", ">", 1]])
+    assert unknown["reason"] == "unknown_column" and "金额" in unknown["detail"]
+
+
+def test_aggregates_and_group_by(orders):
+    whole = _rows(orders, fields=["COUNT(*)", "SUM(金额)", "MAX(数量)", "COUNT(金额)"])
+    assert whole["rows"] == [{"COUNT(*)": 5, "SUM(金额)": 365.5, "MAX(数量)": 5, "COUNT(金额)": 4}]
+
+    by_kind = _rows(orders, fields=["类别", "SUM(金额)", "COUNT(*)"], group_by=["类别"],
+                    where=[["类别", "is not null"]], order_by=["SUM(金额) DESC"])
+    assert by_kind["rows"] == [{"类别": "文具", "SUM(金额)": 215.5, "COUNT(*)": 2},
+                               {"类别": "书", "SUM(金额)": 150.0, "COUNT(*)": 2}]
+    assert by_kind["total"] == 2
+    assert [c["name"] for c in by_kind["columns"]] == ["类别", "SUM(金额)", "COUNT(*)"]
+
+    # group_by alone: the distinct values with their counts, ordered by the group.
+    assert _rows(orders, group_by="类别", where=[["类别", "is not null"]])["rows"] == [
+        {"类别": "书", "COUNT(*)": 2}, {"类别": "文具", "COUNT(*)": 2}]
+    assert _rows(orders, fields=["COUNT(DISTINCT 类别)"])["rows"] == [{"COUNT(DISTINCT 类别)": 2}]
+
+    ungrouped = _call(orders, "select", table="orders", fields=["客户", "SUM(金额)"])
+    assert ungrouped["ok"] is False and "group_by" in ungrouped["detail"]
+    text_sum = _call(orders, "select", table="orders", fields=["SUM(客户)"])
+    assert text_sum["ok"] is False and "INTEGER / REAL" in text_sum["detail"]
+
+
+def test_projection_order_and_paging(orders):
+    page = _rows(orders, fields=["客户", "金额"], order_by=["金额 DESC"], limit=2,
+                 where=[["金额", "is not null"]])
+    assert page["total"] == 4 and page["has_more"] is True
+    assert page["rows"] == [{"rowid": 4, "客户": "王五", "金额": 200.0},
+                            {"rowid": 2, "客户": "李四", "金额": 120.0}]
+    # Canvas cards saved before `fields` existed still send `columns`.
+    old = _call(orders, "select", table="orders", columns="客户", where={"rowid": 1})
+    assert old["rows"] == [{"rowid": 1, "客户": "张三"}]
+
+
+def test_update_and_delete_take_condition_lists(orders):
+    upd = _call(orders, "update", table="orders", set={"类别": "大单"}, where=[["金额", ">", 100]])
+    assert upd["updated"] == 2 and upd["rowids"] == [2, 4]
+    gone = _call(orders, "delete", table="orders", where=[["金额", "is null"]])
+    assert gone["deleted"] == 1
+    no_where = _call(orders, "delete", table="orders", where=[])
+    assert no_where["ok"] is False and no_where["column"] == "where"
 
 
 def test_insert_failure_rolls_back_entire_batch(tmp_path):
@@ -256,7 +336,7 @@ def test_hostile_names_and_values_cannot_inject_sql(tmp_path):
                  values=[{evil_col: "'; DELETE FROM _tables; --"}])["ok"] is True
     got = _call(card, "select", table=evil_table, where={evil_col: "'; DELETE FROM _tables; --"})
     assert got["total"] == 1
-    assert _call(card, "tables")["count"] == 1
+    assert _call(card, "list_tables")["count"] == 1
 
 
 # ── import & export (.csv and .xlsx only) ────────────────────────────────────
