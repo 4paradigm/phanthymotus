@@ -144,18 +144,23 @@ def front_surface(depth_m, bbox_norm, intrinsics, ground=None):
     ray = (np.arange(cols.start + 1, cols.stop - 1) - cx) / fx
     horizontal_range = np.where(supported, centre * np.hypot(1., ray), np.inf)
     row, col = np.unravel_index(np.argmin(horizontal_range), horizontal_range.shape)
+    middle = centre.shape[0] // 2
     bottom = 3 * centre.shape[0] // 4
-    if bottom > 0 and row >= bottom:
+    if middle > 0 and row >= middle:
         # A low occluder can enter a person's box without belonging to the
-        # person. A separate near depth layer confined to the bottom edge
-        # must not replace the person's range or hide the occluder from Navi.
-        upper = centre[:bottom][supported[:bottom]]
+        # person. Require a separate measured upper surface, and for a near
+        # layer extending above the bottom quarter, evidence at a lower
+        # corner where the occluder continues out of the detection box.
+        edge = bottom if row >= bottom else middle
+        upper = centre[:edge][supported[:edge]]
         if upper.size >= 9 and float(np.percentile(upper, TARGET_PERCENTILE) - centre[row, col]) > .60:
             ordered = np.sort(centre[supported])
             gaps = np.flatnonzero(np.diff(ordered) > .40)
             for gap in gaps:
                 split = ordered[gap + 1]
                 if centre[row, col] < split <= upper.min():
+                    if row < bottom and not np.any(supported[-1, [0, -1]] & (centre[-1, [0, -1]] < split)):
+                        continue
                     horizontal_range[centre < split] = np.inf
                     row, col = np.unravel_index(np.argmin(horizontal_range), horizontal_range.shape)
                     break

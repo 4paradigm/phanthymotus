@@ -616,6 +616,7 @@ class Tracker:
     def __init__(self):
         self.track: Track | None = None
         self._generation = 0
+        self.matched_detections = None  # includes gated, not-yet-confirmed matches
         # Keep recent stamps across blind ticks and out-of-order delivery.
         self._detection_stamps = deque(maxlen=64)
         self._range_frames = deque(maxlen=64)
@@ -627,7 +628,7 @@ class Tracker:
     # ── the tick ─────────────────────────────────────────────────────────────
 
     def step(self, *, detections, depth, target: str, config, ego, dt: float,
-             ego_measured: bool = True):
+             ego_measured: bool = True, receipt_ms: int = 0):
         """Predict, associate, update. Returns the track if it may drive, else None.
 
         `ego` is our own twist as (vx, vy, wz) in the body frame. `ego_measured`
@@ -670,6 +671,8 @@ class Tracker:
         # Prediction still runs above: our own motion continues whether or not
         # a new picture arrived. Only the *evidence* is skipped.
         stamp = (detections or {}).get("timestamp")
+        if stamp is None and detections is not None and receipt_ms:
+            stamp = ("receipt", receipt_ms)
         if stamp is not None:
             # A late, previously unseen detector frame cannot refresh a DWA
             # motion origin. Its producer clock is used only for ordering.
@@ -688,6 +691,7 @@ class Tracker:
         matched = (_associate(candidates, config, position, track.cov, track.since_obs_s, track.hue)
                    if track is not None else _associate(candidates, config, None))
 
+        self.matched_detections = detections if matched is not None else None
         if matched is not None:
             self._hit(matched, config)
             if self.track.accepted_detection:

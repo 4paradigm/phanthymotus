@@ -251,6 +251,50 @@ class ObservedObstacles:
                     self.cell_sources[cell] = (source_id, pose, OCCUPANCY_MEMORY_SAMPLES if last is None else last[2] + 1)
         window[tuple((retained - origin).T)] = UNKNOWN
 
+    def after_velocity_gap(self, frame, pivot, travel, turn):
+        """Cover each occupied square's possible positions after a bounded outage."""
+        result = ObservedObstacles(frame=frame)
+        pivot = np.asarray(pivot) / RESOLUTION
+        window_center = np.rint(pivot).astype(int)
+        window_origin = window_center - FREE_MEMORY_RADIUS_CELLS
+        side = 2 * FREE_MEMORY_RADIUS_CELLS + 1
+        persistent = np.asarray(list(self.cells), dtype=int).reshape(-1, 2)
+        rolling = (np.argwhere(self.free_cells == OCCUPIED) + self.free_center - FREE_MEMORY_RADIUS_CELLS
+                   if self.free_cells is not None else np.empty((0, 2), dtype=int))
+        for cells, is_rolling in ((persistent, False), (rolling, True)):
+            if not len(cells):
+                continue
+            offsets = cells - pivot
+            radius = np.linalg.norm(offsets, axis=1) + 1 / math.sqrt(2)
+            # Split a rotation into arcs at most one grid cell long. Adding
+            # the residual arc length bounds every orientation between samples.
+            turn = min(math.pi, turn)
+            segments = max(1, math.ceil(2 * turn * radius.max()))
+            if segments > side:
+                return None
+            half_step = turn / segments
+            counts = np.zeros((side + 1, side + 1), dtype=int)
+            for angle in np.linspace(-turn + half_step, turn - half_step, segments):
+                c, s = math.cos(angle), math.sin(angle)
+                centers = pivot - window_origin + offsets @ np.array([[c, s], [-s, c]])
+                extra = radius * half_step + .5 * (abs(c) + abs(s) - 1)
+                padding = travel / RESOLUTION + extra[:, None]
+                lo, hi = np.floor(centers - padding).astype(int), np.ceil(centers + padding).astype(int) + 1
+                if lo.min() < 0 or hi.max() > side:
+                    return None  # Keep the original map and hold rather than clip a blind obstacle.
+                x0, y0 = lo.T
+                x1, y1 = hi.T
+                for corner, sign in (((x0, y0), 1), ((x1, y1), 1), ((x0, y1), -1), ((x1, y0), -1)):
+                    np.add.at(counts, corner, sign)
+            cover = counts.cumsum(axis=0).cumsum(axis=1)[:-1, :-1] > 0
+            if is_rolling:
+                result.free_cells = np.where(cover, OCCUPIED, UNKNOWN).astype(np.uint8)
+                result.hit_votes = np.zeros_like(result.free_cells)
+                result.free_center = tuple(window_center)
+            else:
+                result.cells.update(map(tuple, np.argwhere(cover) + window_origin))
+        return result
+
     def project_free(self, pose):
         if self.free_cells is None or pose is None or pose.frame != self.frame:
             return None
@@ -380,6 +424,7 @@ class ActiveScan:
     pending_depth: dict | None = None
     _pending_projection: tuple | None = None
     keep_physical_views: bool = False
+    use_obstacle_history: bool = True
     registered_history: tuple = ()
     _physical_views: tuple | None = field(default=None, repr=False, compare=False)
     _fused_view: tuple | None = None
@@ -400,6 +445,7 @@ class ActiveScan:
     pose_origin: PlanarPose | None = None
     pose_registration: tuple[PlanarPose, PlanarPose] | None = None
     pose_reference_missing: bool = False
+    gap_recheck: tuple[int, int] | None = None
     pose_feedback_since_ms: int = 0
     control_ms: int = 0
     turn_stop_ms: int | None = None
@@ -471,7 +517,8 @@ class ActiveScan:
             depth.pop("obstacle_capture_pose")
         return depth, odom
 
-    def update(self, depth, odom, geometry, *, receipt_only=False, max_depth_age_ms=500, follow_leg=False):
+    def update(self, depth, odom, geometry, *, receipt_only=False, max_depth_age_ms=500, follow_leg=False,
+               gap_speed_bounds=None):
         """Update measured motion and the latest usable depth observation."""
         if self.receipt_only != receipt_only:
             self.invalidate()
@@ -498,9 +545,13 @@ class ActiveScan:
         if self.poses:
             previous = self.poses[-1][0]
             gap = self.max_feedback_gap_ms if self.receipt_only and body_pose is None else ODOM_GAP_MS
-            if (self.receipt_only and (self.active or follow_leg or self.near_obstacles.has_cells)
+            if (self.receipt_only and (self.active or follow_leg or self.near_obstacles.has_cells
+                                       or (self.keep_physical_views and not self.use_obstacle_history))
                     and body_pose is None and stamp > previous and history):
-                hold = self._integrate_receipt_motion(history, stamp, source, motion)
+                hold = self._integrate_receipt_motion(
+                    history, stamp, source, motion, gap_speed_bounds=gap_speed_bounds
+                    if self.keep_physical_views and not (odom.get("motion_pose") or odom.get("obstacle_pose"))
+                    and self.pose_registration is None else None)
                 if hold is not None:
                     return hold
                 stamp, source, motion = self.poses[-1][0], self.odom_source, self.motion
@@ -538,6 +589,13 @@ class ActiveScan:
                     self.pose_reference_missing = True
                 elif absolute is not None and absolute.frame == self.pose_registration[1].frame:
                     self.pose_reference_missing = False
+        if self.gap_recheck is not None:
+            resumed, expires = self.gap_recheck
+            if (capture is None or capture < resumed or self._pose_at(capture) is None
+                    or not has_valid_returns((depth or {}).get("map"))):
+                return self.hold_for_replan("主动观察：反馈恢复，停车等待新坐标系深度复检")
+            if stamp > expires:
+                self.gap_recheck = None
         timeout = 2 * SCAN_TIMEOUT_MS if self.receipt_only else SCAN_TIMEOUT_MS
         if self.phase in ("brake", "turn", "return") and stamp - self.start_ms > timeout:
             return self.interrupt("主动观察：观测超时，停车")
@@ -574,6 +632,8 @@ class ActiveScan:
             return self.interrupt()
         grid = self._project_view(depth, geometry)
         self.source_frame = depth.get("source_frame_id")
+        if not self.use_obstacle_history:
+            self.views.clear()
         self.views.append(self._source_view(capture, pose, grid, depth, geometry))
 
     def _integrate_motion(self, motion, dt):
@@ -584,11 +644,13 @@ class ActiveScan:
                      right + dt * (vx * math.sin(mid) - vy * math.cos(mid)),
                      heading - dt * wz)
 
-    def _integrate_receipt_motion(self, history, stamp, source, motion):
+    def _integrate_receipt_motion(self, history, stamp, source, motion, *, gap_speed_bounds=None):
         # The control timer may run late while odometry is still arriving.
         # Validate the entire sample sequence before integrating any of it.
         previous = self.poses[-1][0]
         samples = [sample for sample in history if previous < sample[0] <= stamp]
+        if not samples or samples[-1] != (stamp, source, motion):
+            gap_speed_bounds = None
         if not samples or samples[-1][0] != stamp:
             samples.append((stamp, source, motion))
         last_stamp, last_source, last_motion = previous, self.odom_source, self.motion
@@ -610,6 +672,8 @@ class ActiveScan:
                 # Both identities are producer stamp_ms values. Their elapsed
                 # time also detects outages hidden by delivery in a batch.
                 if identity - last_source > self.max_feedback_gap_ms:
+                    if gap_speed_bounds is not None and received - last_stamp > self.max_feedback_gap_ms:
+                        return self._hold_for_short_gap(samples, gap_speed_bounds)
                     return self._hold_for_feedback_gap()
             if not 0 < received - last_stamp <= self.max_feedback_gap_ms:
                 return self._hold_for_feedback_gap()
@@ -625,6 +689,47 @@ class ActiveScan:
                 (vx < -tolerance or abs(vy) > tolerance if self.advance_m is not None
                  else math.hypot(vx, vy) > tolerance) for _, (vx, vy, _), _ in intervals):
             return self.hold_for_replan("主动观察：检测到平移，停车后重规划", retry_scan=False)
+
+    def _hold_for_short_gap(self, samples, speed_bounds):
+        previous, source = self.poses[-1][0], self.odom_source
+        stamp, identity, motion = samples[-1]
+        memory = self.near_obstacles
+        if (source is None or identity is None or self.obstacles.has_cells
+                or (memory.has_cells and memory.frame != ("navi_relative", self.motion_frame))
+                or (self.near_projection.origin is not None and not memory.has_occupied)):
+            return self._hold_for_feedback_gap()
+        elapsed = max(stamp - previous, identity - source)
+        if elapsed > 2 * self.max_feedback_gap_ms:
+            return self._hold_for_feedback_gap()
+        for received, sample_id, velocity in samples:
+            if (sample_id is None or not (previous < received and source < sample_id) or velocity is None
+                    or not all(abs(v) <= limit for v, limit in zip(velocity, speed_bounds))):
+                return self._hold_for_feedback_gap()
+            previous, source = received, sample_id
+        if not all(abs(v) <= limit for v, limit in zip(self.motion, speed_bounds)):
+            return self._hold_for_feedback_gap()
+        frame = object()
+        seconds = elapsed / 1000
+        vx, vy, wz = speed_bounds
+        turn = seconds * wz
+        c, s = abs(math.cos(self.pose[2])), abs(math.sin(self.pose[2]))
+        # During the gap each body axis can rotate by at most wz*t. Integrate
+        # that rotation's additional contribution to each world velocity bound.
+        speed = math.hypot(vx, vy)
+        travel = seconds * np.minimum(speed, np.array((vx*c + vy*s, vx*s + vy*c)) + .5 * turn * speed)
+        carried = memory.after_velocity_gap(("navi_relative", frame), (self.pose[0], -self.pose[1]), travel, turn)
+        hold = self._hold_for_feedback_gap()
+        if carried is not None:
+            # Keep the last numeric pivot only as the centre of the uncertainty
+            # envelope. No pose or exposure inside the outage can be interpolated.
+            self.motion_frame = frame
+            self.near_obstacles = carried
+            self.poses.append((stamp, self.pose, motion[2]))
+            self.odom_source, self.motion = identity, motion
+            prior_views = (*self.registered_history, *self.views)
+            expires = max(((v[5][0] if len(v) > 5 else v[0]) + MAP_AGE_MS for v in prior_views), default=stamp)
+            self.gap_recheck = stamp, expires
+        return hold
 
     def _hold_for_feedback_gap(self, reason="主动观察：运动反馈间隔过长，停车后重规划"):
         hold = self.hold_for_replan(reason)
@@ -712,7 +817,7 @@ class ActiveScan:
         # Project it when a turn or local plan needs it.
         self._pending_projection = (depth, geometry, anchor)
         self.source_frame = source
-        if self.keep_physical_views and self.views:
+        if self.use_obstacle_history and self.keep_physical_views and self.views:
             previous = self.views[-1]
             if len(previous) > 5 and previous[5][1] is not None:
                 self.registered_history = tuple(v for v in (*self.registered_history, previous)
@@ -802,7 +907,11 @@ class ActiveScan:
         pose = self._near_pose(pose)
         if pose is None:
             self.near_free = None
-            # Keep checking the last occupied projection until odometry resumes.
+            # Occupancy outside the last projection is still a blind hazard
+            # if the relative frame was lost.
+            if (self.keep_physical_views and memory.frame and memory.frame[0] == "navi_relative"
+                    and memory.frame != ("navi_relative", self.motion_frame) and memory.has_occupied):
+                return ScanCommand(reason="主动观察：近障缺少同坐标系位姿，停车等待重新配准")
             return
         capture = (depth or {}).get("obstacle_capture_pose")
         if (self.views and self.current_frame > memory.last_source
@@ -1003,6 +1112,17 @@ class ActiveScan:
         grid = free & ~occupied, occupied
         self._fused_view = (latest, self.pose, stamp, expires, grid)
         return grid
+
+    def discard_obstacle_history(self):
+        self.obstacles = ObservedObstacles()
+        self.near_obstacles = ObservedObstacles()
+        self.near_projection = NearProjection()
+        self.near_free = self.historical_free = self.historical_hits = None
+        self.historical_layers = self.registered_history = ()
+        self._fused_view = self._physical_views = None
+        self.gap_recheck = None
+        while len(self.views) > 1:
+            self.views.popleft()
 
     def matches_route_view(self, depth):
         """Match the route's depth image to the projected observation."""
@@ -1467,6 +1587,7 @@ class ActiveScan:
         self.pose_registration = None
         self.pose_reference_missing = False
         self.registered_history = ()
+        self.gap_recheck = None
         self.pose_feedback_since_ms = 0
         self.turn_stop_ms = None
         return stop

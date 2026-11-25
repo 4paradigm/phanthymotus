@@ -932,3 +932,22 @@ def test_clearance_route_keeps_every_original_turn_node_as_its_topology(monkeypa
     tier, ref = policy._dwa_route_reference(plan, 2, (1.8, 0.), .50, .05)
     assert tier == "route" and ref.points == plan.points[:2]
     assert ref.topology == raw and ref.geometry is geometry
+
+
+def test_descriptor_latest_depth_only_executes_a_visible_detour(monkeypatch):
+    config, state, depth, odom = observation_case(body=False, attempted=False)
+    policy.adopt_limits(config, {"navigation": {"use_obstacle_history": False}})
+    scan = state.active_scan
+    scan.near_obstacles.frame = ("navi_relative", scan.motion_frame)
+    scan.near_obstacles.cells.add((4, -3))
+    calls = observe_selector(monkeypatch)
+    card, packets = card_for_case(monkeypatch, config, state, depth, odom)
+
+    message = card.next_command()
+    card._stage_command(message, card._output_epoch)
+
+    assert config.use_obstacle_history is False
+    assert calls and any(choice and choice.check.accepted for _, choice in calls)
+    assert all(not inputs["remembered"] for inputs, _ in calls)
+    assert state.view_detour is not None
+    assert packets[-1]["values"][0] > 0.

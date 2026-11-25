@@ -291,7 +291,7 @@ def _legal_command(cmd, limits, floors):
             and _valid_axis(wz, *wl, floors[3] if vx or vy else floors[2]))
 
 
-def _commands(previous, measured, preferred, limits, floors, extra, budget):
+def _commands(previous, measured, preferred, limits, floors, extra, budget, *, recovery_speed=0.):
     xl, yl, wl = limits
 
     def legal(cmd):
@@ -344,6 +344,14 @@ def _commands(previous, measured, preferred, limits, floors, extra, budget):
         # turn must not reshuffle the entire spread of lateral velocities.
         entry = dict.fromkeys((vx, 0., yaw) for _, _, yaw in routes[:2] if abs(yaw) >= .1
                               for vx in (0., low) if legal((vx, 0., yaw)))
+        if 0. < recovery_speed < xl[1] / 8:
+            # Use the unseeded tail for a single cell of travel in each legal axis.
+            for vy in (0., recovery_speed, -recovery_speed):
+                cmd = (recovery_speed, vy, 0.)
+                if legal(cmd):
+                    entry[cmd] = None
+                    if len(pool) < slots and cmd not in ordered and cmd not in pool:
+                        pool.append(cmd)
         missing_entry = [cmd for cmd in entry if cmd not in ordered and cmd not in pool]
         if missing_entry:
             for index in reversed(range(len(pool))):
@@ -494,7 +502,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            footprint: FootprintSpec | None = None, latency_s=0., remembered=None,
            supported_region=None, terminal_boundary=None, occupied=None, alternate_routes=(),
            candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None,
-           guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0.) -> Choice | None:
+           guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0., retry_from_rest=False) -> Choice | None:
     """Select a legal target velocity whose complete predicted stop is admissible.
 
     Routes, occupied cells and targets share the current grid frame. Each
@@ -706,8 +714,9 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             yield handoff
         if first:
             yield previous
+        recovery_speed = local_path.RESOLUTION / horizon if retry_from_rest else 0.
         distinct, missing = (_commands(previous, measured, preferred, limits, floors, candidate_commands,
-                                       max_candidates) if slots else ((), []))
+                                       max_candidates, recovery_speed=recovery_speed) if slots else ((), []))
         diag["uncovered_families"] = missing
         cached = (cmd for cmd in outcomes if _legal_command(cmd, limits, floors))
         for cmd in dict.fromkeys((*distinct, *cached)):

@@ -695,6 +695,59 @@ def target_in_grid(geometry, forward, right):
     return float(f), -float(left)
 
 
+def front_corner_sweep_grid(frame, geometry, half_width, occupied, *, guard_blind_sides=False):
+    """Constrain the blind corner beside a continuous wall reaching the image edge."""
+    if geometry.front != 0. or geometry.horizontal is None or geometry.vertical is None or not occupied.any():
+        return occupied
+    height, width = frame.shape
+    fx, cx, _, cy = intrinsics_for(geometry, height, width)
+    row = round(cy)
+    if not 1 <= row < height - 1 or not 0 < cx < width - 1 or width < 16:
+        return occupied
+    guard = occupied
+    if guard_blind_sides:
+        reach = math.hypot(geometry.half_length, half_width) + RESOLUTION
+        near_front = (FORWARD >= 0.) & (FORWARD**2 + RIGHT**2 <= reach**2)
+        if (occupied & near_front).any():
+            # A close face can move across the edge of the image during a
+            # turn. The opposite side is already blind. Limit expansion of
+            # the current chassis corridor until the near front reopens.
+            sides = ((abs(RIGHT) > half_width + RESOLUTION / 2)
+                     & (abs(RIGHT) <= half_width + 3 * RESOLUTION / 2)
+                     & (FORWARD >= -geometry.rear) & (FORWARD <= reach))
+            guard = occupied | sides
+    for side in (-1, 1):
+        edge = 0 if side < 0 else width - 1
+        edge_z = frame[row, edge]
+        if not 0. < edge_z < half_width * fx / abs(edge - cx):
+            continue
+        cols = edge - side * np.arange(width // 4 + 1)
+        strip = frame[row-1:row+2, cols]
+        if not (np.isfinite(strip).all() and (strip > 0.).all()):
+            continue
+        z = np.median(strip, axis=0)
+        right = (cols - cx) * z / fx
+        span = right[-1] - right[0]
+        if abs(span) < RESOLUTION / 2:
+            continue
+        slope = (z[-1] - z[0]) / span
+        if abs(slope) > 1. or np.max(abs(strip - (z[0] + slope * (right-right[0])))) > RESOLUTION / 8:
+            continue
+        indices = np.rint(np.column_stack((z, right)) / RESOLUTION) + START
+        if np.any(indices < 0) or np.any(indices >= occupied.shape):
+            continue
+        rows, columns = indices.astype(int).T
+        if not occupied[rows, columns].all():
+            continue
+        # Only the command sweep uses this short continuation. Keep it out of
+        # measured occupancy and memory so the next view can reveal an opening.
+        lateral = side * RIGHT
+        corner = (lateral >= side * right[0]) & (lateral <= half_width + RESOLUTION / 2)
+        line = z[0] + slope * (RIGHT - right[0])
+        guard = guard | (corner & (abs(FORWARD - line) <= RESOLUTION * (1 + abs(slope)) / 2))
+    return guard
+
+
 class DepthProjection:
     """Keep raw projections for one received frame, shared by both timers."""
 

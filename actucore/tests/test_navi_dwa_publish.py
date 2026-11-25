@@ -212,6 +212,24 @@ def test_followup_prefers_the_already_published_route(monkeypatch):
     assert len(card._last_decision.dwa_acceptance.route_points) == len(original.route_points)
 
 
+def test_latest_only_detour_can_keep_its_checked_route_after_the_obstacle_leaves_view(monkeypatch):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    first = card.next_command()
+    assert card._stage_command(first, card._output_epoch)
+    assert card._wire_dwa_origin.acceptance.passage_exit is None
+    advance_snapshot(snapshot, clock, 1100, vx=first["values"][0])
+    snapshot[0][1]["map"].fill(5.)
+
+    following = card.next_command()
+
+    assert card._state.dwa_trace.get("retained_route")
+    assert card._last_decision.dwa_acceptance.motion_guard.check.accepted
+    assert not card._last_decision.dwa_acceptance.motion_guard.remembered
+    assert card._stage_command(following, card._output_epoch)
+    assert packets[-1]["values"][0] > 0.
+
+
 @pytest.mark.parametrize("next_depth", ["expired", "clear", "obstacle"])
 def test_expired_depth_leaves_the_sent_packet_until_its_original_deadline(monkeypatch, next_depth):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
@@ -2071,8 +2089,10 @@ def test_late_depth_can_be_replaced_before_a_fast_first_send(monkeypatch, update
 
 
 @pytest.mark.parametrize("obstacle", [False, True])
-def test_receipt_timed_depth_rechecks_first_send_and_repeat(monkeypatch, obstacle):
+@pytest.mark.parametrize("use_obstacle_history", [True, False])
+def test_receipt_timed_depth_rechecks_first_send_and_repeat(monkeypatch, obstacle, use_obstacle_history):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = use_obstacle_history
     card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
     snapshot[0][1].update(receipt_timed=True, capture_ms=100, source_frame_id=100)
     message = card.next_command()

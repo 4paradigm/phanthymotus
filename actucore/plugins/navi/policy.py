@@ -256,6 +256,8 @@ class Config:
     max_obs_age_ms: int = 500
     max_depth_age_ms: int | None = None
     scan_odom_linear_tolerance_mps: float = SCAN_ODOM_LINEAR_TOLERANCE_MPS
+    gap_speed_bounds: tuple | None = None
+    use_obstacle_history: bool = True
     max_feedback_gap_ms: int = ODOM_GAP_MS
     watchdog_ms: float = 300
     stuck_window_s: float = 3.0
@@ -803,6 +805,7 @@ class State:
     reacquire_generation: int | None = None
     reacquire_receipt_ms: int = 0
     reacquire_source: float | None = None
+    reacquire_candidate: dict | None = None
     missing_frames: int = 0
     last_seen_side: float = 1.0          # +1 target was right, -1 it was left
     searching_for_s: float = 0.0
@@ -1082,6 +1085,9 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     """
     notes: list[str] = []
     notes.extend(_adopt_footprint(config, descriptor))
+    navigation = (descriptor or {}).get("navigation")
+    if isinstance(navigation, dict) and type(navigation.get("use_obstacle_history")) is bool:
+        config.use_obstacle_history = navigation["use_obstacle_history"]
     rate = (descriptor or {}).get("rate") or {}
     watchdog = rate.get("watchdog_ms")
     if (isinstance(watchdog, (int, float)) and not isinstance(watchdog, bool)
@@ -1141,6 +1147,10 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     config.motion_braking = tuple(rate or fallback for rate, fallback in
                                   zip(nominal_ramp, motion_model._DEFAULT_BRAKING))
 
+    bounds = [(signed_at(lower, i), signed_at(upper, i)) for i in (0, 1, 5)]
+    config.gap_speed_bounds = (tuple(max(-lo, hi) for lo, hi in bounds)
+                               if all(lo is not None and hi is not None and lo <= 0 <= hi for lo, hi in bounds)
+                               else None)
     config.floor_vx_moving = at(moving_floors, 0)
     config.floor_vy_moving = at(moving_floors, 1)
     left_vy, right_vy = signed_at(upper, 1), signed_at(lower, 1)
@@ -1520,7 +1530,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
             decision.dwa_acceptance = DwaAcceptance(
                 state.decision_id, proposal.command, trace["guard_horizon_s"],
                 state.dwa_motion_guard, isinstance(proposal, DwaTurn),
-                proposal.reference.points if isinstance(proposal, DwaProposal) and proposal.branch != "visual_probe" else (),
+                proposal.reference.points if isinstance(proposal, DwaProposal) and proposal.branch not in ("visual_probe", "direct") else (),
                 followed_route=bool(trace.get("retained_route")),
                 passage_exit=proposal.reference.passage_exit if isinstance(proposal, DwaProposal) else None,
                 corridor_corner=(isinstance(proposal, DwaProposal) and proposal.reference.corridor_corner))
@@ -1609,6 +1619,7 @@ def _ego_twist(odom, state: State, *, command_fraction=1.):
 
 MAX_PREDICTED_DETOUR_TRAVEL_M = 3.
 NO_LOCAL_ROUTE = "局部规划未找到可执行的避让路线；停下"
+INITIAL_MEMORY_OVERLAP = "近障记忆与车身起始轮廓重叠，停车等待重新观测或配准"
 
 
 def current_target_observed(state):
@@ -1819,9 +1830,18 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # otherwise a camera that stopped publishing would leave a track coasting
     # for ever, and the robot driving towards a prediction nobody is checking.
     ego, ego_measured = _ego_twist(odom, state, command_fraction=state.command_dt_s / dt if dt else 0.)
+    recovering = state.reacquire_generation is not None
+    detection_source = observation_source(detections) if recovering else None
+    fresh_recovery = (recovering and detections is not None and objects_ms > state.reacquire_receipt_ms
+                      and (state.reacquire_source is None or (detection_source is not None and detection_source > state.reacquire_source)))
+    same_receipt = objects_ms == state.reacquire_receipt_ms and detection_source == state.reacquire_source
+    if recovering and state.target == "person" and not (fresh_recovery or same_receipt):
+        # Out-of-order receipts cannot vote for confirming a person.
+        detections = None
     track = state.tracker.step(detections=detections, depth=depth,
                                target=state.target, config=config,
-                               ego=ego, ego_measured=ego_measured, dt=dt)
+                               ego=ego, ego_measured=ego_measured, dt=dt,
+                               receipt_ms=objects_ms if recovering and state.target == "person" else 0)
     if (config.local_controller == "dwa" and isinstance(track, Track) and track.observed
             and track.accepted_detection and track.range_known and track.source is not None):
         stamp = (depth or {}).get("control_ms")
@@ -1839,17 +1859,26 @@ def _decide(detections, depth, odom, config: Config, state: State,
         state.goal_anchor = anchor = None
     visual_only = bool(track is not None and track.observed and getattr(track, "front_required", False)
                        and track.front_fix is None)
-    recovering = state.reacquire_generation is not None
-    detection_source = observation_source(detections) if recovering else None
-    fresh_recovery = (recovering and detections is not None and objects_ms > state.reacquire_receipt_ms
-                      and (state.reacquire_source is None or (detection_source is not None and detection_source > state.reacquire_source)))
-    if fresh_recovery and track is not None and track.observed and track.accepted_detection:
+    matched_person = (state.target == "person" and detections is not None
+                      and state.tracker.track is not None and state.tracker.matched_detections is detections)
+    if fresh_recovery:
+        state.reacquire_receipt_ms, state.reacquire_source = objects_ms, detection_source
+        state.reacquire_candidate = detections if matched_person else None
+    # One gated detector receipt can span several control ticks. Keep the
+    # camera still for confirmation, including when its depth arrives later.
+    pending_person = (recovering and detections is not None and state.reacquire_candidate is detections
+                      and objects_ms == state.reacquire_receipt_ms and state.tracker.track is not None)
+    if track is not None and track.observed and (
+            fresh_recovery and track.accepted_detection or pending_person and track.measured_range_m is not None):
+        if matched_person and track.image_region and track.image_region[0]:
+            state.last_seen_side = 1. if track.image_region[0][0] >= 0. else -1.
         # A confirmed replacement owns a new goal; it cannot inherit the old detour.
         if anchor is not None and (track.generation != anchor.generation or visual_only):
             _reset_detour_route(state)
             state.goal_anchor = anchor = None
         if track.measured_range_m is not None or visual_only:
             state.reacquire_generation = None
+            state.reacquire_candidate = None
             state.missing_frames = 0
             state.searching_for_s = state.searched_rad = 0.
     needs_probe = visual_only and (anchor is None or config.local_controller == "dwa")
@@ -1859,13 +1888,13 @@ def _decide(detections, depth, odom, config: Config, state: State,
             state.goal_anchor = anchor = None
         scan = state.active_scan
         scan.interrupt()
-        history = (odom or {}).get("velocity_history")
-        if scan.receipt_only and scan.near_obstacles.has_cells and scan.poses and history:
-            scan.sync_buffered_motion(history, odom.get("received_ms", history[-1][0]))
         if not (scan.active or scan.exhausted or scan.has_result):
             scan.attempted = False
         state.commanded_vx = 0.
         if config.local_controller != "dwa" or not config.local_planning or config.local_geometry is None:
+            history = (odom or {}).get("velocity_history")
+            if scan.receipt_only and scan.near_obstacles.has_cells and scan.poses and history:
+                scan.sync_buffered_motion(history, odom.get("received_ms", history[-1][0]))
             return Decision(_twist(0., 0., 0.), BLIND, "等待目标最前端的有效深度")
     elif track is not None and getattr(track, "front_required", False) and track.front_fix is None and anchor is None:
         track = None
@@ -1970,6 +1999,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
 
         scan = state.active_scan
         scan.keep_physical_views = config.local_controller == "dwa"
+        if scan.use_obstacle_history and not config.use_obstacle_history:
+            scan.discard_obstacle_history()
+        scan.use_obstacle_history = config.use_obstacle_history
         scan.odom_linear_tolerance_mps = config.scan_odom_linear_tolerance_mps
         scan.max_feedback_gap_ms = config.max_feedback_gap_ms
         obstacle_pose = _obstacle_reference(odom, depth)
@@ -2008,7 +2040,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
         else:
             update = scan.update(scan_depth, odom, geometry,
                                  receipt_only=receipt_only, max_depth_age_ms=config.depth_age_limit_ms,
-                                 follow_leg=state.detour_leg is not None)
+                                 follow_leg=state.detour_leg is not None,
+                                 gap_speed_bounds=config.gap_speed_bounds
+                                 if config.use_obstacle_history and config.scan_geometry is None else None)
         scan.observation_pose = obstacle_pose
         capture_pose = (depth or {}).get("obstacle_capture_pose")
         if (update is None and scan.phase == "turn" and not scan.route_segment
@@ -2019,7 +2053,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 vantage = scan.views[-1][1]
                 if not scan._already_observed(vantage, 0.):
                     scan.observed_vantages.append(vantage)
-        if config.scan_geometry is None and geometry is not None and geometry.horizontal is not None:
+        if (config.use_obstacle_history and config.scan_geometry is None
+                and geometry is not None and geometry.horizontal is not None):
             target_range = (track.range_m if track is not None and track.range_known else math.inf)
             if anchor is not None:
                 target_range = min(target_range, math.hypot(anchor.x, anchor.y))
@@ -2027,8 +2062,22 @@ def _decide(detections, depth, odom, config: Config, state: State,
                         target_range - FORWARD_CLEARANCE_MARGIN_M)
             approaching = (feedback is not None and (track is not None or anchor is not None)
                            and max(feedback[0], state.commanded[0]) > STILL_LINEAR)
-            scan.update_near_obstacles(scan_depth, geometry, obstacle_pose, _keepout_m(config), reach,
-                                       approaching=approaching)
+            near_hold = scan.update_near_obstacles(scan_depth, geometry, obstacle_pose, _keepout_m(config), reach,
+                                                   approaching=approaching)
+            if near_hold is not None:
+                return Decision(_twist(0., 0., 0.), AVOIDING, near_hold.reason)
+        if scan.gap_recheck is not None:
+            return Decision(_twist(0., 0., 0.), AVOIDING,
+                            update.reason if update is not None else "主动观察：反馈恢复，停车等待旧视图到期")
+        if state.reacquire_generation is not None:
+            if scan.active or scan.result_frame or state.detour_leg is not None:
+                _reset_detour_route(state)
+            if depth is None:
+                return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
+            if matched_person:
+                return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待目标确认或新深度")
+            state.missing_frames = max(state.missing_frames, config.lost_frames)
+            return _search_for_target(depth, config, state, dt, odom)
         if config.local_controller == "dwa" and depth is not None and geometry is not None:
             live_range = track is not None and track.observed and track.measured_range_m is not None
             arc = None
@@ -2060,15 +2109,6 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 if arc is not None:
                     vx, vy, wz, status, reason = arc
                     return Decision(_twist(vx, vy, wz), status, reason, distance_m=distance)
-        if state.reacquire_generation is not None:
-            if fresh_recovery:
-                state.reacquire_receipt_ms, state.reacquire_source = objects_ms, detection_source
-            if scan.active or scan.result_frame or state.detour_leg is not None:
-                _reset_detour_route(state)
-            if depth is None:
-                return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
-            state.missing_frames = max(state.missing_frames, config.lost_frames)
-            return _search_for_target(depth, config, state, dt, odom)
         if needs_probe:
             return _visual_approach(depth, config, state, geometry, track, feedback, objects_ms, detections)
         reviewing_observation = (target_fix is not None and feedback is not None
@@ -2172,11 +2212,13 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if missing_person and track is not None and anchor is None and not (
             state.published_dwa_route or state.published_camera_passage or scan.active):
         state.commanded_vx = 0.
+        if matched_person:
+            return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待目标确认")
         return _search_for_target(depth, config, state, dt, odom)
 
     if track is None and anchor is None:
         if (state.searched_rad > 0. and state.tracker.track is not None
-                and any(target_objects(detections, state.target, config))):
+                and (matched_person if person_approach else any(target_objects(detections, state.target, config)))):
             return Decision(_twist(0., 0., 0.), ALIGNING, "已看到目标，等待新观测确认")
         return _search_for_target(depth, config, state, dt, odom)
 
@@ -2287,7 +2329,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         vx, vy, raw_wz, depth, config, status, reason, state,
         target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
         aligned=abs(bearing) < config.align_full_stop, odom=odom,
-        may_scan=live or anchor is not None, dt=dt)
+        may_scan=live or anchor is not None, dt=dt, desired_forward=speed if driving else 0.)
     if missing_person and (vx or vy or raw_wz) and not (
             state.dwa_selected or state.camera_arc_selected or state.executing_leg):
         state.commanded_vx = 0.
@@ -2304,7 +2346,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if yaw and _check_dwa_turn(depth, config, state, geometry, target, "align", (0., 0., yaw)):
             state.commanded_vx = 0.
             return Decision(_twist(0., 0., yaw), ALIGNING, "原地转向当前可见目标", distance_m=distance, bearing=bearing)
-    if not state.camera_arc_selected:
+    if not state.camera_arc_selected and not (isinstance(state.dwa_proposal, DwaProposal)
+                                              and state.dwa_proposal.branch == "direct"):
         _remember_detour_goal(state, config, track, odom)
     # Legacy uses forward requests and lateral feedback for blockage. DWA
     # accounts measured route and viewpoint progress across all phases in step.
@@ -3408,10 +3451,14 @@ def _dwa_motion_inputs(depth, config, state, geometry, target, motion, *, corner
         return dwa_registration(pose, current, stamp, now_ms, geometry, velocities, reference=reference)
 
     try:
-        observed, remembered = dwa_obstacles(scan, sources, geometry, registration)
-        if raw is not None:
+        observed, remembered = (dwa_obstacles(scan, sources, geometry, registration)
+                                if config.use_obstacle_history else ((), ()))
+        if raw is not None or not config.use_obstacle_history:
             capture = depth.get("capture_ms") or sources.current_frame
-            observed += (registration(capture, depth.get("obstacle_capture_pose")).squares(raw[1]),)
+            cells = (local_path.front_corner_sweep_grid(
+                state.dwa_projection.frame, geometry, _keepout_m(config), raw[1],
+                guard_blind_sides=not config.use_obstacle_history) if raw is not None else grid[1])
+            observed += (registration(capture, depth.get("obstacle_capture_pose")).squares(cells),)
     except DwaFrameMismatch:
         return None, "geometry_mismatch"
     footprint = motion_model.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
@@ -3643,8 +3690,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         occupied=inputs.observed, remembered=inputs.remembered, supported_region=local_path.SUPPORTED_REGION,
         latency_s=(inputs.deadline_ms - inputs.checked_ms) / 1000,
         measured=inputs.measured, previous=inputs.previous, x_limit=(0., max(0., limit_x)),
-        y_limit=(-right_vy, left_vy),
-        yaw_limit=(-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.)),
+        y_limit=(0., 0.) if branch == "direct" else (-right_vy, left_vy),
+        yaw_limit=(0., 0.) if branch == "direct" else (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.)),
         floors=(floor_x, floor_y, config.floor_wz, config.floor_wz_moving),
         target=target, stop_distance=config.stop_distance_m,
         acceleration=config.motion_acceleration, braking=config.motion_braking,
@@ -3653,7 +3700,9 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         diagnostics=diagnostics, alternate_routes=tuple(ref.points for ref in alternates),
         candidate_budget=state.dwa_budget, motion_frame=(scan.motion_frame, inputs.pose), guidance=guidance,
         measured_target=inputs.measured_target, follow_published=follow_published, route_error=route_error,
-        handoff_yaw_step=state.dwa_handoff_yaw_step if not visual else 0.)
+        handoff_yaw_step=state.dwa_handoff_yaw_step if not visual else 0.,
+        retry_from_rest=(recovery and scan.dwa_failures > 0 and not any(inputs.previous)
+                         and math.hypot(*inputs.measured[:2]) <= config.scan_odom_linear_tolerance_mps))
     for key in ("sampled_candidates", "cached_candidates", "considered_candidates", "physical_evaluations", "bound_skips", "response_reuse",
                 "admissible_candidates", "reference_scores"):
         trace[key] = trace.get(key, 0) + diagnostics[key]
@@ -3667,6 +3716,18 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
             view = _blocking_memory_view(scan, context, state.dwa_budget)
             if view is not None:
                 trace["memory_recheck"] = view
+        if (diagnostics["reason"] == "no_admissible_candidates"
+                and diagnostics["rejected"].get("remembered_obstacle")):
+            # Distinguish a registered footprint overlap at rest from a
+            # collision that only a candidate's motion or braking would cause.
+            footprint = inputs.footprint
+            margin = footprint.clearance_margin_m
+            start = ((0., 0., 0.),)
+            if any(local_path.rectangle_clearance(
+                    start, layer, footprint.front + margin, footprint.rear + margin,
+                    footprint.half_width + margin)[1] == 0
+                   for layer in inputs.remembered):
+                return unavailable("initial_remembered_overlap")
         return unavailable(diagnostics["reason"])
     guard = DwaMotionGuard(**vars(inputs), trace=proposed.trace, check=proposed.check,
                            visibility_required=shadow is not None,
@@ -3698,6 +3759,8 @@ def _use_dwa(state, proposal, side):
     state.detour_leg = state.executing_leg = None
     points = tuple((f, r) for f, r, _ in choice.trajectory)
     state.view_detour = Detour(None, points, route.geometry, route.points)
+    if proposal.branch == "direct":
+        return *proposal.command, APPROACHING, "沿目标方向安全直行"
     return (*proposal.command, AVOIDING, "局部规划：DWA沿已验证绕行轨迹运动")
 
 
@@ -3721,7 +3784,9 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
         return None
     exit_line = (tuple(map(tuple, transform.points(previous.passage_exit)))
                  if previous.passage_exit is not None else None)
-    if not foreground and not local_path.passage_ahead(exit_line):
+    # In single-view mode the obstacle can leave the front camera before
+    # the chassis clears it. Pursue the route using a fresh sweep.
+    if config.use_obstacle_history and not foreground and not local_path.passage_ahead(exit_line):
         return None
     route = Detour(None, tuple(map(tuple, transform.points(previous.route_points))), geometry,
                    passage_exit=exit_line, corridor_corner=previous.corridor_corner)
@@ -4043,7 +4108,7 @@ def _dwa_recovery_route(depth, config, state, geometry, ahead, distance, bearing
                 sides = tuple(sorted(sides, key=lambda side: side != preferred))
             if scan.begin(sides):
                 return 0., 0., 0., AVOIDING, "主动观察：连续新观测没有可执行路线，停车后观察"
-    return 0., 0., 0., AVOIDING, NO_LOCAL_ROUTE
+    return 0., 0., 0., AVOIDING, INITIAL_MEMORY_OVERLAP if reason == "initial_remembered_overlap" else NO_LOCAL_ROUTE
 
 
 def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distance, may_scan):
@@ -4053,10 +4118,11 @@ def _observed_obstacle_ahead(scan, depth, config, geometry, pose, target_distanc
     memory = scan.obstacles
     source = depth.get("source_stamp_ns") or depth.get("source_frame_id") or depth.get("capture_ms")
     max_depth = target_distance - FORWARD_CLEARANCE_MARGIN_M if target_distance is not None else None
-    if depth.get("body_mount_required") and not geometry.free_space_validated:
+    if not config.use_obstacle_history or (depth.get("body_mount_required") and not geometry.free_space_validated):
         # An estimated moving mount suffices for this view, but must not
         # insert obstacles into an odometry map that cannot clear them again.
-        if geometry is not config.scan_geometry or not scan.views or not scan.matches_route_view(depth):
+        if not scan.views or not scan.matches_route_view(depth) or (
+                config.use_obstacle_history and geometry is not config.scan_geometry):
             return None
         hits = scan.observed_grid()[1] if scan.receipt_only else scan.views[-1][3]
         front = transform[0, 2]
@@ -4345,7 +4411,7 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
 
 def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
            target_distance=None, measured_vx=None, aligned=True, odom=None, may_scan=False,
-           target_bearing=None, dt=0.):
+           target_bearing=None, dt=0., desired_forward=0.):
     """Slow for foreground obstacles and look around them before local detours."""
     scan = state.active_scan if config.local_planning and state is not None else None
     geometry = config.scan_geometry or config.local_geometry
@@ -4389,7 +4455,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             foreground = plan_obstacle = True
             state.last_clearance = ahead
     if (scan is not None and state.published_dwa_route is not None
-            and (foreground or state.published_dwa_route.passage_exit is not None) and geometry is not None
+            and (foreground or state.published_dwa_route.passage_exit is not None
+                 or not config.use_obstacle_history) and geometry is not None
             and may_scan and target_distance is not None and target_bearing is not None):
         following = _follow_published_route(depth, config, state, geometry, target_distance, target_bearing,
                                             foreground=foreground)
@@ -4510,7 +4577,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                              and (state.published_dwa_route is not None
                                   or (saved is not None and saved.anchor is state.goal_anchor
                                       and saved.frame is scan.motion_frame)))
-        if needs_detour or continuing_detour:
+        stalled_approach = path_clear and not vx and desired_forward > 0.
+        if needs_detour or continuing_detour or stalled_approach:
             motion = planar_feedback(odom) or state.command_tail
             floor = config.floor_wz_moving if vx or vy else config.floor_wz
             limit = _scan_yaw_rate(config, 1. if wz < 0. else -1.)
@@ -4518,7 +4586,16 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             corridor_clear = _target_corridor_clear(
                 depth, config, scan, target_distance, target_bearing, (motion, state.commanded, (vx, vy, yaw)))
             needs_detour = not corridor_clear
-            if path_clear and needs_detour and not continuing_detour:
+            if path_clear and (needs_detour or stalled_approach) and not continuing_detour:
+                # The requested twist can clip a jamb even when a slower motion
+                # along the direct reference can brake safely before it.
+                track = state.tracker.track
+                if max(vx, desired_forward) > 0. and not scan.command_only and track is not None and track.observed:
+                    route = Detour(None, ((0., 0.), target), geometry)
+                    checked = _dwa_detour(depth, config, state, route, target_distance, target_bearing,
+                                          branch="direct", speed_limit=vx or desired_forward, recovery=True)
+                    if checked is not None:
+                        return _use_dwa(state, checked, state.escape_side)
                 return 0., 0., 0., AVOIDING, "目标直达路径畅通，等待当前运动扫掠范围清空"
     if (needs_detour and config.local_controller == "dwa" and state is not None and state.goal_anchor is not None
             and may_scan and geometry is not None and scan is not None and scan.views and scan.current_frame

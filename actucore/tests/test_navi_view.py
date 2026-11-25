@@ -344,6 +344,19 @@ def test_person_overlay_shows_only_the_associated_measurement(monkeypatch):
 
 
 @needs_cv2
+def test_person_overlay_marks_the_last_seen_box_without_a_range(monkeypatch):
+    labels = []
+    edges = []
+    monkeypatch.setattr(V, "_text", lambda frame, label, *args, **kwargs: labels.append(label))
+    monkeypatch.setattr(V, "_dashed_line", lambda frame, a, b, colour: edges.append((a, b, colour)))
+    _render(box=(.3, .3, .6, .8), measured=2., box_last_seen=True, clearance=None,
+            track={"name": "person", "state": "coasting", "range_m": .63})
+    assert len(edges) == 4
+    assert "last seen" in labels
+    assert all("meas" not in label for label in labels)
+
+
+@needs_cv2
 def test_both_numbers_are_drawn_when_a_measurement_exists():
     plain = _render(box=(0.3, 0.3, 0.6, 0.8),
                     track={"state": "confirmed", "range_m": 1.23})

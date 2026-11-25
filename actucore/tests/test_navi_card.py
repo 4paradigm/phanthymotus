@@ -3118,3 +3118,45 @@ def test_decision_log_preserves_bends_and_reversals_within_log_budget():
     message = navi_plugin._decision_log(trace)
     assert len(message.encode()) <= 3800
     assert json.loads(message)["attempts_count"] == 250
+
+
+def test_person_overlay_keeps_matched_box_without_range_and_marks_short_detector_loss(monkeypatch):
+    import queue
+    import numpy as np
+    from plugins.navi.track import COASTING, CONFIRMED, Track
+
+    card = _card()
+    card._view_queue = queue.Queue(maxsize=1)
+    state = card._state
+    state.target = "person"
+    box = (.3, .2, .6, .8)
+    state.tracker.track = track = Track(mean=np.array([2., 0., 0., 0.]), cov=np.eye(4), hue="", name="person",
+                                       state=CONFIRMED, source=1., front_required=True, front_box=box)
+    clock = [1000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: clock[0] / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: clock[0] / 1000)
+    card._objects = {"timestamp": 1., "objects": [{"name": "person", "bbox_norm": box}]}
+    card._objects_ms = 1000
+
+    def snapshot():
+        card._view_next_at = 0.
+        card._publish_view()
+        return card._view_queue.get_nowait()
+
+    fresh = snapshot()
+    assert card._box_for(fresh) == (box, None)
+    assert not fresh["box_last_seen"]
+
+    clock[0] = 1250
+    track.state, track.since_obs_s = COASTING, .25
+    card._objects = {"timestamp": 1.25, "objects": []}
+    card._objects_ms = 1250
+    coasting = snapshot()
+    assert card._box_for(coasting) == (box, None)
+    assert coasting["box_last_seen"]
+
+    clock[0] = 2400
+    track.since_obs_s = 1.4
+    expired = snapshot()
+    assert card._box_for(expired) == (None, None)
+    assert not expired["box_last_seen"]

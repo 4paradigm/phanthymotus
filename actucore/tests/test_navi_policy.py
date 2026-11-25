@@ -6468,3 +6468,35 @@ def test_incomplete_route_search_does_not_count_as_an_obstructed_view(monkeypatc
     monkeypatch.setattr(P, "_dwa_route_motion", out_of_time)
     P._dwa_recovery_route({}, config, state, None, .8, 2., 0.)
     assert scan.dwa_failures == 0
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+@pytest.mark.parametrize("forward", [.3, 0.], ids=["moving", "approach-stopped"])
+def test_visible_goal_with_clear_path_checks_an_alternative_to_blocked_sweep(monkeypatch, accepted, forward):
+    from types import SimpleNamespace
+
+    grid = P.local_path
+    geometry = grid.camera_square(P.HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20, at_front=True)
+    config = _cfg(local_planning=True, local_geometry=geometry, half_width_m=.20)
+    state = _state(motion_source="measured")
+    state.tracker.track = SimpleNamespace(observed=True, accepted_detection=False)
+    scan = state.active_scan
+    scan.receipt_only, scan.current_frame = True, 1000
+    occupied = np.isclose(grid.FORWARD, 1.) & np.isclose(grid.RIGHT, .45)
+    scan.views.append((1000, scan.pose, ~occupied, occupied))
+    depth = dict(_scene(3.), frame_id=1000, ground=occupied)
+    monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs: (.7, 1.))
+    monkeypatch.setattr(P, "_target_corridor_clear", lambda *args: False)
+    checked = (.12, 0., 0., P.AVOIDING, "checked direct prefix")
+    calls = []
+
+    def direct(view, cfg, current, route, distance, bearing, *, branch, speed_limit, recovery):
+        calls.append((branch, speed_limit, distance, bearing, recovery))
+        return checked if accepted else None
+
+    monkeypatch.setattr(P, "_dwa_detour", direct)
+    monkeypatch.setattr(P, "_use_dwa", lambda current, proposal, side: proposal)
+    result = P._avoid(forward, .03 if forward else 0., -.2, depth, config, P.APPROACHING, "tracking", state,
+                      target_distance=2.4, target_bearing=.04, may_scan=True, desired_forward=.3)
+    assert calls == [("direct", .3, 2.4, .04, True)]
+    assert result[:3] == (checked[:3] if accepted else (0., 0., 0.))

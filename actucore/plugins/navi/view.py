@@ -351,7 +351,7 @@ def _dashed_line(frame, a, b, colour):
 
 
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
-           measured=None, rgb_jpeg=None, blend: float = 0.5,
+           measured=None, box_last_seen=False, rgb_jpeg=None, blend: float = 0.5,
            ground=None, detour=None, executing=None, project_detour=True,
            width: int = 640, height: int = 480):
     """One frame. Every input may be absent — the overlay still draws.
@@ -433,15 +433,21 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     if box:
         x1, y1, x2, y2 = (int(box[0] * width), int(box[1] * height),
                           int(box[2] * width), int(box[3] * height))
-        cv2.rectangle(frame, (x1, y1), (x2, y2), _CASING, 5)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), _TARGET, 2)
         state = (track or {}).get("state", "")
         rng = (track or {}).get("range_m")
         label = f"{state}" + (f"  {rng:.2f}m" if rng is not None else "  ?m")
         colour = _TARGET
-        if (track or {}).get("name", "").lower() == "person":
+        if box_last_seen:
+            vertices = ((x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1))
+            for a, b in zip(vertices, vertices[1:]):
+                _dashed_line(frame, a, b, _WARN)
+            label, colour = "last seen", _WARN
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), _CASING, 5)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), _TARGET, 2)
+        if not box_last_seen and (track or {}).get("name", "").lower() == "person":
             label = f"meas {measured:.2f}m" if measured is not None else state
-        elif measured is not None:
+        elif not box_last_seen and measured is not None:
             # **Both numbers, because the gap between them is a real failure
             # mode.** The tracked range is a filtered estimate that has been
             # ego-motion compensated every tick since the last observation, and

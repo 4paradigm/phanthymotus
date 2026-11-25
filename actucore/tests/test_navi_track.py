@@ -641,6 +641,21 @@ def test_person_front_surface_rejects_a_separate_near_layer_at_box_bottom(foregr
     assert np.linalg.norm(point) == pytest.approx(expected)
 
 
+@pytest.mark.parametrize(("edge", "expected"), [(True, 2.61), (False, .52)])
+def test_person_front_surface_distinguishes_side_occlusion_from_an_interior_near_patch(edge, expected):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.depth import front_surface
+
+    frame = np.full((480, 640), 2.61, dtype=np.float32)
+    left = 162 if edge else 170
+    frame[203:308, left:left + 30] = .52
+    bbox = (162 / 640, 38 / 480, 215 / 640, 308 / 480)
+    point = front_surface(frame, bbox, HorizontalIntrinsics(640, 315., 337.))
+
+    assert point[0] == pytest.approx(expected)
+    assert frame[205, left + 4] == pytest.approx(.52)
+
+
 def test_person_arrival_ignores_bottom_foreground_connected_by_filled_depth():
     from plugins.navi.camera import HorizontalIntrinsics
 

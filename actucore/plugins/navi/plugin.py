@@ -1465,6 +1465,7 @@ class NaviPlugin:
                            "max_depth_age_ms": self._config.depth_age_limit_ms,
                            "scan_odom_linear_tolerance_mps": self._config.scan_odom_linear_tolerance_mps,
                            "max_feedback_gap_ms": self._config.max_feedback_gap_ms,
+                           "use_obstacle_history": self._config.use_obstacle_history,
                            "stop_tolerance_m": self._config.stop_tolerance_m,
                            "arrival_distance_m": self._config.arrival_distance_m,
                            "k_fwd": self._config.k_fwd,
@@ -2323,8 +2324,13 @@ class NaviPlugin:
         if grid is None:
             return None
         shadow = local_path.occluded_cells(*grid, geometry) if guard.visibility_required else None
-        occupied = (view.squares(grid[1]),)
-        if sources.views and sources.current_frame:
+        cells = local_path.front_corner_sweep_grid(
+            projection.frame, geometry, policy_mod._keepout_m(self._config), grid[1],
+            guard_blind_sides=not self._config.use_obstacle_history)
+        occupied = (view.squares(cells),)
+        if not self._config.use_obstacle_history:
+            remembered = ()
+        elif sources.views and sources.current_frame:
             rolling, remembered = policy_mod.dwa_obstacles(scan, sources, geometry, registration)
             occupied += rolling
         else:
@@ -3522,7 +3528,7 @@ class NaviPlugin:
         fields = ("local_controller", "local_planning", "vx_max", "vy_max", "wz_max", "use_lateral",
                   "floor_vx", "floor_vy", "floor_wz", "floor_vx_moving", "floor_vy_moving",
                   "floor_wz_moving", "left_vy_limit", "right_vy_limit", "left_wz_limit",
-                  "right_wz_limit", "half_width_m", "stop_distance_m", "max_feedback_gap_ms",
+                  "right_wz_limit", "half_width_m", "stop_distance_m", "max_feedback_gap_ms", "use_obstacle_history",
                   "watchdog_ms", "dwa_horizon_s", "motion_acceleration", "motion_braking")
         return (tuple(getattr(config, key) for key in fields), config.depth_age_limit_ms,
                 footprint, config.scan_geometry is not None, config.depth_intrinsics, config.half_fov_rad,
@@ -5144,21 +5150,29 @@ class NaviPlugin:
                 selected = policy_mod.PathLeg(geometry, (scan.advance_m, 0.), origin)
                 detour = local_path.Detour(None, ((0., 0.), selected.remaining(scan.pose)), geometry)
         person = track is not None and track.front_required
-        person_measurement = None
-        if person and track.observed and track.front_box and track.measured_point is not None:
+        person_box = person_range = None
+        box_last_seen = False
+        if person and track.front_box:
             fix = track.measured_point
             now_ms = int(time.time() * 1000)
-            if (fix.box == track.front_box and fix.observation_ms
-                    and 0 <= now_ms - fix.observation_ms < self._config.depth_age_limit_ms
-                    and track.front_fix is not None and track.since_obs_s * 1000 < self._config.max_obs_age_ms
-                    and 0 <= now_ms - objects_ms < self._config.max_obs_age_ms
-                    and observation_source(objects) == track.source
-                    and any(tuple(obj.get("bbox_norm") or ()) == track.front_box
-                            for obj in (objects or {}).get("objects", ()))):
-                person_measurement = track.front_box, math.hypot(*fix.point)
+            current_box = (track.observed and track.since_obs_s * 1000 < self._config.max_obs_age_ms
+                           and 0 <= now_ms - objects_ms < self._config.max_obs_age_ms
+                           and observation_source(objects) == track.source
+                           and any(tuple(obj.get("bbox_norm") or ()) == track.front_box
+                                   for obj in (objects or {}).get("objects") or ()))
+            if current_box:
+                person_box = track.front_box
+                if (fix is not None and fix.box == person_box and fix.observation_ms
+                        and track.front_fix is not None
+                        and 0 <= now_ms - fix.observation_ms < self._config.depth_age_limit_ms):
+                    person_range = math.hypot(*fix.point)
+            elif track.drivable and track.since_obs_s <= self._config.max_coast_s:
+                person_box, box_last_seen = track.front_box, True
         snapshot = {
             "person": person,
-            "person_measurement": person_measurement,
+            "person_box": person_box,
+            "person_range": person_range,
+            "box_last_seen": box_last_seen,
             # Arrays and payloads are *replaced* by their callbacks, never
             # mutated in place, so holding a reference is a safe snapshot.
             "depth_m": depth,
@@ -5213,7 +5227,7 @@ class NaviPlugin:
                     depth_m=snapshot["depth_m"],
                     decision=snapshot["decision"],
                     track=snapshot["track"],
-                    box=box, measured=measured,
+                    box=box, measured=measured, box_last_seen=snapshot["box_last_seen"],
                     clearance=snapshot["clearance"],
                     coverage=snapshot["coverage"],
                     rgb_jpeg=snapshot["jpeg"], blend=self._view_blend,
@@ -5272,11 +5286,11 @@ class NaviPlugin:
         threading one through it to draw a picture would put display concerns
         into the estimator. The cost is that this is a *display-time* guess —
         the nearest detection by bearing, of the right name — and when the
-        detector is not seeing the target at all there is simply no box, which
-        is itself the thing worth showing.
+        detector is not seeing a non-person target there is no box. The
+        person overlay uses the tracker association copied by the tick.
         """
         if snapshot.get("person"):
-            return snapshot["person_measurement"] or (None, None)
+            return snapshot["person_box"], snapshot["person_range"]
         payload = snapshot["objects"] or {}
         target = snapshot["target"]
         bearing = snapshot["bearing"]
