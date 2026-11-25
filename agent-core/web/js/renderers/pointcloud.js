@@ -14,6 +14,7 @@ const MAX_POINTS_PER_FRAME = 40000;
 
 export const PointCloudRenderer = {
   name: 'pointcloud',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint === 'sensor/pointcloud',
 
   _el: null,

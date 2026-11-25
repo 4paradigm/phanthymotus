@@ -18,6 +18,7 @@ export function isAudioEof(buffer) {
 
 export const AudioRenderer = {
   name: 'audio',
+  channels: ['data', 'event'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint && hint.startsWith('audio/'),
 
   _el:       null,

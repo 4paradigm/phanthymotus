@@ -6,7 +6,7 @@
 
 import { ActivityRenderer } from './renderers/activity.js';
 import { KvLatestRenderer } from './renderers/kv-latest.js';
-import { RENDERERS }        from './renderers/registry.js';
+import { instantiate, pickRenderer } from './renderers/registry.js';
 import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
@@ -479,11 +479,11 @@ function _switchMode(topicPath, newMode, modeBtns) {
 
 function _createRenderer(format, mode) {
   if (mode === 'kv') {
-    return Object.assign(Object.create(Object.getPrototypeOf(KvLatestRenderer)), KvLatestRenderer);
+    return instantiate(KvLatestRenderer);
   }
-  const hint = format || 'activity';
-  const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
-  return Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
+  // monitor only ever delivers topic frames; the channel filter keeps
+  // event-only renderers (image/video/lidar) from being picked and starved.
+  return instantiate(pickRenderer(format || 'activity', 'data'));
 }
 
 // ── Auto-placement helper ──────────────────────────────────────────────────────

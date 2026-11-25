@@ -3,6 +3,7 @@ import { decodeNestedJson, plainValue, escapeHtml } from './json-util.js';
 
 export const TextRenderer = {
   name: 'text',
+  channels: ['data', 'event'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint && (hint.startsWith('text/') || hint === 'data/json'),
   _el: null,
   _textEl: null,

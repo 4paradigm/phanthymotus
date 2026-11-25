@@ -4,16 +4,7 @@
  */
 
 import { connectMotus, onMotusEvent, offMotusEvent } from './motus-stream.js';
-import { ActivityRenderer } from './renderers/activity.js';
-import { TextRenderer }     from './renderers/text.js';
-import { VideoRenderer }    from './renderers/video.js';
-import { ImageRenderer }    from './renderers/image.js';
-import { CameraRenderer }   from './renderers/camera.js';
-import { AudioRenderer }    from './renderers/audio.js';
-import { LidarRenderer }    from './renderers/lidar.js';
-import { ControlRenderer }  from './renderers/control.js';
-
-const RENDERERS = [VideoRenderer, ImageRenderer, CameraRenderer, AudioRenderer, LidarRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
+import { instantiate, pickRenderer } from './renderers/registry.js';
 
 const PREVIEW_CAPACITY = 100;  // sliding window frame count per topic
 
@@ -367,7 +358,9 @@ function mountRenderer(skill) {
   }
 
   const hint     = skill.render_hint || 'activity';
-  const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
+  // no channel filter: the dashboard feeds BOTH channels to the main preview
+  // (motus events + topic buffer), so a renderer consuming either works.
+  const Renderer = pickRenderer(hint);
 
   const topicIn  = skill.topic_in?.[0]  || null;
   const topicOut = skill.topic_out?.[0] || null;
@@ -423,8 +416,7 @@ function mountRenderer(skill) {
 
     // Mount a renderer for in_topic based on its format — no playback (monitoring only)
     const inHint = topicIn.format || 'activity';
-    const InRenderer = RENDERERS.find(r => r.canRender(inHint)) || ActivityRenderer;
-    _inRenderer = Object.assign(Object.create(Object.getPrototypeOf(InRenderer)), InRenderer);
+    _inRenderer = instantiate(pickRenderer(inHint, 'data'));
     _inRenderer.mount(inBody, skill.id + '_in');
 
     // Attach to background buffer (replay last N frames then receive live data)
@@ -451,7 +443,7 @@ function mountRenderer(skill) {
     outBody.className = 'renderer-panel-body';
     outPanel.appendChild(outBody);
     rendererWrap.appendChild(outPanel);
-    _activeRenderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
+    _activeRenderer = instantiate(Renderer);
     _activeRenderer.mount(outBody, skill.id);
   } else {
     // Single panel
@@ -470,7 +462,7 @@ function mountRenderer(skill) {
     const bodyEl = document.createElement('div');
     bodyEl.className = 'renderer-panel-body';
     rendererWrap.appendChild(bodyEl);
-    _activeRenderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
+    _activeRenderer = instantiate(Renderer);
     _activeRenderer.mount(bodyEl, skill.id);
   }
 

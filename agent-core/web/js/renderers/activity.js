@@ -1,6 +1,7 @@
 /** activity.js — Default renderer: shows MCP request/response timeline */
 export const ActivityRenderer = {
   name: 'activity',
+  channels: ['data', 'event'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => !hint
     || hint.startsWith('sensor/') || hint.startsWith('control/')
     || hint.startsWith('state/')  || hint.startsWith('data/'),

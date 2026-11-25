@@ -34,6 +34,7 @@ const MOTOR_INDEX_MAP = [
 
 export const SkeletonRenderer = {
   name: 'skeleton',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint === 'sensor/skeleton',
 
   _el: null,

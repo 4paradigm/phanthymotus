@@ -37,6 +37,7 @@ export function parseTactilePayload(input) {
 
 export const TactileRenderer = {
   name: 'tactile',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: hint => hint === 'sensor/tactile',
   _canvas: null,
 

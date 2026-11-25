@@ -8,7 +8,7 @@
 
 import { ActivityRenderer } from './renderers/activity.js';
 import { TextRenderer }     from './renderers/text.js';
-import { RENDERERS }        from './renderers/registry.js';
+import { instantiate, pickRenderer } from './renderers/registry.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
 
 let _panel    = null;
@@ -97,10 +97,12 @@ export function showTopicDetail(topicPath, format, mcpId) {
   body.innerHTML = '';
 
   const hint     = format || 'activity';
-  const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
+  // detail-panel only delivers topic frames; the channel filter keeps
+  // event-only renderers (image/video/lidar) from being picked and starved.
+  const Renderer = pickRenderer(hint, 'data');
   _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
 
-  _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
+  _renderer = instantiate(Renderer);
   _renderer.mount(body, mcpId || 'dashboard');
 
   _frames = 0;

@@ -12,7 +12,7 @@ const source = read('./detail-panel.js');
 // real work happens, are replaced by the doubles below.
 const real = {};
 for (const file of ['activity', 'text', 'video', 'image', 'audio', 'lidar', 'control', 'pointcloud',
-                    'mapping', 'skeleton', 'pose2d', 'tactile', 'camera']) {
+                    'mapping', 'skeleton', 'pose2d', 'tactile', 'camera', 'battery']) {
   const body = read(`./renderers/${file}.js`)
     .replace(/^import[\s\S]*?;\r?$/gm, '').replace(/^export /gm, '');
   const names = [...body.matchAll(/^const (\w+Renderer) = /gm)].map(m => m[1]);
@@ -30,6 +30,7 @@ function harness() {
   const doubles = Object.fromEntries(Object.entries(real).map(([name, renderer]) => [name, {
     name,
     canRender: renderer.canRender,
+    channels: renderer.channels,
     mount(body, mcpId) { this.body = body; this.mcpId = mcpId; this.received = []; mounted.push(this); },
     onData(buffer, hint) { this.received.push({ buffer, hint }); },
     unmount() { unmounted.push(this); },
@@ -46,7 +47,7 @@ function harness() {
   }
   imports['./renderers/registry.js'] = runInNewContext(
     asConsts(registrySource, file => './renderers/' + file.slice(2)).replace(/^export /gm, '')
-      + '\n({ RENDERERS });', { imports });
+      + '\n({ RENDERERS, pickRenderer, instantiate });', { imports });
   imports['./renderers/activity.js'] = { ActivityRenderer: doubles.ActivityRenderer };
   imports['./renderers/text.js'] = { TextRenderer: doubles.TextRenderer };
   imports['./mobile.js'] = { openDetailPanelMobile() {}, closeDetailPanelMobile() {} };
@@ -126,7 +127,7 @@ test('mapping topics get the mapping renderer, as on the monitor page', () => {
 test('the monitor page and the detail panel share one renderer list', () => {
   for (const file of ['./detail-panel.js', './monitor-dashboard.js']) {
     const text = read(file);
-    assert.match(text, /^import \{ RENDERERS \}\s+from '\.\/renderers\/registry\.js';$/m, file);
+    assert.match(text, /from '\.\/renderers\/registry\.js';/, file);
     assert.doesNotMatch(text, /^const RENDERERS\b/m, `${file} must not keep its own copy`);
   }
 });

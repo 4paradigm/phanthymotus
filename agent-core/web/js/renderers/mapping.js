@@ -21,6 +21,7 @@ const MAX_POINTS = 80000;
 
 export const MappingRenderer = {
   name: 'mapping',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint === 'sensor/mapping',
 
   _el: null,

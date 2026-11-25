@@ -1,6 +1,7 @@
 /** image.js — Renders a static/updated image */
 export const ImageRenderer = {
   name: 'image',
+  channels: ['event'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint === 'image',
   _el: null,
   _img: null,

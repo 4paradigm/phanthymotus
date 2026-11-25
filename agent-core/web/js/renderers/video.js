@@ -1,6 +1,7 @@
 /** video.js — Renders MJPEG stream or base64 frame updates */
 export const VideoRenderer = {
   name: 'video',
+  channels: ['event'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint && hint.startsWith('video/'),
   _el: null,
   _img: null,

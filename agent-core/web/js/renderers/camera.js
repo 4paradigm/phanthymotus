@@ -115,6 +115,7 @@ export function paintDepth(u16, rgba, count) {
 
 export const CameraRenderer = {
   name: 'camera',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint === 'image/jpeg',
   _el: null,
   _img: null,
@@ -177,6 +178,7 @@ export const DepthRenderer = {
   // panel that renders nothing, with no hint that the driver is the thing to
   // update. It decodes no pixels; it only says what to do.
   name: 'depth-z16-retired',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint === 'image/depth-z16',
   _el: null,
 
@@ -202,6 +204,7 @@ export const DepthRenderer = {
 
 export const DepthZlibRenderer = {
   name: 'depth-zlib',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint === 'image/depth-zlib',
   _el: null,
   _canvas: null,

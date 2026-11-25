@@ -5,6 +5,7 @@
  */
 export const LidarRenderer = {
   name: 'lidar',
+  channels: ['event'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint && hint.startsWith('sensor/lidar'),
   _el: null,
   _canvas: null,

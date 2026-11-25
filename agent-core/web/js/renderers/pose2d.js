@@ -214,6 +214,7 @@ const MIN_CONFIDENCE = 0.3;
 
 export const Pose2dRenderer = {
   name: 'pose2d',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint === 'sensor/pose2d',
   _el: null,
   _canvas: null,

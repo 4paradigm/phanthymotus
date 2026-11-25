@@ -58,6 +58,7 @@ const STALE_AGE_MS = 200;
 
 export const ControlRenderer = {
   name: 'control',
+  channels: ['data'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => !!hint && hint.startsWith('control/'),
 
   _el: null,

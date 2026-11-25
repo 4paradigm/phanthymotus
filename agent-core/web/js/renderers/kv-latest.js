@@ -6,6 +6,7 @@ import { decodeNestedJson } from './json-util.js';
 
 export const KvLatestRenderer = {
   name: 'kv-latest',
+  channels: ['data', 'event'],   // frames consumed: 'data' topic frames, 'event' tool-call results
   canRender: (hint) => hint && (hint.startsWith('text/') || hint === 'data/json'),
 
   _el: null,
