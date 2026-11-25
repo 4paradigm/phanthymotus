@@ -487,14 +487,14 @@ class _VOPNode(Node):
         self._last_inference_time = now
         # Drop old frame if queue full (no backpressure)
         try:
-            self._frame_queue.put_nowait(msg.data)
+            self._frame_queue.put_nowait(msg)
         except queue.Full:
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._frame_queue.put_nowait(msg.data)
+                self._frame_queue.put_nowait(msg)
             except queue.Full:
                 pass
 
@@ -504,14 +504,14 @@ class _VOPNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                image_msg = self._frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             started = time.time()
             frame_time = time.monotonic()
             try:
                 frame = cv2.imdecode(
-                    np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
+                    np.frombuffer(image_msg.data, np.uint8), cv2.IMREAD_COLOR
                 )
                 if frame is None:
                     continue
@@ -527,11 +527,11 @@ class _VOPNode(Node):
                     obj["track_id"] = tracks[int(index)]
                 self._publish_objects(objects, started)
                 if self._pub_overlay is not None:
-                    self._publish_overlay_frame(frame, boxes[visible], objects)
+                    self._publish_overlay_frame(frame, boxes[visible], objects, image_msg.header)
             except Exception as e:
                 log.error(f"[vop] inference error: {e}", exc_info=True)
 
-    def _publish_overlay_frame(self, frame, boxes, objects):
+    def _publish_overlay_frame(self, frame, boxes, objects, source_header):
         import cv2
 
         # Boxes and pixels come from the same inference call.
@@ -557,6 +557,7 @@ class _VOPNode(Node):
         ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ok:
             message = CompressedImage()
+            message.header = source_header
             message.format = "jpeg"
             message.data = encoded.tobytes()
             self._pub_overlay.publish(message)

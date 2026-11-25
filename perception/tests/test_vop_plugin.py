@@ -387,9 +387,14 @@ def test_stream_can_publish_tracking_preview_with_bboxes_disabled():
         model=_FakeModel(rows=[[40, 40, 100, 90, 0.9, 1]]),
     )
     node = _node_with(plugin, executor)
-    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    source = _FakeCompressedImage(frame_bytes(200, 100))
+    source.header.stamp = 123456
+    source.header.frame_id = "camera_rgb_optical_frame"
+    node._image_cb(source)
     json_pub, image_pub = node.publishers
-    assert _wait_until(lambda: bool(image_pub.messages))
+    assert _wait_until(lambda: bool(image_pub.raw_messages))
+    assert image_pub.raw_messages[0].header.stamp == 123456
+    assert image_pub.raw_messages[0].header.frame_id == "camera_rgb_optical_frame"
     detected = json.loads(json_pub.messages[0])["objects"][0]
     assert detected["track_id"] == 1
     assert "bbox" not in detected
