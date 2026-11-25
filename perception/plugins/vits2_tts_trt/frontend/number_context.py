@@ -9,7 +9,7 @@ import datetime
 import re
 
 from .numeric_formats import find_spans as find_numeric_format_spans
-from .math_units import has_explicit_math_context
+from .math_units import _UNITS, has_explicit_math_context
 
 
 _DASH = r"\-‐‑‒–−﹣－"
@@ -33,6 +33,35 @@ _DATE_LIKE_RUN = re.compile(
     rf"(?<![A-Za-z0-9_.])\d{{4}}(?:[{_DASH}/.]\d*){{2,}}"
     rf"(?![A-Za-z0-9_]|[./{_DASH}][A-Za-z0-9_])"
 )
+_DATE_POINT = (
+    r"[0-9]{4}(?:\.[0-9]{1,2}\.[0-9]{1,2}|/[0-9]{1,2}/[0-9]{1,2}|-[0-9]{1,2}-[0-9]{1,2})"
+    r"|[0-9]{1,2}[./][0-9]{1,2}"
+)
+_CALENDAR_FIELD = re.compile(
+    rf"(?<![A-Za-z0-9_./\\+\-=])(?P<first>{_DATE_POINT})"
+    rf"(?:[ \t]*(?:[{_DASH}—~～]|到|至|\bto\b)[ \t]*(?P<last>{_DATE_POINT}))?"
+    rf"(?![A-Za-z0-9_/\\]|\.[A-Za-z0-9_.]|[{_DASH}—][0-9])", re.I,
+)
+_CALENDAR_CUE = re.compile(
+    r"(?:假期|放假|休假|假日|日程|日期|元旦|(?:会议|预约|活动|考试)(?:日期|时间|安排在|定于)|"
+    r"\b(?:dates?|holiday|vacation)\b)"
+    r"(?:[ \t:：（(]|大概率|预计|可能|安排|从|在|是|为|开始|结束|范围|\b(?:is|are|from|on|runs?)\b)*$", re.I,
+)
+_CALENDAR_NONDATE_CUE = re.compile(
+    r"(?:版本(?:号)?|版号|型号|机型|编号|金额|数量|温度|比例|计算|算式|公式|"
+    r"\b(?:versions?|models?|builds?|calculate|equation|formula)\b)"
+    r"(?:[ \t:：=]|为|是|从|范围|\b(?:is|are|from|range)\b)*$", re.I,
+)
+_CALENDAR_QUANTITY = re.compile(
+    r"[ \t]*(?:天(?!气)|周(?![一二三四五六日天])|个月|小时|分钟|秒|[%％元℃℉]|版本(?:号)?|"
+    r"个|条|台|份|项|次|人|件|张|页|套|本|组|公里|人民币|美元|欧元|"
+    r"(?:days?|weeks?|hours?|minutes?|seconds?|months?|years?|versions?|builds?|items?|records?|requests?|devices?|people|times?|rows?)\b|"
+    + "(?:" + "|".join(map(re.escape, sorted(set(_UNITS).union(
+        reading for labels in _UNITS.values() for reading in labels)))) + r")(?![A-Za-z0-9_]))", re.I,
+)
+_HOLIDAY_DURATION = re.compile(r"[ \t]*(?:连休|放假|休假)[ \t]*[0-9一二三四五六七八九十两]+[ \t]*天")
+_WEEKDAY = re.compile(r"[ \t]*(?:是[ \t]*)?(?:星期|周|礼拜)[一二三四五六日天](?![0-9一二三四五六七八九十])")
+_ADJACENT_MATH = "=+×÷*/^≥≤≠<>|"
 _TIME = re.compile(
     r"(?<![A-Za-z0-9_:])(?P<hour>\d{1,2})[:：](?P<minute>\d{2})"
     r"(?:[:：](?P<second>\d{2}))?(?![A-Za-z0-9_:：])"
@@ -150,6 +179,62 @@ def protected_identifier_ranges(text):
 
 def _date_is_math(text, start):
     return has_explicit_math_context(text, start)
+
+
+def _calendar_fields(text, extra_quantity=None):
+    """Yield calendar offsets and validated endpoints before arithmetic claims them."""
+    for match in _CALENDAR_FIELD.finditer(text):
+        first, last = match["first"], match["last"]
+        left = text[max(0, match.start() - 64):match.start()]
+        right = text[match.end():match.end() + 64]
+        weekday = last is None and first.count(".") == 1 and _WEEKDAY.match(right)
+        if last is None and first.count(".") != 2 and not weekday:
+            continue
+        if (_CALENDAR_NONDATE_CUE.search(left) or _CALENDAR_QUANTITY.match(right)
+                or (extra_quantity is not None and extra_quantity.match(right))
+                or _date_is_math(left, len(left))
+                or (left.rstrip()[-1:] or " ") in _ADJACENT_MATH
+                or (right.lstrip()[:1] or " ") in _ADJACENT_MATH
+                or re.match(rf"[ \t]*[{_DASH}—][ \t]*[0-9]", right)):
+            continue
+        cue = _CALENDAR_CUE.search(left)
+        parts = [int(part) for part in re.split(r"[./-]", first)]
+        has_year = len(parts) == 3
+        if cue is None and not weekday and (last is None or (not has_year and not _HOLIDAY_DURATION.match(right))):
+            continue
+        year, month, day = parts if has_year else (2000, *parts)
+        try:
+            start = datetime.date(year, month, day)
+            endpoints = [(start, has_year)]
+            if last is not None:
+                tail = [int(part) for part in re.split(r"[./-]", last)]
+                end_has_year = len(tail) == 3
+                if end_has_year and not has_year:
+                    continue
+                end = datetime.date(*(tail if end_has_year else (year + (tail[0] < month), *tail)))
+                if end < start:
+                    continue
+                endpoints.append((end, end_has_year))
+        except ValueError:
+            continue
+        yield match.start(), match.end(), endpoints
+
+
+def find_calendar_spans(text, language, verbalize_number, *, extra_quantity=None):
+    """Read additional calendar forms for callers that opt into them."""
+    language = language.upper()
+    zh = language == "ZH"
+
+    def speak(value, has_year):
+        if zh:
+            year = _digits(f"{value.year:04d}", language) + "年" if has_year else ""
+            return year + verbalize_number(str(value.month), language) + "月" + verbalize_number(str(value.day), language) + "日"
+        words = f"{_MONTHS[value.month]} {_DAYS[value.day]}"
+        return words + " " + verbalize_number(str(value.year), language) if has_year else words
+
+    for start, end, endpoints in _calendar_fields(text, extra_quantity):
+        if zh or endpoints[0][1]:
+            yield start, end, ("至" if zh else " to ").join(speak(*part) for part in endpoints)
 
 
 def malformed_date_ranges(text):

@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Optional
 
 import numpy as np
@@ -29,6 +31,15 @@ from utils.resample import downsample_24k_to_16k
 from plugins.zh_text_norm import ZhTextNormalizer
 
 log = logging.getLogger(__name__)
+
+XIAOYOU_TTS_ENGINE = "xiaoyou-zh-en"
+XIAOYOU_LANGUAGES = ("zh", "en")
+_XIAOYOU_FIXED_SETTINGS = {
+    "xiaoyou_device": "gpu",
+    "xiaoyou_speaker_id": 0,
+    "xiaoyou_speed": 1.0,
+}
+_XIAOYOU_CONFIG_KEYS = ("xiaoyou_language", "runtime_manifest_sha256", *_XIAOYOU_FIXED_SETTINGS)
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms @ 16kHz 16-bit mono
@@ -239,12 +250,13 @@ TOOLS = [
                 # without rebuilding the image. Mirrors asr_model in asr.py.
                 "tts_engine": {"type": "string",
                                "enum": ["vits2-zh-en", "matcha-zh-en", "mms-th",
-                                        "kokoro-multi"],
+                                        "kokoro-multi", XIAOYOU_TTS_ENGINE],
                                "description": "TTS engine, named <model>-<languages> to match "
                                               "asr_model (vits2-zh-en = VITS2 on TensorRT, "
                                               "matcha-zh-en = Matcha-icefall, "
                                               "mms-th = MMS Thai, "
-                                              "kokoro-multi = Kokoro-82M v1.0)",
+                                              "kokoro-multi = Kokoro-82M v1.0, "
+                                              "xiaoyou-zh-en = Xiaoyou on TensorRT FP32)",
                                "default": "vits2-zh-en", "scope": "shared"},
                 # matcha-zh-en, mms-th and kokoro-multi only — vits2-zh-en is a
                 # TensorRT engine and never touches ONNX Runtime, so this field does
@@ -262,6 +274,9 @@ TOOLS = [
                                 "default": "cpu", "scope": "shared",
                                 "x-show-when": {"tts_engine": ["matcha-zh-en", "mms-th",
                                                                "kokoro-multi"]}},
+                "xiaoyou_device": {"title": "Inference device", "type": "string",
+                                   "enum": [_XIAOYOU_FIXED_SETTINGS["xiaoyou_device"]], "default": "gpu",
+                                   "scope": "shared", "x-show-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
                 # Kokoro takes `lang` per generate() call, so this is a scale on the
                 # resident model like `speed` — not a session key.
                 #
@@ -287,6 +302,11 @@ TOOLS = [
                                    "voice for the non-Chinese parts of the text",
                     "default": "en-us", "scope": "shared",
                     "x-show-when": {"tts_engine": ["kokoro-multi"]}},
+                "xiaoyou_language": {
+                    "type": "string", "enum": ["auto", *XIAOYOU_LANGUAGES],
+                    "description": "Pronunciation language for xiaoyou-zh-en. Auto reads by context.",
+                    "default": "auto", "scope": "shared",
+                    "x-show-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
                 # Thai has no spaces between words, and MMS was trained on text
                 # that spaced only phrase boundaries. Segmenting every word may
                 # help prosody or hurt it — off until it has been A/B'd on device.
@@ -296,8 +316,16 @@ TOOLS = [
                                    "experimental — may change prosody either way)",
                     "default": False, "scope": "shared",
                     "x-show-when": {"tts_engine": "mms-th"}},
-                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared"},
-                "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
+                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared",
+                               "x-hide-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
+                "xiaoyou_speaker_id": {"title": "Speaker ID", "type": "integer",
+                                       "enum": [_XIAOYOU_FIXED_SETTINGS["xiaoyou_speaker_id"]], "default": 0,
+                                       "scope": "shared", "x-show-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
+                "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared",
+                               "x-hide-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
+                "xiaoyou_speed": {"title": "Speech speed (1.0 = normal)", "type": "number",
+                                  "enum": [_XIAOYOU_FIXED_SETTINGS["xiaoyou_speed"]], "default": 1.0,
+                                  "scope": "shared", "x-show-when": {"tts_engine": XIAOYOU_TTS_ENGINE}},
             },
             "required": []
         },
@@ -2160,7 +2188,7 @@ DEFAULT_TTS_ENGINE = "vits2-zh-en"
 # `matcha` and `mms-th` both run on sherpa-onnx.
 #
 # Language codes, not country codes: `zh`, not `cn`.
-TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th", "kokoro-multi")
+TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th", "kokoro-multi", XIAOYOU_TTS_ENGINE)
 # What each engine can speak, in the codes the rest of this file uses. Answered
 # by action=support_language straight from the facade: it is a property of the
 # engine, not of a loaded model, so it works while an engine is still loading.
@@ -2171,6 +2199,7 @@ ENGINE_LANGUAGES = {
     "matcha-zh-en": ("zh", "en"),
     "mms-th": ("th",),
     "kokoro-multi": KokoroTTSAdapter.LANGUAGES,
+    XIAOYOU_TTS_ENGINE: XIAOYOU_LANGUAGES,
 }
 # Older spellings, still accepted. `vits2_trt` and `sherpa_onnx` are not
 # decoration: both are already persisted in ConfigDB rows and in config.yaml on
@@ -2201,6 +2230,7 @@ ENGINE_MODEL_DIRS = {
     # it: the two devices load different weight files (fp32 vs int8), so they are
     # separate downloads that must not overwrite each other.
     "kokoro-multi": "/models/kokoro-multi",
+    XIAOYOU_TTS_ENGINE: "/models/xiaoyou01",
 }
 # Where an engine wants to run when nothing has been configured. Only Kokoro
 # differs: it is a 310 MB fp32 graph on gpu and the CUDA provider is worth having,
@@ -2232,14 +2262,9 @@ class TTSPlugin:
     the new one on a background thread, because sherpa-onnx downloads its Matcha
     model in its constructor and that is open-ended.
 
-    `action=config` then waits up to ENGINE_SWITCH_WAIT_S for that build and only
-    answers `loading` if it is still going, so the bounded part — constructing the
-    session, ~2 s on cpu and ~5 s on gpu — is not something callers have to poll
-    for. It can afford to wait: the dashboard's start-project path
-    (agent-core/src/api/mcp_manage.py mcp_call_tool) sets no client timeout at all,
-    and its loading watcher polls for up to 900 s. The 60 s figure that used to be
-    cited here belongs to the *LLM* tool path (agent-core/src/mcp_client.py), which
-    does not send config.
+    Xiaoyou returns `loading` while it builds so the dashboard can start polling
+    and show model download progress. Other engines wait up to ENGINE_SWITCH_WAIT_S
+    for the bounded session construction, then let the dashboard poll if needed.
     """
 
     PREFIX = "tts"
@@ -2248,10 +2273,16 @@ class TTSPlugin:
         self._cfg = dict(plugin_cfg)
         self._executor = executor
         self._lock = threading.Lock()
+        self._build_lock = threading.Lock()
+        self._xiaoyou_replay_lock = threading.Lock()
+        self._build_revision = 0
+        self._retiring_impl = None
+        self._closed = False
         self._impl = None
         self._impl_engine = ""
         self._building = ""          # engine name while a build is in flight
         self._build_error = None
+        self._xiaoyou_build_status = None
         # `start` calls that arrived while a build was in flight, keyed by
         # instance_id, replayed against the new engine once it is resident. Agent
         # Core's contract for a start that answers `state: loading` is that the
@@ -2262,8 +2293,10 @@ class TTSPlugin:
         # the same batch, which is exactly what the dashboard does, left the card
         # cancelled even though the engine had loaded fine.
         self._pending_starts: dict[str, dict] = {}
-        engine = self._select_engine(self._cfg.get("engine")
-                                     or self._cfg.get("tts_engine"))
+        configured_engine = self._select_engine(self._cfg.get("engine")
+                                                or self._cfg.get("tts_engine"))
+        engine = (XIAOYOU_TTS_ENGINE if os.environ.get("XIAOYOU_TTS_ENABLE") == "1"
+                  else configured_engine)
         self._engine = engine
         # model_dir is per engine: sherpa-onnx wants its Matcha/vocoder pair,
         # VITS2 wants its TensorRT release. config.yaml carries one model_dir,
@@ -2271,7 +2304,7 @@ class TTSPlugin:
         # other engine made sherpa download its models into /models/vits2 and
         # then try to load them from there. So the configured path applies only
         # to the configured engine; every other engine gets its own default.
-        self._configured_engine = engine
+        self._configured_engine = configured_engine
         self._configured_model_dir = self._cfg.get("model_dir") or ""
         # Built inline at startup so info/start are immediately truthful, and so
         # a misconfigured engine shows up in the boot log rather than on the
@@ -2305,12 +2338,18 @@ class TTSPlugin:
             return self._configured_model_dir
         return ENGINE_MODEL_DIRS[engine]
 
-    def _build(self, engine: str):
-        cfg = dict(self._cfg)
-        cfg["engine"] = engine
-        cfg["model_dir"] = self._model_dir_for(engine)
-        impl = (self._build_vits2(cfg) if engine == "vits2-zh-en"
-                else SherpaOnnxTTSPlugin(cfg, self._executor))
+    def _build(self, engine: str, *, revision: int | None = None):
+        with self._lock:
+            cfg = dict(self._cfg)
+        if engine == XIAOYOU_TTS_ENGINE:
+            impl = self._build_xiaoyou(cfg, revision=revision)
+        else:
+            for key in _XIAOYOU_CONFIG_KEYS:
+                cfg.pop(key, None)
+            cfg["engine"] = engine
+            cfg["model_dir"] = self._model_dir_for(engine)
+            impl = (self._build_vits2(cfg) if engine == "vits2-zh-en"
+                    else SherpaOnnxTTSPlugin(cfg, self._executor))
         # An implementation may swallow its own model-load failure and come back
         # as an object that reports error through info (sherpa does exactly
         # that). Installing it would make the facade claim ready and let a start
@@ -2328,62 +2367,129 @@ class TTSPlugin:
 
         return Vits2TTSPlugin(cfg, self._executor)
 
-    def _build_async(self, engine: str) -> None:
-        """Build an engine off the request thread; the old one is already gone."""
-        def _run():
-            try:
-                impl = self._build(engine)
-            except Exception as error:  # noqa: BLE001
-                log.error("[tts] failed to build engine %r: %s", engine, error,
-                          exc_info=True)
-                with self._lock:
-                    if self._building == engine:
-                        self._building = ""
-                        self._build_error = str(error)
-                return
-            stale = None
-            replay = []
-            with self._lock:
-                if self._building != engine:
-                    stale = impl          # another switch superseded this one
-                else:
-                    self._impl = impl
-                    self._impl_engine = engine
-                    self._building = ""
-                    self._build_error = None
-                    replay = list(self._pending_starts.values())
-                    self._pending_starts.clear()
-            if stale is not None:
-                _dispose_impl(stale)
-                return
+    def _build_xiaoyou(self, cfg: dict, *, revision: int | None):
+        from plugins.xiaoyou_tts.plugin import TTSPlugin as XiaoYouTTSPlugin
+        from plugins.xiaoyou_tts.runtime.model_bundle import resolve_runtime_manifest_pin
 
-            # Honour the starts that arrived mid-build. Without this the engine
-            # comes up idle, and Agent Core — which polls `info` after a start
-            # answered `loading` — reports the card as "启动已取消".
-            for start_args in replay:
-                instance = (start_args.get("instance_id")
-                            or start_args.get("input_topic") or "?")
-                try:
-                    log.info("[tts] replaying start deferred during the %s build: %s",
-                             engine, instance)
-                    result = impl.dispatch("tts", start_args) or {}
-                except Exception:
-                    log.error("[tts] deferred start failed after the %s build",
-                              engine, exc_info=True)
-                    continue
-                # dispatch REPORTS failure, it does not raise it — start() returns
-                # {"state": "error", ...} for a failed dry-run — so the except above
-                # never fired and a replayed start that failed was completely
-                # silent. That is what made a broken Thai start look like a
-                # successful one: the only trace was the frontend's own warning,
-                # and the card kept whatever state Agent Core inferred from
-                # polling. Inspect the result.
-                if result.get("state") == "error":
-                    log.error("[tts] deferred start for %s failed after the %s "
-                              "build: %s", instance, engine,
-                              result.get("message") or result.get("desc") or result)
+        configured = self._configured_engine == XIAOYOU_TTS_ENGINE
+        pin = resolve_runtime_manifest_pin(cfg.get("runtime_manifest_sha256") if configured else None)
+        model_dir = (os.environ.get("XIAOYOU_V6_MODEL_DIR")
+                     or f"{ENGINE_MODEL_DIRS[XIAOYOU_TTS_ENGINE]}/{pin[:12]}")
+
+        def on_status(message):
+            with self._lock:
+                if self._building == XIAOYOU_TTS_ENGINE and revision == self._build_revision:
+                    self._xiaoyou_build_status = message
+
+        return XiaoYouTTSPlugin({
+            "engine": XIAOYOU_TTS_ENGINE,
+            "model_dir": model_dir,
+            "runtime_manifest_sha256": pin,
+            "language": cfg.get("xiaoyou_language", "auto"),
+            "warmup": cfg.get("warmup", True) if configured else True,
+            "pace_audio": os.environ.get("XIAOYOU01_TTS_BENCHMARK") != "1",
+        }, self._executor, on_status=on_status if revision is not None else None)
+
+    def _wait_for_vits_load(self, impl) -> None:
+        # VITS2 stop clears pending nodes, but the initial adapter may still
+        # be downloading/loading. Its public info retains that state after stop.
+        while (impl.dispatch("tts", {"action": "info"}) or {}).get("state") == "loading":
+            with self._lock:
+                if self._closed:
+                    return
+            time.sleep(0.1)
+
+    def _dispose_retiring(self, incoming: str = "") -> None:
+        with self._lock:
+            retiring = self._retiring_impl
+        if retiring is not None:
+            engine, impl = retiring
+            wait_for_load = (self._wait_for_vits_load if engine == DEFAULT_TTS_ENGINE
+                             and incoming == XIAOYOU_TTS_ENGINE else None)
+            _dispose_impl(impl, wait_for_load)
+            with self._lock:
+                self._retiring_impl = None
+
+    def _build_async(self, engine: str, revision: int) -> None:
+        """Release outgoing resources and build off the request thread."""
+        def _run():
+            # Superseded builds and their cleanup share this slot. An older
+            # TensorRT engine must release its lease before another can load.
+            with self._build_lock:
+                with self._lock:
+                    if revision != self._build_revision:
+                        return
+                self._finish_build(engine, revision)
 
         threading.Thread(target=_run, name=f"tts-engine-{engine}", daemon=True).start()
+
+    def _finish_build(self, engine: str, revision: int) -> None:
+        try:
+            self._dispose_retiring(engine)
+            with self._lock:
+                if revision != self._build_revision:
+                    return
+            impl = self._build(engine, revision=revision)
+        except Exception as error:  # noqa: BLE001
+            log.error("[tts] failed to build engine %r: %s", engine, error, exc_info=True)
+            with self._lock:
+                if revision == self._build_revision:
+                    self._building = ""
+                    self._build_error = str(error)
+                    self._xiaoyou_build_status = None
+            return
+
+        with self._xiaoyou_replay_lock if engine == XIAOYOU_TTS_ENGINE else nullcontext():
+            self._install_and_replay(engine, impl, revision)
+
+    def _install_and_replay(self, engine: str, impl, revision: int) -> None:
+        xiaoyou = engine == XIAOYOU_TTS_ENGINE
+        with self._lock:
+            stale = revision != self._build_revision
+            if stale:
+                self._retiring_impl = (engine, impl)
+            else:
+                if xiaoyou:
+                    impl.dispatch("tts", {"action": "config",
+                                         "language": self._cfg.get("xiaoyou_language", "auto")})
+                self._impl = impl
+                self._impl_engine = engine
+                self._building = ""
+                self._build_error = None
+                self._xiaoyou_build_status = None
+                replay = list(self._pending_starts)
+        if stale:
+            try:
+                self._dispose_retiring()
+            except Exception:
+                log.error("[tts] failed to release the superseded engine", exc_info=True)
+            return
+
+        for key in replay:
+            with self._lock:
+                if revision != self._build_revision:
+                    break
+                # Keep Xiaoyou's start visible to info until its synchronous
+                # ROS publisher and speech session have actually started.
+                start_args = (self._pending_starts.get(key) if xiaoyou
+                              else self._pending_starts.pop(key, None))
+            if start_args is None:
+                continue
+            try:
+                result = impl.dispatch("tts", start_args) or {}
+            except Exception:
+                log.error("[tts] deferred start for %s failed after the %s build", key or "?",
+                          engine, exc_info=True)
+                continue
+            finally:
+                if xiaoyou:
+                    with self._lock:
+                        if (revision == self._build_revision
+                                and self._pending_starts.get(key) is start_args):
+                            self._pending_starts.pop(key)
+            if result.get("state") == "error":
+                log.error("[tts] deferred start for %s failed after the %s build: %s", key or "?", engine,
+                          result.get("message") or result.get("desc") or result)
 
     def get_tools(self) -> list:
         return TOOLS
@@ -2403,8 +2509,27 @@ class TTSPlugin:
             impl = self._impl
             building = self._building
             error = self._build_error
+            load_status = self._xiaoyou_build_status
             engine = self._engine
+            key = args.get("instance_id") or args.get("input_topic") or ""
+            if action == "stop":
+                if key:
+                    self._pending_starts.pop(key, None)
+                else:
+                    self._pending_starts.clear()
+            if (action == "info" and impl is not None and engine == XIAOYOU_TTS_ENGINE
+                    and key in self._pending_starts):
+                return {"engine": engine, "state": "loading", "desc": "正在启动小优音频输出"}
         if impl is not None:
+            if engine == XIAOYOU_TTS_ENGINE and action in ("start", "stop"):
+                # A stop can cancel an unclaimed start immediately. If replay
+                # has already claimed it, stop the session after it starts.
+                with self._xiaoyou_replay_lock:
+                    with self._lock:
+                        current = self._impl is impl
+                    if current:
+                        return impl.dispatch(name, args)
+                return self.dispatch(name, args)
             result = impl.dispatch(name, args)
             if isinstance(result, dict) and action == "info":
                 # Assignment, not setdefault: the facade is the only thing that
@@ -2425,7 +2550,7 @@ class TTSPlugin:
             result = {
                 "name": "TTS", "manufacture": "Embodied", "model": engine,
                 "engine": engine, "state": state,
-                "desc": (f"Switching to the {building} engine..." if building
+                "desc": (load_status or f"Switching to the {building} engine..." if building
                          else f"Engine {engine} failed to load: {error}"),
             }
             if state == "error" and error:
@@ -2438,6 +2563,8 @@ class TTSPlugin:
                 # not a rare race — and _build_async replays it.
                 with self._lock:
                     if self._building:
+                        building = self._building
+                        load_status = self._xiaoyou_build_status
                         key = args.get("instance_id") or args.get("input_topic") or ""
                         self._pending_starts[key] = dict(args)
                         deferred = True
@@ -2448,18 +2575,12 @@ class TTSPlugin:
             elif action == "stop":
                 # Cancel a deferred start rather than letting it revive the node
                 # after the operator asked for it to stop.
-                with self._lock:
-                    key = args.get("instance_id") or args.get("input_topic") or ""
-                    if key in self._pending_starts:
-                        self._pending_starts.pop(key, None)
-                    elif not key:
-                        self._pending_starts.clear()
                 return {"state": "idle"}
             return {"state": "loading",
-                    "message": f"TTS engine {building} is initializing, retry shortly"}
+                    "message": load_status or f"TTS engine {building} is initializing, retry shortly"}
         return {"state": "error", "message": f"TTS engine {engine} failed: {error}"}
 
-    def _await_build(self, engine: str, timeout_s: float) -> tuple[bool, str | None]:
+    def _await_build(self, engine: str, revision: int, timeout_s: float) -> tuple[bool, str | None]:
         """Wait for an in-flight build. Returns (ready, error).
 
         `ready` false with no error means it is still going, which is the caller's
@@ -2470,7 +2591,7 @@ class TTSPlugin:
         deadline = time.monotonic() + timeout_s
         while True:
             with self._lock:
-                if self._engine != engine:
+                if revision != self._build_revision:
                     return False, None          # superseded by a newer switch
                 if self._impl is not None and self._impl_engine == engine:
                     return True, None
@@ -2487,31 +2608,55 @@ class TTSPlugin:
         """Apply shared config, switching engines when tts_engine changes."""
         requested = args.get("tts_engine") or args.get("engine")
         forwarded = {k: v for k, v in args.items()
-                     if k not in ("tts_engine", "engine")}
-        for key in SHARED_CONFIG_KEYS:
-            if key in args:
-                self._cfg[key] = args[key]
+                     if k not in ("tts_engine", "engine", *_XIAOYOU_CONFIG_KEYS)}
+        with self._lock:
+            if self._closed:
+                return {"state": "error", "message": "TTS plugin has shut down"}
+            engine = self._select_engine(requested) if requested else self._engine
+            already_building = self._building == engine
+            switching = requested and not already_building and (
+                engine != self._impl_engine or self._impl is None)
+            if engine == XIAOYOU_TTS_ENGINE:
+                for key, supported in _XIAOYOU_FIXED_SETTINGS.items():
+                    if key in args and (isinstance(args[key], bool) or args[key] != supported):
+                        return {"state": "error", "message": f"{key} must be {supported}"}
+                if switching:
+                    from plugins.xiaoyou_tts.frontend.phonemizer import require_runtime
+
+                    try:
+                        require_runtime()
+                    except RuntimeError as error:
+                        return {"status": "error", "state": "error", "engine": self._engine,
+                                "message": str(error)}
+                forwarded = {}
+                if "xiaoyou_language" in args:
+                    language = args["xiaoyou_language"]
+                    if language not in ("auto", *XIAOYOU_LANGUAGES):
+                        return {"state": "error", "message": "xiaoyou_language must be auto, zh or en"}
+                    self._cfg["xiaoyou_language"] = language
+                    if self._impl is not None and self._impl_engine == engine:
+                        return self._impl.dispatch(name, {"action": "config", "language": language})
+            else:
+                for key in SHARED_CONFIG_KEYS:
+                    if key in forwarded:
+                        self._cfg[key] = args[key]
+
+            if switching:
+                if self._impl is not None:
+                    self._retiring_impl = (self._impl_engine, self._impl)
+                    self._impl = None
+                self._impl_engine = ""
+                self._engine = engine
+                self._cfg["engine"] = engine
+                self._building = engine
+                self._build_error = None
+                self._xiaoyou_build_status = None
+                self._build_revision += 1
+            revision = self._build_revision
 
         if requested:
-            engine = self._select_engine(requested)
-            with self._lock:
-                already_building = self._building == engine
-                switching = not already_building and (
-                    engine != self._impl_engine or self._impl is None)
-                if switching:
-                    outgoing, self._impl = self._impl, None
-                    self._impl_engine = ""
-                    self._engine = engine
-                    self._cfg["engine"] = engine
-                    self._building = engine
-                    self._build_error = None
             if switching:
-                # Stop the old engine's nodes before the new one publishes on
-                # the same topics — two live TTS publishers on one topic is the
-                # duplicate-audio failure mode in README § Plugin Concurrency.
-                if outgoing is not None:
-                    _dispose_impl(outgoing)
-                self._build_async(engine)
+                self._build_async(engine, revision)
                 log.info("[tts] switching engine to %s", engine)
             if switching or already_building:
                 if already_building:
@@ -2523,31 +2668,34 @@ class TTSPlugin:
                     # cold CUDA build the card never settles and just reloads
                     # the model over and over. Ride the in-flight build instead.
                     log.info("[tts] config for %s while already building; "
-                              "waiting on the in-flight build instead of "
+                              "using the in-flight build instead of "
                               "starting another", engine)
-                # Wait for it, up to a bound. Only part of a build is open-ended
-                # (downloading a model); constructing the session afterwards took
-                # ~2 s on cpu and ~5 s on gpu, and answering `loading` for that is
-                # what made the dashboard send a start the engine could not honour.
-                # A time bound rather than "does it need to download" because the
-                # download is not the only slow phase — the gpu paraformer encoder
-                # is 636 MB and reading it cold takes seconds on its own.
-                ready, error = self._await_build(engine, ENGINE_SWITCH_WAIT_S)
+                # Core sends start only after config returns. Let it queue start
+                # and poll Xiaoyou's progress while the model is still downloading.
+                timeout_s = 0.0 if engine == XIAOYOU_TTS_ENGINE else ENGINE_SWITCH_WAIT_S
+                ready, error = self._await_build(engine, revision, timeout_s)
                 if error:
                     return {"status": "error", "engine": engine,
                             "state": "error", "message": error}
                 if ready:
                     log.info("[tts] engine %s ready", engine)
                     return {"status": "configured", "engine": engine}
+                with self._lock:
+                    load_status = (self._xiaoyou_build_status
+                                   if revision == self._build_revision else None)
                 return {"status": "configured", "state": "loading",
-                        "engine": engine,
-                        "message": f"loading the {engine} engine"}
+                        "engine": engine, "message": load_status or f"loading the {engine} engine"}
 
         with self._lock:
             impl = self._impl
-            engine = self._engine
-        if impl is None:
-            return {"status": "configured", "state": "loading", "engine": engine}
+            current = self._engine
+            already_changed = revision != self._build_revision
+            load_status = None if already_changed else self._xiaoyou_build_status
+        if impl is None or already_changed or current != engine:
+            result = {"status": "configured", "state": "loading", "engine": engine}
+            if load_status:
+                result["message"] = load_status
+            return result
         result = impl.dispatch(name, {**forwarded, "action": "config"})
         if isinstance(result, dict):
             result.setdefault("engine", engine)
@@ -2563,13 +2711,41 @@ class TTSPlugin:
             raise RuntimeError(f"TTS engine {engine} not ready: {error or 'loading'}")
         return impl.synthesize_raw(text)
 
+    def shutdown(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._build_revision += 1
+            self._building = ""
+            self._xiaoyou_build_status = None
+            self._pending_starts.clear()
+            if self._impl is not None:
+                self._retiring_impl = (self._impl_engine, self._impl)
+                self._impl = None
+            retiring = self._retiring_impl is not None
+        # A model download holds no ROS node yet. Its worker discards the
+        # result after closing rather than holding up Perception shutdown.
+        if not self._build_lock.acquire(blocking=retiring):
+            return
+        try:
+            self._dispose_retiring()
+        finally:
+            self._build_lock.release()
 
-def _dispose_impl(impl) -> None:
+
+def _dispose_impl(impl, wait_for_load=None) -> None:
     """Stop every node an engine implementation owns before dropping it."""
+    shutdown = getattr(impl, "shutdown", None)
+    if shutdown is not None:
+        shutdown()
+        return
     try:
         impl.dispatch("tts", {"action": "stop"})
     except Exception:
         log.error("[tts] failed to stop the outgoing engine", exc_info=True)
+        if wait_for_load is not None:
+            raise
+    if wait_for_load is not None:
+        wait_for_load(impl)
     # Kokoro's Japanese path may own a worker process. Dropping the impl does not
     # reap it — a child is not garbage — and on `device: gpu` it is holding a CUDA
     # context the incoming engine is about to want.

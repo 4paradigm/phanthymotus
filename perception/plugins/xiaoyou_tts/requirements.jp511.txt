@@ -1,0 +1,15 @@
+# Private Xiaoyou frontend for JetPack 5.1.1 (Python 3.8).
+numpy==1.24.4
+misaki==0.9.4
+spacy==3.7.5
+thinc==8.2.4
+blis==0.7.11
+regex==2024.11.6
+cn2an==0.5.24
+jieba==0.42.1
+pypinyin==0.55.0
+pypinyin-dict==0.9.0
+espeakng-loader==0.2.4
+phonemizer-fork==3.3.2
+num2words==0.5.14
+ordered-set==4.1.0

@@ -655,6 +655,7 @@ and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
 | `matcha-zh-en` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
 | `mms-th` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-th` |
 | `kokoro-multi` | Kokoro-82M v1.0 | 英 / 中 / 日 / 西 / 法 / 意 / 葡 / 印地, code-switching | ONNX Runtime | `/models/kokoro-multi/<device>` |
+| `xiaoyou-zh-en` | Xiaoyou 01yuewen | 中 / 英, code-switching | TensorRT FP32 (JetPack 5.1.1 and 6.1) | `/models/xiaoyou01/<manifest prefix>` |
 
 `vits2_trt` and `sherpa_onnx` still resolve, via `ENGINE_ALIASES` in
 `plugins/tts.py`, and underscores fold to hyphens first so `vits2_zh_en` works too.
@@ -665,6 +666,64 @@ unknown engine — so dropping them would put every existing TTS card into
 
 Only one engine is resident at a time. Switching disposes the outgoing one's nodes
 first, because two live publishers on one audio topic play both voices at once.
+
+### `xiaoyou-zh-en`, the bilingual Xiaoyou voice
+
+The standard Jetson image includes Xiaoyou's frontend by default with
+`ENABLE_XIAOYOU_TTS=1`. The TTS card selects its engine after deployment, so
+the image includes the pinned native frontend needed for that selection.
+Building and checking these dependencies once makes engine switching work
+offline with the Python ABI and package versions exercised by image CI.
+Installing them when the operator selects an engine would add package
+resolution and native-extension installation to the running service. The
+current runtime download contract covers verified model archives.
+
+This default increases image size. The published
+`release.261123.9e1f35a-jetson-jp5.11` and
+`release.261123.9e1f35a-jetson-jp6.1` manifests contain the following frontend
+installation layers.
+
+| Platform | Compressed frontend layer | Share of compressed image |
+|---|---:|---:|
+| JP5.11 | 90,238,397 bytes (86.1 MiB) | 1.32% |
+| JP6.1 | 160,244,150 bytes (152.8 MiB) | 1.94% |
+
+These are registry transfer sizes for the frontend layer. Extracted filesystem
+usage is a separate measurement. Model and dictionary archives are downloaded
+on first engine selection into the mounted model cache.
+
+The speech frontend runs in a private environment at `/opt/xiaoyou-tts`.
+JP5.1.1 uses the image's Python 3.8, the versions pinned in
+`plugins/xiaoyou_tts/requirements.jp511.txt`, and a pinned 12.8 MB English
+pipeline (spaCy `en_core_web_sm` 3.7.1). JP6.1 uses the image's Python 3.10
+and loads its pinned English pipeline 3.8.0 from the Xiaoyou runtime bundle.
+Build with `--build-arg ENABLE_XIAOYOU_TTS=0` to omit the frontend when the
+deployment uses other engines. Selecting Xiaoyou in that image reports a
+missing frontend error.
+
+The TTS card offers contextual (`auto`), Chinese (`zh`) and English (`en`)
+reading. This runtime accepts Speaker ID `0` (01yuewen), Speech speed `1.0`
+and Inference device `gpu`.
+
+On first selection, Xiaoyou fetches the ModelScope runtime archive for the
+JetPack version whose revision, size and SHA-256 are pinned in
+`plugins/xiaoyou_tts/runtime/model_bundle.py`. The card shows the download
+percentage and the extraction phase. The loader verifies the archive, runtime
+manifest and individual files before making the cache available. On later
+selections it verifies and reuses the cached bundle. Watch for the extraction
+and load phases after the download reaches 100%.
+
+The legacy Darvin launcher is opt-in with `XIAOYOU_TTS_DARVIN=1`. For a
+benchmark run, bind-mount the official `/opt/phanthy-motus/dds-local.xml`
+read-only at the same path in Perception and the evaluator. Both must use
+FastDDS (`RMW_IMPLEMENTATION=rmw_fastrtps_cpp`), the same ROS domain, and this
+loopback profile through `FASTRTPS_DEFAULT_PROFILES_FILE`. Set
+`FASTDDS_DEFAULT_PROFILES_FILE` to that same path if the evaluator uses it.
+Leave `FASTDDS_BUILTIN_TRANSPORTS` unset. Perception sets both profile variable
+spellings to the official path in the benchmark launcher and stops startup if
+the mounted file is missing or differs from the official profile. This keeps
+host-network benchmark traffic on the same machine. The standard Perception
+service supplies its DDS profile through `deploy/service.yml`.
 
 ### Chinese number normalisation is applied by us, never by `rule_fsts`
 
