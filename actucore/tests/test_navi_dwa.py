@@ -929,3 +929,24 @@ def test_route_ranking_does_not_override_collision_checks():
     guarded = _run(straight, alternate_routes=(turn,), previous=(.3, 0., 0.),
                    validate_candidate=lambda cmd, *_: dwa.CandidateCheck(cmd[2] < 0, "blocked_lane"))
     assert guarded is not None and guarded.check.accepted and guarded.command[2] < 0.
+
+
+def test_clearance_cost_is_lowest_at_one_body_length():
+    geometry = _geometry()
+    wall = local_path.ObstacleSquares(np.column_stack((np.linspace(.4, 2.4, 41), np.full(41, 1.))), 0.)
+    near = ((.5, .6), (2., .6))
+    preferred = ((.5, .1), (2., .1))
+    far = ((.5, -.6), (2., -.6))
+    gap_cost = local_path.route_clearance_cost
+    assert gap_cost(preferred, wall, geometry, .275) == pytest.approx(0.)
+    assert gap_cost(near, wall, geometry, .275) > gap_cost(preferred, wall, geometry, .275)
+    assert gap_cost(far, wall, geometry, .275) > gap_cost(preferred, wall, geometry, .275)
+    assert gap_cost(far, None, geometry, .275) == 0.
+
+
+def test_equal_velocity_change_routes_prefer_a_body_length_from_the_wall():
+    near = ((0., 0.), (.7, 0.), (1.3, .3), (1.8, .3))
+    clear = ((0., 0.), (.7, 0.), (1.3, -.3), (1.8, -.3))
+    wall = _grid(obstacles=[(f, .65) for f in np.linspace(1.05, 1.8, 16)])
+    choice = _run(near, grid=wall, alternate_routes=(clear,), occupied=(), target=(3., 0.))
+    assert choice is not None and choice.reference_index == 1

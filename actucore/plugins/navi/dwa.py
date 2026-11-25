@@ -40,6 +40,11 @@ class CandidateScore:
     heading: float
     goal: float
     route_change: float = 0.
+    route_clearance: float = 0.
+
+    @property
+    def route_cost(self):
+        return self.route_change + self.route_clearance
 
     @property
     def total(self):
@@ -575,6 +580,9 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     progress_scale = max(.2, min(1.0, translation_speed * horizon))
     route_costs = (0.,) if len(routes) == 1 else tuple(
         local_path.route_velocity_change(ref, *limits, previous) for ref in routes)
+    route_obstacles = local_path.occupied_squares(grid[1]) if len(routes) > 1 and not follow_published else None
+    clearance_costs = tuple(local_path.route_clearance_cost(ref, route_obstacles, geometry, half_width) for ref in routes)
+    route_cost_sum = tuple(change + clearance for change, clearance in zip(route_costs, clearance_costs))
     nominal = min(max(x_speed, y_speed), .35)
     preferred = tuple(_preferred_command(ref, nominal, horizon, yaw_limit,
                                          differential=guidance and not y_speed and footprint_mode == "body")
@@ -645,7 +653,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         if validate_candidate is not None and not validate_candidate(command, poses, prediction.duration).accepted:
             return choice
         components = replace(components, obstacle=_obstacle_score(check),
-                             route_change=choice.components.route_change)
+                             route_change=choice.components.route_change,
+                             route_clearance=choice.components.route_clearance)
         diag["entry_arc_selected" if entry_yaw else "handoff_yaw_interpolated"] = True
         diag["admissible_candidates"] += 1
         return Choice(command, poses[:prediction.moving_count], components.total, progress,
@@ -703,7 +712,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     outcomes = budget.for_context(context)
     straight = (x_speed, 0., 0.)
     continuing = previous == straight
-    straight_reference = (route_costs[0] == min(route_costs) and candidate_budget is not None and target is not None and target[0] > 0.
+    straight_reference = (route_cost_sum[0] == min(route_cost_sum) and candidate_budget is not None and target is not None and target[0] > 0.
                           and abs(math.atan2(target[1], target[0])) <= .1
                           and all(f >= 0. and abs(r) <= (max(1e-8, min(local_path.RESOLUTION / 2, .1 * f))
                                                          if continuing else 1e-8)
@@ -797,7 +806,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 progress_scale=progress_scale, target=target, segments=segments_by_reference[index],
                 initial_position=initial_positions[index], guidance=guidance)
             if components is not None:
-                components = replace(components, route_change=route_costs[index])
+                components = replace(components, route_change=route_costs[index], route_clearance=clearance_costs[index])
                 scores.append((components, progress, index))
             else:
                 rejection = reason
@@ -821,7 +830,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 straight_check = checked
             obstacle = _obstacle_score(check)
             components, progress, index = (scores[0] if preferred_check and not early_translation
-                                           else min(scores, key=lambda item: (item[0].route_change, item[0].total)))
+                                           else min(scores, key=lambda item: (item[0].route_cost, item[0].total)))
             components = replace(components, obstacle=obstacle)
             choice = Choice(cmd, poses[:prediction.moving_count], components.total, progress,
                             check.min_clearance_m, prediction, check, components, index)
@@ -834,7 +843,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 first_checked = choice
         if retaining_speed:
             continue  # Ordinary detour ranking only admits speeds inside its cap.
-        lower = min(((score.route_change, score.total, index, ordinal) for score, _, index in scores),
+        lower = min(((score.route_cost, score.total, index, ordinal) for score, _, index in scores),
                     default=(math.inf, math.inf, 0, ordinal))
         entries.append((lower, ordinal, cmd, scores, rejection))
 
@@ -878,7 +887,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             components = replace(components, obstacle=obstacle)
             # Follow an admissible forward arc on the route before falling back
             # to a stationary heading change.
-            key = (guidance and not any(cmd[:2]), components.route_change, components.total, index, ordinal)
+            key = (guidance and not any(cmd[:2]), components.route_cost, components.total, index, ordinal)
             if (cmd == previous and cmd[0] > 0. and (cmd[1] or cmd[2]) and obstacle == 0.
                     and (retained is None or components.total < retained.score)):
                 retained = Choice(cmd, poses[:prediction.moving_count], components.total, progress,

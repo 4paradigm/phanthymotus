@@ -918,6 +918,7 @@ class Decision:
     dwa_acceptance: DwaAcceptance | None = None
     hold_search: bool = False
     predicted_search: bool = False
+    target_pending: bool = False
 
     @property
     def publishes(self) -> bool:
@@ -1765,16 +1766,16 @@ def _search_yaw_candidates(config, yaw, both, scales):
 def _search_for_target(depth, config, state, dt, odom):
     reason = _search_turn_stop(depth, config, state)
     if reason is None:
-        return _search(config, state, dt, odom)
+        return replace(_search(config, state, dt, odom), target_pending=True)
     if "扫掠范围有障碍" in reason:
         yaw = -state.last_seen_side * config.search_rate
         for rate in _search_yaw_candidates(config, yaw, True, (.5, .25)):
             if _search_turn_stop(depth, config, state, requested_yaw=rate) is None:
                 if state.missing_frames + 1 < config.lost_frames:
-                    return _search(config, state, dt, odom)
+                    return replace(_search(config, state, dt, odom), target_pending=True)
                 state.missing_frames += 1
                 return _search(config, state, dt, odom, requested_yaw=rate)
-    return Decision(_twist(0., 0., 0.), AVOIDING, reason)
+    return Decision(_twist(0., 0., 0.), AVOIDING, reason, target_pending=True)
 
 
 def _continue_search_without_speed(depth, config, state, dt, odom):
@@ -2017,6 +2018,15 @@ def _decide(detections, depth, odom, config: Config, state: State,
             if state.feedback_boot_s * 1000 < ODOM_GAP_MS:
                 return Decision(_twist(0, 0, 0), AVOIDING, "等待首个有效运动反馈")
         if state.motion_source and (state.motion_source != source or frame_changed):
+            if (config.local_controller == "dwa" and not frame_changed and anchor is None
+                    and (track is None or not track.observed)
+                    and not any(target_objects(detections, state.target, config))):
+                continued = _continue_search_without_speed(depth, config, state, dt, ego_odom)
+                if continued is not None:
+                    state.motion_source = source
+                    if source == "pose":
+                        state.motion_pose_frame = motion_pose.frame
+                    return continued
             needs_guard = any(state.commanded) or state.active_scan.active
             previous_scan = state.active_scan
             if source == "command" and previous_scan.active and not previous_scan.command_only:
@@ -2142,7 +2152,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
             if depth is None:
                 return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
             if matched_person:
-                return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待目标确认或新深度")
+                return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待目标确认或新深度", target_pending=True)
             state.missing_frames = max(state.missing_frames, config.lost_frames)
             return _search_for_target(depth, config, state, dt, odom)
         if config.local_controller == "dwa" and depth is not None and geometry is not None:
@@ -2241,7 +2251,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
             missing = "depth"
         elif depth is not None:
             missing = "vop"
-        return Decision(None, BLIND, f"observation stale or missing ({missing})")
+        return Decision(None, BLIND, f"observation stale or missing ({missing})", target_pending=depth is not None)
 
     previous_vy = state.commanded[1]
     lateral_progress = (feedback is not None and previous_vy != 0.
@@ -2270,13 +2280,13 @@ def _decide(detections, depth, odom, config: Config, state: State,
             state.published_dwa_route or state.published_camera_passage or scan.active):
         state.commanded_vx = 0.
         if matched_person:
-            return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待目标确认")
+            return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待目标确认", target_pending=True)
         return _search_for_target(depth, config, state, dt, odom)
 
     if track is None and anchor is None:
         if (state.searched_rad > 0. and state.tracker.track is not None
                 and (matched_person if person_approach else any(target_objects(detections, state.target, config)))):
-            return Decision(_twist(0., 0., 0.), ALIGNING, "已看到目标，等待新观测确认")
+            return Decision(_twist(0., 0., 0.), ALIGNING, "已看到目标，等待新观测确认", target_pending=True)
         return _search_for_target(depth, config, state, dt, odom)
 
     if not missing_person:
@@ -3598,7 +3608,7 @@ def dwa_trace_visible(poses, shadow, view=None, *, pad_cell=False):
 
 
 def _visual_approach(depth, config, state, geometry, track, feedback, objects_ms, detections):
-    hold = Decision(_twist(0., 0., 0.), ALIGNING, "已看到人，等待可验证的接近空间")
+    hold = Decision(_twist(0., 0., 0.), ALIGNING, "已看到人，等待可验证的接近空间", target_pending=True)
     region = track.image_region
     if (not depth or depth.get("map") is None or not region or geometry is None
             or feedback is None or not objects_ms or _dwa_unavailable_reason(depth, config, state)):
@@ -3836,10 +3846,11 @@ def _route_travel_limits(config):
     return (0., forward), (-right, left), (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
 
 
-def _route_rank(plan, target, config, previous):
+def _route_rank(plan, target, config, previous, cells):
     change = local_path.route_velocity_change(plan.points, *_route_travel_limits(config), previous)
     residual = math.dist(plan.points[-1], local_path.target_in_grid(plan.geometry, *target))
-    return change, max(0., residual - config.stop_distance_m)
+    clearance = local_path.route_clearance_cost(plan.points, cells, plan.geometry, _keepout_m(config))
+    return change + clearance, max(0., residual - config.stop_distance_m)
 
 
 def _dwa_route_reference(plan, visible, target, stop, tolerance):
@@ -3964,7 +3975,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
                 yield plan
 
     def candidates():
-        plans = (sorted(routes(), key=lambda plan: _route_rank(plan, optical_target, config, state.commanded))
+        cells = local_path.occupied_squares(occupied) if closest and optical_target is not None else None
+        plans = (sorted(routes(), key=lambda plan: _route_rank(plan, optical_target, config, state.commanded, cells))
                  if closest and optical_target is not None else routes())
         for plan in plans:
             yield plan, True, "reachable_prefix" if plan.reachable_prefix else "route"
@@ -4697,6 +4709,7 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
             transitioning = False
             compare_dwa_routes = config.local_controller == "dwa" and config.use_lateral
             rank_fallback = planning_depth["closest"] and route_target is not None
+            cells = local_path.occupied_squares(scan.grid()[1]) if rank_fallback else None
             for candidate in order:
                 if state is not None and state.side_stall_s.get(candidate, -math.inf) >= config.stuck_window_s:
                     continue
@@ -4711,8 +4724,8 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                         if compare_dwa_routes and route is not None:
                             dwa_lateral_routes.append((candidate, route))
                         if local_command is not None and (not rank_fallback or local_route is None or
-                                route is None or _route_rank(route, route_target, config, state.commanded)
-                                >= _route_rank(local_route, route_target, config, state.commanded)):
+                                route is None or _route_rank(route, route_target, config, state.commanded, cells)
+                                >= _route_rank(local_route, route_target, config, state.commanded, cells)):
                             continue
                         side, local_command, local_route = candidate, command, route
                         if not compare_dwa_routes and (not rank_fallback or route is None):

@@ -102,6 +102,30 @@ def route_velocity_change(points, x_limit, y_limit, yaw_limit, previous):
     return min(aligned + abs(prior_yaw), fixed) if x_limit[1] > 0. else fixed
 
 
+def route_clearance_cost(points, obstacles, geometry, half_width):
+    """Prefer a gap of one body length from the current occupied cells."""
+    if obstacles is None or not len(obstacles.centers):
+        return 0.
+    route = np.asarray(points, dtype=float)
+    lengths = np.r_[0., np.cumsum(np.linalg.norm(np.diff(route, axis=0), axis=1))]
+    body_length = max(RESOLUTION, geometry.front + geometry.rear)
+    count = min(16, max(1, math.ceil(lengths[-1] / RESOLUTION)))
+    along = (np.arange(count) + .5) * lengths[-1] / count
+    forward, right = (np.interp(along, lengths, axis) for axis in route.T)
+    (min_f, min_r), (max_f, max_r) = SUPPORTED_REGION
+    inside = (min_f <= forward) & (forward <= max_f) & (min_r <= right) & (right <= max_r)
+    if not inside.any():
+        return 0.
+    cell_forward, cell_right = obstacles.centers.T
+    df = cell_forward - forward[inside, None]
+    dr = cell_right - right[inside, None]
+    half_cell = RESOLUTION / 2
+    longitudinal = np.maximum(np.maximum(df - geometry.front, -df - geometry.rear) - half_cell, 0.)
+    lateral = np.maximum(np.abs(dr) - half_width - half_cell, 0.)
+    gap = np.hypot(longitudinal, lateral).min(axis=1)
+    return float(np.square(np.minimum(1., np.abs(gap - body_length) / body_length)).mean())
+
+
 def shortest_path(allowed, start, goal, *, later_goal=False, last_goal_col=None, steps=STEPS,
                   target_cells=None, target_cost=None, cell_cost=None):
     if not allowed[start]:
@@ -1554,11 +1578,15 @@ def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allo
         # the body/goal ray inside it here discards that useful reference.
         gaps = [(RIGHT[0, a], RIGHT[0, b]) for a, b in zip(cols[:-1], cols[1:])
                 if RIGHT[0, b] - RIGHT[0, a] - RESOLUTION >= 2 * half_width]
+        cells = occupied_squares(occupied) if travel_limits is not None and len(gaps) > 1 else None
+
         def opening_cost(gap):
             midpoint = (plane, sum(gap) / 2)
             if travel_limits is None:
                 return math.hypot(*midpoint) + math.dist(midpoint, target)
-            return route_velocity_change(((0., 0.), midpoint, target), *travel_limits, previous)
+            route = (0., 0.), midpoint, target
+            return (route_velocity_change(route, *travel_limits, previous)
+                    + route_clearance_cost(route, cells, geometry, half_width))
 
         gaps.sort(key=opening_cost)
     else:

@@ -3630,3 +3630,84 @@ def test_missing_depth_does_not_rewrite_the_sent_direct_command(monkeypatch):
     assert packets == [first]
     assert card._scheduled_command is work
     assert (work.expires_ms, work.expires_at) == original_window
+
+
+@pytest.mark.parametrize("route", [False, True], ids=["direct", "detour"])
+@pytest.mark.parametrize("expired", [False, True])
+def test_person_dropout_continues_the_last_wire_twist(monkeypatch, route, expired):
+    if route:
+        card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    else:
+        card, packets, clock = direct_tracking_card(monkeypatch, body=False)
+        snapshot = [card._observation_snapshot(with_capture_timing=True)]
+        monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._config.use_obstacle_history = False
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms
+    card._tick()
+    first, = packets
+    work = card._scheduled_command
+    assert first["values"][0] > 0. and bool(work.dwa_origin) is route
+    stamp = 1000 + round(card._config.max_coast_s * 1000) + 1 if expired else 1180
+    advance_snapshot(snapshot, clock, stamp, vx=first["values"][0])
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = {"timestamp": stamp / 1000, "objects": []}, depth, odom, stamp
+
+    card._tick()
+
+    if expired:
+        assert not any(any(packet["values"][:2]) for packet in packets[1:])
+    else:
+        assert card._scheduled_command is work
+        assert packets[-1]["seq"] > first["seq"]
+        assert packets[-1]["values"] == first["values"]
+        assert card._last_decision.status != policy.SEARCHING
+
+
+def test_route_renews_on_a_new_view_after_the_last_packet_expires(monkeypatch):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    card._tick()
+    first, = packets
+    work = card._scheduled_command
+    assert work.dwa_origin.acceptance.route_points
+    stamp = work.expires_ms + 1
+    advance_snapshot(snapshot, clock, stamp, vx=first["values"][0])
+    _, depth, odom, _ = snapshot[0]
+    old_objects, _, _, _ = snapshot[0]
+    snapshot[0] = dict(old_objects, timestamp=stamp / 1000), depth, odom, stamp
+
+    card._dispatch_command()
+
+    assert card._scheduled_command is work
+    assert packets[-1]["stamp_ms"] == stamp
+    assert packets[-1]["values"] == first["values"]
+
+
+def test_search_handoff_from_pose_to_velocity_keeps_turning(monkeypatch):
+    card, packets, clock, snapshot = observation_card(monkeypatch)
+    card._command_timer = object()
+    cfg, state = card._config, card._state
+    cfg.use_obstacle_history = False
+    state.goal_anchor = None
+    state.commanded = (0., 0., 0.)
+    state.missing_frames = cfg.lost_frames - 1
+    _, depth, odom, _ = snapshot[0]
+    frame = np.full_like(depth["map"], 5.)
+    objects = {"timestamp": 1.0, "objects": []}
+    measured = dict(odom, vx=0., received_speed_ms=1000,
+                    velocity_history=((1000, 1000, (0., 0., 0.)),))
+    snapshot[0] = objects, dict(depth, map=frame), measured, 1000
+    card._tick()
+    first, = packets
+    assert first["values"][5] and not any(first["values"][:5])
+    state.motion_source = "pose"
+    advance_snapshot(snapshot, clock, 1110, vx=0.)
+    objects, depth, odom, _ = snapshot[0]
+    odom.update(received_speed_ms=1110, velocity_history=(*measured["velocity_history"], (1110, 1110, (0., 0., 0.))))
+    snapshot[0] = objects, depth, odom, 1000
+
+    card._tick()
+
+    assert all(packet["values"] == first["values"] for packet in packets), card._last_decision
+    assert state.feedback_guard_s == 0.
+    assert state.motion_source == "measured"
