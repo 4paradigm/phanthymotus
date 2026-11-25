@@ -55,8 +55,12 @@ test('the Canvas opens live and cached joint streams with their own driver model
   skeleton._setModelStatus = () => {};
   skeleton._parseAndBuild = (...args) => builds.push(args);
   skeleton._buildQuadrupedSkeleton = model => builds.push(model);
-  for (const mcpId of mounted) await skeleton._loadModel(mcpId, new AbortController().signal);
-  assert.deepEqual(requested, mounted.map(id => [`/api/mcp/${id}/call?timeout_s=5`, { tool: 'model', arguments: {} }]));
+  for (const mcpId of mounted) {
+    skeleton._modelRequest = new AbortController();
+    await skeleton._loadModel(mcpId, `/${mcpId}/joints`);
+  }
+  assert.deepEqual(requested, mounted.map(id => [`/api/mcp/${id}/call`,
+    { tool: 'model', arguments: { topic: `/${id}/joints` } }]));
   assert.deepEqual(builds, [['<robot/>', ['base_link']], { type: 'quadruped' }]);
 });
 
@@ -66,15 +70,16 @@ test('a missing model is reported and a response after unmount is discarded', as
   const statuses = [];
   skeleton._setModelStatus = status => statuses.push(status);
   skeleton._parseAndBuild = () => assert.fail('no robot should be drawn');
-  await skeleton._loadModel('dashboard', new AbortController().signal);
+  skeleton._modelRequest = new AbortController();
+  await skeleton._loadModel('dashboard');
   assert.match(statuses.at(-1), /未找到/);
-  const missing = skeleton._loadModel('robot', new AbortController().signal);
+  const missing = skeleton._loadModel('robot');
   response({ ok: true, json: async () => ({ code: 200, data: [] }) });
   await missing;
   assert.match(statuses.at(-1), /没有提供可用/);
 
   const request = skeleton._modelRequest = new AbortController();
-  const late = skeleton._loadModel('robot', request.signal);
+  const late = skeleton._loadModel('robot');
   skeleton.unmount();
   response({ ok: true, json: async () => ({ code: 200, data: { urdf: '<robot/>' } }) });
   await late;

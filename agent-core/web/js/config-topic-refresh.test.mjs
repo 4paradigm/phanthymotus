@@ -69,12 +69,13 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     _buildCardEl: c => cards.find(old => old.id === c.id).el,
     _makeDraggable() {}, _syncGeometryObservers() {}, _syncEmptyState() {},
     _debouncedSave() { saves++; },
-    _viewport: viewport, _isEditor: true, _sessionId: 'editor', _execConnections: [],
+    _viewport: viewport, _isEditor: true, _clearing: false, _layoutGen: 0, _pendingLayoutSaves: new Set(),
+    _sessionId: 'editor', _execConnections: [], AbortController, setTimeout, clearTimeout,
     _zoom: 1, _tx: 0, _ty: 0, _updateEditorUI() {},
     fetch: async (url, init) => {
       if (url === '/api/canvas/layout') {
         if (init) persisted = JSON.parse(init.body);
-        return { status: 200, json: async () => ({ data: persisted, editor: 'editor' }) };
+        return { ok: true, status: 200, json: async () => ({ data: persisted, editor: 'editor' }) };
       }
       return fetch(url, init);
     },
@@ -83,7 +84,7 @@ function refreshHarness(cards, fetch, connections = [], { dom = false, metadata 
     (dom ? code('_fmtColorClass') + code('_esc') + code('_buildCardEl') : '')
     + (revalidate ? code('_inputTopicsFor') + code('_revalidateDerivedTopics') : '')
     + code('_parseMcpCallResult') + code('_fetchTopicsFromDriver') + code('_refreshConfiguredTopics')
-    + code('updateCanvasMcps') + code('_resolveAllTopics') + code('_addCard') + code('_saveLayout') + code('_reloadLayout')
+    + code('updateCanvasMcps') + code('_resolveAllTopics') + code('_addCard') + code('_saveLayout') + code('_writeLayout') + code('_reloadLayout')
     + `\n({ refresh: _refreshConfiguredTopics, info: _fetchTopicsFromDriver, poll: updateCanvasMcps,
       add: _addCard, save: _saveLayout, reload: _reloadLayout, resolve: _resolveAllTopics, cards: () => _cards });`, scope);
   let listener, refreshing;

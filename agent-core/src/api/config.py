@@ -1821,13 +1821,8 @@ async def reset_config(req: ResetRequest):
     memory_dir = pathlib.Path('./resource/memory')
 
     if req.chat_history:
-        import chat_history
-        chat_history.clear_all()
         import event
-        event.llm._turns = []
-        event.llm._summary = None
-        event.llm._session_id = None
-        event.llm._current_turn = []
+        await event.llm.clear_history('reset: chat history')
         reset_items.append('chat_history')
 
     if req.tasks:

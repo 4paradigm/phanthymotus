@@ -105,15 +105,74 @@ def remove_job(name: str) -> None:
 
 
 # ── 静态配置启动 ──────────────────────────────────────────────────────────────
+#
+# `config.main['scheduler']` 里的条目和对话、任务都无关：清空历史、重置任务、重启都
+# 不碰它，到点就把 `text` 当成新事件送进来。仓库默认是空列表，所以一台机器上有这种
+# 条目，就是有人直接写进了 config 表 —— 现场看到的是「历史清了、重启了，机器人还在
+# 每 10 分钟做一件以前的事」，而出处在界面上哪儿都看不到。
+#
+# 所以每个静态 job 单独登记在 `_static_tasks`，`remove_static` 能当场停掉它并从配置里
+# 删掉，不用再靠重启。和 `_dynamic_tasks` 分开存：静态条目的名字是人随手起的，可能和
+# `task:<id>` / `once:<id>` 撞名。
+
+_static_tasks: dict[str, asyncio.Task] = {}    # name → asyncio.Task
+
+
+def _static_entries() -> list[dict]:
+    return [j for j in config.main.get('scheduler', []) if isinstance(j, dict)]
+
+
+def list_static() -> list[dict]:
+    """配置里的静态 job，附带是否在跑、下次触发时间（cron 非法时为 None）。"""
+    out = []
+    for job in _static_entries():
+        name = job.get('name', 'unnamed')
+        try:
+            next_ts = _next_run(job.get('cron', ''), time.time())
+        except Exception:
+            next_ts = None
+        task = _static_tasks.get(name)
+        out.append({
+            'name':     name,
+            'cron':     job.get('cron', ''),
+            'text':     job.get('text', ''),
+            'running':  bool(task and not task.done()),
+            'next_run': next_ts,
+        })
+    return out
+
+
+def remove_static(name: str) -> bool:
+    """从配置里删掉一个静态 job，并停掉已经在跑的那个定时器。"""
+    jobs = config.main.get('scheduler', [])
+    kept = [j for j in jobs if not (isinstance(j, dict) and j.get('name', 'unnamed') == name)]
+    task = _static_tasks.pop(name, None)
+    if task and not task.done():
+        task.cancel()
+    if len(kept) == len(jobs):
+        return task is not None
+    config.main['scheduler'] = kept
+    print(f'[scheduler] removed static job {name!r}')
+    return True
+
 
 async def run() -> None:
-    """常驻 async task：加载配置并驱动所有定时任务。"""
-    jobs = list(config.main.get('scheduler', []))
-    if not jobs:
-        return
-
-    # 每个 job 独立运行一个协程
-    await asyncio.gather(*[_run_job(job) for job in jobs])
+    """常驻 async task：加载配置并驱动所有静态定时任务。"""
+    for job in _static_entries():
+        name = job.get('name', 'unnamed')
+        old = _static_tasks.pop(name, None)
+        if old and not old.done():
+            old.cancel()
+        _static_tasks[name] = asyncio.ensure_future(_run_job(job))
+    if _static_tasks:
+        print(f'[scheduler] loaded {len(_static_tasks)} static job(s): '
+              f'{", ".join(_static_tasks)}')
+    try:
+        await asyncio.Event().wait()
+    finally:
+        for task in _static_tasks.values():
+            task.cancel()
+        _static_tasks.clear()
 
 
 async def _run_job(job: dict) -> None:

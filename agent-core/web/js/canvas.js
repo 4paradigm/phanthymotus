@@ -57,13 +57,19 @@ let _allMcps    = [];
 const _sessionId = sessionId();
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
+let _clearing = false;
+let _layoutGen = 0;  // bumped on every _reloadLayout; see _clearCanvas
 
 /**
  * Ensure current session holds the edit lock, auto-claiming it if free.
  * Returns true if editing may proceed, false if the canvas is occupied by
  * another session (in which case a toast + locked UI state is shown).
  */
-async function _ensureEdit() {
+async function _ensureEdit({ forClear = false } = {}) {
+  if (_clearing && !forClear) {
+    _showToast('正在清空画布，请稍候');
+    return false;
+  }
   if (_isEditor) return true;
   try {
     const resp = await fetch('/api/canvas/claim-edit', {
@@ -76,7 +82,7 @@ async function _ensureEdit() {
       _currentEditor = _sessionId;
       _updateEditorUI();
       _showToast('已自动获取编辑权限');
-      return true;
+      return !_clearing || forClear;
     }
     _currentEditor = data.editor || null;
     _updateEditorUI();
@@ -145,10 +151,14 @@ export function cardsForTool(mcpId, toolName) {
 }
 
 /** Why editing is refused right now, or '' when it is allowed. */
-function _editLockReason() {
+function _projectEditLockReason() {
   if (!_projectStateKnown) return '正在确认运行状态，请稍候重试';
   if (_projectRunning) return '请停止智能控制后修改';
   return '';
+}
+
+function _editLockReason() {
+  return _clearing ? '正在清空画布，请稍候' : _projectEditLockReason();
 }
 
 /**
@@ -329,6 +339,7 @@ function _applyProjectState(running) {
   _projectRunning = !!running;
   _projectStateKnown = true;
   _syncProjectBtn();
+  _syncEmptyState();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
     btn.classList.toggle('locked', !_projectRunning);
   });
@@ -808,7 +819,10 @@ function _setupControlButtons() {
     _viewportChanged();
   });
 
+  document.getElementById('canvas-clear')?.addEventListener('click', _clearCanvas);
+
   document.getElementById('canvas-project-toggle')?.addEventListener('click', () => {
+    if (_clearing) { _showToast('正在清空画布，请稍候'); return; }
     if (_projectRunning) { _stopProject(); return; }
     // _projectRunning only flips true once the start fetch resolves, so a
     // second click during that async window used to fire a second concurrent
@@ -841,17 +855,12 @@ function _setupDropZone() {
     }
   });
 
-  _canvasEl.addEventListener('drop', (e) => {
+  _canvasEl.addEventListener('drop', async (e) => {
     e.preventDefault();
     _canvasEl.classList.remove('drag-over');
 
     if (_editsLocked()) {
       _showDropReject(e, _editLockReason());
-      return;
-    }
-
-    if (!_isEditor) {
-      _showDropReject(e, _currentEditor ? '画布已被其他用户锁定' : '请先获取编辑权');
       return;
     }
 
@@ -874,6 +883,10 @@ function _setupDropZone() {
         return;
       }
     }
+
+    // Claim the lock only now, after the drag payload is read and validated —
+    // viewing a tool in the sidebar must not take the canvas from anyone.
+    if (!(await _ensureEdit())) return;
 
     // Convert screen coords → world coords
     const rect   = _canvasEl.getBoundingClientRect();
@@ -1006,6 +1019,93 @@ async function _removeCard(id) {
   _saveLayout();
 }
 
+async function _clearCanvas() {
+  if (!_cards.length || _refuseEdit()) return;
+  if (!confirm('确定清空画布上的所有卡片和连线吗？已安装的技能不会被删除。')) return;
+
+  // Flush a pending autosave instead of cancelling it: every abort below
+  // returns without saving, so a cancelled save was the user's last edit lost.
+  if (_saveTimer) {
+    clearTimeout(_saveTimer);
+    _saveTimer = null;
+    _saveLayout();
+  }
+  // A reload while we wait (a solution load, another tab's save) means the
+  // canvas the user agreed to clear is not the one on screen any more.
+  const gen = _layoutGen;
+  _clearing = true;
+  _syncEmptyState();
+  try {
+    if (!(await _ensureEdit({ forClear: true }))) return;
+    // An earlier autosave must finish before the empty layout is sent, or a
+    // delayed write can put the deleted cards back on the server.
+    let waitTimer;
+    const settled = await Promise.race([
+      Promise.all([..._pendingLayoutSaves]).then(() => true),
+      new Promise(resolve => { waitTimer = setTimeout(() => resolve(false), 15000); }),
+    ]);
+    clearTimeout(waitTimer);
+    if (!settled) { _showToast('等待画布保存超时，请检查网络后重试'); return; }
+    const stateKnown = await Promise.race([
+      _syncProjectState(),
+      new Promise(resolve => { waitTimer = setTimeout(() => resolve(false), 15000); }),
+    ]);
+    clearTimeout(waitTimer);
+    if (!stateKnown) {
+      _showToast('无法确认运行状态，请检查网络后重试');
+      return;
+    }
+    const reason = _projectEditLockReason();
+    if (reason) { _showToast(reason); return; }
+    if (!_isEditor) { _showToast('编辑权已释放，请重试'); return; }
+    if (_layoutGen !== gen) { _showToast('画布刚刚被更新，未清空，请确认后重试'); return; }
+
+    const doomed = _cards;
+    if (await _writeLayout([], [], [], { timeout: 15000 })) {
+      // Something reloaded the canvas while the write was in flight; show what
+      // the server ended up with rather than the empty canvas we assume.
+      if (_layoutGen !== gen) await _reloadLayout();
+    } else {
+      // A 403 has already reloaded the server's layout in _writeLayout.
+      if (!_isEditor) { _showToast('编辑权已被其他会话获取，画布未清空'); return; }
+      // The server persists the layout first and only then stops each removed
+      // instance, so a slow teardown outlasts the timeout after the clear has
+      // in fact happened. Ask the server instead of reporting a failure.
+      await _reloadLayout();
+      if (_cards.length) {
+        _showToast('未能确认画布是否清空，请检查网络后重试');
+        return;
+      }
+    }
+
+    // The server stops the removed instances as part of the layout write.
+    // Browser-owned sources live in this tab and have to be stopped here —
+    // including when a reload above has already taken their cards off screen.
+    for (const card of doomed) {
+      if (card.toolName === 'remote_camera') stopCameraStream();
+      if (card.toolName === 'remote_mic') stopMicStream();
+      card.el.remove();
+    }
+    if (_cards === doomed) {
+      _cards = [];
+      _connections = [];
+      _execConnections = [];
+    }
+    _syncGeometryObservers();
+    _scheduleRedraw();
+    _syncEmptyState();
+    _showToast('画布已清空');
+  } finally {
+    _clearing = false;
+    _syncEmptyState();
+    // Pans, zooms and topic refreshes that tried to save during the clear.
+    if (_saveDeferred) {
+      _saveDeferred = false;
+      _debouncedSave();
+    }
+  }
+}
+
 // ── Card rendering ────────────────────────────────────────────────────────────
 
 function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTopicIn, topicOut: savedTopicOut, topicOutFrom }) {
@@ -1127,7 +1227,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
           const desc = def.description || '';
-          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+          // The help sits under the input rather than in a 40-char placeholder that
+          // disappears once typed into; clamped to two lines, the full text is
+          // in the label's tooltip.
+          inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}">`
+            + (desc ? `<div class="canvas-field-help">${_esc(desc)}</div>` : '');
         }
         return `
           <div class="canvas-field">
@@ -1302,7 +1406,11 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
         const desc = def.description || '';
-        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}" placeholder="${_esc(desc.slice(0, 40))}">`;
+        // The help sits under the input rather than in a 40-char placeholder that
+        // disappears once typed into; clamped to two lines, the full text is
+        // in the label's tooltip.
+        inputHtml = `<input class="canvas-field-input" type="${type}" data-key="${_esc(key)}">`
+          + (desc ? `<div class="canvas-field-help">${_esc(desc)}</div>` : '');
       }
       return `
         <div class="canvas-field">
@@ -3080,13 +3188,22 @@ function _makeDraggable(el, cardData) {
 // ── Layout persistence ────────────────────────────────────────────────────────
 
 let _saveTimer = null;
+let _saveDeferred = false;  // a save was skipped during a clear; replay it after
+const _pendingLayoutSaves = new Set();
 function _debouncedSave() {
   clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(_saveLayout, 400);
+  _saveTimer = setTimeout(() => { _saveTimer = null; _saveLayout(); }, 400);
 }
 
-async function _saveLayout() {
-  if (!_isEditor) return;  // only the current editor may persist; system-triggered saves must not auto-claim
+function _saveLayout() {
+  // System-triggered saves must not auto-claim.
+  if (!_isEditor) return Promise.resolve(false);
+  // Nor race the clear's empty write — but remember them, or an aborted clear
+  // leaves the server on a layout older than what this editor shows.
+  if (_clearing) {
+    _saveDeferred = true;
+    return Promise.resolve(false);
+  }
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
@@ -3098,26 +3215,47 @@ async function _saveLayout() {
     topicOut:   c.topicOut || [],
     topicOutFrom: c.topicOutFrom,
   }));
-  try {
-    const resp = await fetch('/api/canvas/layout', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
-    });
-    if (resp.status === 403) {
-      // Lost edit permission — reload layout from server
-      _isEditor = false;
-      _updateEditorUI();
-      await _reloadLayout();
-    }
-  } catch { /* silent */ }
+  return _writeLayout(cards, _connections, _execConnections);
+}
+
+function _writeLayout(cards, connections, execConnections, { timeout = 0 } = {}) {
+  const pending = (async () => {
+    const controller = timeout ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeout) : null;
+    try {
+      const resp = await fetch('/api/canvas/layout', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ cards, connections, execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
+        signal: controller?.signal,
+      });
+      if (resp.status === 403) {
+        // Lost edit permission — reload layout from server
+        _isEditor = false;
+        _updateEditorUI();
+        await _reloadLayout();
+      }
+      return resp.ok;
+    } catch { return false; }
+    finally { if (timer) clearTimeout(timer); }
+  })();
+  _pendingLayoutSaves.add(pending);
+  pending.then(() => _pendingLayoutSaves.delete(pending));
+  return pending;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _syncEmptyState() {
-  if (!_emptyEl) return;
-  _emptyEl.style.display = _cards.length === 0 ? '' : 'none';
+  if (_emptyEl) _emptyEl.style.display = _cards.length === 0 ? '' : 'none';
+  // Disabled wherever a click could only end in a refusal: running or unknown
+  // project state, or another session holding the edit lock. On a phone this is
+  // a floating red action over the canvas — it must not invite a tap it refuses.
+  const clearBtn = document.getElementById('canvas-clear');
+  if (clearBtn) {
+    clearBtn.disabled = _cards.length === 0 || _clearing || _editsLocked()
+      || (!_isEditor && !!_currentEditor);
+  }
 }
 
 function _esc(s) {
@@ -3155,7 +3293,7 @@ function _updateEditorUI() {
     bar.innerHTML = `${_SVG_PEN}<button class="editor-btn editor-btn--claim" id="canvas-claim-btn">编辑</button>`;
     bar.querySelector('#canvas-claim-btn').onclick = _ensureEdit;
     _setCanvasReadonly(true);
-  }
+  }  _syncEmptyState();  // the clear button follows the lock
 }
 
 function _setCanvasReadonly(readonly) {
@@ -3283,6 +3421,7 @@ async function _reloadLayout() {
   try {
     const layoutRes = await fetch('/api/canvas/layout');
     const layoutJson = await layoutRes.json();
+    _layoutGen++;
     // Clear current cards
     for (const c of _cards) c.el.remove();
     _cards = [];

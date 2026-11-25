@@ -487,17 +487,45 @@ async function _loadTasks() {
   const el = document.getElementById('history-tasks');
   el.innerHTML = '<div class="history-empty">加载中…</div>';
   try {
-    const res = await fetch('/api/tasks');
+    const [res, sched] = await Promise.all([
+      fetch('/api/tasks'),
+      fetch('/api/tasks/scheduler').catch(() => null),
+    ]);
     const data = await res.json();
-    _renderTasks(el, data.tasks || []);
+    const jobs = sched && sched.ok ? ((await sched.json()).jobs || []) : [];
+    _renderTasks(el, data.tasks || [], jobs);
   } catch {
     el.innerHTML = '<div class="history-empty">读不到任务列表。确认机器在线后点「刷新」重试。</div>';
   }
 }
 
-function _renderTasks(el, tasks) {
+// 配置里的固定定时任务（config.main['scheduler']）。清历史、清任务、重启都不碰它们，
+// 到点就把指令当新事件送给代理 —— 不在这里列出来，现场只能看到「清完了还在做旧事」。
+function _renderStaticJobs(jobs) {
+  if (!jobs.length) return '';
+  return `
+    <div class="task-section-title">固定定时任务<small>写在配置里，清空历史、清除任务、重启都不会停；删除后立即停止</small></div>
+    ${jobs.map(j => `
+      <div class="task-card">
+        <div class="task-header">
+          <span class="task-goal">${_escape(j.name)}</span>
+          <span class="task-badge ${j.running ? 'running' : 'pending'}">${j.running ? '运行中' : '未加载'}</span>
+        </div>
+        <div class="task-meta">
+          <div>定时: ${_escape(j.cron)}${j.next_run ? `（下次 ${_formatDateTime(j.next_run)}）` : ''}</div>
+          ${j.text ? `<div>指令: ${_escape(j.text)}</div>` : ''}
+        </div>
+        <div class="task-actions">
+          <button class="sched-delete-btn danger" data-name="${encodeURIComponent(j.name)}">删除</button>
+        </div>
+      </div>`).join('')}`;
+}
+
+function _renderTasks(el, tasks, jobs = []) {
   if (!tasks.length) {
-    el.innerHTML = '<div class="history-empty">没有进行中的任务。代理接到长期目标时会在这里建任务并跟踪进度。</div>';
+    el.innerHTML = '<div class="history-empty">没有进行中的任务。代理接到长期目标时会在这里建任务并跟踪进度。</div>'
+      + _renderStaticJobs(jobs);
+    _bindStaticJobs(el);
     return;
   }
 
@@ -520,7 +548,8 @@ function _renderTasks(el, tasks) {
           <button class="task-delete-btn danger" data-id="${t.id}">删除</button>
         </div>
       </div>`;
-  }).join('');
+  }).join('') + _renderStaticJobs(jobs);
+  _bindStaticJobs(el);
 
   // Bind actions
   el.querySelectorAll('.task-done-btn').forEach(btn => {
@@ -538,6 +567,17 @@ function _renderTasks(el, tasks) {
   });
   el.querySelectorAll('.task-edit-btn').forEach(btn => {
     btn.addEventListener('click', () => _showTaskEdit(btn.dataset.id, tasks));
+  });
+}
+
+function _bindStaticJobs(el) {
+  el.querySelectorAll('.sched-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const name = decodeURIComponent(btn.dataset.name);
+      if (!confirm(`确认删除定时任务「${name}」？删除后立即停止，不再触发。`)) return;
+      await fetch(`/api/tasks/scheduler/${btn.dataset.name}`, { method: 'DELETE' });
+      _loadTasks();
+    });
   });
 }
 

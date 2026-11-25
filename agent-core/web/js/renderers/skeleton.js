@@ -50,11 +50,15 @@ export const SkeletonRenderer = {
   _loaded: false,
   _modelRequest: null,
   _modelStatus: null,
+  _pendingFrame: null,
+  _mcpId: null,
 
-  mount(container, mcpId) {
+  mount(container, mcpId, topicPath) {
+    this._mcpId = mcpId;
     this._joints = {};
     this._links = {};
     this._loaded = false;
+    this._pendingFrame = null;
     this._el = document.createElement('div');
     this._el.className = 'renderer-skeleton';
     container.appendChild(this._el);
@@ -65,8 +69,8 @@ export const SkeletonRenderer = {
     this._modelStatus.style.cssText = 'position:absolute;inset:0;display:grid;place-content:center;' +
       'text-align:center;padding:12px;color:#ddd;font-size:13px;pointer-events:none';
     this._el.appendChild(this._modelStatus);
-    const request = this._modelRequest = new AbortController();
-    this._loadModel(mcpId, request.signal);
+    this._modelRequest = new AbortController();
+    this._loadModel(mcpId, topicPath);
     this._animate();
 
     this._ro = new ResizeObserver(() => this._resize());
@@ -112,28 +116,32 @@ export const SkeletonRenderer = {
     this._modelStatus.style.display = text ? 'grid' : 'none';
   },
 
-  async _loadModel(mcpId, signal) {
+  async _loadModel(mcpId, topicPath) {
+    // unmount() aborts this request; a late response must not touch a closed panel.
+    const signal = this._modelRequest?.signal;
     if (!mcpId || mcpId === 'dashboard') {
       this._setModelStatus('未找到此关节流对应的机器人驱动');
       return;
     }
     this._setModelStatus('正在加载机器人模型…');
     try {
-      const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call?timeout_s=5`, {
+      const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tool: 'model', arguments: {} }),
+        // The panel's topic identifies the card that is asking. One driver can
+        // serve several cards, each with its own model.
+        body: JSON.stringify({ tool: 'model', arguments: topicPath ? { topic: topicPath } : {} }),
         signal,
       });
       const json = await res.json();
-      if (signal.aborted) return;
-      if (!res.ok || (json.code !== undefined && json.code !== 200) || json.result?.isError) {
+      if (signal?.aborted) return;
+      if (res.ok === false || (json.code !== undefined && json.code !== 200) || json.result?.isError) {
         this._setModelStatus('无法从此驱动加载机器人模型，请检查驱动是否在线并提供 model');
         return;
       }
       // Local MCP returns a content array; a paired driver wraps the tool result.
       let data = json.data?.result ?? json.data ?? json.result?.content;
-      if (Array.isArray(data)) data = data.find(item => item?.type === 'text')?.text;
+      if (Array.isArray(data)) data = data.find(item => typeof item?.text === 'string')?.text;
       if (typeof data === 'string') data = JSON.parse(data);
       if (typeof data?.urdf === 'string' && data.urdf.trim()) {
         this._parseAndBuild(data.urdf, data.skeleton_visual_links);
@@ -145,9 +153,15 @@ export const SkeletonRenderer = {
       }
       this._setModelStatus(null);
     } catch (e) {
-      if (signal.aborted) return;
+      if (signal?.aborted) return;
       console.warn('[skeleton] Failed to load URDF model:', e);
       this._setModelStatus('机器人模型加载失败，请检查驱动后重新打开数据流');
+    } finally {
+      if (!signal?.aborted && this._loaded && this._pendingFrame) {
+        const frame = this._pendingFrame;
+        this._pendingFrame = null;
+        this.onData(frame);
+      }
     }
   },
 
@@ -461,7 +475,11 @@ export const SkeletonRenderer = {
   },
 
   onData(buffer, fmt) {
-    if (!this._loaded) return;
+    if (!this._loaded) {
+      // The bus can replay its latest snapshot before the URDF request finishes.
+      if (this._scene) this._pendingFrame = buffer;
+      return;
+    }
     try {
       const text = new TextDecoder().decode(buffer);
       const data = JSON.parse(text);
@@ -523,6 +541,8 @@ export const SkeletonRenderer = {
     this._ro?.disconnect();
     this._controls?.dispose();
     if (this._threeRenderer) {
+      // See PointCloudRenderer.unmount: release the context, not just buffers.
+      this._threeRenderer.forceContextLoss();
       this._threeRenderer.dispose();
       this._threeRenderer.domElement?.remove();
     }
@@ -546,5 +566,6 @@ export const SkeletonRenderer = {
     this._raf = null;
     this._ro = null;
     this._loaded = false;
+    this._pendingFrame = null;
   },
 };
