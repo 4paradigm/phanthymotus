@@ -2550,6 +2550,7 @@ class NaviPlugin:
                                                     self._config.local_geometry.min_obstacle_height))
         front_required = bool(not guard.corner_only and track is not None and track.front_required)
         live_point = None
+        live_person_front = False
         target_pending = False
         range_pending = False
         # A later depth exposure can measure a different surface at the old
@@ -2599,6 +2600,7 @@ class NaviPlugin:
             else:
                 surface = match.standoff_point or match.point
                 live_point = surface[0], -surface[1]
+                live_person_front = match.standoff_point is not None
         elif (front_required and not guard.probe_region and revision[2] != check.input_revision[2] and isinstance(objects, dict)
               and any(target_objects(objects, check.target, config))):
             target_pending = True
@@ -2702,6 +2704,10 @@ class NaviPlugin:
             prediction, terminal_boundary=boundary, footprint=guard.footprint, occupied=(),
             remembered=(), supported_region=local_path.SUPPORTED_REGION, original_goal=None,
             stop_distance_m=0.)
+        if (check.target == "person" and (live_person_front or (
+                live_point is None and guard.front_required and not guard.probe_region))):
+            result = dwa.check_measured_standoff(prediction, result, front_constraint,
+                                                 config.arrival_min_distance_m, footprint=guard.footprint)
         if result.accepted and memory_first_send:
             # Reappearing detections still need a front measurement for association.
             for person in target_objects(objects, "person", config):
@@ -2722,7 +2728,8 @@ class NaviPlugin:
         newer_guard = replace(guard, checked_ms=now_ms, deadline_ms=deadline, prediction_horizon_s=hold,
                               pose=current, goal=goal, goal_error=goal_error, measured=measured,
                               previous=previous, observed=occupied, remembered=remembered,
-                              measured_target=front_constraint, trace=prediction, check=result)
+                              measured_target=front_constraint, front_required=guard.front_required or live_person_front,
+                              trace=prediction, check=result)
         newer = replace(check, target_ms=objects_ms if refresh_target else check.target_ms,
                         geometry=geometry, motion_guard=newer_guard, frame_id=depth["frame_id"],
                         source_id=source, feedback_source=feedback, feedback_ms=odom_ms, depth_ms=depth_ms,
@@ -2813,6 +2820,7 @@ class NaviPlugin:
                     return None
                 if feedback_source == check.feedback_source and check.feedback_ms is not None:
                     odom_ms = min(odom_ms, check.feedback_ms)
+        match = None
         if refresh_direct and check.direct_association is not None:
             association, pose = check.direct_association
             source = observation_source(objects)
@@ -2866,6 +2874,24 @@ class NaviPlugin:
                 return None
             occupied = grid[1]
         clear = True
+        if check.target == "person" and match is not None and match.standoff_point is not None:
+            command = (values[0] if check.direct_vx is None else check.direct_vx, values[1], values[5])
+            rates = (measured, check.previous_twist, command)
+            mode = "body" if config.scan_geometry is not None or check.mount_frame is not None else "camera_approx"
+            footprint = motion.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
+                                             config.clearance_margin_m, mode)
+            forward, left = match.standoff_point
+            point = local_path.target_in_grid(geometry, forward, -left)
+            view = policy_mod.dwa_registration(None, None, depth_ms, now_ms, geometry, rates)
+            front = point, view.error(math.hypot(*point))
+            admission = (deadline - now_ms) / 1000
+            trace = motion.predict_motion(*rates, hold_s=policy_mod.dwa_hold(config, admission), latency_s=admission,
+                                          geometry=geometry, mode=mode, acceleration=config.motion_acceleration,
+                                          braking=config.motion_braking)
+            if not dwa.person_standoff_clear(trace, front, config.arrival_min_distance_m, footprint):
+                if diagnostics is not None:
+                    diagnostics["reason"] = "target_standoff"
+                return obs_ms, deadline, False, check
         if command_only:
             command_vx = check.direct_vx if check.direct_vx is not None else values[0]
             speeds = (measured, check.previous_twist, (command_vx, values[1], values[5]))
@@ -3938,6 +3964,7 @@ class NaviPlugin:
                 geometry = replace(geometry, base_from_optical=mount)
             elif not np.array_equal(mount, geometry.base_from_optical):
                 return None
+        match = None
         if not direct and not target_pending:
             match = self._dwa_target_match(check, objects, depth, odom, objects_ms, geometry,
                                            check.front_required, follow_route=True)
@@ -3963,12 +3990,15 @@ class NaviPlugin:
             rates += (guard.measured,)
         bounds = tuple(tuple(bound(axis) for axis in zip(*rates)) for bound in (min, max))
         speed = max(math.hypot(*v[:2]) for v in rates)
+        history = (odom or {}).get("velocity_history")
+        if history is None:
+            # A stale latest sample does not invalidate the earlier measured
+            # part of the interval. The uncovered tail uses the wire twist.
+            with self._obs_lock:
+                history = tuple(self._velocity_history)
         unobserved_travel = 0.
         if target_pending:
-            # A slowing feedback sample cannot add back distance that could
-            # already have been travelled before this check.
-            speed_cap = math.hypot(config.vx_max, config.vy_max if config.use_lateral else 0.)
-            unobserved_travel = (now_ms - target_ms) * max(speed, speed_cap) / 1000
+            unobserved_travel = odom_mod.travel_since(history, target_ms, now_ms, config.max_feedback_gap_ms, command)
         motion_room = policy_mod.MAX_PREDICTED_DETOUR_TRAVEL_M - unobserved_travel
         if direct:
             travel = speed * (config.watchdog_ms + deadline_ms - now_ms + 50) / 1000
@@ -3998,7 +4028,8 @@ class NaviPlugin:
             return None
         # Consume the unseen translation from the original path. Camera
         # frames can refresh collision evidence, but cannot reset this room.
-        room = dwa.remaining_route_length(route) - elapsed * speed
+        travelled = odom_mod.travel_since(history, guard.checked_ms, now_ms, config.max_feedback_gap_ms, command)
+        room = dwa.remaining_route_length(route) - travelled
         room -= anchor.error(math.hypot(*route[-1]))
         if target_pending:
             room = min(room, motion_room)
@@ -4019,6 +4050,26 @@ class NaviPlugin:
             prediction, footprint=guard.footprint, occupied=(), remembered=(),
             supported_region=local_path.SUPPORTED_REGION, original_goal=None,
             stop_distance_m=0., terminal_boundary=motion.TravelBudget(room))
+        front = None
+        if match is not None and match.standoff_point is not None and check.target == "person":
+            forward, left = match.standoff_point
+            point = local_path.target_in_grid(geometry, forward, -left)
+            front = point, registration.error(math.hypot(*point))
+        elif (check.target == "person" and guard.front_required and guard.measured_target is not None
+                and check.target_capture_ms is not None
+                and 0 <= now_ms - check.target_capture_ms < config.depth_age_limit_ms):
+            scan = state.active_scan
+            point, error = guard.measured_target
+            try:
+                current = policy_mod.dwa_grid_pose(scan, geometry, now_ms, odom)
+                transform = policy_mod.dwa_registration(
+                    guard.pose, current, guard.checked_ms, now_ms, geometry, rates,
+                    reference=policy_mod.dwa_pose_reference(scan, odom))
+            except policy_mod.DwaFrameMismatch:
+                return None
+            front = tuple(transform.points(point)), error + transform.error(math.hypot(*point))
+        result = dwa.check_measured_standoff(prediction, result, front,
+                                             config.arrival_min_distance_m, footprint=guard.footprint)
         if not result.accepted:
             return None
         if visibility_required:
@@ -4190,6 +4241,7 @@ class NaviPlugin:
             track = self._state.tracker.track
             if (active is not None and self._config.local_controller == "dwa"
                     and self._state.target == "person" and decision is not None
+                    and decision.reason != policy_mod.PERSON_STANDOFF_STOP
                     and decision.status in (policy_mod.SEARCHING, policy_mod.ALIGNING, policy_mod.AVOIDING,
                                             policy_mod.BLIND, policy_mod.APPROACHING)
                     and (decision.target_pending or track is None or not track.observed or

@@ -1,5 +1,6 @@
 """A DWA renewal needs actual evidence for the requested target."""
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -584,6 +585,47 @@ def test_measured_target_limits_motion_independently_of_fixed_anchor(monkeypatch
         accepted = outcome is not None
     assert accepted == (stop < 5.)
     assert anchor.x == 5.6
+
+
+@pytest.mark.parametrize("associated_front", [False, True], ids=["range-only", "person-front"])
+def test_dwa_rejects_motion_into_a_measured_person_front(monkeypatch, associated_front):
+    from plugins.navi import policy
+
+    card, _, _, snapshot, _ = selected_card(monkeypatch, body=True, live_target=True)
+    _, depth, _, _ = snapshot[0]
+    state, config = card._state, card._config
+    track = state.tracker.track
+    track.front_required = associated_front
+    track.measured_point = replace(track.measured_point,
+                                   standoff_point=(.45, 0.) if associated_front else None)
+    state.dwa_budget = None
+    route = state.view_detour
+
+    proposal = policy._dwa_detour(depth, config, state, route, state.goal_anchor.x, 0.)
+
+    assert (proposal is None) is associated_front
+    if associated_front:
+        assert state.dwa_trace["rejected"]["target_standoff"] > 0
+
+
+def test_nearer_associated_person_front_vetoes_first_packet(monkeypatch):
+    from plugins.navi.track import TargetMatch
+
+    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=True, live_target=True)
+    first_check = card._staged_dwa_command[1].forward_check
+    track = card._state.tracker.track
+    advance_snapshot(snapshot, clock, 1010)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=1.01), depth, odom, 1010
+    monkeypatch.setattr(card, "_dwa_target_match", lambda *a, **kw: TargetMatch(
+        track.generation, 1.01, (5., 0.), 5., standoff_point=(.45, 0.)))
+
+    card._publish_command(message)
+
+    packet, = packets
+    assert first_check.motion_guard.check.accepted
+    assert not any(packet["values"])
+    assert card._dwa_publication["reason"] == "target_standoff"
 
 
 @pytest.mark.parametrize("body", [True, False], ids=["body-pose", "camera-twist-history"])

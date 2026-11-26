@@ -1843,6 +1843,29 @@ def test_normal_direct_tracking_is_not_no_reference(monkeypatch, body):
     assert card._state.dwa_totals.get("published_decisions", 0) == 0
 
 
+@pytest.mark.parametrize("front,stops", [(.45, True), (.92, False)])
+def test_direct_tracking_limits_motion_at_the_person_front(monkeypatch, front, stops):
+    card, packets, _ = direct_tracking_card(monkeypatch, body=True)
+    track_step = card._state.tracker.step
+
+    def with_near_front(**kwargs):
+        track = track_step(**kwargs)
+        track.front_required = True
+        track.front_fix = track.last_obs
+        track.measured_point = replace(track.measured_point, standoff_point=(front, 0.))
+        return track
+
+    monkeypatch.setattr(card._state.tracker, "step", with_near_front)
+    message = card.next_command()
+    card._publish_command(message)
+
+    if stops:
+        assert not any(packets[-1]["values"])
+        assert card._state.dwa_trace["fallback_reason"] == "target_standoff"
+    else:
+        assert 0. < packets[-1]["values"][0] < card._config.vx_max
+
+
 def test_planning_expiry_keeps_measured_dwa_progress(monkeypatch):
     card, _, clock, snapshot, first = selected_card(monkeypatch)
     card._publish_command(first)
@@ -2773,11 +2796,12 @@ def test_blocked_candidate_brakes_only_if_outgoing_motion_is_also_blocked(
         assert len(packets) == 1 and card._scheduled_command is previous
         assert (previous.expires_ms, previous.expires_at, previous.repeat_until) == window
 
-def tracked_route_card(monkeypatch):
+def tracked_route_card(monkeypatch, *, history=True):
     """A sent route on measured poses, and a feeder for later odometry reports."""
     from plugins.navi.odom import PlanarPose
 
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = history
     card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
     _, depth, odom, _ = snapshot[0]
     pose = PlanarPose(1000, ("odom",), 0., 0., 0.)
@@ -3433,7 +3457,7 @@ def test_first_detour_freezes_its_measured_goal_before_publish(monkeypatch, chan
 @pytest.mark.parametrize("update", [
     "fresh", "early", "slower", "below_moving_floor",
     "feedback_during_check", "repeat_feedback_during_check", "obstacle_during_check",
-    "duplicate", "obstacle", "no_feedback", "different_target",
+    "duplicate", "obstacle", "no_feedback", "different_target", "person_front",
 ])
 def test_direct_controller_checks_new_target_before_the_old_packet_expires(monkeypatch, update):
     card, packets, clock = direct_tracking_card(monkeypatch, body=True)
@@ -3461,6 +3485,11 @@ def test_direct_controller_checks_new_target_before_the_old_packet_expires(monke
             card._config.floor_vx_moving = first["values"][0]
     if update == "different_target":
         objects["objects"] = [dict(objects["objects"][0], name="chair")]
+    if update == "person_front":
+        from plugins.navi.track import TargetMatch
+
+        monkeypatch.setattr(plugin, "match_observation", lambda *a, **kw: TargetMatch(
+            card._state.tracker.track.generation, stamp / 1000, (5., 0.), 5., standoff_point=(.45, 0.)))
     pose = policy.PlanarPose(stamp, ("body",), 0., 0., 0.)
     first_feedback = (stamp, stamp, (.1, 0., 0.))
     odom = dict(odom, motion_pose=pose, velocity_history=(first_feedback,))
@@ -3500,6 +3529,8 @@ def test_direct_controller_checks_new_target_before_the_old_packet_expires(monke
             assert len(packets) == 1 and card._scheduled_command is None
         else:
             assert len(packets) == 2 and not any(packets[-1]["values"])
+            if update == "person_front":
+                assert card._dwa_publication["reason"] == "target_standoff"
 
 
 def test_first_send_retry_uses_original_association_to_refresh_the_target_clock(monkeypatch):
@@ -3610,6 +3641,42 @@ def test_route_renewal_standoff_rechecks_the_actual_packet(monkeypatch, blocked)
         assert (work.expires_ms, work.expires_at, work.repeat_until) == window
 
 
+def test_route_renewal_brakes_for_a_nearer_associated_front(monkeypatch):
+    from plugins.navi.track import TargetMatch
+
+    card, packets, _, snapshot, feed = tracked_route_card(monkeypatch)
+    first, = packets
+    committed = card._state.committed_route
+    feed(1100, .1, frame=snapshot[0][1]["map"].copy())
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=1.1), depth, odom, 1100
+    monkeypatch.setattr(card, "_dwa_target_match", lambda *a, **kw: TargetMatch(
+        card._state.tracker.track.generation, 1.1, (5., 0.), 5., standoff_point=(.45, 0.)))
+
+    card._dispatch_command()
+
+    assert len(packets) == 2 and any(first["values"]) and not any(packets[-1]["values"])
+    assert card._dwa_publication["reason"] == "target_standoff"
+    assert card._state.committed_route is committed
+
+
+@pytest.mark.parametrize("front", [.45, 5.])
+def test_predicted_route_respects_the_new_person_front(monkeypatch, front):
+    from plugins.navi.track import TargetMatch
+
+    card, _, _, snapshot, feed = tracked_route_card(monkeypatch, history=False)
+    work = card._scheduled_command
+    feed(1100, .1, frame=snapshot[0][1]["map"].copy())
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=1.1), depth, odom, 1100
+    monkeypatch.setattr(card, "_dwa_target_match", lambda *a, **kw: TargetMatch(
+        card._state.tracker.track.generation, 1.1, (5., 0.), 5., standoff_point=(front, 0.)))
+
+    proof = card._check_predicted_outgoing_route(work, snapshot[0], 1100, renew=True, timing=True)
+
+    assert bool(proof) == (front > 1.)
+
+
 def test_missing_depth_does_not_rewrite_the_sent_direct_command(monkeypatch):
     card, packets, clock = direct_tracking_card(monkeypatch, body=True)
     snapshot = [card._observation_snapshot(with_capture_timing=True)]
@@ -3690,6 +3757,37 @@ def test_direct_target_loss_uses_remaining_motion_room_after_track_expires(monke
         assert all(packet["values"] == first["values"] for packet in packets)
     else:
         assert not any(packets[-1]["values"][:2])
+
+
+@pytest.mark.parametrize("with_feedback", [True, False])
+def test_direct_target_loss_accounts_for_measured_or_commanded_travel(monkeypatch, with_feedback):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=False)
+    snapshot = [card._observation_snapshot(with_capture_timing=True)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._config.use_obstacle_history = False
+    card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
+    card._tick()
+    first, = packets
+    work = card._scheduled_command
+    vx = first["values"][0]
+    assert vx > .08
+    card._config.vx_max = .8
+    # Allow the actual packet and brake, but distinguish measured travel at
+    # .08 m/s from half a second at the last published speed or the speed cap.
+    stop_travel = vx * .75 + vx**2 / (2 * card._config.motion_braking[0])
+    work.forward_check = replace(work.forward_check, target_ms=1000, previous_twist=(vx, 0., 0.),
+                                 distance_m=card._config.stop_distance_m + stop_travel + .06)
+    advance_snapshot(snapshot, clock, 1500, vx=.08)
+    _, depth, odom, _ = snapshot[0]
+    odom = dict(odom, velocity_history=tuple((ms, ms, (.08, 0., 0.)) for ms in range(1000, 1501, 100)))
+    snapshot[0] = ({"objects": [], "timestamp": 1.5}, depth, odom if with_feedback else None, 1500)
+
+    proof = card._check_predicted_outgoing_route(work, snapshot[0], 1500, renew=True, target_pending=True)
+
+    assert bool(proof) == with_feedback
+    if not with_feedback:
+        work.forward_check = replace(work.forward_check, distance_m=work.forward_check.distance_m + vx * .5)
+        assert card._check_predicted_outgoing_route(work, snapshot[0], 1500, renew=True, target_pending=True)
 
 
 def test_duplicate_detection_keeps_evidence_for_an_association_miss(monkeypatch):

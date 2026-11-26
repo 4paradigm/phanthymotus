@@ -1472,6 +1472,19 @@ def step(*, detections, depth, odom, config: Config, state: State,
         searched = decision.status == SEARCHING and state.search_sweep_checked and not any(twist[:2])
         if not searched and _near_sweep_hits(config, scan, odom, state, twist).any():
             decision = Decision(_twist(0., 0., 0.), AVOIDING, "当前运动的扫掠区有盲区内已观测障碍")
+    if (config.local_controller == "dwa" and state.target == "person" and geometry is not None
+            and not state.dwa_selected and decision.values and any(decision.values)):
+        command = tuple(decision.values[i] for i in (0, 1, 5))
+        limited = _person_standoff_command(config, state, geometry, depth, command)
+        if limited is None:
+            decision = Decision(_twist(0., 0., 0.), AVOIDING, PERSON_STANDOFF_STOP,
+                                distance_m=decision.distance_m, bearing=decision.bearing)
+            state.commanded_vx = 0.
+            state.dwa_trace["fallback_reason"] = "target_standoff"
+        elif limited != command:
+            decision.values = _twist(*limited)
+            decision.reason += "；接近人体前缘，减速"
+            state.commanded_vx = limited[0]
     if (decision.reason == NO_LOCAL_ROUTE and scan.exhausted and scan.current_frame
             and anchor is not None and anchor.verified_range_m is not None
             and anchor.verified_range_m > config.arrival_distance_m
@@ -1634,6 +1647,7 @@ def _ego_twist(odom, state: State, *, command_fraction=1.):
 
 MAX_PREDICTED_DETOUR_TRAVEL_M = 3.
 NO_LOCAL_ROUTE = "局部规划未找到可执行的避让路线；停下"
+PERSON_STANDOFF_STOP = "人体前缘进入停车范围，保持停车"
 
 
 def current_target_observed(state):
@@ -3473,7 +3487,7 @@ def dwa_hold(config, admission_s):
 def dwa_measured_target(track, geometry, now_ms, depth_age_ms, registration, *, track_ms):
     """Register a physical constraint without refreshing the observation that supplied it."""
     fix = track.measured_point
-    if fix is None:
+    if fix is None or (track.front_required and fix.standoff_point is None):
         return None
     if fix.observation_ms is None:
         if track.measured_range_m is None:
@@ -3485,13 +3499,58 @@ def dwa_measured_target(track, geometry, now_ms, depth_age_ms, registration, *, 
     if track.front_required and track.front_fix is not None and track.measured_range_m is None:
         # The tracker already transported this coasting front to its tick frame.
         # Its original capture still limits the lifetime above.
-        surface = track.front_reference if fix.standoff_point is not None else track.front_fix
-        point = min((surface, track.front_fix), key=lambda p: math.hypot(*p))
-        frame, stamp, pose = track.frame, track_ms, None
+        if track.front_reference is not None:
+            point, frame, stamp, pose = track.front_reference, track.frame, track_ms, None
     point = (frame.grid_point(point, geometry) if frame is not None else
              local_path.target_in_grid(geometry, point[0], -point[1]))
     view = registration(stamp, pose)
     return tuple(view.points(point)), view.error(math.hypot(*point))
+
+
+def _person_standoff_command(config, state, geometry, depth, command):
+    track = state.tracker.track
+    now = (depth or {}).get("control_ms") or (depth or {}).get("frame_id")
+    if not now or track is None or not track.front_required or track.measured_point is None:
+        return command
+    odom = state.dwa_odom
+    scan = state.active_scan
+    current = dwa_grid_pose(scan, geometry, now, odom)
+    measured = planar_feedback(odom) or state.commanded
+    rates = (measured, state.commanded, command)
+
+    def registration(stamp, capture):
+        source = dwa_grid_pose(scan, geometry, stamp, odom, capture=capture)
+        return dwa_registration(source, current, stamp, now, geometry, rates, reference=dwa_pose_reference(scan, odom))
+
+    try:
+        front = dwa_measured_target(track, geometry, now, config.depth_age_limit_ms, registration, track_ms=now)
+    except DwaFrameMismatch:
+        return None
+    if front is None:
+        return command
+    mode = "camera_approx" if config.scan_geometry is None else "body"
+    footprint = motion_model.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
+                                           config.clearance_margin_m, mode)
+    admission = state.dwa_admission_ms / 1000
+    hold = dwa_hold(config, admission)
+    (floor_x, _), (floor_y, _) = _local_velocity_limits(config, -1. if command[1] > 0. else 1.)
+    floor_yaw = (config.floor_wz_moving if any(command[:2]) and config.floor_wz_moving is not None
+                 else config.floor_wz)
+    scales = (1.,) if state.camera_arc_selected or state.executing_leg is not None else (1., .75, .5, .25)
+    previous = None
+    for scale in scales:
+        slower = (command if scale == 1. else tuple(
+            math.copysign(min(abs(v), max(abs(v) * scale, floor)), v)
+            for v, floor in zip(command, (floor_x, floor_y, floor_yaw))))
+        if slower == previous:
+            continue
+        previous = slower
+        trace = motion_model.predict_motion(measured, state.commanded, slower, hold_s=hold, latency_s=admission,
+                                            geometry=geometry, mode=mode, acceleration=config.motion_acceleration,
+                                            braking=config.motion_braking)
+        if dwa.person_standoff_clear(trace, front, config.arrival_min_distance_m, footprint):
+            return slower
+    return None
 
 
 def _dwa_motion_inputs(depth, config, state, geometry, target, motion, *, corner_only=False):
@@ -3541,7 +3600,8 @@ def _dwa_motion_inputs(depth, config, state, geometry, target, motion, *, corner
                         if association else None)
     measured_target = None
     anchor = state.goal_anchor
-    if not corner_only and track is not None and (anchor is None or anchor.generation == track.generation):
+    if (not corner_only and track is not None
+            and (anchor is None or anchor.generation == track.generation or track.front_required and track.observed)):
         try:
             measured_target = dwa_measured_target(track, geometry, now_ms, config.depth_age_limit_ms,
                                                   registration, track_ms=now_ms)
@@ -3561,7 +3621,9 @@ def _dwa_context(inputs, geometry, config, motion_frame):
         (inputs.deadline_ms - inputs.checked_ms) / 1000, geometry, inputs.footprint,
         (), (), local_path.SUPPORTED_REGION, inputs.goal, 0.,
         acceleration=config.motion_acceleration, braking=config.motion_braking,
-        frame=(motion_frame, inputs.pose))
+        frame=(motion_frame, inputs.pose),
+        measured_target=inputs.measured_target if inputs.target_name == "person" and inputs.front_required else None,
+        measured_standoff_m=config.arrival_min_distance_m)
 
 
 def _check_dwa_turn(depth, config, state, geometry, target, branch, command):
@@ -3743,6 +3805,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         yaw_limit=(0., 0.) if branch == "direct" else (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.)),
         floors=(floor_x, floor_y, config.floor_wz, config.floor_wz_moving),
         target=target,
+        measured_target=inputs.measured_target if inputs.target_name == "person" and inputs.front_required else None,
+        measured_standoff_m=config.arrival_min_distance_m,
         acceleration=config.motion_acceleration, braking=config.motion_braking,
         horizon=inputs.prediction_horizon_s, max_candidates=limit,
         candidate_commands=candidate_commands, validate_candidate=visible if shadow is not None else None,

@@ -19,7 +19,7 @@ import numpy as np
 
 from . import local_path
 from .motion import (FootprintSpec, MotionCheck, MotionTrace, Pose, Twist, _DEFAULT_ACCELERATION, _DEFAULT_BRAKING,
-                     evaluate_motion, minimum_target_distance, predict_motion, stopping_horizon)
+                     evaluate_motion, minimum_footprint_distance, minimum_target_distance, predict_motion, stopping_horizon)
 
 
 MAX_SEARCH_CANDIDATES = 64
@@ -79,13 +79,25 @@ def _array_key(array):
     return array.shape, array.dtype.str, array.tobytes()
 
 
-def check_measured_standoff(trace, checked, measured_target, stop_distance):
+def check_measured_standoff(trace, checked, measured_target, stop_distance, *, footprint=None):
     """Apply the measured target's spacing to the same complete physical trace."""
     if checked.accepted and measured_target is not None:
         point, registration_error = measured_target
-        if minimum_target_distance(trace, point) < stop_distance + registration_error - 1e-10:
+        if footprint is None:
+            clear = minimum_target_distance(trace, point) >= stop_distance + registration_error - 1e-10
+        else:
+            clear = person_standoff_clear(trace, measured_target, stop_distance, footprint)
+        if not clear:
             return replace(checked, accepted=False, reason="target_standoff")
     return checked
+
+
+def person_standoff_clear(trace, measured_target, camera_range, footprint):
+    """Convert the camera-range tolerance to a minimum front-edge clearance."""
+    point, registration_error = measured_target
+    camera_forward = 0. if footprint.mode == "camera_approx" else trace.camera_offset[0]
+    front_gap = max(footprint.clearance_margin_m, camera_range - max(0., footprint.front - camera_forward))
+    return minimum_footprint_distance(trace, point, footprint) >= front_gap + registration_error - 1e-10
 
 
 @dataclass(frozen=True)
@@ -109,6 +121,7 @@ class MotionContext:
     terminal_boundary: object = None
     frame: tuple = ()
     measured_target: tuple | None = None
+    measured_standoff_m: float | None = None
 
     def key(self):
         g = self.geometry
@@ -121,7 +134,7 @@ class MotionContext:
                 tuple(self.target) if self.target is not None else None, self.stop_distance,
                 tuple(self.acceleration), tuple(self.braking),
                 tuple(self.rotation_center) if self.rotation_center is not None else None,
-                self.terminal_boundary, self.frame, self.measured_target)
+                self.terminal_boundary, self.frame, self.measured_target, self.measured_standoff_m)
 
     @property
     def response_key(self):
@@ -157,7 +170,10 @@ class MotionContext:
             supported_region=self.supported_region, original_goal=self.target,
             stop_distance_m=self.stop_distance, terminal_boundary=self.terminal_boundary,
             prepared_layers=self.prepared_layers)
-        return check_measured_standoff(prediction, checked, self.measured_target, self.stop_distance)
+        spacing = self.measured_standoff_m
+        return check_measured_standoff(prediction, checked, self.measured_target,
+                                       self.stop_distance if spacing is None else spacing,
+                                       footprint=self.footprint if spacing is not None else None)
 
     def check(self, command):
         prediction = self.predict(command)
@@ -514,6 +530,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            footprint: FootprintSpec | None = None, latency_s=0., remembered=None,
            supported_region=None, terminal_boundary=None, occupied=None, alternate_routes=(),
            candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None,
+           measured_standoff_m=None,
            guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0., retry_from_rest=False) -> Choice | None:
     """Select a legal target velocity whose complete predicted stop is admissible.
 
@@ -604,7 +621,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     obstacles = local_path.occupied_squares(grid[1]) if occupied is None else occupied
     context = MotionContext(measured, previous, horizon, latency_s, geometry, footprint, obstacles, remembered,
                             supported_region, target, stop_distance, acceleration, braking, rotation_center,
-                            terminal_boundary, motion_frame, measured_target)
+                            terminal_boundary, motion_frame, measured_target, measured_standoff_m)
 
     def interpolate(choice, room=math.inf):
         if not (transition_slot or entry_slot) or choice is None or not any(choice.command[:2]) or budget.expired():

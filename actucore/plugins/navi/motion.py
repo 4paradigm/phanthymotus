@@ -458,3 +458,19 @@ def minimum_target_distance(trace, goal):
     angular_error = trace.half_turn + trace.delay_yaw_error
     error = linear_error + math.hypot(*trace.camera_offset) * min(2., angular_error)
     return min(math.dist(p[:2], goal) for p in camera) - error
+
+
+def minimum_footprint_distance(trace, point, footprint):
+    """Lower bound on the distance from a measured point to the moving body."""
+    camera_mode = footprint.mode == "camera_approx"
+    f, r, yaw = np.asarray(trace.camera_poses if camera_mode else trace.body_poses).T
+    dx, dy = point[0] - f, point[1] - r
+    c, s = np.cos(yaw), np.sin(yaw)
+    forward, right = c * dx + s * dy, -s * dx + c * dy
+    gap = np.hypot(np.maximum(0., np.maximum(forward - footprint.front, -forward - footprint.rear)),
+                   np.maximum(0., abs(right) - footprint.half_width))
+    ox, oy = trace.camera_offset if camera_mode else (0., 0.)
+    radius = math.hypot(max(abs(ox + footprint.front), abs(ox - footprint.rear)),
+                        abs(oy) + footprint.half_width)
+    errors = np.asarray([linear + radius * min(2., angular) for linear, angular in trace.interval_errors])
+    return float(np.min(gap - np.maximum(np.r_[0., errors], np.r_[errors, 0.])))
