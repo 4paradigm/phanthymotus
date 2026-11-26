@@ -1644,6 +1644,14 @@ def lateral_camera_detour(config, geometry, route):
             and route is not None and route.locks_detour)
 
 
+def parking_target_unobserved(config, state):
+    track = state.tracker.track
+    return (config.use_lateral and config.scan_geometry is None and state.target == "person"
+            and state.parking_target_generation is not None
+            and (track is None or track.generation != state.parking_target_generation
+                 or not (track.observed and track.navigation_range_known)))
+
+
 def current_target_observed(state):
     """Whether this decision used a current accepted target and depth range."""
     track, anchor = state.tracker.track, state.goal_anchor
@@ -1920,6 +1928,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
                                ego=ego, ego_measured=ego_measured, dt=dt,
                                receipt_ms=objects_ms if recovering and state.target == "person" else 0,
                                retain_identity=retained_target)
+    if parking_target_unobserved(config, state):
+        return Decision(_twist(0., 0., 0.), AVOIDING, "近距目标暂不可见，保持停车等待同一目标")
+    if (config.use_lateral and config.scan_geometry is None and state.parking_target_generation is not None
+            and track is not None
+            and track.generation == state.parking_target_generation and track.accepted_detection
+            and track.measured_range_m is not None
+            and track.measured_range_m > config.arrival_distance_m + config.stop_tolerance_m):
+        state.parking_target_generation = None
     if (config.local_controller == "dwa" and isinstance(track, Track) and track.observed
             and track.accepted_detection and track.range_known and track.source is not None):
         if track.measured_range_m is not None and track.navigation_range_known and objects_ms:
@@ -2505,6 +2521,25 @@ def _decide(detections, depth, odom, config: Config, state: State,
         aligned=abs(bearing) < config.align_full_stop, odom=odom,
         may_scan=live or anchor is not None or last_seen_measurement is not None,
         dt=dt, desired_forward=speed if driving else 0.)
+    if (person_approach and live and distance is not None and status == APPROACHING and vx > 0.
+            and config.use_lateral and geometry.front == 0. and not scan.command_only
+            and not state.dwa_selected and not state.camera_arc_selected and state.executing_leg is None):
+        # Near arrival, a proportional range request alone cannot account
+        # for the current motion and the time the driver can hold the packet.
+        motion = feedback or state.commanded
+        approach_speed = max(math.hypot(vx, vy), math.hypot(*motion[:2]), math.hypot(*state.commanded[:2]))
+        hold = dwa_hold(config, state.dwa_admission_ms / 1000)
+        reach = approach_speed * hold + approach_speed ** 2 / (2 * config.motion_braking[0])
+        if distance <= config.arrival_distance_m + reach:
+            target = local_path.target_in_grid(geometry, distance * math.cos(bearing_rad),
+                                               distance * math.sin(bearing_rad))
+            route = Detour(None, ((0., 0.), target), geometry)
+            approach = _dwa_detour(depth, config, state, route, distance, bearing_rad, branch="direct",
+                                   speed_limit=vx, recovery=True)
+            if approach is None or approach.guard.measured_target is None:
+                return Decision(_twist(0., 0., 0.), AVOIDING, "接近目标，等待可验证的制动距离",
+                                distance_m=distance, bearing=bearing)
+            vx, vy, raw_wz, status, reason = _use_dwa(state, approach, side)
     if missing_person and (vx or vy or raw_wz) and not (
             state.dwa_selected or state.camera_arc_selected or state.executing_leg):
         state.commanded_vx = 0.
@@ -3929,8 +3964,10 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     measured_range = track.measured_range_m if track is not None else None
     closer = (measured_range is not None and target_distance is not None
               and measured_range + config.stop_tolerance_m < target_distance)
-    measured = (inputs.measured_target if measured_range is not None
-                and (closer or measured_range <= config.arrival_min_distance_m) else None)
+    check_direct_spacing = (branch == "direct" and mode == "camera_approx"
+                            and config.use_lateral and state.target == "person")
+    measured = (inputs.measured_target if check_direct_spacing or (measured_range is not None
+                and (closer or measured_range <= config.arrival_min_distance_m)) else None)
     spacing = config.arrival_min_distance_m
     preferred_spacing = None
     if (follow_published and measured is None and measured_range is not None and target_distance is not None
@@ -4135,6 +4172,18 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
                                                      distance, bearing, closest=True, dwa_only=True)
                     if isinstance(replanned, tuple):
                         return replanned
+                if ahead is None and "remembered_obstacle" in blocked and scan.near_hits is not None:
+                    forwards = FORWARD[scan.near_hits]
+                    room = distance * math.cos(bearing) - config.stop_distance_m
+                    length = min(geometry.rear + 3 * local_path.RESOLUTION, room)
+                    if forwards.size and forwards.max() <= 0. and length > 3 * local_path.RESOLUTION:
+                        # The front camera has passed the blocker, but the
+                        # rear still needs room before the return turn.
+                        prefix = Detour(None, ((0., 0.), (length, 0.)), geometry)
+                        proposal = _dwa_detour(depth, config, state, prefix, distance, bearing,
+                                               branch="reachable_prefix", follow_published=True, recovery=True)
+                        if proposal is not None:
+                            return _use_dwa(state, proposal, state.escape_side)
         if (remaining > 2 * local_path.RESOLUTION
                 and state.dwa_trace.get("fallback_reason") == "search_deadline"):
             state.dwa_trace["wait_for_committed_route"] = True

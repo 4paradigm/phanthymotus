@@ -475,13 +475,16 @@ def _obstacle_score(check):
     return 1.5 * max(0., PREFERRED_CLEARANCE_M - check.min_clearance_m) / PREFERRED_CLEARANCE_M
 
 
-def pursuit_cost(command, previous, nominal_speed, yaw_limit, check):
+def pursuit_cost(command, previous, nominal_speed, yaw_limit, check, *, lateral_camera=False):
     """Rank checked arcs by continuity, progress, and speed near an obstacle."""
     speed_scale = max(.1, nominal_speed)
     speed_fraction = min(1., math.hypot(*command[:2]) / speed_scale)
     change = .6 * math.dist(command[:2], previous[:2]) / speed_scale
     change += .75 * abs(command[2] - previous[2]) / max(.2, *map(abs, yaw_limit))
-    return change + .75 * (1. - speed_fraction) + _obstacle_score(check) * (1. + speed_fraction)
+    # A lateral route can run parallel to the same obstacle at several
+    # speeds. Rank by the clearance of each complete stop in that case.
+    clearance_weight = 1. if lateral_camera else 1. + speed_fraction
+    return change + .75 * (1. - speed_fraction) + _obstacle_score(check) * clearance_weight
 
 
 def pursuit_options(yaw_limit, lateral, scales=ROUTE_SPEED_SCALES):
@@ -752,7 +755,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 continue
             components = CandidateScore(0., -progress, _obstacle_score(check), 0., 0., 0.)
             diag["admissible_candidates"] += 1
-            cost = pursuit_cost(command, previous, max(x_speed, y_speed), yaw_limit, check)
+            cost = pursuit_cost(command, previous, max(x_speed, y_speed), yaw_limit, check,
+                                lateral_camera=bool(y_speed) and footprint_mode == "camera_approx")
             # Among complete safe stops, prefer one with room for the next feedback update.
             # If every safe arc is close, keep the normal pursuit ranking.
             near_limit = (preferred_standoff_m is not None and measured_target is not None

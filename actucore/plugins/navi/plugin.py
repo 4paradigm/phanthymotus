@@ -4091,6 +4091,8 @@ class NaviPlugin:
         coast_end_ms = None
         target_ms = objects_ms
         if target_pending:
+            if policy_mod.parking_target_unobserved(config, state):
+                return None
             # A duplicate or missed detection cannot renew the receipt of the
             # last range-confirmed target. A newly swept route may omit that receipt.
             target_ms = check.target_ms
@@ -4721,7 +4723,8 @@ class NaviPlugin:
             values = diagnostics.pop("visual_command", candidate)
             if checked is not None and checked[2]:
                 result = checked[3].motion_guard.check
-                cost = dwa.pursuit_cost(tuple(values[i] for i in (0, 1, 5)), previous, nominal, yaw_limit, result)
+                cost = dwa.pursuit_cost(tuple(values[i] for i in (0, 1, 5)), previous, nominal, yaw_limit, result,
+                                        lateral_camera=cfg.use_lateral and check.geometry.front == 0.)
                 if cost < best_cost:
                     best_cost = cost
                     best = checked, values, diagnostics.copy()
@@ -4730,8 +4733,9 @@ class NaviPlugin:
             else:
                 reason = diagnostics.get("reason")
                 swept_into_obstacle |= bool(wz and reason == "footprint_collision")
-                if (checked is None or (not wz and steering == yaw_limit) or reason not in
-                        ("insufficient_room", "outside_grid", "footprint_collision", "occluded_prefix", "target_standoff")):
+                if (checked is None or reason not in
+                        ("insufficient_room", "outside_grid", "footprint_collision", "occluded_prefix", "target_standoff")
+                        or (not wz and steering == yaw_limit and reason not in ("insufficient_room", "target_standoff"))):
                     break
             if int(time.time() * 1000) >= packet_deadline_ms:
                 break

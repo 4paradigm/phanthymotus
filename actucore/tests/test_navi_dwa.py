@@ -134,6 +134,18 @@ def test_retained_route_prefers_a_slower_arc_with_more_braking_clearance():
     assert choice.clearance > .05
 
 
+def test_retained_lateral_camera_route_accelerates_with_equal_clearance():
+    geometry = Geometry(None, None, np.eye(4), 0., .46, None)
+    footprint = dwa.FootprintSpec(0., .46, .21, .05, "camera_approx")
+    grid = _grid(obstacles=[(x / 20, .45) for x in range(-12, 28)])
+    choice = _run(((0., 0.), (1.8, 0.)), grid=grid, geometry=geometry, footprint=footprint,
+                  measured=(.125, 0., 0.), previous=(.125, 0., 0.), lateral=True, follow_published=True)
+
+    assert choice is not None and choice.check.accepted
+    assert choice.command[0] == pytest.approx(.5)
+    assert choice.clearance > .15
+
+
 @pytest.mark.parametrize("side", [-1., 1.])
 @pytest.mark.parametrize("arc_clear", [False, True])
 def test_a_bent_route_sweeps_the_declared_turn_floor_before_sending(side, arc_clear):

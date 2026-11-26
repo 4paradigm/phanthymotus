@@ -1273,8 +1273,11 @@ def test_committed_detour_replans_when_old_odometry_frame_cannot_register(monkey
     assert guard.pose.frame != old_pose.frame and guard.check.accepted and guard.trace.stopped
 
 
-def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypatch):
+@pytest.mark.parametrize("side_only", [False, True], ids=["forward-blocker", "remembered-side-blocker"])
+def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypatch, side_only):
+    import numpy as np
     from plugins.navi import policy
+    from plugins.navi.active_scan import NearProjection
 
     card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
     card._config.use_lateral = True
@@ -1284,13 +1287,21 @@ def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypat
     route = state.committed_route
     assert route.locks_detour and route.passage_exit is None
 
-    def blocked(*args, **kwargs):
-        state.dwa_trace.update(fallback_reason="no_admissible_candidates", rejected={"footprint_collision": 4})
+    def blocked(_depth, _config, _state, reference, *args, **kwargs):
+        if kwargs.get("branch") == "reachable_prefix":
+            replans.append(reference.points)
+            return None
+        reason = "remembered_obstacle" if side_only else "footprint_collision"
+        state.dwa_trace.update(fallback_reason="no_admissible_candidates", rejected={reason: 4})
+        if side_only:
+            hits = np.zeros(policy.FORWARD.shape, dtype=bool)
+            hits[(policy.FORWARD == 0.) & np.isclose(policy.RIGHT, -.40)] = True
+            state.active_scan.near_projection = NearProjection(hits=hits)
         return None
 
     replans = []
     monkeypatch.setattr(policy, "_dwa_detour", blocked)
-    monkeypatch.setattr(policy, "projected_forward_clearance", lambda *args: 1.)
+    monkeypatch.setattr(policy, "projected_forward_clearance", lambda *args: None if side_only else 1.)
     monkeypatch.setattr(policy, "_start_detour_segment", lambda *args, **kwargs: replans.append(args))
     for stamp, depth_stamp in ((1100, 1100), (1200, 1100), (1300, 1300), (1400, 1400)):
         advance_snapshot(snapshot, clock, stamp, vx=0.)
@@ -1300,6 +1311,10 @@ def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypat
         card.next_command()
         assert len(replans) == int(stamp == 1400)
         assert state.committed_route is route
+    if side_only:
+        points, = replans
+        assert points[0] == (0., 0.)
+        assert points[1][0] > 0. and points[1][1] == 0.
 
 
 def test_expired_person_detour_stops_translation_and_keeps_the_original_track(monkeypatch):
@@ -1320,3 +1335,34 @@ def test_expired_person_detour_stops_translation_and_keeps_the_original_track(mo
     assert state.committed_route is None
     assert state.reacquire_generation == original.generation
     assert state.tracker.track is original
+
+
+def test_target_loss_in_parking_range_cannot_start_a_search_turn(monkeypatch):
+    from test_navi_dwa_publish import direct_tracking_card
+
+    card, packets, clock = direct_tracking_card(monkeypatch, body=False)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    card._config.stop_distance_m = .60
+    card._config.lost_frames = 1
+    card._config.max_coast_s = .12
+    card._state.tracker = type(card._state.tracker)()
+    objects, depth, odom, _ = card._observation_snapshot(with_capture_timing=True)
+    depth["map"][72:160, 385:455] = .62
+    depth["ground"][72:160, 385:455] = False
+    person = dict(objects["objects"][0], bbox_norm=[.60, .15, .71, .333], position=[.31, -.52])
+    snapshot = [(dict(objects, objects=[person]), depth, dict(odom, vx=0.), 1000)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._tick()
+    state = card._state
+    generation = state.tracker.track.generation
+    assert state.parking_target_generation == generation
+
+    for stamp in (1100, 1200, 1300, 1400):
+        advance_snapshot(snapshot, clock, stamp, vx=0.)
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = absent_target_payload("empty", stamp), depth, odom, stamp
+        count = len(packets)
+        card._tick()
+        assert all(not any(packet["values"]) for packet in packets[count:])
+    assert state.tracker.track.generation == generation

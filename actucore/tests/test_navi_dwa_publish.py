@@ -1973,6 +1973,37 @@ def test_direct_forward_renewal_checks_the_latest_obstacle_sweep(monkeypatch):
     assert diagnostics["reason"] == "footprint_collision"
 
 
+@pytest.mark.parametrize("feedback, late_feedback, advances", [(.35, None, True), (.40, None, False), (0., .40, False)])
+def test_close_lateral_person_approach_checks_the_full_stop_before_publishing(
+        monkeypatch, feedback, late_feedback, advances):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=False)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    card._config.stop_distance_m = .60
+    card._state.tracker = type(card._state.tracker)()
+    objects, depth, odom, _ = card._observation_snapshot(with_capture_timing=True)
+    depth["map"][72:160, 285:355] = .72
+    depth["ground"][72:160, 285:355] = False
+    person = dict(objects["objects"][0], bbox_norm=[.45, .15, .55, .333], position=[0., -.52])
+    snapshot = [(dict(objects, objects=[person]), depth, dict(odom, vx=feedback), 1000)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    message = card.next_command()
+    if late_feedback is not None:
+        assert message["values"][0] > 0.
+        advance_snapshot(snapshot, clock, 1010, vx=late_feedback)
+    card._stage_command(message, card._output_epoch)
+
+    assert packets
+    vx = packets[-1]["values"][0]
+    if advances:
+        assert 0. < vx < .05
+        guard = card._wire_dwa_origin.forward_check.motion_guard
+        point, error = guard.measured_target
+        assert dwa.minimum_target_distance(guard.trace, point) >= card._config.arrival_min_distance_m + error
+    else:
+        assert vx == 0.
+
+
 @pytest.mark.parametrize("stage", ["direct", "scheduled", "timer"])
 @pytest.mark.parametrize("near_person", [True, False], ids=["near-person", "small-foreground-patch"])
 def test_direct_translation_checks_new_unassociated_person_depth(monkeypatch, stage, near_person):
@@ -2997,6 +3028,31 @@ def test_route_controller_resweeps_late_feedback_before_expiration(monkeypatch):
     assert packets[-1]["stamp_ms"] == cutoff - 5
     assert packets[-1]["stamp_ms"] + packets[-1]["ttl_ms"] <= cutoff
     assert card._wire_dwa_origin.forward_check.motion_guard.measured == (.05, 0., 0.)
+
+
+def test_straight_route_recheck_can_retry_slower_for_target_spacing(monkeypatch):
+    card, _, clock, snapshot, feed = tracked_route_card(monkeypatch)
+    work = card._scheduled_command
+    origin = work.dwa_origin
+    proof = work.forward_check
+    feed(1050, .1, frame=snapshot[0][1]["map"])
+    origin = replace(origin, acceptance=replace(origin.acceptance, route_points=((0., 0.), (2., 0.))))
+    tested = []
+
+    def check_motion(check, values, *args, diagnostics, **kwargs):
+        tested.append(values)
+        accepted = len(tested) > 1
+        if not accepted:
+            diagnostics["reason"] = "target_standoff"
+        return 1000, 1200, accepted, check
+
+    monkeypatch.setattr(card, "_recheck_dwa_motion", check_motion)
+    checked, values = card._check_route_control(origin, proof, 800, clock[0], snapshot[0],
+                                               card._state.active_scan, {}, renew=True, packet_deadline_ms=1200)
+
+    assert tested[0][5] == 0.
+    assert checked[2]
+    assert 0. < values[0] < tested[0][0]
 
 
 def test_retained_route_retries_early_when_feedback_overtakes_its_sweep(monkeypatch):
