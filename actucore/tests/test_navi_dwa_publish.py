@@ -534,8 +534,8 @@ def test_route_timer_brakes_for_an_unassociated_near_person(monkeypatch, feedbac
 
 
 @pytest.mark.parametrize("target_missing", [False, True])
-@pytest.mark.parametrize("changed", [False, True], ids=["same-scene", "new-scene"])
-def test_camera_successor_uses_the_registered_path_with_no_odom(monkeypatch, target_missing, changed):
+@pytest.mark.parametrize("scene", ["same", "new", "blocked"])
+def test_camera_successor_uses_the_registered_path_with_no_odom(monkeypatch, target_missing, scene):
     card, packets, clock, snapshots, first = selected_card(monkeypatch, body=False, live_target=True)
     assert card._stage_command(first, card._output_epoch)
     work = card._scheduled_command
@@ -549,6 +549,8 @@ def test_camera_successor_uses_the_registered_path_with_no_odom(monkeypatch, tar
                     direct_association=(SimpleNamespace(reference_ms=1000), None),
                     camera_passage=policy.CameraPassage(route, occupied, 1000, None, corridor_corner=target_missing))
     current = np.roll(occupied, -1, axis=0)
+    if scene == "blocked":
+        current[row+3, col-1:col+2] = True
     monkeypatch.setattr(local_path, "project_observation", lambda *a, **kw: (~current, current))
     match = None if target_missing else SimpleNamespace(point=(2., 0.), range_m=2.)
     monkeypatch.setattr(plugin, "match_observation", lambda *a, **kw: match)
@@ -560,6 +562,10 @@ def test_camera_successor_uses_the_registered_path_with_no_odom(monkeypatch, tar
     clock[0] = 1100
     snapshots[0] = ({"timestamp": 1.1}, {"frame_id": 1100, "capture_ms": 1100}, None, 1100)
 
+    if scene == "blocked":
+        assert not card._prepare_camera_arc(work, clock[0])
+        assert work.successor is None
+        return
     assert card._prepare_camera_arc(work, clock[0])
     successor = work.successor
     renewed = successor.forward_check
@@ -568,13 +574,13 @@ def test_camera_successor_uses_the_registered_path_with_no_odom(monkeypatch, tar
     assert renewed.camera_passage.capture_ms == 1100
     assert renewed.camera_passage.route.points[-1] == pytest.approx((1.35, .25), abs=.06)
     clock[0] = 1150
-    if changed:
+    if scene == "new":
         objects, _, _, receipt = snapshots[0]
         snapshots[0] = objects, {"frame_id": 1150, "capture_ms": 1150}, None, receipt
 
     card._dispatch_command()
 
-    assert len(packets) == (1 if changed else 2)
+    assert len(packets) == (1 if scene == "new" else 2)
 
 
 def planned_camera_card(monkeypatch, *, target_missing=False):

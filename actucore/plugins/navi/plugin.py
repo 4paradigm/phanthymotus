@@ -108,7 +108,8 @@ def _motion_inputs(objects, depth, odom):
     return ((local_path.array_revision(depth.get("map")), local_path.array_revision(depth.get("ground")),
              local_path.array_revision(depth.get("body_from_optical")), depth.get("obstacle_capture_pose"),
              depth.get("source_frame_id", depth.get("frame_id")), depth.get("mount_accuracy_validated"),
-             depth.get("capture_ms"), depth.get("capture_invalid"), depth.get("body_mount_required")),
+             depth.get("capture_ms"), depth.get("capture_invalid"), depth.get("body_mount_required"),
+             depth.get("front_flank_ms"), depth.get("blind_passing_flank_ms")),
             (odom_mod.planar_feedback(odom), odom.get("source_sample_id", odom.get("received_ms")),
              odom.get("stamp_ms"), odom.get("motion_pose"), odom.get("obstacle_pose"),
              tuple(odom.get("velocity_history", ()))),
@@ -559,6 +560,8 @@ class NaviPlugin:
         self._depth_map = None
         self._depth_ground = None
         self._depth_projection = None
+        self._depth_front_flank_ms = (None, None)
+        self._depth_passing_flanks = ((None, False), (None, False))
         self._depth_vertical = None
         self._depth_bands = {}
         self._depth_ms = 0
@@ -869,6 +872,8 @@ class NaviPlugin:
             self._depth_map = None
             self._depth_ground = None
             self._depth_projection = None
+            self._depth_front_flank_ms = (None, None)
+            self._depth_passing_flanks = ((None, False), (None, False))
             self._depth_vertical = None
             self._depth_bands = {}
             self._depth_ms = 0
@@ -2054,6 +2059,12 @@ class NaviPlugin:
             ground = depth_mod.ground_mask(depth, horizontal, vertical)
         bands = depth_mod.nearest_by_band(depth)
         projection = local_path.DepthProjection.received(depth, ground)
+        config = self._config
+        geometry = config.scan_geometry or config.local_geometry
+        flanks = passing = (False, False)
+        if (config.local_controller == "dwa" and not config.use_obstacle_history
+                and geometry is not None and geometry.front == 0. and not self._binding.get("body_mount")):
+            flanks, passing = local_path.front_flank_observations(projection, geometry, policy_mod._keepout_m(config))
         with self._obs_lock:
             expected_frame = self._depth_vendor.get("frame_id")
             if expected_frame and source_frame and source_frame != expected_frame:
@@ -2065,6 +2076,10 @@ class NaviPlugin:
             self._depth_map = projection.frame
             self._depth_ground = projection.ground
             self._depth_projection = projection
+            self._depth_front_flank_ms = tuple(received_ms if hit else stamp
+                                               for hit, stamp in zip(flanks, self._depth_front_flank_ms))
+            self._depth_passing_flanks = tuple((received_ms if seen else stamp, seen)
+                                                for seen, (stamp, _) in zip(passing, self._depth_passing_flanks))
             self._depth_bands = bands
             self._depth_ms = received_ms
             self._depth_source_ns = source or None
@@ -2145,6 +2160,11 @@ class NaviPlugin:
             if depth is not None:
                 if self._depth_projection is not None and self._depth_projection.frame is depth["map"]:
                     depth["grid_projection"] = self._depth_projection
+                if any(stamp is not None for stamp in self._depth_front_flank_ms):
+                    depth["front_flank_ms"] = self._depth_front_flank_ms
+                blind_flanks = tuple(stamp for stamp, seen in self._depth_passing_flanks if not seen and stamp is not None)
+                if blind_flanks:
+                    depth["blind_passing_flank_ms"] = blind_flanks
                 if with_capture_timing:
                     depth["control_ms"] = now
                     ns = self._depth_source_ns
@@ -2338,7 +2358,7 @@ class NaviPlugin:
         cells = local_path.front_corner_sweep_grid(
             projection.frame, geometry, policy_mod._keepout_m(self._config), grid[1],
             guard_blind_sides=not self._config.use_obstacle_history)
-        occupied = (view.squares(cells),)
+        occupied = (view.squares(cells),) + policy_mod.dwa_front_flank_guard(depth, self._config, geometry, now_ms)
         if not self._config.use_obstacle_history:
             remembered = ()
         elif sources.views and sources.current_frame:
@@ -3008,7 +3028,9 @@ class NaviPlugin:
                                           latency_s=admission, geometry=geometry, mode=mode,
                                           acceleration=config.motion_acceleration, braking=config.motion_braking)
             result = motion.evaluate_motion(
-                trace, footprint=footprint, occupied=(registration.squares(occupied),), remembered=(),
+                trace, footprint=footprint, remembered=(),
+                occupied=(registration.squares(occupied),) + policy_mod.dwa_front_flank_guard(
+                    depth, config, geometry, now_ms),
                 supported_region=local_path.SUPPORTED_REGION, original_goal=None, stop_distance_m=0.,
                 cull_obstacles=True)
             clear = result.accepted
@@ -3055,6 +3077,8 @@ class NaviPlugin:
         grid = local_path.project_observation(depth, geometry, require_valid_depth=True, check_free_space=False)
         if grid is None:
             return None
+        occupied = (local_path.occupied_squares(grid[1]),) + policy_mod.dwa_front_flank_guard(
+            depth, config, geometry, now_ms)
         goal = None if corner_only else local_path.target_in_grid(geometry, match.point[0], -match.point[1])
         previous = self._wire_twist or check.previous_twist
         proof = replace(check, previous_twist=previous, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
@@ -3066,8 +3090,9 @@ class NaviPlugin:
                                      previous=previous, residual=self._state.command_tail)
             if route is not None:
                 command = policy_mod.camera_route_command(
-                    route, config, goal, config.vx_max, previous, self._state.command_tail,
-                    (deadline - now_ms) / 1000, require_turn=False)
+                    route, config, goal, policy_mod.passing_speed_limit(depth, config, now_ms, config.vx_max),
+                    previous, self._state.command_tail,
+                    (deadline - now_ms) / 1000, occupied=occupied, require_turn=False)
                 if command is not None:
                     vx, vy, wz = command
                     candidate = [vx, vy, 0., 0., 0., wz]
@@ -3086,7 +3111,7 @@ class NaviPlugin:
                 continue
             command = tuple(candidate[i] for i in (0, 1, 5))
             if policy_mod.camera_arc_clear(geometry, config, command, previous,
-                                           self._state.command_tail, (deadline - now_ms) / 1000):
+                                           self._state.command_tail, (deadline - now_ms) / 1000, occupied=occupied):
                 return obs_ms, deadline, proof, candidate
         return None
 
@@ -4111,7 +4136,8 @@ class NaviPlugin:
             unobserved_travel = (now_ms - target_ms) * max(speed, speed_cap) / 1000
         motion_room = policy_mod.MAX_PREDICTED_DETOUR_TRAVEL_M - unobserved_travel
         registration = policy_mod.dwa_registration(None, None, depth_ms, now_ms, geometry, rates)
-        occupied = (registration.squares(grid[1]),)
+        occupied = (registration.squares(grid[1]),) + policy_mod.dwa_front_flank_guard(
+            depth, config, geometry, now_ms)
         if direct:
             travel = speed * (config.watchdog_ms + deadline_ms - now_ms + 50) / 1000
             travel += speed ** 2 / (2 * config.motion_braking[0])
@@ -4607,7 +4633,8 @@ class NaviPlugin:
             return None, None
         cfg = self._config
         points = transform.points(origin.acceptance.route_points)
-        nominal = math.hypot(*origin.acceptance.command[:2])
+        nominal = policy_mod.passing_speed_limit(snapshot[1] or {}, cfg, now_ms,
+                                                 math.hypot(*origin.acceptance.command[:2]))
         route_error = transform.error(math.hypot(*origin.acceptance.route_points[-1]))
         yaw_limit = (-policy_mod._scan_yaw_rate(cfg, 1.), policy_mod._scan_yaw_rate(cfg, -1.))
         track = self._state.tracker.track

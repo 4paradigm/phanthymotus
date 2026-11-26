@@ -730,7 +730,7 @@ def test_opening_handoff_tracker_keeps_positive_drive():
     route = replay.Detour(None, ((-.1, 0.), (.5, 0.), (.9, .20), (1., .55)), geometry)
     motion = (0., 0., 0.)
     command = policy.camera_route_command(route, config, (2., .65), .30, motion, motion, .08,
-                                          require_turn=False)
+                                          occupied=(), require_turn=False)
     assert command is not None and command[0] > 0.
 
 
@@ -746,8 +746,8 @@ def test_corner_with_no_target_still_bounds_the_complete_stop_to_the_route():
     geometry = replay.Geometry(None, None, np.eye(4), .25, .25, None)
     config = policy.Config(half_width_m=.20)
     args = geometry, config, (.2, 0., 0.), (.2, 0., 0.), (.2, 0., 0.), .1
-    assert policy.camera_arc_clear(*args, route_room=.8)
-    assert not policy.camera_arc_clear(*args, route_room=.04)
+    assert policy.camera_arc_clear(*args, occupied=(), route_room=.8)
+    assert not policy.camera_arc_clear(*args, occupied=(), route_room=.04)
 
 
 def test_corridor_corner_previews_the_observed_exit_around_a_wall():

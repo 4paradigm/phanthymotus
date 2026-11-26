@@ -3551,6 +3551,28 @@ def dwa_measured_target(track, geometry, now_ms, depth_age_ms, registration, *, 
     return tuple(view.points(point)), view.error(math.hypot(*point))
 
 
+def dwa_front_flank_guard(depth, config, geometry, now_ms):
+    if geometry.front != 0. or config.use_obstacle_history:
+        return ()
+    # A flank can go blind while the last admitted motion is still stopping.
+    hold_ms = config.depth_age_limit_ms + config.watchdog_ms
+    active = tuple(stamp is not None and 0 <= now_ms - stamp < hold_ms
+                   for stamp in depth.get("front_flank_ms", (None, None)))
+    if not any(active):
+        return ()
+    return (local_path.front_flank_guard(geometry, _keepout_m(config), *active),)
+
+
+def passing_speed_limit(depth, config, now_ms, speed):
+    """Delay acceleration on an admitted route after a measured flank goes blind."""
+    hold_ms = config.depth_age_limit_ms + config.watchdog_ms
+    if any(stamp is not None and 0 <= now_ms - stamp < hold_ms
+           for stamp in depth.get("blind_passing_flank_ms", ())):
+        (floor, maximum), _ = _local_velocity_limits(config, 1.)
+        return min(speed, max(floor, maximum * dwa.ROUTE_SPEED_SCALES[-1]))
+    return speed
+
+
 def _dwa_motion_inputs(depth, config, state, geometry, target, motion, *, corner_only=False):
     scan = state.active_scan
     mode = "body" if config.scan_geometry is not None else "camera_approx"
@@ -3588,6 +3610,7 @@ def _dwa_motion_inputs(depth, config, state, geometry, target, motion, *, corner
                 state.dwa_projection.frame, geometry, _keepout_m(config), raw[1],
                 guard_blind_sides=not config.use_obstacle_history) if raw is not None else grid[1])
             observed += (registration(capture, depth.get("obstacle_capture_pose")).squares(cells),)
+            observed += dwa_front_flank_guard(depth, config, geometry, now_ms)
     except DwaFrameMismatch:
         return None, "geometry_mismatch"
     footprint = motion_model.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
@@ -3777,7 +3800,7 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         inputs = replace(inputs, front_required=False, generation=state.published_dwa_route.motion_guard.generation)
     if follow_published:
         reachable_vx = max(0., inputs.measured[0]) + config.motion_acceleration[0] * config.dwa_horizon_s
-        limit_x = min(limit_x, reachable_vx)
+        limit_x = passing_speed_limit(depth, config, inputs.checked_ms, min(limit_x, reachable_vx))
     if shadow is None and scan.receipt_only and not config.use_lateral and not visual:
         shadow = scan.occlusion(geometry)
 
@@ -4390,8 +4413,8 @@ def _near_sweep_hits(config, scan, odom, state, twist):
 
 
 def camera_arc_clear(geometry, config, command, previous, residual, admission_s, *,
-                     route_room=None):
-    """Check the predicted command stays within the available route and grid."""
+                     occupied, route_room=None):
+    """Check the full stopping sweep against the latest depth and route room."""
     mode = "camera_approx" if geometry.front == 0. else "body"
     footprint = motion_model.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
                                            config.clearance_margin_m, mode)
@@ -4401,7 +4424,7 @@ def camera_arc_clear(geometry, config, command, previous, residual, admission_s,
         latency_s=admission_s, acceleration=config.motion_acceleration, braking=config.motion_braking,
         geometry=geometry, mode=mode, initial_bounds=bounds)
     check = motion_model.evaluate_motion(
-        trace, footprint=footprint, occupied=(), remembered=(),
+        trace, footprint=footprint, occupied=occupied, remembered=(),
         supported_region=local_path.SUPPORTED_REGION, original_goal=None, stop_distance_m=0.,
         terminal_boundary=motion_model.TravelBudget(route_room) if route_room is not None else None)
     return check.accepted
@@ -4459,7 +4482,7 @@ class CameraPassage:
 
 
 def camera_route_command(route, config, target, nominal, previous, residual, admission,
-                         *, require_turn):
+                         *, occupied, require_turn):
     geometry = route.geometry
     (floor_x, max_x), _ = _local_velocity_limits(config, 1.)
     yaw_limits = (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
@@ -4478,7 +4501,7 @@ def camera_route_command(route, config, target, nominal, previous, residual, adm
                 or (yaw and not yaw_limits[0] <= yaw <= yaw_limits[1]) or (require_turn and not (cy or yaw))):
             continue
         if camera_arc_clear(geometry, config, command, previous, residual, admission,
-                            route_room=room if target is None else None):
+                            occupied=occupied, route_room=room if target is None else None):
             return command
     return None
 
@@ -4512,8 +4535,10 @@ def _preview_corridor_corner(depth, config, state, geometry, distance, bearing):
         control_ms = depth.get("control_ms") or scan.current_frame
         if not 0 <= control_ms - observation_ms(depth, scan.current_frame) < config.depth_age_limit_ms:
             return None
+        occupied = (local_path.occupied_squares(grid[1]),) + dwa_front_flank_guard(depth, config, geometry, control_ms)
         command = camera_route_command(route, config, target, config.vx_max, state.commanded,
-                                       state.command_tail, state.dwa_admission_ms / 1000, require_turn=False)
+                                       state.command_tail, state.dwa_admission_ms / 1000,
+                                       occupied=occupied, require_turn=False)
         return _use_camera_route(state, route, command) if command is not None else None
     proposal = _dwa_detour(depth, config, state, route, distance, bearing, recovery=True, follow_published=True)
     return _use_dwa(state, proposal, math.copysign(1., route.points[-1][1])) if proposal is not None else None
@@ -4532,6 +4557,7 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
     if target is not None and target[0] <= 0.:
         return None
     grid = scan.observed_grid()
+    occupied = (local_path.occupied_squares(grid[1]),) + dwa_front_flank_guard(depth, config, geometry, control_ms)
     admission = state.dwa_admission_ms / 1000
     keep = state.published_camera_passage
     track = state.tracker.track
@@ -4544,8 +4570,8 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
     if (not corner_only and ahead is None
             and (route is None or not (keep.corridor_corner or local_path.passage_ahead(route.passage_exit)))):
         return None
-    command = (camera_route_command(route, config, target, vx, state.commanded,
-                                    state.command_tail, admission, require_turn=False) if route else None)
+    command = (camera_route_command(route, config, target, passing_speed_limit(depth, config, control_ms, vx), state.commanded,
+                                    state.command_tail, admission, occupied=occupied, require_turn=False) if route else None)
     retained = command is not None
     if not retained and (corner_only or ahead is None or retain_only):
         return None
@@ -4559,13 +4585,13 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
         if opening is not None:
             route = local_path.extend_passage(opening, grid, width, target, config.stop_distance_m)
             command = camera_route_command(route, config, target, vx, state.commanded,
-                                           state.command_tail, admission, require_turn=False)
+                                           state.command_tail, admission, occupied=occupied, require_turn=False)
         if command is None:
             route = local_path.clearance_route(grid, geometry, width, target, config.stop_distance_m,
                                                (0., 0.), body_half_width=config.half_width_m)
             if route is not None:
                 command = camera_route_command(route, config, target, vx, state.commanded,
-                                               state.command_tail, admission, require_turn=True)
+                                               state.command_tail, admission, occupied=occupied, require_turn=True)
         if command is None:
             return None
     return _use_camera_route(state, route, command, retained=retained, corner_only=corner_only)

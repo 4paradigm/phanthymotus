@@ -694,6 +694,41 @@ def target_in_grid(geometry, forward, right):
     return float(f), -float(left)
 
 
+def _front_sweep_reach(geometry, half_width):
+    return math.hypot(geometry.half_length, half_width) + RESOLUTION
+
+
+def _front_blind_sides(geometry, half_width):
+    return ((abs(RIGHT) > half_width + RESOLUTION / 2)
+            & (abs(RIGHT) <= half_width + 3 * RESOLUTION / 2)
+            & (FORWARD >= -geometry.rear) & (FORWARD <= _front_sweep_reach(geometry, half_width)))
+
+
+def front_flank_observations(projection, geometry, half_width):
+    """Return immediate collision and wider passing evidence for each side."""
+    reach = _front_sweep_reach(geometry, half_width)
+    passing_reach = max(reach, geometry.rear + RESOLUTION)
+    if not ((projection.frame > 0.) & (projection.frame <= passing_reach + RESOLUTION / 2)).any():
+        return (False, False), (False, False)
+    grid = projection.grid_for(geometry, require_valid_depth=True, check_free_space=False)
+    if grid is None:
+        return (False, False), (False, False)
+    forward = grid[1] & (FORWARD >= 0.)
+    radius_sq = FORWARD**2 + RIGHT**2
+    close = (forward & (radius_sq <= reach**2)
+             & (abs(RIGHT) >= max(RESOLUTION, half_width - 2 * RESOLUTION)))
+    passing = forward & (radius_sq <= passing_reach**2) & (abs(RIGHT) >= half_width)
+    sides = (RIGHT < 0., RIGHT > 0.)
+    return (tuple(bool((close & side).any()) for side in sides),
+            tuple(np.count_nonzero(passing & side) >= 2 for side in sides))
+
+
+def front_flank_guard(geometry, half_width, left, right):
+    """Keep the current chassis corridor without estimating the old wall position."""
+    return occupied_squares(_front_blind_sides(geometry, half_width)
+                            & ((left & (RIGHT < 0.)) | (right & (RIGHT > 0.))))
+
+
 def front_corner_sweep_grid(frame, geometry, half_width, occupied, *, guard_blind_sides=False):
     """Constrain the blind corner beside a continuous wall reaching the image edge."""
     if geometry.front != 0. or geometry.horizontal is None or geometry.vertical is None or not occupied.any():
@@ -705,16 +740,13 @@ def front_corner_sweep_grid(frame, geometry, half_width, occupied, *, guard_blin
         return occupied
     guard = occupied
     if guard_blind_sides:
-        reach = math.hypot(geometry.half_length, half_width) + RESOLUTION
+        reach = _front_sweep_reach(geometry, half_width)
         near_front = (FORWARD >= 0.) & (FORWARD**2 + RIGHT**2 <= reach**2)
         if (occupied & near_front).any():
             # A close face can move across the edge of the image during a
             # turn. The opposite side is already blind. Limit expansion of
             # the current chassis corridor until the near front reopens.
-            sides = ((abs(RIGHT) > half_width + RESOLUTION / 2)
-                     & (abs(RIGHT) <= half_width + 3 * RESOLUTION / 2)
-                     & (FORWARD >= -geometry.rear) & (FORWARD <= reach))
-            guard = occupied | sides
+            guard = occupied | _front_blind_sides(geometry, half_width)
     for side in (-1, 1):
         edge = 0 if side < 0 else width - 1
         edge_z = frame[row, edge]

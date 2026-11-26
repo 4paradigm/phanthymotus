@@ -148,3 +148,89 @@ def test_fresh_close_jamb_constrains_motion_into_the_opposite_blind_side():
     assert context.check((0., 0., 0.))[1].accepted
     assert not grid[local_path.START[0], local_path.START[1] - 5]
     assert guarded[local_path.START[0], local_path.START[1] - 5]
+
+
+@pytest.mark.parametrize("side", [-1, 1])
+def test_missing_jamb_depth_keeps_the_checked_sweep_off_that_side(monkeypatch, side):
+    from types import SimpleNamespace
+
+    from plugins.navi import dwa, plugin
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = plugin.NaviPlugin({}, None)
+    config = card._config
+    config.local_controller = "dwa"
+    config.use_obstacle_history = False
+    config.half_width_m = .20
+    config.max_depth_age_ms = 1200
+    config.depth_intrinsics = HorizontalIntrinsics(640, 315., 320.)
+    card._depth_vertical = (480, 420., 240.)
+    geometry = config.local_geometry = local_path.camera_square(
+        config.depth_intrinsics, card._depth_vertical, .20, at_front=True, half_length=.23)
+    close = np.full((480, 640), 3., dtype=np.float32)
+    edge = slice(None, 100) if side < 0 else slice(-100, None)
+    close[:, edge] = .24
+    missing = np.full_like(close, 3.)
+    missing[:, edge] = np.nan
+    card._set_depth_map(close, received_ms=1000)
+
+    def contexts(stamp):
+        card._set_depth_map(missing, received_ms=stamp)
+        monkeypatch.setattr(plugin.time, "time", lambda: (stamp + 1) / 1000)
+        _, observation, _ = card.observation(with_capture_timing=True)
+        state = policy.State()
+        state.dwa_projection = observation["grid_projection"]
+        state.active_scan.observe_single(observation, geometry, config.depth_age_limit_ms, stamp + 1)
+        inputs, _ = policy._dwa_motion_inputs(
+            observation, config, state, geometry, (2., 0.), (0., 0., 0.))
+        assert inputs is not None and not inputs.remembered
+        guard = policy.DwaMotionGuard(**vars(inputs), trace=None, check=None)
+        check = SimpleNamespace(motion_guard=guard, planning_guard=guard)
+        scan = state.active_scan
+        scene = card._registered_dwa_scene(
+            check, observation, None, stamp + 1, stamp, geometry, ((0., 0., 0.),),
+            scan=scan, sources=policy.dwa_scene_sources(scan, stamp + 1), anchor_changed=False)
+        return [dwa.MotionContext((0., 0., 0.), (0., 0., 0.), 1., 0., geometry, inputs.footprint,
+                                  occupied, (), None, None, 0.) for occupied in (inputs.observed, scene[2])]
+
+    toward_jamb = (.074, -side * .023, -side * .2)
+    for context in contexts(1300):
+        assert context.check(toward_jamb)[1].reason == "footprint_collision"
+        assert context.check((.074, 0., 0.))[1].accepted
+    for context in contexts(1000 + config.depth_age_limit_ms + config.watchdog_ms):
+        assert context.check(toward_jamb)[1].accepted
+
+
+@pytest.mark.parametrize("side", [-1, 1])
+def test_retained_route_keeps_passing_speed_after_losing_a_near_face(monkeypatch, side):
+    from plugins.navi import plugin
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = plugin.NaviPlugin({}, None)
+    config = card._config
+    config.half_width_m = .20
+    config.vx_max = .30
+    config.depth_intrinsics = HorizontalIntrinsics(640, 315., 320.)
+    card._depth_vertical = (480, 420., 240.)
+    geometry = config.local_geometry = local_path.camera_square(
+        config.depth_intrinsics, card._depth_vertical, .20, at_front=True, half_length=.23)
+    face = np.full((480, 640), 3., dtype=np.float32)
+    edge = slice(None, 100) if side < 0 else slice(-100, None)
+    face[:, edge] = .36
+    clear = np.full_like(face, 3.)
+    card._set_depth_map(face, received_ms=1000)
+    route = local_path.Detour(None, ((-.23, 0.), (2., 0.)), geometry)
+
+    def forward_at(stamp):
+        card._set_depth_map(clear, received_ms=stamp)
+        monkeypatch.setattr(plugin.time, "time", lambda: stamp / 1000)
+        _, observation, _ = card.observation(with_capture_timing=True)
+        odom = dict(vx=0., vy=0., wz=0., received_ms=stamp, stamp_ms=stamp, source_sample_id=stamp)
+        state = policy.State(motion_source="measured", dwa_odom=odom, dwa_projection=observation["grid_projection"])
+        state.active_scan.update(observation, odom, geometry, receipt_only=True)
+        proposal = policy._dwa_detour(observation, config, state, route, 3., 0., follow_published=True)
+        assert proposal is not None and proposal.guard.check.accepted
+        return proposal.command[0]
+
+    assert forward_at(1300) == pytest.approx(.075)
+    assert forward_at(1850) == pytest.approx(.30)
