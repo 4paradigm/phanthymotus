@@ -53,7 +53,8 @@ def test_passage_retry_preserves_priority_families_and_budget(budget):
 
 
 @pytest.mark.parametrize("side", [-1, 1])
-def test_close_wall_edge_only_constrains_the_current_front_corner_sweep(side):
+@pytest.mark.parametrize("slope,range_at_axis", [(0., .17), (1.2, .31)])
+def test_close_wall_edge_only_constrains_the_current_front_corner_sweep(side, slope, range_at_axis):
     from plugins.navi.camera import HorizontalIntrinsics
 
     g = local_path.camera_square(HorizontalIntrinsics(640, 430., 320.), (480, 420., 240.), .2, at_front=True)
@@ -61,7 +62,10 @@ def test_close_wall_edge_only_constrains_the_current_front_corner_sweep(side):
     edge = np.arange(161)
     if side > 0:
         edge = 639 - edge
-    cell = tuple(np.rint(np.array([.17, side * .20]) / local_path.RESOLUTION).astype(int) + local_path.START)
+    range_at_corner = range_at_axis - slope * .20
+    cell = tuple(np.rint(np.array([range_at_corner, side * .20])
+                         / local_path.RESOLUTION).astype(int) + local_path.START)
+    ranges = range_at_axis / (1. + slope * side * (edge - 320.) / 430.)
 
     def evidence():
         _, occupied = local_path.DepthProjection(frame, None).grid_for(
@@ -70,9 +74,9 @@ def test_close_wall_edge_only_constrains_the_current_front_corner_sweep(side):
         assert not occupied[cell]
         return guard[cell]
 
-    frame[:, edge[::40]] = .17
+    frame[:, edge[::40]] = ranges[::40]
     assert not evidence()
-    frame[:, edge] = .17
+    frame[:, edge] = ranges
     assert evidence()
     frame[240, edge[20:35]] = np.nan
     assert not evidence()

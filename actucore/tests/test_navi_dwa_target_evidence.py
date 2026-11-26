@@ -533,8 +533,8 @@ def test_accepted_target_jitter_can_publish(monkeypatch, body, offset, confidenc
     assert [packet["values"] for packet in packets] == [message["values"]]
 
 
-@pytest.mark.parametrize("life", ["reconfirmed", "pending", "replaced"])
-def test_publication_follows_confirmed_target_generation(monkeypatch, life):
+@pytest.mark.parametrize("life", ["matched", "first_return", "replaced"])
+def test_publication_follows_associated_target_generation(monkeypatch, life):
     card, packets, clock, snapshot, message = selected_card(monkeypatch, body=True, live_target=True)
     tracker = card._state.tracker
     original = tracker.track
@@ -552,12 +552,12 @@ def test_publication_follows_confirmed_target_generation(monkeypatch, life):
         if index == 0:
             payload = dict(payload, timestamp=stamp / 1000)
             snapshot[0] = payload, depth, odom, stamp
-        if life == "pending" and index == 1:
+        if life == "first_return" and index == 1:
             break
     assert (tracker.track is original) == (life != "replaced")
-    assert tracker.track.observed == (life != "pending")
+    assert tracker.track.observed
     card._publish_command(message)
-    if life == "reconfirmed":
+    if life != "replaced":
         assert [packet["values"] for packet in packets] == [message["values"]]
     else:
         assert not packets
@@ -962,7 +962,7 @@ def test_tick_checks_search_when_target_lost_before_first_send(monkeypatch, body
         assert packet["values"][5] != 0
 
 
-def test_active_route_hands_off_to_checked_search_without_a_zero(monkeypatch):
+def test_active_route_keeps_the_checked_translation_on_target_loss(monkeypatch):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
     card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
     assert card._stage_command(card.next_command(), card._output_epoch)
@@ -985,7 +985,8 @@ def test_active_route_hands_off_to_checked_search_without_a_zero(monkeypatch):
     card._tick()
     assert not card._last_error
     assert len(packets) == 2
-    assert packets[1]["values"][:5] == [0.] * 5 and packets[1]["values"][5] != 0.
+    assert packets[1]["values"] == packets[0]["values"]
+    assert card._state.committed_route is not None
 
 
 @pytest.mark.parametrize("update", ["confirmed", "duplicate", "unrelated", "obstacle",

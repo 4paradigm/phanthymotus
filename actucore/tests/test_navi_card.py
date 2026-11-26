@@ -2630,6 +2630,8 @@ def test_legacy_local_planner_connects_to_the_navi_command_stream(monkeypatch, d
     for index in range(6):
         card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
         command = card.next_command()
+        if command is not None and command["values"][:2] == [.04, 0.]:
+            break
     assert command["values"] == [.04, 0., 0.0, 0.0, 0.0, 0.0], card._last_decision.reason
     if bumi_mount:
         assert "body_mount" not in reply["inputs"]

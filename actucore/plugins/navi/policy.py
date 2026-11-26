@@ -294,11 +294,8 @@ class Config:
     # `max_objects` cap and the payload reaches LLM context whole), so that is
     # a measurement to take on hardware rather than a default to change here.
     sustain_confidence: float = 0.15
-    # Three of the last five frames before a track may move the robot. The old
-    # behaviour was one frame to start and ten to give up — an asymmetry
-    # pointing the wrong way, since starting is the direction that moves a
-    # robot. (ByteTrack's default is two; this is deliberately stricter,
-    # because a wrong start here walks a humanoid at somebody.)
+    # Stability of the object inventory. Navigation accepts the first
+    # observation that passes its confidence and association gates.
     confirm_hits: int = 3
     confirm_window: int = 5
     # How long a confirmed track may be driven from prediction alone. A person
@@ -899,6 +896,7 @@ class DwaAcceptance:
     followed_route: bool = False
     passage_exit: tuple | None = None
     corridor_corner: bool = False
+    locks_detour: bool = False
 
     @property
     def target_observed(self):
@@ -1546,7 +1544,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
                 proposal.reference.points if isinstance(proposal, DwaProposal) and proposal.branch not in ("visual_probe", "direct") else (),
                 followed_route=bool(trace.get("retained_route")),
                 passage_exit=proposal.reference.passage_exit if isinstance(proposal, DwaProposal) else None,
-                corridor_corner=(isinstance(proposal, DwaProposal) and proposal.reference.corridor_corner))
+                corridor_corner=(isinstance(proposal, DwaProposal) and proposal.reference.corridor_corner),
+                locks_detour=(isinstance(proposal, DwaProposal) and proposal.branch in ("route", "reachable_prefix")))
             trace.update(controller_used="dwa", accepted_twist=proposal.command, fallback_reason=None)
         else:
             if state.dwa_selected:
@@ -1917,8 +1916,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if fresh_recovery:
         state.reacquire_receipt_ms, state.reacquire_source = objects_ms, detection_source
         state.reacquire_candidate = detections if matched_person else None
-    # One gated detector receipt can span several control ticks. Keep the
-    # camera still for confirmation, including when its depth arrives later.
+    # One associated detector receipt can span multiple ticks while its
+    # depth arrives on a separate stream.
     pending_person = (recovering and detections is not None and state.reacquire_candidate is detections
                       and objects_ms == state.reacquire_receipt_ms and state.tracker.track is not None)
     if track is not None and track.observed and (
@@ -2147,13 +2146,36 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if scan.gap_recheck is not None:
             return Decision(_twist(0., 0., 0.), AVOIDING,
                             update.reason if update is not None else "主动观察：反馈恢复，停车等待旧视图到期")
+        if published is not None and published.locks_detour and published is state.committed_route:
+            measured = track.measured_range_m if track is not None else None
+            same_target = track is not None and track.generation == published.motion_guard.generation
+            seen_target = track is not None and track.observed and track.navigation_range_known
+            if (same_target or seen_target) and measured is not None and measured <= config.arrival_distance_m + 1e-6:
+                state.committed_route = state.published_dwa_route = published = None
+            elif depth is None or geometry is None or not scan.current_frame:
+                return Decision(_twist(0., 0., 0.), BLIND, "绕行：保留原路线，等待可用深度")
+            else:
+                distance = bearing = None
+                if anchor is not None and anchor.generation == published.motion_guard.generation:
+                    distance, bearing = math.hypot(anchor.x, anchor.y), math.atan2(-anchor.y, anchor.x)
+                if seen_target or (same_target and track.navigation_range_known):
+                    distance, bearing = track.range_m, track.bearing_rad
+                speed = max(0., config.k_fwd * (distance - config.stop_distance_m)) if distance is not None else None
+                arc = _follow_published_route(depth, config, state, geometry, distance, bearing,
+                                              foreground=True, approach_speed=speed)
+                if arc is not None:
+                    vx, vy, wz, status, reason = arc
+                    return Decision(_twist(vx, vy, wz), status, reason, distance_m=distance)
+                if state.committed_route is not None:
+                    return Decision(_twist(0., 0., 0.), AVOIDING, "绕行：保留原路线，等待安全续发")
+                published = None
         if state.reacquire_generation is not None:
             if scan.active or scan.result_frame or state.detour_leg is not None:
                 _reset_detour_route(state)
             if depth is None:
                 return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
             if matched_person:
-                return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待目标确认或新深度", target_pending=True)
+                return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待有效测距", target_pending=True)
             state.missing_frames = max(state.missing_frames, config.lost_frames)
             return _search_for_target(depth, config, state, dt, odom)
         if config.local_controller == "dwa" and depth is not None and geometry is not None:
@@ -2277,7 +2299,10 @@ def _decide(detections, depth, odom, config: Config, state: State,
     person_approach = (config.local_planning and config.local_geometry is not None
                        and config.local_controller == "dwa" and state.target == "person")
     missing_person = person_approach and not (track is not None and track.observed)
-    if missing_person and track is not None and anchor is None and not (
+    last_seen_target = (track is not None and not track.observed
+                        and getattr(track, "front_fix", None) is not None
+                        and track.since_obs_s * 1000 < config.max_obs_age_ms)
+    if missing_person and track is not None and not last_seen_target and anchor is None and not (
             state.published_dwa_route or state.published_camera_passage or scan.active):
         state.commanded_vx = 0.
         if matched_person:
@@ -2323,7 +2348,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 else config.k_yaw)
     steering_bearing = bearing
     if (config.local_controller == "dwa" and live and isinstance(track, Track)
-            and track.range_known and track.hits >= config.confirm_hits + 2):
+            and track.range_known and track.hits >= 5):
         x, y, vx_target, vy_target = track.mean
         range_sq = x * x + y * y
         if range_sq > 0. and abs(bearing) > config.align_tol / 2:
@@ -2334,19 +2359,26 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 steering_bearing = _clamp(bearing + _clamp(.35 * rate, .25), 1.)
     raw_wz = _clamp(-yaw_gain * steering_bearing, config.wz_max)
 
+    last_seen_measurement = (track.measured_range_m if last_seen_target and
+                             (anchor is None or anchor.generation == track.generation) else None)
     within = distance is not None and distance <= config.arrival_distance_m + 1e-6
     if freeze_goal and target_fix is not None and target_fix[0] <= config.arrival_distance_m + 1e-6:
         within = True
         distance = target_fix[0]
         bearing = _clamp(target_fix[1] / max(1e-6, config.half_fov_rad), 1.)
+    if last_seen_measurement is not None and last_seen_measurement <= config.arrival_distance_m + 1e-6:
+        within = True
+        distance = last_seen_measurement
+        bearing = _clamp(track.bearing_rad / max(1e-6, config.half_fov_rad), 1.)
     if within:
-        if missing_person:
+        if missing_person and not last_seen_target:
             return _search_for_target(depth, config, state, dt, odom)
-        observed = live or target_fix is not None or (
+        observed = live or target_fix is not None or last_seen_measurement is not None or (
             anchor is not None and track is not None and (track.generation == anchor.generation if freeze_goal else track is anchor.track) and track.observed
             and not anchor.target_missing and (
                 not getattr(track, "front_required", False) or track.front_fix is not None))
-        measured = target_fix[0] if target_fix is not None else track.measured_range_m if live else None
+        measured = (target_fix[0] if target_fix is not None else track.measured_range_m if live
+                    else last_seen_measurement)
         last = getattr(track, "last_obs", None)
         if live and measured is not None and last is not None and getattr(track, "front_fix", None) is None:
             bearing = _clamp(math.atan2(-last[1], last[0]) / max(1e-6, config.half_fov_rad), 1.)
@@ -2405,7 +2437,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
         vx, vy, raw_wz, depth, config, status, reason, state,
         target_distance=distance, target_bearing=bearing_rad, measured_vx=(odom or {}).get("vx"),
         aligned=abs(bearing) < config.align_full_stop, odom=odom,
-        may_scan=live or anchor is not None, dt=dt, desired_forward=speed if driving else 0.)
+        may_scan=live or anchor is not None or last_seen_measurement is not None,
+        dt=dt, desired_forward=speed if driving else 0.)
     if missing_person and (vx or vy or raw_wz) and not (
             state.dwa_selected or state.camera_arc_selected or state.executing_leg):
         state.commanded_vx = 0.
@@ -3810,7 +3843,9 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
     track = state.tracker.track
     now = depth.get("control_ms") or scan.control_ms or scan.current_frame
     current = dwa_grid_pose(scan, geometry, now, state.dwa_odom)
-    generation_matches = corner_only or guard.generation == (track.generation if track is not None else None)
+    locked = previous.locks_detour and previous is state.committed_route
+    generation_matches = (corner_only or guard.generation == (track.generation if track is not None else None)
+                          or (locked and track is not None and track.observed and track.navigation_range_known))
     if (guard.target_name != state.target or not generation_matches
             or current is None or not 0 <= now - current.stamp_ms < config.max_feedback_gap_ms
             or (guard.footprint.front, guard.footprint.rear) != (geometry.front, geometry.rear)):
@@ -3828,6 +3863,15 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
         return None
     route = Detour(None, tuple(map(tuple, transform.points(previous.route_points))), geometry,
                    passage_exit=exit_line, corridor_corner=previous.corridor_corner)
+    remaining = dwa.remaining_route_length(route.points)
+    if locked and not local_path.passage_ahead(exit_line):
+        at_end = remaining <= 2 * local_path.RESOLUTION
+        clear_tail = (remaining <= 3 * local_path.RESOLUTION and distance is not None and bearing is not None
+                      and track is not None and track.observed
+                      and _target_corridor_clear(depth, config, scan, distance, bearing))
+        if at_end or clear_tail:
+            state.committed_route = state.published_dwa_route = None
+            return None
     # Once the target enters the full-speed stopping envelope, carry the
     # normal approach speed into the route and its publisher-side pursuit.
     speed_limit = None
@@ -3841,7 +3885,7 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
                            follow_published=True, route_error=transform.error(math.hypot(*previous.route_points[-1])),
                            corner_only=corner_only)
     if proposal is None:
-        if (dwa.remaining_route_length(route.points) > 2 * local_path.RESOLUTION
+        if (remaining > 2 * local_path.RESOLUTION
                 and state.dwa_trace.get("fallback_reason") == "search_deadline"):
             state.dwa_trace["wait_for_committed_route"] = True
         return None
@@ -4502,13 +4546,15 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
         if state.dwa_trace.get("wait_for_committed_route"):
             return 0., 0., 0., AVOIDING, NO_LOCAL_ROUTE
     path_clear = None
+    track = state.tracker.track if state is not None else None
+    last_seen_range = track is not None and not track.observed and track.measured_range_m is not None
     if (config.local_controller == "dwa" and may_scan and geometry is not None and scan is not None
             and not scan.has_result and not scan.attempted and target_distance is not None
             and target_bearing is not None and scan.views and scan.matches_route_view(depth)):
         target = local_path.target_in_grid(geometry, target_distance * math.cos(target_bearing),
                                            target_distance * math.sin(target_bearing))
         free, occupied = scan.grid(include_near=False)
-        if target[0] > 0. and (occupied.any() or (current_target_observed(state) and free.any())):
+        if target[0] > 0. and (occupied.any() or ((current_target_observed(state) or last_seen_range) and free.any())):
             obstacle = _target_path_obstacle(occupied, geometry, config, target, config.stop_distance_m)
             if obstacle is None and ahead is not None and ahead <= config.obstacle_stop_m and state.dwa_projection:
                 raw = state.dwa_projection.grid_for(geometry, require_valid_depth=True, check_free_space=False)
@@ -4616,13 +4662,13 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                              and (state.published_dwa_route is not None
                                   or (saved is not None and saved.anchor is state.goal_anchor
                                       and saved.frame is scan.motion_frame)))
-        stalled_approach = path_clear and not vx and desired_forward > 0.
-        if needs_detour or continuing_detour or stalled_approach:
+        checked_approach = path_clear and (not vx or last_seen_range) and desired_forward > 0.
+        if needs_detour or continuing_detour or checked_approach:
             corridor_clear = _target_corridor_clear(depth, config, scan, target_distance, target_bearing)
             needs_detour = not corridor_clear
-            if path_clear and (needs_detour or stalled_approach) and not continuing_detour:
-                track = state.tracker.track
-                if max(vx, desired_forward) > 0. and not scan.command_only and track is not None and track.observed:
+            if path_clear and (needs_detour or checked_approach) and not continuing_detour:
+                if (max(vx, desired_forward) > 0. and not scan.command_only and track is not None
+                        and (track.observed or last_seen_range)):
                     route = Detour(None, ((0., 0.), target), geometry)
                     checked = _dwa_detour(depth, config, state, route, target_distance, target_bearing,
                                           branch="direct", speed_limit=vx or desired_forward, recovery=True)

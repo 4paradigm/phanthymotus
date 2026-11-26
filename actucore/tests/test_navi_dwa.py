@@ -1020,7 +1020,7 @@ def test_isolated_blocker_detour_enters_on_expanded_circle_tangent():
     box = (abs(f - 1.95) <= .201) & (abs(r) <= .251)
     route = local_path.clearance_route((~box, box), _geometry(), .30, (3.05, 0.), .60, (0., 0.),
                                        body_half_width=.25)
-    radius = math.hypot(.225, .275) + 3 * .25
+    radius = math.hypot(.225, .275) + 4.5 * .25
     angle = math.asin(radius / 1.95)
     forward, right = route.points[1]
     assert abs(math.atan2(right, forward)) == pytest.approx(angle, abs=.09)
@@ -1084,6 +1084,7 @@ def test_compact_detour_exit_follows_the_tangent_toward_the_target():
     route = local_path.clearance_route((~occupied, occupied), _geometry(), .30, (goal, 0.), .60,
                                        (0., 0.), body_half_width=.25)
     assert route is not None
+    # At this range the wider soft radius includes the start.
     radius = math.hypot(.325, .175) + 3 * .25
     slope = math.tan(math.asin(radius / (goal - box_center)))
     exit_leg = [(forward, right) for forward, right in route.topology if forward >= 2.5]

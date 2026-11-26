@@ -1,11 +1,43 @@
-"""A search stops turning while a real association is awaiting confirmation."""
+"""Recover the first associated person while retaining detector ordering."""
+import numpy as np
 import pytest
 
 from test_navi_dwa_publish import advance_snapshot, observation_card
 
 
+def test_fresh_depth_on_the_last_seen_person_can_start_a_checked_approach(monkeypatch):
+    from plugins.navi.depth import ground_mask
+    from test_navi_dwa_integration import card_for_case, observation_case
+
+    config, state, depth, odom = observation_case(attempted=False)
+    geometry = config.local_geometry
+    config.depth_intrinsics = geometry.horizontal
+    config.use_obstacle_history = False
+    state.goal_anchor = None
+    state.commanded = (0., 0., 0.)
+    ray = (np.arange(480) - 240.) / 420.
+    floor = np.minimum(.42 / np.maximum(ray, .001), 5.)
+    frame = np.broadcast_to(floor[:, None], (480, 640)).copy()
+    frame[120:260, 255:385] = 1.8
+    depth.update(map=frame, ground=ground_mask(frame, geometry.horizontal, geometry.vertical))
+    person = {"name": "person", "position": [0., -.2], "confidence": .95,
+              "bbox_norm": [.4, .25, .6, .54]}
+    track = state.tracker.step(detections={"timestamp": .9, "objects": [person]},
+                               depth=dict(depth, frame_id=900, source_frame_id=900, control_ms=900),
+                               target="person", config=config, ego=(0., 0., 0.), dt=.1)
+    assert track.front_fix is not None
+    card, packets = card_for_case(monkeypatch, config, state, depth, odom)
+    monkeypatch.setattr(card, "_observation_snapshot",
+                        lambda **_: ({"timestamp": 1., "objects": []}, depth, odom, 1000))
+    command = card.next_command()
+    assert not track.observed and track.measured_range_m == pytest.approx(1.8)
+    assert card._last_decision.dwa_acceptance is not None, card._last_decision.reason
+    card._publish_command(command)
+    assert packets[-1]["values"][0] > 0.
+
+
 @pytest.mark.parametrize("stamped", [True, False], ids=["source-stamp", "receipt-only"])
-def test_search_waits_for_associated_person_and_resumes_only_after_confirmation(monkeypatch, stamped):
+def test_search_resumes_on_the_first_associated_person_with_depth(monkeypatch, stamped):
     card, packets, clock, snapshot = observation_card(monkeypatch, live_target=True, detector_timestamp=stamped)
     motion = card.next_command()
     assert card._last_decision.dwa_acceptance is not None
@@ -28,19 +60,9 @@ def test_search_waits_for_associated_person_and_resumes_only_after_confirmation(
     # Same label and almost the same bearing, but on the foreground obstacle at 2 m.
     observe(1050, [dict(original[0], position=[0., .1])])
     assert card.next_command()["values"][5] != 0.
-    assert card._state.tracker.track.reacquire_hits == 0
+    assert not card._state.tracker.track.observed
 
-    for stamp, hits in ((1100, 1), (1150, 2)):
-        observe(stamp, original)
-        for _ in range(2):
-            command = card.next_command()
-            assert command["values"] == [0.] * 6
-            card._publish_command(command)
-            assert packets[-1]["values"] == [0.] * 6
-            assert card._state.tracker.track.reacquire_hits == hits
-            assert card._state.reacquire_generation == generation
-
-    observe(1200, original)
+    observe(1100, original)
     command = card.next_command()
     assert card._state.reacquire_generation is None
     assert card._state.tracker.track.generation == generation
@@ -70,7 +92,7 @@ def test_new_depth_can_finish_recovery_between_detector_frames(monkeypatch):
         snapshot[0] = {"timestamp": stamp / 1000, "objects": [person]}, depth, odom, stamp
         assert card.next_command()["values"] == [0.] * 6
 
-    assert state.last_seen_side == -1., "Once confirmed, search should face the last measured side"
+    assert state.last_seen_side == -1., "Search should face the last associated side"
     assert track.observed and track.measured_range_m is None
     assert state.reacquire_generation == track.generation
     advance_snapshot(snapshot, clock, 1170, vx=0.)
@@ -83,18 +105,21 @@ def test_new_depth_can_finish_recovery_between_detector_frames(monkeypatch):
 
 
 @pytest.mark.parametrize("stale_stamp,stale_receipt", [(1.04, 1060), (1.06, 1040)])
-def test_out_of_order_return_does_not_count_toward_confirmation(monkeypatch, stale_stamp, stale_receipt):
+def test_out_of_order_detection_cannot_restore_tracking(monkeypatch, stale_stamp, stale_receipt):
     card, _, clock, snapshot = observation_card(monkeypatch, live_target=True)
     motion = card.next_command()
     original = snapshot[0][0]["objects"]
     for now, source, receipt, objects in (
-            (1010, 1.01, 1010, []), (1050, 1.05, 1050, original),
+            (1010, 1.01, 1010, []), (1050, 1.05, 1050, []),
             (1060, stale_stamp, stale_receipt, original), (1100, 1.1, 1100, original)):
         advance_snapshot(snapshot, clock, now, vx=0.)
         _, depth, odom, _ = snapshot[0]
         snapshot[0] = {"timestamp": source, "objects": objects}, depth, odom, receipt
-        if not objects:
+        if now == 1010:
             card._publish_command(motion)
         command = card.next_command()
-    assert card._state.reacquire_generation is not None
-    assert command["values"] == [0.] * 6
+        if now == 1060:
+            assert card._state.reacquire_generation is not None
+            assert not card._state.tracker.track.observed
+    assert card._state.reacquire_generation is None
+    assert command["values"][0] > 0.

@@ -1,12 +1,6 @@
 """The tracker, behaviour by behaviour.
 
-Two groups of tests, and they answer different questions.
-
-The **lifecycle** ones are about a number that used to be wrong: navi took one
-frame to start chasing something and ten to give up. That asymmetry points the
-wrong way — starting is the direction that moves a robot — and it is what made a
-single false-positive frame walk a humanoid forward and then choose which way
-the subsequent search swept.
+The lifecycle tests cover immediate association and bounded prediction.
 
 The **occlusion** ones are about the thing this module exists for: a person
 walks in front of the target for half a second and the robot should not notice.
@@ -65,49 +59,24 @@ def _feed(tracker, detections, *, config, depth=None, ticks=1, ego=STILL,
 
 # ── lifecycle: the asymmetry that used to point the wrong way ────────────────
 
-def test_one_frame_does_not_move_a_robot():
-    """The bug this module was written for.
-
-    A single detection above the confidence bar used to be enough to start
-    driving, and the same frame set the direction the later search swept in. So
-    one false positive produced "turn left a bit, walk forward a bit, then scan
-    counter-clockwise" — which is exactly what it looked like on the robot, and
-    none of it was a coincidence.
-    """
+def test_first_confident_detection_supplies_a_target():
     config = _cfg()
     tracker = T.Tracker()
-    assert _feed(tracker, _detections(_obj()), config=config) is None
-    assert tracker.track is not None, "it is remembered..."
-    assert tracker.track.state == T.TENTATIVE, "...but not acted on"
+    track = _feed(tracker, _detections(_obj()), config=config)
+    assert track.observed and track.accepted_detection and track.hits == 1
 
 
-def test_three_of_five_confirms():
-    config = _cfg()
-    tracker = T.Tracker()
-    for _ in range(config.confirm_hits - 1):
-        assert _feed(tracker, _detections(_obj()), config=config) is None
-    assert _feed(tracker, _detections(_obj()), config=config) is not None
-    assert tracker.track.state == T.CONFIRMED
-
-
-def test_a_ghost_that_appears_once_is_dropped():
-    """And never drives anything on the way out."""
-    config = _cfg()
+def test_a_single_detection_still_expires_after_the_coast_budget():
+    config = _cfg(max_coast_s=.25)
     tracker = T.Tracker()
     _feed(tracker, _detections(_obj()), config=config)
-    for _ in range(config.confirm_window):
-        assert _feed(tracker, _detections(), config=config) is None
-        if tracker.track is None:
-            break
-    assert tracker.track is None
-    # Read at the moment of the drop: later ticks overwrite it with the ordinary
-    # "nothing in view", which says nothing about why the candidate went.
-    assert "没能在窗口内确认" in tracker.last_reason
+    coast = _feed(tracker, _detections(), config=config)
+    assert coast.state == T.COASTING
+    assert _feed(tracker, _detections(), config=config, dt=.2) is None
 
 
-def test_a_flicker_does_not_stop_confirmation():
-    """Requiring three *consecutive* frames would never confirm anything: a
-    chair that is really there shows up in seven frames out of ten."""
+def test_a_flicker_does_not_replace_the_track():
+    """A short miss keeps the target generation."""
     config = _cfg()
     tracker = T.Tracker()
     for detections in (_detections(_obj()), _detections(),
@@ -349,30 +318,14 @@ def _stamped(stamp, *objects):
     return {"timestamp": stamp, "objects": list(objects)}
 
 
-def test_re_reading_one_payload_does_not_confirm_a_track():
-    """Measured on r1_sz: the policy ticks at 10 Hz and vop publishes at 3.6 Hz,
-    so the same payload is read on about three consecutive ticks.
-
-    Counting a hit each time turns "three of the last five frames" into "one
-    frame, read three times" — which confirms a track off a single false
-    positive, the exact failure this lifecycle exists to prevent.
-    """
+def test_re_reading_one_payload_does_not_update_the_filter_again():
     config = _cfg()
     tracker = T.Tracker()
     payload = _stamped(100.0, _obj())
-    for _ in range(6):
-        assert _feed(tracker, payload, config=config) is None, \
-            "one detection frame confirmed a track by being read repeatedly"
-    assert tracker.track.state == T.TENTATIVE
+    assert _feed(tracker, payload, config=config).accepted_detection
+    for _ in range(5):
+        assert not _feed(tracker, payload, config=config).accepted_detection
     assert tracker.track.hits == 1
-
-
-def test_three_distinct_payloads_confirm():
-    config = _cfg()
-    tracker = T.Tracker()
-    for index in range(config.confirm_hits):
-        drivable = _feed(tracker, _stamped(100.0 + index, _obj()), config=config)
-    assert drivable is not None
 
 
 def test_a_repeated_payload_still_advances_the_prediction():
@@ -416,14 +369,11 @@ def test_reacquisition_after_the_coast_budget_starts_a_new_track():
     for index in range(config.confirm_hits):
         _feed(tracker, _stamped(index, _obj()), config=config)
 
+    generation = tracker.track.generation
     _feed(tracker, _stamped(10), config=config)
-    _feed(tracker, _stamped(11, _obj()), config=config)
-    _feed(tracker, _stamped(12, _obj()), config=config)
-    assert tracker.track.state == T.REACQUIRING
-
-    assert _feed(tracker, _stamped(13, _obj()), config=config) is None
-    assert tracker.track.state == T.TENTATIVE
-    assert tracker.track.hits == 1
+    track = _feed(tracker, _stamped(11, _obj()), config=config, dt=config.max_coast_s)
+    assert track.observed and track.hits == 1
+    assert track.generation != generation
 
 
 def test_a_payload_is_still_a_duplicate_after_a_blind_tick():
@@ -517,42 +467,13 @@ def test_a_payload_with_no_stamp_is_counted_every_time():
 
 # ── re-acquisition: reviving a track has the same consequences as starting one ──
 
-def test_a_single_frame_cannot_revive_a_coasted_track():
-    """The asymmetry that stopped a navigation on the wrong object.
-
-    Creating a track took `confirm_hits` frames; resurrecting one took a single
-    frame — and it did so exactly when the gate was at its widest, because the
-    covariance had been growing for the whole coast. On r1_sz a track on a
-    person was re-acquired onto a traffic cone that vop had labelled `person`
-    for one frame, and the card reported that it had arrived.
-    """
+def test_first_matching_return_revives_a_coasted_track():
     config = _cfg()
     tracker = T.Tracker()
-    _feed(tracker, _detections(_obj(bearing=0.0)), config=config,
-          ticks=config.confirm_hits)
+    original = _feed(tracker, _detections(_obj()), config=config)
     _feed(tracker, _detections(), config=config, ticks=3)
-
-    track = _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
-    assert track is not None and track.state == T.REACQUIRING
-    assert track.drivable, "the prediction is still good enough to keep walking"
-    assert not track.observed, "but not good enough to call it an arrival"
-
-    for _ in range(config.confirm_hits - 1):
-        track = _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
-    assert track.state == T.CONFIRMED and track.observed
-
-
-def test_one_missed_frame_restarts_the_re_acquisition_count():
-    """A flicker is not evidence. Only a run of consecutive matches is."""
-    config = _cfg()
-    tracker = T.Tracker()
-    _feed(tracker, _detections(_obj(bearing=0.0)), config=config,
-          ticks=config.confirm_hits)
-    _feed(tracker, _detections(), config=config, ticks=2)
-    _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
-    _feed(tracker, _detections(), config=config)
-    track = _feed(tracker, _detections(_obj(bearing=0.05)), config=config)
-    assert track.state == T.REACQUIRING and track.reacquire_hits == 1
+    track = _feed(tracker, _detections(_obj(bearing=.05)), config=config)
+    assert track is original and track.observed and track.accepted_detection
 
 
 def test_reacquiring_a_static_target_after_ego_motion_preserves_zero_velocity():

@@ -14,12 +14,9 @@ and answers "where is it now" every tick, whether or not it was seen this tick.
 
 Nothing here is new. Three ideas, each from a paper that earned it:
 
-* **A track has a lifecycle, and the thresholds are symmetric** (SORT's
-  `min_hits` / `max_age`). Before this, navi took **one** frame to start
-  chasing something and **ten** to give up — and that asymmetry points the
-  wrong way, because starting is the direction that moves a robot. Ultralytics'
-  ByteTrack gets this right by default (a new `STrack` is `is_activated=False`
-  until it matches again, so two frames), and we ask for three of five.
+* **A track has a bounded lifetime.** Use the first detection that passes
+  confidence and association checks. Keep the target through a short miss
+  and expire it when the prediction is no longer reliable.
 
 * **Low-confidence detections are not noise; they are what occlusion looks
   like** (ByteTrack, MOT20: ID switches down 71%). A detection below the
@@ -72,17 +69,15 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
 from .depth import observation_ms
 from .odom import PlanarPose
 
-TENTATIVE = "tentative"    # seen, not yet trusted enough to move a robot
 CONFIRMED = "confirmed"
 COASTING = "coasting"      # not seen this tick; position is predicted
-REACQUIRING = "reacquiring"  # something matched after a coast, not yet believed
 LOST = "lost"
 
 
@@ -205,9 +200,8 @@ class Track:
     cov: np.ndarray
     hue: str = ""
     name: str = ""
-    state: str = TENTATIVE
+    state: str = CONFIRMED
     hits: int = 0
-    history: deque = field(default_factory=lambda: deque(maxlen=8))
     age_s: float = 0.0
     # The last real observation and how long ago it was, for the re-update on
     # re-acquisition. It is transported into the current body frame at each
@@ -222,11 +216,6 @@ class Track:
     accepted_detection: bool = False
     measured_range_m: float | None = None
     measured_point: MeasuredPoint | None = None
-
-    # Matches accumulated since the track started coasting. Resurrecting a
-    # track decides what the robot chases, exactly as creating one does, so it
-    # is held to the same evidence — see `_hit`.
-    reacquire_hits: int = 0
 
     # The goal uses the associated box measurement. Keep its nearest coherent
     # surface independently for physical standoff checks.
@@ -260,16 +249,16 @@ class Track:
 
     @property
     def drivable(self) -> bool:
-        """Whether this track may move the robot. Tentative ones may not."""
-        return self.state in (CONFIRMED, COASTING, REACQUIRING)
+        """Whether this track can serve as a navigation target."""
+        return self.state in (CONFIRMED, COASTING)
 
     @property
     def coast_s(self) -> float:
-        return self.since_obs_s if self.state in (COASTING, REACQUIRING) else 0.0
+        return self.since_obs_s if self.state == COASTING else 0.0
 
     @property
     def observed(self) -> bool:
-        """A confirmed fix with no missed detection, including between frames."""
+        """A matched detection with no intervening miss."""
         return self.state == CONFIRMED
 
     @property
@@ -449,9 +438,7 @@ def _associate(candidates, config, position, cov=None, since_obs_s=0., hue=""):
         return None
 
     if position is None:
-        # Nothing to gate against — only a confident detection may start a
-        # track, and it starts tentative. This is the half of the
-        # asymmetry that used to move the robot on a single frame.
+        # Without a prior position to gate against, require high confidence.
         confident = [c for c in candidates
                      if c["confidence"] >= config.min_confidence]
         if not confident:
@@ -616,13 +603,11 @@ class Tracker:
     def __init__(self):
         self.track: Track | None = None
         self._generation = 0
-        self.matched_detections = None  # includes gated, not-yet-confirmed matches
+        self.matched_detections = None
         # Keep recent stamps across blind ticks and out-of-order delivery.
         self._detection_stamps = deque(maxlen=64)
         self._range_frames = deque(maxlen=64)
-        # Why the last tick did what it did — surfaced in info(), because a
-        # tracker that quietly refuses to confirm anything looks identical from
-        # outside to a camera with nothing in front of it.
+        # Expose why a target was lost or recovered in info().
         self.last_reason = ""
 
     # ── the tick ─────────────────────────────────────────────────────────────
@@ -657,19 +642,8 @@ class Tracker:
                 self.last_reason = (f"目标消失超过 {config.max_coast_s:.1f}s，"
                                     "外推已不可信，放弃轨迹")
 
-        # **One payload is one piece of evidence, however many times it is read.**
-        #
-        # The policy ticks at `rate_hz` and the detector publishes at whatever
-        # rate it manages; on r1_sz those are 10 Hz and 3.6 Hz, so the card sees
-        # the same payload on roughly three consecutive ticks. Counting a hit
-        # each time turns "three of the last five frames" into "one frame, read
-        # three times" — which confirms a track off a single false positive,
-        # the exact failure this lifecycle exists to prevent. It would also fold
-        # the same measurement into the filter three times and shrink the
-        # covariance as if three cameras had agreed.
-        #
-        # Prediction still runs above: our own motion continues whether or not
-        # a new picture arrived. Only the *evidence* is skipped.
+        # Apply each detector sample to the filter once. Prediction and a
+        # new depth measurement can still advance between detector frames.
         stamp = (detections or {}).get("timestamp")
         if stamp is None and detections is not None and receipt_ms:
             stamp = ("receipt", receipt_ms)
@@ -680,7 +654,7 @@ class Tracker:
                      and isinstance(stamp, (int, float)) and self.track.latest_source is not None
                      and stamp < self.track.latest_source)
             if older or stamp in self._detection_stamps:
-                if stamp == self._detection_stamps[-1] and self.track is not None and self.track.observed:
+                if stamp == self._detection_stamps[-1] and self.track is not None:
                     self._update_front(depth, config, dt)
                 return self.track if (self.track and self.track.drivable) else None
             self._detection_stamps.append(stamp)
@@ -713,7 +687,9 @@ class Tracker:
                     if depth_id is not None:
                         self._range_frames.append(depth_id)
         elif not expired:
-            self._miss(config, candidates)
+            self._miss(candidates)
+            if self.track is not None:
+                self._update_front(depth, config, dt)
 
         return self.track if (self.track and self.track.drivable) else None
 
@@ -730,6 +706,14 @@ class Tracker:
                 track.front_frame_id is not None and frame <= track.front_frame_id):
             return
         track.front_frame_id = frame
+        stamp = observation_ms(depth)
+        now = depth.get("control_ms")
+        depth_age_ms = now - stamp if type(now) is int and type(stamp) is int else 0
+        coasting = not track.observed
+        if coasting and (track.front_fix is None or track.front_reference is None
+                         or track.since_obs_s * 1000 >= config.max_obs_age_ms
+                         or not 0 <= depth_age_ms < min(config.depth_age_limit_ms, config.max_obs_age_ms)):
+            return
         point = _front_point(depth, box, config, track.front_reference, track.front_fix is not None,
                              track.range_known, track.position, dt)
         if point is None:
@@ -737,15 +721,22 @@ class Tracker:
         if range_m is None:
             from .depth import sample_box
             range_m = sample_box(depth["map"], box)
-        bearing = (track.image_region[0] or (0.,))[0] * config.half_fov_rad
+        if coasting:
+            # The remembered crop can contain a new foreground object. Both
+            # the box range and the coherent front must agree with the
+            # transported target before the new depth can verify arrival.
+            tolerance = config.stop_tolerance_m
+            if (abs(range_m - track.range_m) > tolerance
+                    or math.dist(point, track.front_reference) > tolerance):
+                return
+            bearing = track.bearing_rad
+        else:
+            bearing = (track.image_region[0] or (0.,))[0] * config.half_fov_rad
         track.front_fix = point_of(range_m, bearing)
         track.front_reference = point
         # Frame reception and processing may already have used part of
         # the depth budget. Reading this frame again cannot renew it.
-        stamp = observation_ms(depth)
-        now = depth.get("control_ms")
-        track.front_age_s = (max(0, now - stamp) / 1000
-                             if type(now) is int and type(stamp) is int else 0.)
+        track.front_age_s = max(0, depth_age_ms) / 1000
         track.record_range(range_m, track.front_fix, depth, standoff_point=tuple(point))
 
     # ── 1. predict: mostly a statement about our own motion ──────────────────
@@ -787,31 +778,11 @@ class Tracker:
         point = candidate["point"]
         if self.track is None:
             self._create(candidate, config)
-            self.last_reason = (f"看到 {candidate['name']!r}，建立候选轨迹"
-                                f"（需 {config.confirm_hits} 帧确认）")
+            self.last_reason = f"已关联目标 {candidate['name']!r}"
             return
 
         track = self.track
-        was_coasting = track.state in (COASTING, REACQUIRING)
-
-        if was_coasting:
-            # **One frame resurrects a track; three create one.** That asymmetry
-            # is the same bug that made a single false positive start a chase,
-            # moved to the other end of the lifecycle — and it is worse here,
-            # because the gate is at its widest exactly when the evidence is at
-            # its thinnest. Until the count is met the track keeps coasting on
-            # its prediction: still drivable, still not jumped.
-            track.reacquire_hits += 1
-            track.history.append(True)
-            # The coast clock keeps running until the match is accepted, so
-            # slow detection cannot extend the budget for driving a prediction.
-            if track.reacquire_hits < config.confirm_hits:
-                track.state = REACQUIRING
-                self.last_reason = (
-                    f"疑似重新看到目标（{track.reacquire_hits}/{config.confirm_hits}）"
-                    "，先按预测继续，确认了才接受它的位置")
-                return
-            track.reacquire_hits = 0
+        was_coasting = track.state == COASTING
 
         if was_coasting and track.last_obs is not None and track.since_obs_s > 1e-6:
             # OC-SORT's observation-centric re-update, in the form this state
@@ -829,24 +800,12 @@ class Tracker:
         track.hue = candidate["hue"] or track.hue
         track.range_known = track.range_known or candidate["range_measured"]
         track.hits += 1
-        track.history.append(True)
         track.accepted_detection = True
         track.last_obs = point.copy()
         track.since_obs_s = 0.0
 
-        if track.state == TENTATIVE:
-            if track.hits >= config.confirm_hits:
-                track.state = CONFIRMED
-                self.last_reason = f"轨迹确认（{track.hits} 帧）"
-            else:
-                self.last_reason = (f"候选轨迹 {track.hits}/{config.confirm_hits} "
-                                    "帧，还不驱动底盘")
-        else:
-            if was_coasting:
-                self.last_reason = "目标重新出现，轨迹恢复"
-            else:
-                self.last_reason = ""
-            track.state = CONFIRMED
+        track.state = CONFIRMED
+        self.last_reason = "目标重新出现，轨迹恢复" if was_coasting else ""
 
     def _create(self, candidate, config):
         self._generation += 1
@@ -858,13 +817,11 @@ class Tracker:
             cov=self._initial_cov(candidate, config),
             hue=candidate["hue"],
             name=candidate["name"],
-            state=TENTATIVE,
             hits=1,
             range_known=candidate["range_measured"],
             accepted_detection=True,
             last_obs=candidate["point"].copy(),
         )
-        self.track.history.append(True)
 
     @staticmethod
     def _initial_cov(candidate, config) -> np.ndarray:
@@ -878,27 +835,14 @@ class Tracker:
 
     # ── 4. miss ──────────────────────────────────────────────────────────────
 
-    def _miss(self, config, candidates):
+    def _miss(self, candidates):
         track = self.track
         if track is None:
             self.last_reason = ("视野里没有匹配目标的检测" if not candidates
                                 else "有疑似检测，但置信度不足以建立轨迹")
             return
 
-        track.history.append(False)
-
-        if track.state == TENTATIVE:
-            # A candidate that cannot keep showing up is dropped rather than
-            # kept around: it never moved the robot, and holding it would let a
-            # ghost win the gate against a real detection later.
-            if len(track.history) >= config.confirm_window and \
-                    track.hits < config.confirm_hits:
-                self.track = None
-                self.last_reason = "候选轨迹没能在窗口内确认，丢弃"
-            return
-
         track.state = COASTING
-        track.reacquire_hits = 0
         self.last_reason = (f"目标暂时看不见（{track.coast_s:.1f}s），"
                             "按自身运动推算位置继续")
 

@@ -729,7 +729,9 @@ def front_corner_sweep_grid(frame, geometry, half_width, occupied, *, guard_blin
         if abs(span) < RESOLUTION / 2:
             continue
         slope = (z[-1] - z[0]) / span
-        if abs(slope) > 1. or np.max(abs(strip - (z[0] + slope * (right-right[0])))) > RESOLUTION / 8:
+        # An oblique wall can reach the blind corner before the centre ray
+        # gets close. Require the same continuous, occupied depth strip.
+        if abs(slope) > 2. or np.max(abs(strip - (z[0] + slope * (right-right[0])))) > RESOLUTION / 8:
             continue
         indices = np.rint(np.column_stack((z, right)) / RESOLUTION) + START
         if np.any(indices < 0) or np.any(indices >= occupied.shape):
@@ -1446,8 +1448,11 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     center = ((low + high) / 2 - START) * RESOLUTION
     forward, lateral = center[0] - pivot, center[1]
     distance = math.hypot(forward, lateral)
-    # Circumscribe the occupied cells, then add three chassis half widths.
-    radius = math.hypot(*span) / 2 + 3 * body_half_width
+    # Bias the compact-blocker tangents outward by 2.25 chassis widths.
+    radius = math.hypot(*span) / 2 + 4.5 * body_half_width
+    if distance <= radius + RESOLUTION:
+        # A tangent within one grid cell of the start can force a sharp turn.
+        radius -= 1.5 * body_half_width
     if distance <= radius:
         return cost, None
     bearing = math.atan2(lateral, forward)

@@ -27,9 +27,8 @@ def observation_card(monkeypatch, *, body=True, live_target=False, mount_forward
             {"name": "person", "position": [0., -.6], "confidence": .95}]}
         if not detector_timestamp:
             del objects["timestamp"]
-        # The measured target lies on the 5 m background above the 2 m
-        # obstacle. Confirm it through real earlier frames, retaining the
-        # production three-hit requirement rather than injecting a Track.
+        # Establish the measured target on the 5 m background above the
+        # 2 m obstacle using earlier detector frames.
         for stamp in confirm_stamps:
             state.tracker.step(
                 detections=(dict(objects, timestamp=stamp / 1000) if detector_timestamp else objects),
@@ -301,6 +300,50 @@ def test_retained_route_budget_does_not_start_searching_alternate_paths(monkeypa
     assert attempted == [True]
     assert card._state.dwa_trace["wait_for_committed_route"]
     assert not any(candidate["values"])
+
+
+@pytest.mark.parametrize("lost_target", [False, True])
+def test_stopped_detour_rechecks_the_same_route_before_new_motion(monkeypatch, lost_target):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    first = card.next_command()
+    assert card._stage_command(first, card._output_epoch)
+    committed = card._state.committed_route
+    side = card._state.escape_side
+    assert committed is not None and committed.route_points
+
+    clock[0] = 1050
+    card._cancel_scheduled_motion(stop=(1050, "new depth must be checked", False),
+                                  dwa_reason="target_missing" if lost_target else "footprint_collision")
+    assert not any(packets[-1]["values"])
+    advance_snapshot(snapshot, clock, 1100, vx=0.)
+    objects, depth, odom, _ = snapshot[0]
+    if lost_target:
+        snapshot[0] = {"timestamp": 1.1, "objects": []}, depth, odom, 1100
+
+    attempts = []
+
+    def blocked(depth, config, state, route, *args, **kwargs):
+        attempts.append(kwargs.get("follow_published", False))
+        state.dwa_trace["fallback_reason"] = "no_admissible_candidates"
+        return None
+
+    with monkeypatch.context() as patch:
+        patch.setattr(policy, "_dwa_detour", blocked)
+        stop = card.next_command()
+        assert attempts == [True]
+        assert not any(stop["values"])
+        assert card._state.committed_route is committed
+        assert card._state.escape_side == side
+
+    advance_snapshot(snapshot, clock, 1200, vx=0.)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=1.2), depth, odom, 1200
+    resumed = card.next_command()
+    assert card._state.dwa_trace.get("retained_route")
+    assert resumed["values"][0] > 0.
+    assert card._stage_command(resumed, card._output_epoch)
+    assert packets[-1]["values"][0] > 0.
 
 
 @pytest.mark.parametrize("next_depth", ["expired", "clear", "obstacle"])
@@ -3070,7 +3113,7 @@ def test_route_controller_keeps_an_updated_target_range_on_later_depth(monkeypat
 
 
 @pytest.mark.parametrize("new_obstacle", [False, True])
-def test_timer_hands_lost_target_to_search_inside_the_active_window(monkeypatch, new_obstacle):
+def test_timer_retains_the_detour_instead_of_switching_to_search(monkeypatch, new_obstacle):
     card, packets, _, snapshot, feed = tracked_route_card(monkeypatch)
     work = card._scheduled_command
     cutoff = min(work.expires_ms, work.repeat_until[0])
@@ -3087,8 +3130,10 @@ def test_timer_hands_lost_target_to_search_inside_the_active_window(monkeypatch,
     else:
         assert len(packets) == 1 and work.expires_ms == cutoff
         assert card._state.reacquire_generation is not None
+        committed = card._state.committed_route
         card._tick()
-        assert len(packets) == 2 and packets[-1]["values"][5] != 0.
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+        assert card._state.committed_route is committed
 
 
 @pytest.mark.parametrize("change", ["clear", "obstacle", "cancelled", "expired"])

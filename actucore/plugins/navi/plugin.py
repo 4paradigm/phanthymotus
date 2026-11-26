@@ -1115,11 +1115,8 @@ class NaviPlugin:
                     "message": f"已订阅 {self._binding['objects']}，但还没收到任何"
                                f"检测结果 —— 确认 vop 卡片在运行且相机有画面"}
 
-        # Same bar as the tracker's: something that would be *chased* after
-        # `confirm_hits` of `confirm_window` frames should be *listed* on the
-        # same evidence. The two used to disagree by an order of magnitude —
-        # ten frames to appear in this list, one frame to start driving a
-        # chassis — and the list was the strict one.
+        # Keep the object inventory stable across detector flicker. Target
+        # association itself uses the current matching detection.
         need = self._stability_bar(len(frames))
         items = policy_mod.stable_objects(frames, min_frames=need,
                                           config=self._config)
@@ -3010,7 +3007,7 @@ class NaviPlugin:
                     self._state.published_dwa_route = accepted
             committed = self._state.committed_route
             if (self._state.published_dwa_route is None and committed is not None
-                    and self._state.dwa_trace.get("wait_for_committed_route")):
+                    and (committed.locks_detour or self._state.dwa_trace.get("wait_for_committed_route"))):
                 self._state.published_dwa_route = committed
             if self._config.local_controller == "dwa" and self._wire_twist is not None:
                 # A preview or an expired candidate did not change the chassis

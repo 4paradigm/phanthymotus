@@ -5268,12 +5268,34 @@ def test_person_arrival_uses_box_measurement_at_configured_standoff(person_range
 
     decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=100),
                       odom=None, config=config, state=state, dt=.1)
-    assert decision.status != P.ARRIVED and not any(decision.values or ())
-    decision = P.step(detections=_detections(person), depth=dict(map=frame, frame_id=200),
-                      odom=None, config=config, state=state, dt=.1)
     assert (decision.status == P.ARRIVED) == arrived
-    assert not any(decision.values)
+    if arrived:
+        assert not any(decision.values)
     assert decision.distance_m == pytest.approx(person_range, abs=.002)
+
+
+@pytest.mark.parametrize("range_m, frame_id, arrived", [
+    (.63, 200, True), (.63, 100, False), (.25, 200, False),
+])
+def test_last_seen_person_arrival_requires_a_new_consistent_depth_range(range_m, frame_id, arrived):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    config = _cfg(stop_distance_m=.60, stop_tolerance_m=.05,
+                  depth_intrinsics=HorizontalIntrinsics(80, 65., 39.5))
+    state = P.State(target="person")
+    person = _obj("person", bbox=(.2, .1, .8, .9))
+    for index, stamp in enumerate((80, 90, 100)):
+        P.step(detections=dict(_detections(person), timestamp=index + 1),
+               depth=dict(map=np.full((60, 80), .67), frame_id=stamp),
+               odom=None, config=config, state=state, dt=.1)
+
+    decision = P.step(detections=dict(_detections(), timestamp=4),
+                      depth=dict(map=np.full((60, 80), range_m), frame_id=frame_id),
+                      odom=None, config=config, state=state, dt=.1)
+    assert not state.tracker.track.observed
+    assert (decision.status == P.ARRIVED) is arrived
+    if arrived:
+        assert decision.distance_m == pytest.approx(.63)
 
 
 def test_legacy_wheeled_box_corner_prefers_longer_checked_escape_to_the_open_side(monkeypatch):
