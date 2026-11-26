@@ -20,13 +20,18 @@ _queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
 _recent: list[dict]   = []    # 最近 N 条事件，用于 L2 环境快照
 
 
-async def enqueue(source: str, text: str, payload: dict | None = None) -> None:
+async def enqueue(source: str, text: str, payload: dict | None = None, *,
+                  channel_origin: dict | None = None) -> None:
     event = {
         'source':  source,
         'text':    text,
         'payload': payload or {},
         'ts':      time.time(),
     }
+    if channel_origin is not None:
+        # Only internal callers supply this keyword. Never trust origin fields
+        # embedded in a driver payload or in user-provided JSON text.
+        event['_channel_origin'] = channel_origin
     await _queue.put(event)
     _recent.append(event)
     if len(_recent) > 100:

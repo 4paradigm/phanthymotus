@@ -758,6 +758,7 @@ class Subagent:
                 await event_bus.enqueue(
                     source=f'subagent:{self.id}/report',
                     text=progress,
+                    channel_origin=self.spec.metadata.get('_channel_origin'),
                 )
             else:
                 # 非紧急：存入 DB 供 memory_recall 检索，不触发 main agent

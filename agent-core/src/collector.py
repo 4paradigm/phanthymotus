@@ -291,8 +291,17 @@ def _can_steer(event: dict) -> bool:
     if not _is_channel_event(event):
         return True
     scope = channel_scope([event])
-    return (scope is not None and scope == _current_channel_scope
+    return (scope is not None and scope == tuple(_current_channel_scope or ())
             and scope[4] in ('operator', 'owner'))
+
+
+def _preempts_restricted_turn(event: dict) -> bool:
+    if not _current_turn_restricted or '_channel_origin' in event:
+        return False
+    if _is_channel_event(event):
+        scope = channel_scope([event])
+        return bool(scope and scope[4] in ('operator', 'owner') and not scope[5])
+    return _infer_channel(event) in ('remote_web', 'local_mic', 'remote_mic')
 
 
 def set_interrupt_mode(mode: str):
@@ -368,12 +377,26 @@ def get_available_sources() -> list[str]:
 
 
 def _is_channel_event(event: dict) -> bool:
-    return '/channel/request/' in str(event.get('source', ''))
+    return ('_channel_origin' in event
+            or '/channel/request/' in str(event.get('source', '')))
 
 
 def _channel_payloads(events: list[dict]) -> list[dict]:
     payloads = []
     for ev in events:
+        if '_channel_origin' in ev:
+            from channel import context
+            origin = context.capture(ev['_channel_origin'])
+            if origin is not None:
+                platform, channel_id, chat_id, user_id, role, chat_only = origin['_channel_scope']
+                payloads.append({
+                    'platform': platform, 'channel_id': channel_id, 'chat_id': chat_id,
+                    'user_id': user_id, 'user_role': role, 'chat_only': chat_only,
+                    'sender_type': 'user', 'message_id': origin['_channel_message_ids'][-1],
+                    'files': [{'kind': 'image', 'path': path}
+                              for path in origin['_channel_image_paths']],
+                })
+            continue
         if not _is_channel_event(ev):
             continue
         text = ev.get('text', '')
@@ -415,13 +438,8 @@ def channel_scope(events: list[dict]) -> tuple | None:
 
 
 def channel_context_key(trigger: dict) -> str:
-    scope = trigger.get('_channel_scope')
-    if (not isinstance(scope, (tuple, list)) or len(scope) != 6
-            or not all(isinstance(value, str) and value for value in scope[:4])
-            or scope[4] not in ('viewer', 'operator', 'owner')
-            or not isinstance(scope[5], bool)):
-        return ''
-    return _json.dumps(scope, ensure_ascii=False, separators=(',', ':'))
+    from channel.context import context_key
+    return context_key(trigger)
 
 
 def has_viewer_only_channel_event(events: list[dict]) -> bool:
@@ -434,8 +452,14 @@ def has_viewer_only_channel_event(events: list[dict]) -> bool:
 
 def channel_message_ids(events: list[dict]) -> list[str]:
     """Return message IDs for every Channel payload (human + bot) in a batch."""
-    return [payload['message_id'] for payload in _channel_payloads(events)
-            if isinstance(payload.get('message_id'), str) and payload['message_id']]
+    ids = []
+    for event in events:
+        if '_channel_origin' in event:
+            ids.extend(event['_channel_origin'].get('_channel_message_ids') or [])
+        else:
+            ids.extend(payload['message_id'] for payload in _channel_payloads([event])
+                       if isinstance(payload.get('message_id'), str) and payload['message_id'])
+    return list(dict.fromkeys(ids))
 
 
 def channel_image_paths(events: list[dict]) -> list[str]:
@@ -484,7 +508,11 @@ def _split_by_authorization(events: list[dict]) -> list[list[dict]]:
     batches: list[list[dict]] = []
     last_key = None
     for event in events:
-        if not _is_channel_event(event):
+        if '_channel_origin' in event:
+            origin = event['_channel_origin']
+            key = ('channel-followup', channel_context_key(origin),
+                   origin.get('_channel_session_id'))
+        elif not _is_channel_event(event):
             key = ('non-channel',)
         else:
             payloads = _channel_payloads([event])
@@ -557,11 +585,16 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
             channel_ids.append(channel_id)
     bot_payloads = _bot_channel_payloads(batch)
     trusted_payloads = _trusted_bot_channel_payloads(batch)
-    history_text = _chat_history_blocks(batch)
     formatted = _format_priority_batch(batch)
+    origin = batch[0].get('_channel_origin')
+    if origin:
+        formatted += '\n[Channel reply context] ' + _json.dumps({
+            'channel_id': origin['_channel_scope'][1],
+            'source_message_ids': channel_message_ids(batch),
+        }, ensure_ascii=False)
     trigger = {
         'source': 'collector',
-        'text': f'{history_text}\n{formatted}' if history_text else formatted,
+        'text': formatted,
         'payload': {
             'event_count': len(batch),
             'sources': [e['source'] for e in batch],
@@ -581,6 +614,10 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
     }
+    if origin:
+        trigger['_channel_origin'] = origin
+        if origin['_channel_scope'][5]:
+            trigger['_chat_only_channel'] = origin['_channel_scope'][1]
     if batch[0].get('_chat_only_key'):
         trigger['_chat_only_channel'] = batch[0]['_chat_only_key'][0]
     from channel.manager import manager as channel_manager
@@ -881,6 +918,8 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
 def _infer_channel(ev: dict) -> str:
     """从事件 source 推断渠道标签。"""
     source = ev.get('source', '')
+    if '_channel_origin' in ev:
+        return f"channel:{ev['_channel_origin']['_channel_scope'][0]}"
     if '/channel/' in source or source.startswith('channel:'):
         text = ev.get('text', '')
         if text and text.startswith('{'):
@@ -942,6 +981,10 @@ async def _drain_loop():
     while True:
         ev = await event_bus.dequeue()
         source = ev.get('source', 'unknown')
+        if '_channel_origin' in ev:
+            from channel import context
+            if not context.is_active(ev['_channel_origin']):
+                continue
 
         # 没启动就什么都不该跑。
         #
@@ -996,9 +1039,13 @@ async def _drain_loop():
                 asyncio.create_task(hooks.fire('on_kws_wakeup'))
 
         # Ring buffer 始终存储（所有事件，供 raw_input_info 查询）
-        if source not in _source_ring:
-            _source_ring[source] = deque(maxlen=ring_size)
-        _source_ring[source].append(ev)
+        if '_channel_origin' not in ev:
+            if source not in _source_ring:
+                _source_ring[source] = deque(maxlen=ring_size)
+            _source_ring[source].append(ev)
+
+        if priority <= 0 and '_channel_origin' in ev:
+            continue  # A silent Channel completion must not enter shared BG context.
 
         if priority > 0:
             # ── P>0: 送 main agent ──
@@ -1019,6 +1066,15 @@ async def _drain_loop():
                         continue
 
                 # 按模式处理
+                if _preempts_restricted_turn(ev):
+                    # Start a separate authorized turn. Injecting this input
+                    # into a viewer turn would leave it with viewer-only tools.
+                    index = next((i for i, item in enumerate(_priority_pending)
+                                  if not _preempts_restricted_turn(item)), len(_priority_pending))
+                    _priority_pending.insert(index, ev)
+                    if _cancel_event:
+                        _cancel_event.set()
+                    continue
                 if _interrupt_mode == 'steer':
                     # Same-sender operator steering keeps its authority. Other
                     # contexts wait for a turn with their own tools and routing.

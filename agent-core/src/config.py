@@ -162,6 +162,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     for table, column, ddl in (
         ('chat_sessions', 'kind', 'kind TEXT DEFAULT \'main\''),
         ('chat_sessions', 'context_key', 'context_key TEXT DEFAULT \'\''),
+        ('chat_sessions', 'rolling_summary', 'rolling_summary TEXT DEFAULT \'\''),
+        ('chat_sessions', 'summarized_through', 'summarized_through INTEGER DEFAULT -1'),
         ('chat_messages', 'updated_at', 'updated_at REAL'),
     ):
         try:

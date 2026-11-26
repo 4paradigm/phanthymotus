@@ -248,7 +248,7 @@ def clear_all():
     with _get_conn() as conn:
         conn.execute('DELETE FROM chat_messages')
         conn.execute('DELETE FROM chat_sessions')
-        conn.execute("DELETE FROM config WHERE key = 'channel_chat_history'")
+        conn.execute("DELETE FROM config WHERE key IN ('channel_chat_history', 'channel_history_migrations')")
         try:
             conn.execute('DELETE FROM chat_messages_fts')
         except Exception:
@@ -334,25 +334,155 @@ def search(query: str, limit: int = 10, *, context_key: str | None = None,
 
 # ── 重启续跑 ──────────────────────────────────────────────────────────────────
 
-def get_channel_session(context_key: str, limit: int = 18) -> dict | None:
+_LEGACY_EVENTS = re.compile(r'<event\b([^>]*)>\s*(.*?)\s*</event>', re.DOTALL)
+
+
+def _legacy_channel_turn(messages: list[dict], context_key: str) -> list[dict] | None:
+    """Attribute a legacy turn only when every user input has the same identity.
+
+    Drop the old global environment and chat recap from the trigger. They may
+    contain other conversations even when this turn's actual input is ours.
+    """
+    from channel.context import context_key as key_for
+    restored = []
+    found = False
+    for message in messages:
+        if message.get('role') != 'user':
+            restored.append(message)
+            continue
+        content = message.get('content')
+        if not isinstance(content, str):
+            return None
+        blocks = list(_LEGACY_EVENTS.finditer(content))
+        if blocks:
+            if any('/channel/request/' not in block[1] for block in blocks):
+                return None
+            texts = [block[2] for block in blocks]
+        elif content.startswith('[system notification source=dds:/channel/request/'):
+            texts = [content.partition('\n')[2]]
+        else:
+            return None
+        for text in texts:
+            try:
+                payload = json.loads(text)
+            except (ValueError, TypeError):
+                return None
+            if not isinstance(payload, dict) or payload.get('sender_type') in ('bot', 'app'):
+                return None
+            scope = [payload.get(key) for key in ('platform', 'channel_id', 'chat_id', 'user_id')]
+            scope.extend([payload.get('user_role'), payload.get('chat_only') is True])
+            if key_for({'_channel_scope': scope}) != context_key:
+                return None
+        found = True
+        restored.append({**message, 'content': '\n'.join(
+            block[0] for block in blocks) if blocks else content})
+    return restored if found else None
+
+
+def _migrate_channel_session(context_key: str) -> str | None:
+    """Copy attributable legacy transcripts once, retaining the original archive."""
+    with _get_conn() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute("SELECT value FROM config WHERE key='channel_history_migrations'").fetchone()
+        migrated = json.loads(row[0]) if row else {}
+        if context_key in migrated:
+            return None
+        existing = conn.execute(
+            'SELECT id FROM chat_sessions WHERE kind=? AND context_key=?',
+            (KIND_CHANNEL, context_key),
+        ).fetchone()
+        if existing:
+            return existing[0]
+        candidates = conn.execute(
+            "SELECT cm.messages, cm.created_at, cm.updated_at FROM chat_messages cm "
+            "JOIN chat_sessions cs ON cs.id=cm.session_id WHERE cs.kind=? "
+            "AND cs.context_key='' AND cs.summary NOT LIKE '[subagent:%' "
+            "AND cm.messages LIKE '%/channel/request/%' ORDER BY cm.created_at, cm.id",
+            (KIND_MAIN,),
+        )
+        turns = []
+        for blob, created_at, updated_at in candidates:
+            restored = _legacy_channel_turn(json.loads(blob), context_key)
+            if restored:
+                turns.append((restored, created_at, updated_at))
+        sid = None
+        if turns:
+            sid = str(uuid.uuid4())
+            conn.execute(
+                'INSERT INTO chat_sessions (id, kind, context_key, started_at, ended_at, turn_count, summary) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (sid, KIND_CHANNEL, context_key, turns[0][1], turns[-1][2] or turns[-1][1],
+                 len(turns), summary_text(turns[0][0][0].get('content', ''))[:100]),
+            )
+            for index, (messages, created_at, updated_at) in enumerate(turns):
+                blob = json.dumps(messages, ensure_ascii=False)
+                cursor = conn.execute(
+                    'INSERT INTO chat_messages (session_id, turn_index, messages, created_at, updated_at) '
+                    'VALUES (?, ?, ?, ?, ?)', (sid, index, blob, created_at, updated_at or created_at),
+                )
+                try:
+                    _ensure_fts(conn)
+                    conn.execute('INSERT INTO chat_messages_fts(rowid, content) VALUES (?, ?)',
+                                 (cursor.lastrowid, blob))
+                except Exception:
+                    pass  # Same optional FTS support as save_turn.
+        # Keep this marker after deleting a scoped session, so its legacy
+        # archive cannot resurrect the conversation on the next message.
+        migrated[context_key] = True
+        conn.execute("INSERT OR REPLACE INTO config(key, value) VALUES ('channel_history_migrations', ?)",
+                     (json.dumps(migrated),))
+        conn.commit()
+    return sid
+
+
+def get_channel_session(context_key: str, limit: int | None = 18, *,
+                        session_id: str | None = None) -> dict | None:
     """Restore only this sender's same-platform, same-role Channel conversation."""
     if not context_key:
         return None
     with _get_conn() as conn:
-        row = conn.execute(
-            'SELECT id FROM chat_sessions WHERE kind=? AND context_key=? '
-            'ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 1',
-            (KIND_CHANNEL, context_key),
-        ).fetchone()
-        if not row:
+        query = ('SELECT id, rolling_summary, summarized_through FROM chat_sessions '
+                 'WHERE kind=? AND context_key=?')
+        params = [KIND_CHANNEL, context_key]
+        if session_id is not None:
+            query += ' AND id=?'
+            params.append(session_id)
+        row = conn.execute(query + ' ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 1', params).fetchone()
+    if not row:
+        if session_id is not None or not _migrate_channel_session(context_key):
             return None
-        sid = row[0]
+        return get_channel_session(context_key, limit)
+    sid, summary, through = row
+    with _get_conn() as conn:
+        next_index = conn.execute(
+            'SELECT COALESCE(MAX(turn_index), -1)+1 FROM chat_messages WHERE session_id=?', (sid,),
+        ).fetchone()[0]
+        query = ('SELECT turn_index, messages FROM chat_messages WHERE session_id=? AND turn_index>? '
+                 'ORDER BY turn_index DESC')
+        params = [sid, through]
+        if limit is not None:
+            query += ' LIMIT ?'
+            params.append(limit)
         rows = conn.execute(
-            'SELECT turn_index, messages FROM chat_messages WHERE session_id=? '
-            'ORDER BY turn_index DESC LIMIT ?', (sid, limit),
+            query, params,
         ).fetchall()
-    return {'session_id': sid, 'next_turn_index': rows[0][0] + 1 if rows else 0,
+    return {'session_id': sid, 'next_turn_index': next_index,
+            'summary': summary or '', 'summarized_through': through,
+            'turn_indexes': [row[0] for row in reversed(rows)],
             'turns': [json.loads(row[1]) for row in reversed(rows)]}
+
+
+def save_channel_summary(session_id: str, context_key: str, summary: str, *,
+                         through: int, expected_through: int) -> bool:
+    """Advance a scoped summary without recreating deleted or changed sessions."""
+    with _get_conn() as conn:
+        cursor = conn.execute(
+            'UPDATE chat_sessions SET rolling_summary=?, summarized_through=? '
+            'WHERE id=? AND kind=? AND context_key=? AND summarized_through=?',
+            (summary, through, session_id, KIND_CHANNEL, context_key, expected_through),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
 
 
 def get_last_session_turns(limit: int = 10) -> dict | None:

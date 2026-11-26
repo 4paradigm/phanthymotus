@@ -999,7 +999,7 @@ def _context_pressured(pressure, ratio: float) -> bool:
     return bool(context_tokens) and prompt_tokens >= ratio * context_tokens
 
 
-async def _compress_turns(turns: list[list[dict]]) -> str:
+async def _compress_turns(turns: list[list[dict]], *, cancel_event=None) -> str:
     """用 LLM 压缩旧的 turns 为文本摘要。"""
     text = _turns_to_text(turns)
     # 截断过长的输入（避免压缩请求本身溢出）
@@ -1013,8 +1013,11 @@ async def _compress_turns(turns: list[list[dict]]) -> str:
                 {'role': 'user', 'content': _COMPRESS_PROMPT + text},
             ],
             tool_list=[],
+            **({'cancel_event': cancel_event} if cancel_event is not None else {}),
         )
         return summary_response.get('content', '') or '[历史摘要] （压缩失败，无内容）'
+    except TurnCancelled:
+        raise
     except Exception as e:
         print(f'[decision] compress failed: {e}')
         # 压缩失败时，回退到简单截断
@@ -1458,7 +1461,7 @@ _REWRITE_SUMMARY_PROMPT = """将以下两段历史摘要合并为一段简洁摘
 """
 
 
-async def _rewrite_summary(old: str, new: str, budget: int = 5000) -> str:
+async def _rewrite_summary(old: str, new: str, budget: int = 5000, *, cancel_event=None) -> str:
     """合并两段摘要为固定预算内的单一摘要。"""
     try:
         resp = await client.call(
@@ -1467,12 +1470,15 @@ async def _rewrite_summary(old: str, new: str, budget: int = 5000) -> str:
                 {'role': 'user', 'content': _REWRITE_SUMMARY_PROMPT.format(budget=budget, old=old, new=new)},
             ],
             tool_list=[],
+            **({'cancel_event': cancel_event} if cancel_event is not None else {}),
         )
         result = resp.get('content', '') or new
         # 硬上限兜底
         if len(result) > budget * 2:
             result = result[:budget * 2]
         return result
+    except TurnCancelled:
+        raise
     except Exception as e:
         print(f'[decision] rewrite_summary failed: {e}')
         return new  # 失败时只保留新摘要
@@ -1611,11 +1617,26 @@ async def _raw_input_info(
 _event_instance: 'Event | None' = None
 
 
+def _recent_context_turns(max_turns: int) -> list[list[dict]]:
+    from channel import context as channel_context
+    if channel_context.current.get() is not None:
+        import chat_history
+        origin = channel_context.capture()
+        if origin is None:
+            return []
+        session = chat_history.get_channel_session(
+            channel_context.context_key(origin), limit=max_turns,
+            session_id=origin['_channel_session_id'])
+        if not session:
+            return []
+        summary = [[{'role': 'user', 'content': session['summary']}]] if session['summary'] else []
+        return summary + session['turns']
+    return _event_instance._turns[-max_turns:] if _event_instance else []
+
+
 def get_recent_context(max_turns: int = 5) -> str:
     """返回最近 N 轮 main agent 的 assistant 输出摘要，供 bg subagent 同步上下文。"""
-    if not _event_instance or not _event_instance._turns:
-        return ''
-    recent = _event_instance._turns[-max_turns:]
+    recent = _recent_context_turns(max_turns)
     lines = []
     for turn in recent:
         for msg in turn:
@@ -1636,9 +1657,7 @@ def get_recent_context_rich(max_turns: int = 20, max_chars: int = 6000) -> str:
     策略：20 轮内，纯字符串提取，不额外调 LLM。包含用户消息、
     assistant 决策文本、tool 结果（含 subagent_result 返回值）。
     """
-    if not _event_instance or not _event_instance._turns:
-        return ''
-    recent = _event_instance._turns[-max_turns:]
+    recent = _recent_context_turns(max_turns)
     parts = []
     total = 0
     truncated = False
@@ -1689,6 +1708,10 @@ class Event:
         self._channel_session_id: str | None = None
         self._channel_turn_index: int = 0
         self._channel_context_key: str = ''
+        self._channel_turns: list[list[dict]] = []
+        self._channel_summary: str = ''
+        self._channel_summary_through: int = -1
+        self._channel_turn_indexes: list[int] = []
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
         # 每清空一次历史 +1。凡是「先读出 _turns、await 一次 LLM、再写回」的代码
         # （压缩、溢出重试）和 turn 结束时的保存，都拿它判断中途有没有被清过 ——
@@ -1998,6 +2021,9 @@ class Event:
         """事件驱动：通过 collector 批量获取事件，每批跑一轮推理。"""
         while True:
             ev = await collector.next_trigger()
+            from channel import context as channel_context
+            if ev.get('_channel_origin') and not channel_context.is_active(ev['_channel_origin']):
+                continue
             self._chat_only_active = bool(ev.get('_chat_only_channel'))
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
@@ -2021,6 +2047,7 @@ class Event:
             import chat_history
             _history_token = chat_history.current_channel_context.set(
                 collector.channel_context_key(ev) if ev.get('_channel_event') else None)
+            _origin_token = channel_context.current.set(ev if ev.get('_channel_event') else None)
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev, reconsider_event=reconsider_ev)
             except TurnCancelled:
@@ -2030,7 +2057,7 @@ class Event:
                     'content': '[turn interrupted by user message]',
                 })
                 # 中止正在进行的 TTS 播放和动作
-                if not self._chat_only_active:
+                if not (self._chat_only_active or _channel_tool_restricted(ev)):
                     await self._interrupt_active_outputs()
                 await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
@@ -2051,6 +2078,7 @@ class Event:
             finally:
                 _cancel_ctx.reset(_cancel_token)
                 chat_history.current_channel_context.reset(_history_token)
+                channel_context.current.reset(_origin_token)
                 self._turn_cancel = None
                 collector.set_cancel_event(None)
                 collector.set_reconsider_event(None)
@@ -2084,6 +2112,10 @@ class Event:
         self._channel_session_id = None
         self._channel_turn_index = 0
         self._channel_context_key = ''
+        self._channel_turns = []
+        self._channel_turn_indexes = []
+        self._channel_summary = ''
+        self._channel_summary_through = -1
         self._current_turn = []
         self._context_pressure = None
         if self._turn_cancel is not None:
@@ -2167,7 +2199,8 @@ class Event:
 
     # ── 单轮推理 ─────────────────────────────────────────────────────────────
 
-    def _build_history(self, *, turns: list[list[dict]] | None = None) -> list[dict]:
+    def _build_history(self, *, turns: list[list[dict]] | None = None,
+                       summary: str | None = None) -> list[dict]:
         """从 _turns 构建 L3 历史（tiered retention: tier1 全量 + tier2 降质 + summary）。"""
         llm_cfg = config.main.get('event', {}).get('llm', {})
         tier1 = llm_cfg.get('tier1_turns', 6)
@@ -2180,8 +2213,9 @@ class Event:
 
         history = []
         # 前置历史摘要（如果有）
-        if turns is None and self._summary:
-            history.append({'role': 'user', 'content': self._summary})
+        selected_summary = self._summary if turns is None else summary
+        if selected_summary:
+            history.append({'role': 'user', 'content': selected_summary})
             history.append({'role': 'assistant', 'content': '好的，我已了解之前的对话背景。'})
         for turn in medium:
             history.extend(_degrade_turn(turn))
@@ -2194,20 +2228,60 @@ class Event:
         self._channel_session_id = None
         self._channel_turn_index = 0
         self._channel_context_key = collector.channel_context_key(trigger_event)
+        self._channel_turns = []
+        self._channel_turn_indexes = []
+        self._channel_summary = ''
+        self._channel_summary_through = -1
         if not trigger_event.get('_channel_event') or not self._channel_context_key:
             return []
         import chat_history
-        llm_cfg = config.main.get('event', {}).get('llm', {})
-        limit = llm_cfg.get('history_turns',
-                            llm_cfg.get('tier1_turns', 6) + llm_cfg.get('tier2_turns', 8) + 4)
-        last = chat_history.get_channel_session(self._channel_context_key, limit=limit)
+        origin = trigger_event.get('_channel_origin') or {}
+        last = chat_history.get_channel_session(
+            self._channel_context_key, limit=None, session_id=origin.get('_channel_session_id'))
         if last:
             self._channel_session_id = last['session_id']
             self._channel_turn_index = last['next_turn_index']
-            return self._build_history(turns=[_sanitise_turn(turn) for turn in last['turns']])
-        self._channel_session_id = chat_history.create_session(
-            chat_history.KIND_CHANNEL, context_key=self._channel_context_key)
-        return []
+            self._channel_turns = [_sanitise_turn(turn) for turn in last['turns']]
+            self._channel_turn_indexes = last['turn_indexes']
+            self._channel_summary = last['summary']
+            self._channel_summary_through = last['summarized_through']
+        elif not origin:
+            self._channel_session_id = chat_history.create_session(
+                chat_history.KIND_CHANNEL, context_key=self._channel_context_key)
+        trigger_event['_channel_session_id'] = self._channel_session_id
+        return self._build_history(turns=self._channel_turns, summary=self._channel_summary)
+
+    async def _maybe_compress_channel(self, *, force: bool = False):
+        if not self._channel_session_id:
+            return
+        import chat_history
+        llm_cfg = config.main.get('event', {}).get('llm', {})
+        keep = max(2, llm_cfg.get('tier1_turns', 6) + llm_cfg.get('tier2_turns', 8))
+        turns = self._channel_turns
+        if force:
+            keep = max(1, min(keep, len(turns) // 2))
+        if len(turns) <= keep:
+            return
+        if (not force and len(turns) <= keep + 2
+                and _estimate_chars(turns) <= llm_cfg.get('compress_threshold_chars', 80000)):
+            return
+        gen = self._history_gen
+        session_id, key = self._channel_session_id, self._channel_context_key
+        old_through = self._channel_summary_through
+        through = self._channel_turn_indexes[-keep - 1]
+        cancel_args = {'cancel_event': self._turn_cancel} if self._turn_cancel is not None else {}
+        summary = await _compress_turns(turns[:-keep], **cancel_args)
+        if self._channel_summary and gen == self._history_gen:
+            summary = await _rewrite_summary(self._channel_summary, summary,
+                                             llm_cfg.get('summary_max_chars', 5000), **cancel_args)
+        if (gen != self._history_gen or not summary
+                or not chat_history.save_channel_summary(
+                    session_id, key, summary, through=through, expected_through=old_through)):
+            return
+        self._channel_summary = summary
+        self._channel_summary_through = through
+        self._channel_turns = turns[-keep:]
+        self._channel_turn_indexes = self._channel_turn_indexes[-keep:]
 
     async def _maybe_compress(self):
         """检查历史是否需要压缩（基于轮数或字符数），压缩旧轮次为 rolling summary。"""
@@ -2441,10 +2515,10 @@ class Event:
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
         channel_history = self._load_channel_history(trigger_event)
-        if channel_history and trigger_event.get('_channel_trigger_text'):
-            # The legacy text recap is an upgrade fallback, not a second copy
-            # of the scoped history already included in L3.
-            trigger_event = {**trigger_event, 'text': trigger_event['_channel_trigger_text']}
+        if trigger_event.get('_channel_event'):
+            await self._maybe_compress_channel()
+            channel_history = self._build_history(turns=self._channel_turns,
+                                                  summary=self._channel_summary)
         bot_restricted = _bot_channel_restricted(trigger_event)
         viewer_restricted = _viewer_channel_restricted(trigger_event)
         from channel import chat_only
@@ -2741,7 +2815,10 @@ class Event:
                     # Retry through the normal loop so cancellation/steering
                     # stays active and the triggering request is not appended twice.
                     if trigger_event.get('_channel_event') and channel_history:
-                        reduced = _sanitize(_scrub(_trim(channel_history, max_messages=10, max_images=1)))
+                        await self._maybe_compress_channel(force=True)
+                        reduced = self._build_history(turns=self._channel_turns,
+                                                      summary=self._channel_summary)
+                        reduced = _sanitize(_scrub(_trim(reduced, max_messages=10, max_images=1)))
                         if reduced == channel_history:
                             raise
                         channel_history = reduced

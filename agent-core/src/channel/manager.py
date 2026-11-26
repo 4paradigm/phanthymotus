@@ -791,10 +791,6 @@ class ChannelManager:
             expect_reply=msg.expect_reply,
             user_role=user['role'],
         )
-        self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
-                                   user_label=msg.display_name or msg.user_id,
-                                   user_id=msg.user_id, user_role=user['role'],
-                                   sender_type=msg.sender_type)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
@@ -995,14 +991,6 @@ class ChannelManager:
             result = f'Reply sent to {channel_id} ({"; ".join(parts) or "empty"})'
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
-            if not mention_open_id:
-                # Bot-to-bot mentions aren't this chat's own human-facing conversation —
-                # keep the recap scoped to the human/channel side of the exchange.
-                self._record_chat_exchange(
-                    channel_id, chat_id, 'assistant', text,
-                    user_id=ctx.get('user_id', ''), user_role=ctx.get('user_role', ''),
-                    sender_type=ctx.get('sender_type', ''),
-                )
             return result
         except PartialSendError as e:
             # 部分成功：必须让 LLM 知道哪部分已经到了，否则它会把文本重发一遍

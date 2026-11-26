@@ -737,6 +737,7 @@ async def acp_complete(request: fastapi.Request):
     # 回收掉，回收之后 _pending_silent 里就查不到了，于是一句「播完了」的回执会被
     # 当成新消息唤醒一个 turn。
     silent = mcp_client.completion_is_silent(action_id)
+    channel_origin = mcp_client.action_channel_origin(action_id)
 
     # 通道1: 解锁 sync() 等待
     mcp_client.mark_action_complete(action_id, body)
@@ -749,6 +750,7 @@ async def acp_complete(request: fastapi.Request):
         source=f'acp:{action_id}',
         text=json.dumps(_event, ensure_ascii=False),
         payload=dict(_event),
+        channel_origin=channel_origin,
     )
 
     return {'ok': True, 'action_id': action_id}

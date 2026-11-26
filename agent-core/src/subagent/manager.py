@@ -141,6 +141,14 @@ class SubagentManager:
 
     async def spawn(self, spec: SubagentSpec) -> str:
         """Create and queue a subagent. Returns agent_id."""
+        from channel import context as channel_context
+        # Persist the caller's origin through queueing, preemption and restart.
+        # Replace any externally supplied metadata instead of trusting it.
+        spec.metadata = {key: value for key, value in spec.metadata.items()
+                         if key != '_channel_origin'}
+        origin = channel_context.capture()
+        if origin:
+            spec.metadata['_channel_origin'] = origin
         if len(self._agents) >= self._cfg['max_total']:
             raise RuntimeError(f'Maximum subagent count ({self._cfg["max_total"]}) reached')
 
@@ -371,6 +379,14 @@ class SubagentManager:
 
     async def _run_agent(self, agent: Subagent):
         """Execute one subagent's LLM loop."""
+        import chat_history
+        from channel import context as channel_context
+        origin = agent.spec.metadata.get('_channel_origin')
+        if origin and not channel_context.is_active(origin):
+            agent.cancel('originating Channel conversation is no longer authorized')
+        origin_token = channel_context.current.set(origin)
+        history_token = chat_history.current_channel_context.set(
+            channel_context.context_key(origin) if origin else None)
         agent_id = agent.id
         try:
             result = await agent.run(self._llm_client)
@@ -400,6 +416,8 @@ class SubagentManager:
             agent.status = STATUS_FAILED
             self._finalize(agent)
         finally:
+            chat_history.current_channel_context.reset(history_token)
+            channel_context.current.reset(origin_token)
             self._running.pop(agent_id, None)
             self._timeout_tasks.pop(agent_id, None)
 
@@ -561,6 +579,7 @@ class SubagentManager:
                 'rounds_used': result.rounds_used,
                 'priority': agent.spec.priority,
             },
+            channel_origin=agent.spec.metadata.get('_channel_origin'),
         )
 
         await push_event({

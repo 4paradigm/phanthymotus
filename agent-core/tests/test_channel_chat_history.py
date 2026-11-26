@@ -69,7 +69,7 @@ class ChatHistoryIsolationTest(unittest.TestCase):
         self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '')
         self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_a'), [])
 
-    def test_build_trigger_injects_scoped_chat_history_block(self):
+    def test_build_trigger_does_not_duplicate_the_sqlite_history_with_a_recap(self):
         self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '帮我查电量',
                                            user_label='Alice', user_id='u1',
                                            user_role='viewer', sender_type='user')
@@ -95,9 +95,10 @@ class ChatHistoryIsolationTest(unittest.TestCase):
         finally:
             manager_mod.manager = original
 
-        self.assertIn('<chat_history channel="feishu_r1" chat_id="oc_a">', trigger['text'])
-        self.assertIn('帮我查电量', trigger['text'])
-        self.assertIn('电量 80%', trigger['text'])
+        self.assertNotIn('<chat_history', trigger['text'])
+        self.assertNotIn('帮我查电量', trigger['text'])
+        self.assertNotIn('电量 80%', trigger['text'])
+        self.assertIn('我刚才说的怎么样了', trigger['text'])
         self.assertNotIn('不相关的话', trigger['text'])
 
 
