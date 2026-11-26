@@ -3872,6 +3872,18 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
               and measured_range + config.stop_tolerance_m < target_distance)
     measured = (inputs.measured_target if measured_range is not None
                 and (closer or measured_range <= config.arrival_min_distance_m) else None)
+    spacing = config.arrival_min_distance_m
+    preferred_spacing = None
+    if (follow_published and measured is None and measured_range is not None and target_distance is not None
+            and state.target == "person" and inputs.measured_target is not None
+            and track.measured_point.standoff_point is not None):
+        # A person's near surface can be closer than the representative box range.
+        # Score the candidates against the same surface spacing as the wire recheck.
+        camera = local_path.target_in_grid(geometry, 0., 0.)
+        if math.dist(camera, inputs.measured_target[0]) + config.stop_tolerance_m < target_distance:
+            measured = inputs.measured_target
+            spacing = config.stop_distance_m
+            preferred_spacing = spacing + config.stop_tolerance_m
     proposed = dwa.select(
         route=route.points, grid=grid, geometry=geometry, footprint=inputs.footprint,
         occupied=inputs.observed, remembered=inputs.remembered, supported_region=local_path.SUPPORTED_REGION,
@@ -3880,7 +3892,7 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         y_limit=(0., 0.) if branch == "direct" else (-right_vy, left_vy),
         yaw_limit=yaw_limit,
         floors=(floor_x, floor_y, config.floor_wz, config.floor_wz_moving),
-        target=target, measured_target=measured, measured_standoff_m=config.arrival_min_distance_m,
+        target=target, measured_target=measured, measured_standoff_m=spacing, preferred_standoff_m=preferred_spacing,
         view_bearing=view_bearing,
         acceleration=config.motion_acceleration, braking=config.motion_braking,
         horizon=inputs.prediction_horizon_s, max_candidates=limit,

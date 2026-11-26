@@ -181,8 +181,61 @@ def _person_surface(depth_m, bbox_norm, intrinsics, ground):
                     horizontal_range[centre < split] = np.inf
                     row, col = np.unravel_index(np.argmin(horizontal_range), horizontal_range.shape)
                     break
+            if occluded_below is None and row >= bottom:
+                lower = _wide_lower_occluder(depth_m, ground, rows, cols, centre, supported, row, col)
+                if lower is not None:
+                    horizontal_range[lower] = np.inf
+                    row, col = np.unravel_index(np.argmin(horizontal_range), horizontal_range.shape)
+                    occluded_below = float(centre[row, col])
     forward = float(centre[row, col])
     return np.array([forward, -forward * ray[col]]), occluded_below
+
+
+def _wide_lower_occluder(depth_m, ground, rows, cols, centre, supported, row, col):
+    """Recognize a lower occluder whose sloped top bridges the global depth gap."""
+    near = centre[row, col]
+    middle = len(centre) // 2
+    upper = centre[:middle][supported[:middle]]
+    if upper.size < 9 or upper.min() - near <= .40:
+        return None
+    y, x = rows.start + row + 1, cols.start + col + 1
+    width = cols.stop - cols.start
+    for end in (cols.start - width // 2, cols.stop - 1 + width // 2):
+        if not 0 <= end < depth_m.shape[1]:
+            continue
+        strip = np.s_[y - 1:y + 2, min(x, end):max(x, end) + 1]
+        if ground is not None and ground[strip].any():
+            continue
+        band = depth_m[strip]
+        if not np.all((band > 0.) & (np.abs(band - near) <= .08)):
+            continue
+        # A separate hand or foot in the box keeps its own standoff constraint.
+        layer = supported & (centre < near + .40)
+        layer[:middle] = False
+        return _connected_surface(layer, row, col)
+    return None
+
+
+def _connected_surface(mask, row, col):
+    """Four-connected component of coherent samples, filled one scanline at a time."""
+    found = np.zeros_like(mask)
+    pending = [(row, col)]
+    while pending:
+        y, x = pending.pop()
+        if found[y, x]:
+            continue
+        line = mask[y]
+        left = np.flatnonzero(~line[:x])
+        right = np.flatnonzero(~line[x:])
+        lo = left[-1] + 1 if left.size else 0
+        hi = x + right[0] if right.size else len(line)
+        found[y, lo:hi] = True
+        for other in (y - 1, y + 1):
+            if 0 <= other < len(mask):
+                run = mask[other, lo:hi] & ~found[other, lo:hi]
+                starts = np.flatnonzero(run & ~np.r_[False, run[:-1]])
+                pending.extend((other, lo + i) for i in starts)
+    return found
 
 
 def sample_point(depth_m: np.ndarray, position, window: float = 0.05) -> float | None:

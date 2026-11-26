@@ -778,3 +778,38 @@ def test_steering_range_and_physical_front_use_the_same_occluder_classification(
     expected = 3.0 if foreground else .53
     assert track.measured_range_m == pytest.approx(expected)
     assert track.measured_point.standoff_point[0] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("case, expected", [("wide", .85), ("narrow", .55), ("foot", .62),
+                                           ("ground", .55), ("gap", .55), ("upper_person", .55),
+                                           ("left", .85), ("missing_near", .055)])
+def test_person_front_behind_a_wide_lower_occluder(case, expected):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.depth import person_box_measurement
+
+    depth = np.full((72, 160), 1.35)
+    # Intermediate depth on the left closes the global histogram gap.
+    depth[:, 42:50] = np.linspace(1.35, 2., 8)
+    depth[52:, 48:56] = np.repeat(np.linspace(.85, 1.35, 5), 4)[:, None]
+    depth[55:, 66:98 if case == "narrow" else 145] = .55
+    ground = np.zeros_like(depth, dtype=bool)
+    if case == "ground":
+        ground[55:, 101:] = True
+    if case == "gap":
+        depth[55:, 102:105] = np.nan
+    if case == "upper_person":
+        depth[10:22, 60:65] = .69
+    if case == "foot":
+        depth[57:70, 57:63] = .62
+    box = (.25, 0., .625, 1.)
+    if case == "left":
+        depth = depth[:, ::-1]
+        box = (1. - box[2], box[1], 1. - box[0], box[3])
+    if case == "missing_near":
+        depth[55:, 66:145] = .055
+        depth[55:, 102:105] = 0.
+        depth[45:, 48:56] = np.repeat(np.linspace(.35, 1.35, 9), 3)[:, None]
+    original = depth.copy()
+    _, surface = person_box_measurement(depth, box, HorizontalIntrinsics(160, 150., 80.), ground)
+    np.testing.assert_equal(depth, original)
+    assert surface[0] == pytest.approx(expected)

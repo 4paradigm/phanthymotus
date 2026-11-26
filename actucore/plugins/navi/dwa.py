@@ -550,7 +550,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            footprint: FootprintSpec | None = None, latency_s=0., remembered=None,
            supported_region=None, terminal_boundary=None, occupied=None, alternate_routes=(),
            candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None,
-           measured_standoff_m=None, view_bearing=None,
+           measured_standoff_m=None, preferred_standoff_m=None, view_bearing=None,
            guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0., retry_from_rest=False) -> Choice | None:
     """Select a legal target velocity whose complete predicted stop is admissible.
 
@@ -705,7 +705,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         lookahead = max(.45, x_speed * horizon)
         segments = _route_segments(points)
         best = None
-        best_cost = math.inf
+        best_rank = None
         swept_into_obstacle = False
         scales = ROUTE_SPEED_SCALES[:len(ROUTE_SPEED_SCALES) - int(transition_slot)]
         for steering, scale in pursuit_options(yaw_limit, bool(y_speed), scales):
@@ -749,12 +749,19 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             components = CandidateScore(0., -progress, _obstacle_score(check), 0., 0., 0.)
             diag["admissible_candidates"] += 1
             cost = pursuit_cost(command, previous, max(x_speed, y_speed), yaw_limit, check)
-            if cost < best_cost:
-                best_cost = cost
+            # Among complete safe stops, prefer one with room for the next feedback update.
+            # If every safe arc is close, keep the normal pursuit ranking.
+            near_limit = (preferred_standoff_m is not None and measured_target is not None
+                          and minimum_target_distance(prediction, measured_target[0])
+                          < preferred_standoff_m + measured_target[1])
+            rank = near_limit, cost
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
                 best = Choice(command, poses[:prediction.moving_count], components.total, progress,
                               check.min_clearance_m, prediction, check, components)
                 best_room = room - route_error
-            if scale == 1. and check.min_clearance_m >= PREFERRED_CLEARANCE_M and command[2] * previous[2] >= 0.:
+            if (scale == 1. and not near_limit and check.min_clearance_m >= PREFERRED_CLEARANCE_M
+                    and command[2] * previous[2] >= 0.):
                 break
         if best is not None:
             diag.update(reference_scores=diag["admissible_candidates"],

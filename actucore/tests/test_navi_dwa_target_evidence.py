@@ -600,6 +600,28 @@ def test_measured_target_limits_motion_independently_of_fixed_anchor(monkeypatch
     assert anchor.x == 5.6
 
 
+@pytest.mark.parametrize("front,expected_vx", [(1., None), (1.025, .075), (1.06, .075), (1.1, .15)])
+def test_detour_sweeps_the_nearer_person_surface_before_selecting_a_speed(monkeypatch, front, expected_vx):
+    from dataclasses import replace
+    from plugins.navi import dwa, policy
+
+    card, _, _, snapshot, _ = selected_card(monkeypatch, body=False, live_target=True)
+    state, config = card._state, card._config
+    track = state.tracker.track
+    track.measured_point = replace(track.measured_point, standoff_point=(front, 0.))
+    state.dwa_budget = None
+    _, depth, _, _ = snapshot[0]
+    proposal = policy._dwa_detour(depth, config, state, state.view_detour, track.measured_range_m, 0.,
+                                  follow_published=True)
+
+    if expected_vx is None:
+        assert proposal is None
+        return
+    assert proposal is not None and proposal.command[0] == pytest.approx(expected_vx)
+    point, error = proposal.guard.measured_target
+    assert dwa.minimum_target_distance(proposal.guard.trace, point) >= config.stop_distance_m + error
+
+
 @pytest.mark.parametrize("body", [True, False], ids=["body-pose", "camera-twist-history"])
 def test_association_uses_the_motion_at_the_detector_observation(monkeypatch, body):
     import math
