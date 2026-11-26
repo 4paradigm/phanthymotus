@@ -421,9 +421,10 @@ def stays_on_route(points, positions, half_width):
         _project_to_route(position, points, segments)[1] <= max(.30, half_width) for position in positions)
 
 
-def view_yaw_limits(limits, bearing, half_fov, horizon):
+def view_yaw_limits(limits, bearing, half_fov, horizon, *, protect_person_view=False):
     """Reserve room in the image for a target on the outside of a lateral detour."""
-    if abs(bearing) <= .65 * half_fov:
+    view_edge = .50 if protect_person_view else .65
+    if abs(bearing) <= view_edge * half_fov:
         return limits
     outward = max(0., (.85 * half_fov - abs(bearing)) / horizon)
     # Positive yaw turns left, moving a positive (rightward) image bearing

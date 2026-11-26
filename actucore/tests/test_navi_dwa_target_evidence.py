@@ -1300,3 +1300,23 @@ def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypat
         card.next_command()
         assert len(replans) == int(stamp == 1400)
         assert state.committed_route is route
+
+
+def test_expired_person_detour_stops_translation_and_keeps_the_original_track(monkeypatch):
+    card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    state = card._state
+    original = state.tracker.track
+    assert state.committed_route.locks_detour
+    card._config.max_coast_s = .12
+    for stamp in (1100, 1200, 1300):
+        advance_snapshot(snapshot, clock, stamp, vx=0.)
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = {"timestamp": stamp / 1000, "objects": []}, depth, odom, stamp
+        packet = card.next_command()
+    assert not any(packet["values"][:2])
+    assert state.committed_route is None
+    assert state.reacquire_generation == original.generation
+    assert state.tracker.track is original

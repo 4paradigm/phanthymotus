@@ -4099,9 +4099,12 @@ class NaviPlugin:
                 target_ms = receipt[1]
             if state.target != "person" or not target_ms or target_ms > now_ms:
                 return None
-            # Tracker expiry stops target extrapolation. The issued command may
-            # still use its independently bounded route or last measured goal.
-            coast_end_ms = target_ms + round(config.idle_timeout_s * 1000)
+            # An open front-camera detour must not outlive the target's short
+            # coast. Other routes retain their independently bounded room.
+            coast_s = config.idle_timeout_s
+            if origin is not None and policy_mod.lateral_camera_detour(config, geometry, origin.acceptance):
+                coast_s = min(coast_s, config.max_coast_s)
+            coast_end_ms = target_ms + round(coast_s * 1000)
         elif (track is None or not track.observed or objects is None):
             return None
         depth_ms = depth_mod.observation_ms(depth)
@@ -4676,11 +4679,13 @@ class NaviPlugin:
         blocker_exit = origin.acceptance.blocker_exit
         camera_detour = (cfg.use_lateral and origin.acceptance.locks_detour
                          and not origin.acceptance.corridor_corner and origin.acceptance.passage_exit is None)
-        if (camera_detour and track is not None
+        protect_view = (origin.target == "person"
+                        and policy_mod.lateral_camera_detour(cfg, check.geometry, origin.acceptance))
+        if ((camera_detour or protect_view) and track is not None
                 and track.generation == original.generation and track.observed and track.navigation_range_known):
             yaw_limit = dwa.view_yaw_limits(yaw_limit, track.bearing_rad, cfg.half_fov_rad,
-                                            original.prediction_horizon_s)
-            if (blocker_exit is not None and abs(track.bearing_rad) > cfg.half_fov_rad / 2
+                                            original.prediction_horizon_s, protect_person_view=protect_view)
+            if (camera_detour and blocker_exit is not None and abs(track.bearing_rad) > cfg.half_fov_rad / 2
                     and not local_path.passage_ahead(transform.points(blocker_exit))):
                 view_bearing = track.bearing_rad
         checked = values = previous_values = None

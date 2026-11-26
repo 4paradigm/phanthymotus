@@ -72,7 +72,7 @@ from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, CAMERA_OCCUPANCY_M
                           NearProjection, SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW,
                           TURN_SPEED_REDUCTION, confirmed_square_coverage, relative_pose_at)
 from .depth import has_valid_returns, observation_ms
-from .track import AssociationSnapshot, ObservationFrame, Track, Tracker, observation_source, observation_transform, target_objects
+from .track import LOST, AssociationSnapshot, ObservationFrame, Track, Tracker, observation_source, observation_transform, target_objects
 from . import local_path
 from . import dwa
 from . import motion as motion_model
@@ -1639,6 +1639,11 @@ MAX_PREDICTED_DETOUR_TRAVEL_M = 3.
 NO_LOCAL_ROUTE = "局部规划未找到可执行的避让路线；停下"
 
 
+def lateral_camera_detour(config, geometry, route):
+    return (config.use_lateral and geometry is not None and geometry.front == 0.
+            and route is not None and route.locks_detour)
+
+
 def current_target_observed(state):
     """Whether this decision used a current accepted target and depth range."""
     track, anchor = state.tracker.track, state.goal_anchor
@@ -1906,6 +1911,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # The measured parking target outlives the detour that brought us to it.
     retained_target = (current_track is not None and state.target == "person" and config.local_controller == "dwa"
                        and (current_track.generation == state.parking_target_generation
+                            or (config.use_lateral and config.scan_geometry is None
+                                and current_track.generation == state.reacquire_generation)
                             or (committed is not None and committed.locks_detour and committed.motion_guard is not None
                                 and current_track.generation == committed.motion_guard.generation)))
     track = state.tracker.step(detections=detections, depth=depth,
@@ -2175,6 +2182,19 @@ def _decide(detections, depth, odom, config: Config, state: State,
         if scan.gap_recheck is not None:
             return Decision(_twist(0., 0., 0.), AVOIDING,
                             update.reason if update is not None else "主动观察：反馈恢复，停车等待旧视图到期")
+        lost = state.tracker.track
+        if (state.target == "person" and published is state.committed_route
+                and lateral_camera_detour(config, geometry, published)
+                and lost is not None and lost.state == LOST and lost.generation == published.motion_guard.generation):
+            # The old route was checked for obstacles, but advancing it after
+            # the person leaves view can take the robot away from that person.
+            state.last_seen_side = math.copysign(1., lost.bearing_rad)
+            if state.reacquire_generation != lost.generation:
+                state.reacquire_generation = lost.generation
+                state.reacquire_receipt_ms = objects_ms
+                state.reacquire_source = observation_source(detections)
+            state.goal_anchor = state.dwa_guidance = None
+            state.committed_route = state.published_dwa_route = published = None
         if published is not None and published.locks_detour and published is state.committed_route:
             measured = track.measured_range_m if track is not None else None
             same_target = track is not None and track.generation == published.motion_guard.generation
@@ -3893,10 +3913,14 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         # Reserve a full cell around the estimated footprint during open detours.
         # Measured openings keep the existing footprint and corridor checks.
         inputs = replace(inputs, footprint=replace(inputs.footprint, clearance_margin_m=local_path.RESOLUTION))
-    if lateral_detour and target_bearing is not None:
-        yaw_limit = dwa.view_yaw_limits(yaw_limit, target_bearing, config.half_fov_rad,
-                                        inputs.prediction_horizon_s)
-        if (track is not None and track.observed and abs(target_bearing) > config.half_fov_rad / 2
+    protect_view = (config.use_lateral and mode == "camera_approx" and branch in ("route", "reachable_prefix")
+                    and state.target == "person" and track is not None
+                    and track.observed and track.navigation_range_known)
+    if (lateral_detour or protect_view) and target_bearing is not None:
+        live_bearing = track.bearing_rad if protect_view else target_bearing
+        yaw_limit = dwa.view_yaw_limits(yaw_limit, live_bearing, config.half_fov_rad,
+                                        inputs.prediction_horizon_s, protect_person_view=protect_view)
+        if (lateral_detour and track is not None and track.observed and abs(target_bearing) > config.half_fov_rad / 2
                 and all(ref.blocker_exit is not None and not local_path.passage_ahead(ref.blocker_exit) for ref in routes)):
             view_bearing = target_bearing
     # The ordinary approach already uses a consistent live range. A newly

@@ -59,6 +59,15 @@ def test_route_turning_horizon_does_not_change_the_braking_room_limit():
     assert command[2] == pytest.approx(2 * previous[2])
 
 
+@pytest.mark.parametrize("bearing", [-.44, .44])
+def test_lateral_detour_reserves_view_before_turning_away_from_person(bearing):
+    lower, upper = dwa.view_yaw_limits((-.6, .6), bearing, .8, 2.4, protect_person_view=True)
+    outward = upper if bearing > 0. else -lower
+    inward = -lower if bearing > 0. else upper
+    assert inward == .6
+    assert outward == pytest.approx(.1)
+
+
 @pytest.mark.parametrize("side", [-1., 1.])
 @pytest.mark.parametrize("follow_published", [False, True])
 def test_lateral_detour_keeps_steering_authority_toward_the_target(side, follow_published):
