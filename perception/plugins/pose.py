@@ -37,6 +37,8 @@ of perception on jp5.11 (see plugins/kokoro_worker.py).
 
 from __future__ import annotations
 
+from collections import deque
+import gc
 import json
 import logging
 import os
@@ -67,6 +69,8 @@ from plugins.pose_stgcn import (
     BACKENDS,
     DEFAULT_MIN_SCORE,
     DEFAULT_WINDOW_S,
+    MIN_MOTION,
+    PRENORM_MODE,
     action_vocabulary,
     build_backend,
 )
@@ -311,8 +315,8 @@ TOOLS = [
                 "hands": {"type": "boolean", "title": "Hand keypoints and gestures", "description": "21 points per hand, and the shape they make — open palm, fist, pointing, V, OK. Off by default because it loads a second model; naming the shape on top of the points costs nothing. Near range only: calling the robot from across a room is handled by the body gestures below and does not need this.", "default": False, "scope": "instance"},
                 "publish_gesture_events": {"type": "boolean", "title": "Send gesture events", "description": "Tell the robot when someone gestures at it. One message when a gesture starts and one when it ends — not every frame.", "default": True, "scope": "instance"},
                 "gesture_whitelist": {"type": "array", "items": {"type": "string"}, "title": "Gestures to report", "description": f"Which actions count as gesturing at the robot. Default: {', '.join(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES)}. The last five need `hands: gesture`. Also available: {', '.join(OPTIONAL_GESTURES)}, thumbs_up.", "default": list(DEFAULT_GESTURES + DEFAULT_HAND_GESTURES), "scope": "instance"},
-                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Person detection threshold", "description": "Lower finds more people and more false ones.", "default": 0.4, "scope": "instance"},
-                "fps": {"type": "integer", "minimum": 1, "title": "Frames per second", "description": "How often to look. Below 12 the action model gets too few frames to judge movement, and `info` will say so.", "default": 12, "scope": "instance"},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Person detection threshold", "description": "Lower finds more people and more false ones.", "default": 0.35, "scope": "instance"},
+                "fps": {"type": "integer", "minimum": 1, "title": "Frames per second", "description": "How often to look. Below 12 the action model gets too few frames to judge movement, and `info` will say so.", "default": 8, "scope": "instance"},
                 "max_persons": {"type": "integer", "minimum": 1, "title": "Max people per frame", "description": "Most confident first when there are more.", "default": 5, "scope": "instance"},
                 "publish_overlay": {"type": "boolean", "title": "Draw skeleton on the video", "description": "Publishes a second video stream with the skeleton drawn on it. Costs a draw and a JPEG encode per frame, so it is off unless you want to watch or record it.", "default": False, "scope": "instance"},
 
@@ -339,6 +343,10 @@ TOOLS = [
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "title": "Action recognition", "description": "hybrid uses geometry for posture and a trained model for movement. rules uses geometry only and loads no second model — useful for telling a model mistake apart from a geometry mistake.", "default": "hybrid", "scope": "instance", "advanced": True},
                 "action_window_s": {"type": "number", "minimum": 0.2, "title": "Movement look-back (s)", "description": "How much recent movement is used to judge waving and walking.", "default": 1.5, "scope": "instance", "advanced": True},
                 "activity_interval_s": {"type": "number", "minimum": 0.0, "title": "Action model interval (s)", "description": "The action model judges a clip, so running it every frame re-reads almost the same input. Posture stays frame-rate regardless.", "default": 0.35, "scope": "instance", "advanced": True},
+                "activity_idle_flush_s": {"type": "number", "minimum": 0.0, "title": "Finish action after input pause (s)", "description": "When the image stream pauses, judge the buffered action once. Zero disables this in rolling mode. In segment mode zero starts inference early and confirms the end after at least 0.4 seconds and two configured frame intervals.", "default": 0.0, "scope": "instance", "advanced": True},
+                "activity_segment_pause_s": {"type": "number", "minimum": 0.0, "title": "Confirm segment break after pause (s)", "description": "In segment mode, how long frames must pause before cutting a new segment. Exceeding activity_idle_flush_s previews without splitting brief mid-clip stalls.", "default": 0.0, "scope": "instance", "advanced": True},
+                "activity_stall_backfill_s": {"type": "number", "minimum": 0.0, "title": "Backfill missed frames after stall (s)", "description": "In segment mode, when pose processing lags by at least this interval, backfill up to 3 buffered frames in bounded pose batches to keep temporal coverage.", "default": 0.0, "scope": "instance", "advanced": True},
+                "activity_mode": {"type": "string", "enum": ["rolling", "segment"], "title": "When to recognize an action", "description": "rolling updates actions while video arrives. segment recognizes the received clip once the input pauses, using its complete context.", "default": "rolling", "scope": "instance", "advanced": True},
                 "label_hold": {"type": "integer", "minimum": 1, "title": "Label stability (frames)", "description": "How many frames a new label must win before it replaces the current one. A label flickering several times a second is worse than a steady wrong one.", "default": 3, "scope": "instance", "advanced": True},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "title": "Action score threshold", "description": "Falls use a higher bar of their own: a false fall makes the robot drop what it is doing to ask if someone is hurt.", "default": DEFAULT_MIN_SCORE, "scope": "instance", "advanced": True},
 
@@ -370,6 +378,11 @@ class _PoseNode(Node):
                  publish_keypoints: str = "off", publish_bbox: bool = True,
                  publish_overlay: bool = False, label_hold: int = 3,
                  activity_interval_s: float = 0.35,
+                 activity_idle_flush_s: float = 0.0,
+                 activity_segment_pause_s: float = 0.0,
+                 activity_stall_backfill_s: float = 0.0,
+                 segment_backend=None,
+                 tracker_timeout_s: float = 1.0,
                  gesture_tracker: Optional[GestureEventTracker] = None,
                  publish_gesture_events: bool = True,
                  hand_channel=None, publish_hand_keypoints: str = "off",
@@ -401,11 +414,71 @@ class _PoseNode(Node):
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._activity_interval_s = float(activity_interval_s)
+        self._activity_idle_flush_s = max(0.0, float(activity_idle_flush_s))
+        self._activity_segment_pause_s = max(0.0, float(activity_segment_pause_s))
+        self._activity_stall_backfill_s = max(0.0, float(activity_stall_backfill_s))
+        self._backfill_window_s = 0.60
+        self._backfill_max_frames = 3
+        # Cap each pose infer_batch call to bs<=2 so TensorRT shared scratch
+        # stays below the RGB engine's 42.6 MiB pool (bs=4 jumps to 72.7 MiB).
+        self._backfill_infer_batch_cap = max(
+            1, int(os.environ.get("ACTION_BACKFILL_MAX_BATCH", "2"))
+        )
+        self._backfill_max_bytes = int(1.5 * 1024 * 1024)
+        self._recent_frames = deque(maxlen=20)
+        self._recent_frames_bytes = 0
+        self._recent_frames_lock = threading.Lock()
+        self._last_pose_received_at = 0.0
+        self._backfill_triggers = 0
+        self._backfill_frames = 0
+        self._segment_backend = segment_backend
+        self._segment_buffer = None
+        self._segment_preview = None
+        self._segment_count = 0
+        self._last_segment_confirmed_at = 0.0
+        self._last_segment_score = 0.0
+        self._async_rgb_enabled = (
+            segment_backend is not None
+            and callable(getattr(segment_backend, "compute_rgb_probs", None))
+            and os.environ.get("ACTION_ASYNC_RGB", "1") != "0"
+        )
+        self._rgb_first_obs = max(4, int(os.environ.get("ACTION_ASYNC_RGB_FIRST", "6")))
+        self._rgb_every_obs = max(4, int(os.environ.get("ACTION_ASYNC_RGB_EVERY", "12")))
+        self._rgb_cover_ratio = min(
+            1.0, max(0.0, float(os.environ.get("ACTION_ASYNC_RGB_COVER", "0.70")))
+        )
+        self._rgb_lock = threading.Lock()
+        self._rgb_evt = threading.Event()
+        self._rgb_job = None
+        self._rgb_res = None
+        self._rgb_last_scheduled = (-1, 0)
+        self._rgb_worker_thread = None
+        if segment_backend is not None:
+            from plugins.pose_segment import SegmentBuffer
+            pause = self._activity_idle_flush_s
+            if not pause:
+                # Let classification overlap the remainder of the quiet period.
+                # A transient pause must not discard the start of a segment.
+                self._activity_idle_flush_s = max(.15, 2*self._frame_interval)
+                pause = max(.4, self._activity_idle_flush_s)
+            short_min = 0
+            short_quiet = 0.0
+            if self._activity_segment_pause_s > 0.0:
+                pause = max(pause, self._activity_segment_pause_s)
+                short_min = 10
+                short_quiet = max(pause, 0.50)
+            self._segment_buffer = SegmentBuffer(
+                pause, short_min_frames=short_min, short_quiet_s=short_quiet
+            )
+        self._last_image_received_at = 0.0
+        self._idle_finalized_at = 0.0
+        self._idle_persons: list = []
         # Most recent raw model output, so `info` can show what it actually
         # scored. "The activity field is empty" is otherwise impossible to tell
         # from "the model was never asked" or "nothing cleared the threshold".
         self._last_prediction: dict = {}
         self._tracker = PoseTracker(history_s=classifier.history_s,
+                                   timeout_s=tracker_timeout_s,
                                    min_conf=kpt_confidence,
                                    label_hold=label_hold)
 
@@ -490,6 +563,12 @@ class _PoseNode(Node):
                     target=self._inference_worker, daemon=True,
                     name=f"pose_worker_{self._input_topic}")
                 self._worker.start()
+                if self._async_rgb_enabled and self._rgb_worker_thread is None:
+                    self._rgb_evt.clear()
+                    self._rgb_worker_thread = threading.Thread(
+                        target=self._rgb_worker, daemon=True,
+                        name=f"pose_rgb_{self._input_topic}")
+                    self._rgb_worker_thread.start()
             # Without a topic there is nothing to subscribe to and no frames to
             # consume, so no worker; the node exists to own the publishers that
             # one-shot results go out on.
@@ -510,12 +589,37 @@ class _PoseNode(Node):
         # Flag first, lock second, so a start() holding the lock sees the flag
         # as soon as it releases rather than this call queueing behind it.
         self._stop_event.set()
+        self._rgb_evt.set()
         with self._lifecycle_lock:
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
             self._worker = None
+            if self._rgb_worker_thread and self._rgb_worker_thread.is_alive():
+                self._rgb_worker_thread.join(timeout=2.0)
+            self._rgb_worker_thread = None
+            with self._rgb_lock:
+                self._rgb_job = None
+                self._rgb_res = None
+                self._rgb_last_scheduled = (-1, 0)
             self._running = False
+            while True:
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    break
             self._tracker.reset()
+            self._idle_persons = []
+            self._last_image_received_at = 0.0
+            self._idle_finalized_at = 0.0
+            self._last_pose_received_at = 0.0
+            with self._recent_frames_lock:
+                self._recent_frames.clear()
+                self._recent_frames_bytes = 0
+            if self._segment_buffer is not None:
+                self._segment_buffer.reset()
+                self._segment_preview = None
+                self._last_segment_confirmed_at = 0.0
+                self._last_segment_score = 0.0
             # Drop gesture state with the tracks it belongs to. Keeping it
             # would mean a restart inherits a held gesture and an armed
             # cooldown from before the stop, so the first real gesture after
@@ -530,52 +634,423 @@ class _PoseNode(Node):
             log.info(f"[pose] stopped: {self._input_topic or '(no topic)'}")
             return self._status()
 
+    def _record_recent_frame(self, now: float, data) -> None:
+        raw = bytes(data)
+        with self._recent_frames_lock:
+            if len(self._recent_frames) == self._recent_frames.maxlen:
+                _, old = self._recent_frames.popleft()
+                self._recent_frames_bytes -= len(old)
+            self._recent_frames.append((now, raw))
+            self._recent_frames_bytes += len(raw)
+            cutoff = now - self._backfill_window_s
+            while len(self._recent_frames) > 1 and (
+                self._recent_frames[0][0] < cutoff
+                or self._recent_frames_bytes > self._backfill_max_bytes
+            ):
+                _, old = self._recent_frames.popleft()
+                self._recent_frames_bytes -= len(old)
+
+    def _pick_backfill_frames(self, received_at: float) -> list:
+        if (self._segment_buffer is None
+                or self._activity_stall_backfill_s <= 0.0
+                or self._last_pose_received_at <= 0.0
+                or received_at - self._last_pose_received_at < self._activity_stall_backfill_s):
+            return []
+        if not callable(getattr(self._model, "infer_batch", None)):
+            return []
+        engine = getattr(self._model, "_engine", None)
+        profiles = getattr(engine, "profiles", []) if engine is not None else []
+        max_batch = max((shape[2][0] for shape in profiles), default=4) if profiles else 4
+        max_bf = min(self._backfill_max_frames, max(0, int(max_batch) - 1))
+        if max_bf <= 0:
+            return []
+        with self._recent_frames_lock:
+            snap = list(self._recent_frames)
+        if not snap:
+            return []
+        quiet_s = self._segment_buffer.quiet_s
+        min_t = max(self._last_pose_received_at + 1e-6, received_at - self._backfill_window_s)
+        cands = []
+        next_t = received_at
+        for t, data in reversed(snap):
+            if t >= received_at - 1e-6:
+                continue
+            if next_t - t >= quiet_s:
+                break
+            next_t = t
+            if t < min_t:
+                break
+            cands.append((t, data))
+        cands.reverse()
+        if not cands:
+            return []
+        if len(cands) <= max_bf:
+            return cands
+        sel = np.linspace(0, len(cands) - 1, max_bf + 2)[1:-1].round().astype(int)
+        picks = []
+        seen = set()
+        for idx in sel:
+            i = int(idx)
+            if i not in seen:
+                seen.add(i)
+                picks.append(cands[i])
+        return picks
+
     def _image_cb(self, msg: CompressedImage):
+        if self._stop_event.is_set():
+            return
         now = time.monotonic()
-        if now - self._last_inference_time < self._frame_interval:
+        self._last_image_received_at = now
+        will_infer = (now - self._last_inference_time) >= self._frame_interval
+        if self._segment_buffer is not None:
+            # Pre-cropped ROI patches carry all RGB pixels needed for segment
+            # classification; retain raw JPEG bytes only when hand_channel needs full BGR.
+            keep_jpeg = will_infer and self._hand_channel is not None
+            self._segment_buffer.append(msg.data if keep_jpeg else b"", now)
+            if self._activity_stall_backfill_s > 0.0:
+                self._record_recent_frame(now, msg.data)
+        if not will_infer:
             return
         self._last_inference_time = now
+        item = (now, msg.data) if self._segment_buffer is not None else msg.data
         # Drop the old frame if the queue is full (no backpressure).
         try:
-            self._frame_queue.put_nowait(msg.data)
+            self._frame_queue.put_nowait(item)
         except queue.Full:
             try:
-                self._frame_queue.get_nowait()
+                dropped = self._frame_queue.get_nowait()
+                if self._segment_buffer is not None and isinstance(dropped, tuple):
+                    drop_payload = getattr(self._segment_buffer, "drop_payload", None)
+                    if callable(drop_payload):
+                        drop_payload(dropped[0])
             except queue.Empty:
                 pass
             try:
-                self._frame_queue.put_nowait(msg.data)
+                self._frame_queue.put_nowait(item)
             except queue.Full:
                 pass
 
+    def _next_worker_timeout(self) -> float:
+        timeout = 0.1 if self._activity_idle_flush_s > 0.0 else 1.0
+        if self._segment_buffer is not None:
+            next_wait = getattr(self._segment_buffer, "next_wait_s", None)
+            if callable(next_wait):
+                previewed_t = (self._segment_preview[0][0]
+                               if self._segment_preview is not None else None)
+                wait_s = next_wait(time.monotonic(), self._activity_idle_flush_s, previewed_t)
+                if wait_s is not None:
+                    return max(.001, min(timeout, wait_s))
+            elif (self._segment_preview is not None
+                    and self._segment_preview[0][0] == self._last_image_received_at):
+                remaining = (self._last_image_received_at + self._segment_buffer.quiet_s
+                             - time.monotonic())
+                return max(.001, min(timeout, remaining))
+        if (self._segment_buffer is None
+                and self._activity_idle_flush_s > 0.0 and self._idle_persons
+                and self._last_image_received_at > self._idle_finalized_at):
+            remaining = (self._last_image_received_at + self._activity_idle_flush_s
+                         - time.monotonic())
+            return max(.001, min(timeout, remaining))
+        return timeout
+
+    def _maybe_schedule_async_rgb(self) -> None:
+        if not self._async_rgb_enabled or self._segment_buffer is None:
+            return
+        gen, posed = self._segment_buffer.snapshot_posed()
+        obs_count = len(posed)
+        if obs_count < self._rgb_first_obs:
+            return
+        with self._rgb_lock:
+            if self._rgb_job is not None:
+                return
+            last_gen, last_obs = self._rgb_last_scheduled
+            if last_gen == gen and obs_count - last_obs < self._rgb_every_obs:
+                return
+            self._rgb_last_scheduled = (gen, obs_count)
+            self._rgb_job = (gen, posed)
+        self._rgb_evt.set()
+
+    def _rgb_worker(self) -> None:
+        while not self._stop_event.is_set():
+            if not self._rgb_evt.wait(0.2):
+                continue
+            self._rgb_evt.clear()
+            with self._rgb_lock:
+                job = self._rgb_job
+            if job is None:
+                continue
+            gen, posed = job
+            try:
+                if self._stop_event.is_set():
+                    continue
+                result = self._segment_backend.compute_rgb_probs(
+                    posed, self._stop_event
+                )
+                if result is not None and not self._stop_event.is_set():
+                    rgb_probs, obs_count = result
+                    with self._rgb_lock:
+                        prev = self._rgb_res
+                        if prev is None or prev[0] < gen or (prev[0] == gen and obs_count >= prev[1]):
+                            self._rgb_res = (gen, obs_count, rgb_probs)
+            except Exception as error:
+                log.warning(f"[pose] async rgb precompute failed: {error}")
+            finally:
+                with self._rgb_lock:
+                    if self._rgb_job is job:
+                        self._rgb_job = None
+
+    def _get_usable_async_rgb(self, seg_gen, total_obs: int):
+        if seg_gen is None or total_obs <= 0:
+            return None
+        with self._rgb_lock:
+            res = self._rgb_res
+        if res is None or res[0] != seg_gen:
+            return None
+        _, obs_count, rgb_probs = res
+        if obs_count < self._rgb_cover_ratio * total_obs:
+            return None
+        return rgb_probs
+
     def _inference_worker(self):
         import cv2
+        from plugins.pose_segment import make_dual_roi_patch
         from plugins.vision_runtime import decode_poses
 
         while not self._stop_event.is_set():
             try:
-                jpeg_bytes = self._frame_queue.get(timeout=1.0)
+                item = self._frame_queue.get(timeout=self._next_worker_timeout())
             except queue.Empty:
+                try:
+                    self._flush_idle_activity()
+                except Exception as error:
+                    log.warning(f"[pose] idle action publication failed: {error}")
                 continue
             started = time.time()
             try:
+                if self._segment_buffer is not None:
+                    received_at, jpeg_bytes = item
+                else:
+                    jpeg_bytes = item
                 frame = cv2.imdecode(
                     np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
                 )
                 if frame is None:
                     continue
-                outputs, meta = self._model.infer(frame)
+                ctx_hw = (192 if getattr(self._segment_backend, "rgb_ctx_frames", 0) > 0
+                          else 0)
+                backfill_items = (self._pick_backfill_frames(received_at)
+                                  if self._segment_buffer is not None else [])
+                bf_decoded = []
+                for bf_t, bf_jpeg in backfill_items:
+                    bf_frame = cv2.imdecode(
+                        np.frombuffer(bf_jpeg, np.uint8), cv2.IMREAD_COLOR
+                    )
+                    if bf_frame is not None:
+                        bf_decoded.append((bf_t, bf_frame))
+                if bf_decoded:
+                    batch_frames = [bf_frame for _, bf_frame in bf_decoded] + [frame]
+                    batch_results = []
+                    cap = self._backfill_infer_batch_cap
+                    for chunk_start in range(0, len(batch_frames), cap):
+                        chunk = batch_frames[chunk_start:chunk_start + cap]
+                        if len(chunk) == 1:
+                            batch_results.append(self._model.infer(chunk[0]))
+                        else:
+                            batch_results.extend(self._model.infer_batch(chunk))
+                        if self._stop_event.is_set():
+                            break
+                    if self._stop_event.is_set() or len(batch_results) != len(batch_frames):
+                        break
+                    for (bf_t, bf_frame), (bf_out, bf_meta) in zip(
+                        bf_decoded, batch_results[:-1]
+                    ):
+                        bf_boxes, bf_scores, bf_kps = decode_poses(
+                            bf_out, bf_meta, self._confidence
+                        )
+                        bf_patch = make_dual_roi_patch(
+                            bf_frame, bf_boxes, bf_scores, bf_kps, ctx_hw=ctx_hw
+                        )
+                        self._segment_buffer.record_pose(
+                            bf_t, bf_boxes, bf_scores, bf_kps, bf_frame.shape,
+                            rgb_patch=bf_patch)
+                    self._backfill_triggers += 1
+                    self._backfill_frames += len(bf_decoded)
+                    outputs, meta = batch_results[-1]
+                else:
+                    outputs, meta = self._model.infer(frame)
+                    if self._stop_event.is_set():
+                        break
                 boxes, scores, keypoints = decode_poses(
                     outputs, meta, self._confidence
                 )
+                if self._segment_buffer is not None:
+                    rgb_patch = make_dual_roi_patch(
+                        frame, boxes, scores, keypoints, ctx_hw=ctx_hw
+                    )
+                    self._segment_buffer.record_pose(
+                        received_at, boxes, scores, keypoints, frame.shape,
+                        rgb_patch=rgb_patch)
+                    self._last_pose_received_at = received_at
+                    self._maybe_schedule_async_rgb()
                 persons = self._describe(boxes, scores, keypoints, frame, started)
                 self._publish(persons, frame, started)
+                self._idle_persons = persons
+                if self._segment_backend is not None:
+                    self._flush_idle_activity()
             except Exception as e:
                 log.error(f"[pose] inference error: {e}", exc_info=True)
 
+    def _flush_idle_activity(self) -> None:
+        """Finish one received segment; never create a new camera/detection frame."""
+        if self._segment_backend is not None:
+            self._flush_received_segment()
+            return
+        if (self._stop_event.is_set() or self._activity_idle_flush_s <= 0.0
+                or not self._idle_persons):
+            return
+        received_at = self._last_image_received_at
+        if (received_at <= self._idle_finalized_at or
+                time.monotonic() - received_at < self._activity_idle_flush_s):
+            return
+        finalize = getattr(self._classifier, "finalize", None)
+        self._idle_finalized_at = received_at
+        if finalize is None:
+            return
+        started = time.time()
+        persons = []
+        updated = False
+        for person in self._idle_persons:
+            track = person["track"]
+            if not track.history or started - track.last_seen > self._tracker.timeout_s:
+                continue
+            persons.append(person)
+            try:
+                result = finalize(list(track.history))
+            except Exception as error:
+                log.warning(f"[pose] idle action failed: {error}")
+                continue
+            activity = result.get("activity")
+            if activity is None:
+                continue
+            stable, _ = track.activity_stabiliser.update(activity["name"])
+            if stable != activity["name"]:
+                continue
+            verdict = {**person["verdict"], "activity": activity,
+                       "evidence": {**(result.get("evidence") or {}),
+                                    "finalized_after_idle_s": round(
+                                        time.monotonic() - received_at, 3)}}
+            persons[-1] = {**person, "verdict": verdict}
+            updated = True
+            track.activity = activity
+            self._last_prediction = verdict["evidence"]
+            self._last_actions[person["id"]] = activity["name"]
+        if updated:
+            # Keypoints and gestures have not received another image. Only the
+            # lean action channel gets this last window's revised judgement.
+            self._publish(persons, emit_gestures=False,
+                          publish_skeleton=False, count_frame=False)
+
+    def _flush_received_segment(self) -> None:
+        if self._stop_event.is_set() or not self._frame_queue.empty():
+            return
+        now = time.monotonic()
+        ready = self._segment_buffer.pop_ready(now)
+        confirmed = ready is not None
+        if not confirmed and self._activity_idle_flush_s < self._segment_buffer.quiet_s:
+            ready = self._segment_buffer.snapshot_if_quiet(now, self._activity_idle_flush_s)
+        if ready is None:
+            return
+        records, stats = ready
+        received = [record for record in records if record[2] is not None]
+        stats['processed_observations'] = len(received)
+        key = (records[-1][0], len(received))
+        if self._segment_preview is not None and self._segment_preview[0] == key:
+            _, result, inference_ms = self._segment_preview
+        else:
+            started = time.perf_counter()
+            precomputed_rgb = self._get_usable_async_rgb(
+                stats.get("segment_gen"), len(received)
+            )
+            try:
+                if getattr(self._segment_backend, "supports_precomputed_rgb", False):
+                    result = self._segment_backend.recognize(
+                        received, self._stop_event,
+                        need_image=self._hand_channel is not None,
+                        precomputed_rgb=precomputed_rgb)
+                elif getattr(self._segment_backend, "supports_need_image", False):
+                    result = self._segment_backend.recognize(
+                        received, self._stop_event,
+                        need_image=self._hand_channel is not None)
+                else:
+                    result = self._segment_backend.recognize(received, self._stop_event)
+            except Exception as error:
+                self._segment_backend.last_error = str(error)
+                self._last_prediction = {**stats, "segment_error": str(error)}
+                raise
+            inference_ms = round((time.perf_counter()-started)*1000, 2)
+            if not confirmed and self._frame_queue.empty():
+                pop_same = getattr(self._segment_buffer, "pop_if_same_ready", None)
+                if callable(pop_same):
+                    same_ready = pop_same(time.monotonic(), key[0])
+                    if same_ready is not None:
+                        records, stats = same_ready
+                        received = [record for record in records if record[2] is not None]
+                        stats['processed_observations'] = len(received)
+                        confirmed = True
+        if not confirmed:
+            self._segment_preview = (key, result, inference_ms)
+            return
+        if self._segment_preview is not None and self._segment_preview[0][0] <= key[0]:
+            self._segment_preview = None
+        seg_gen = stats.get("segment_gen")
+        if seg_gen is not None:
+            with self._rgb_lock:
+                if self._rgb_res is not None and self._rgb_res[0] <= seg_gen:
+                    self._rgb_res = None
+        if result is None or self._stop_event.is_set():
+            self._last_prediction = {**stats, "reason": "no segment decision"}
+            return
+        act = result.get("activity")
+        score_val = float(act.get("score") or 0.0) if act is not None else 0.0
+        if self._segment_count >= 1 and act is not None:
+            within_bounce = (self._last_segment_confirmed_at > 0.0
+                             and (now - self._last_segment_confirmed_at) < 2.5)
+            weak_followup = (score_val < 0.38 if within_bounce
+                             else (score_val < 0.35 and self._last_segment_score >= 0.55))
+            if act.get("name") == "none" or weak_followup:
+                self._last_prediction = {**result["evidence"], **stats,
+                                         "inference_ms": inference_ms,
+                                         "reason": "low-confidence follow-up fragment suppressed"}
+                return
+        self._last_segment_confirmed_at = now
+        self._last_segment_score = score_val
+        persons = self._describe(result["boxes"], result["scores"],
+                                 result["keypoints"], result["image"], time.time(),
+                                 primary_box=result["primary_box"])
+        evidence = {**result["evidence"], **stats,
+                    "inference_ms": inference_ms,
+                    "dropped_segments": self._segment_buffer.dropped_segments}
+        self._last_prediction = evidence
+        self._segment_count += 1
+        if persons:
+            persons[0]["verdict"] = {**persons[0]["verdict"],
+                                     "activity": result["activity"],
+                                     "evidence": evidence}
+        self._last_actions = {
+            p["id"]: (p["verdict"].get("activity") or {}).get("name")
+                     or p["verdict"].get("posture") or "unknown"
+            for p in persons}
+        self._publish(persons, emit_gestures=False,
+                      publish_skeleton=False, count_frame=False)
+        log.info(f"[pose] segment published: {act.get('name') if act else None} "
+                 f"score={score_val:.3f} frames={stats.get('received_frames', 0)} "
+                 f"obs={stats.get('processed_observations', 0)} "
+                 f"bf={self._backfill_frames} ms={inference_ms}")
+
     # ── payload construction ─────────────────────────────────────────────
 
-    def _describe(self, boxes, scores, keypoints, frame, now_wall: float) -> list:
+    def _describe(self, boxes, scores, keypoints, frame, now_wall: float,
+                  primary_box=None) -> list:
         """Associate, classify, and build one record per person.
 
         The tracker is fed in confidence order and capped at `max_persons`, so
@@ -583,6 +1058,9 @@ class _PoseNode(Node):
         than whichever happened to be decoded first.
         """
         order = np.argsort(np.asarray(scores, dtype=np.float32))[::-1]
+        if primary_box is not None and len(order):
+            primary = int(np.abs(np.asarray(boxes)-primary_box).sum(axis=1).argmin())
+            order = np.array([primary]+[int(i) for i in order if i != primary])
         order = order[:self._max_persons]
         boxes = [boxes[i] for i in order]
         kept_scores = [float(scores[i]) for i in order]
@@ -615,14 +1093,18 @@ class _PoseNode(Node):
                 stagger = (track.id % 3) * self._activity_interval_s / 3.0
                 due = (now_wall - track.activity_t) >= (
                     self._activity_interval_s + stagger)
+            if self._segment_backend is not None:
+                due = False
             verdict = dict(self._classifier.classify(
                 list(track.history), want_activity=due))
             if due:
                 track.activity = verdict.get("activity")
                 track.activity_t = now_wall
                 self._last_prediction = verdict.get("evidence") or {}
-            elif track.activity is not None:
+            elif self._segment_backend is None and track.activity is not None:
                 verdict["activity"] = track.activity
+            if self._segment_backend is not None:
+                verdict["activity"] = None
             # Hysteresis, per person, per channel. Every threshold here is a
             # cliff and at the boundaries the raw answer flips on every frame —
             # a label alternating twelve times a second is worse than a stable
@@ -642,12 +1124,12 @@ class _PoseNode(Node):
 
             activity = verdict.get("activity")
             name, _ = track.activity_stabiliser.update(
-                activity["name"] if activity else "none")
+                activity["name"] if activity else "__absent__")
             if activity and name != activity["name"]:
                 verdict["evidence"] = {**(verdict.get("evidence") or {}),
                                        "raw_activity": activity["name"]}
                 verdict["activity"] = None
-            elif not activity and name != "none":
+            elif not activity and name != "__absent__":
                 # The stabiliser is still holding the previous activity; do not
                 # resurrect it with a stale score, just say nothing this frame.
                 pass
@@ -780,8 +1262,11 @@ class _PoseNode(Node):
 
     def _publish(self, persons: list, frame=None,
                  started: Optional[float] = None, *,
-                 emit_gestures: bool = True) -> None:
-        self._detect_count += 1
+                 emit_gestures: bool = True,
+                 publish_skeleton: bool = True,
+                 count_frame: bool = True) -> None:
+        if count_frame:
+            self._detect_count += 1
         self._person_count = len(persons)
         payload = {
             "timestamp": time.time(),
@@ -797,29 +1282,31 @@ class _PoseNode(Node):
         message.data = json.dumps(payload, ensure_ascii=False)
         self._pub.publish(message)
 
-        height, width = ((frame.shape[0], frame.shape[1])
-                         if frame is not None and hasattr(frame, "shape")
-                         else (0, 0))
-        skeleton = {
-            "timestamp": payload["timestamp"],
-            "count": len(persons),
-            # The renderer has no other way to know what the coordinates are
-            # relative to — keypoints are in source-frame pixels.
-            "image_size": [int(width), int(height)],
-            # The payload describes its own layout, which is what lets the
-            # renderer draw 59 keypoints with no frontend change at all —
-            # pose2d.js already prefers a payload-carried table over its copy.
-            "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
-                               if self._hand_channel is not None
-                               else list(COCO_KEYPOINTS)),
-            "skeleton": (merged_skeleton(COCO_SKELETON, N_KEYPOINTS)
-                         if self._hand_channel is not None
-                         else [list(edge) for edge in COCO_SKELETON]),
-            "persons": [self._skeleton_record(p) for p in persons],
-        }
-        skeleton_message = String()
-        skeleton_message.data = json.dumps(skeleton, ensure_ascii=False)
-        self._pub_skeleton.publish(skeleton_message)
+        sub_count_fn = getattr(self._pub_skeleton, "get_subscription_count", None)
+        if publish_skeleton and (sub_count_fn is None or sub_count_fn() > 0):
+            height, width = ((frame.shape[0], frame.shape[1])
+                             if frame is not None and hasattr(frame, "shape")
+                             else (0, 0))
+            skeleton = {
+                "timestamp": payload["timestamp"],
+                "count": len(persons),
+                # The renderer has no other way to know what the coordinates are
+                # relative to — keypoints are in source-frame pixels.
+                "image_size": [int(width), int(height)],
+                # The payload describes its own layout, which is what lets the
+                # renderer draw 59 keypoints with no frontend change at all —
+                # pose2d.js already prefers a payload-carried table over its copy.
+                "keypoint_names": (merged_keypoint_names(COCO_KEYPOINTS)
+                                   if self._hand_channel is not None
+                                   else list(COCO_KEYPOINTS)),
+                "skeleton": (merged_skeleton(COCO_SKELETON, N_KEYPOINTS)
+                             if self._hand_channel is not None
+                             else [list(edge) for edge in COCO_SKELETON]),
+                "persons": [self._skeleton_record(p) for p in persons],
+            }
+            skeleton_message = String()
+            skeleton_message.data = json.dumps(skeleton, ensure_ascii=False)
+            self._pub_skeleton.publish(skeleton_message)
 
         if emit_gestures:
             self._publish_gesture_events_for(persons, payload["timestamp"])
@@ -1038,6 +1525,7 @@ class PosePerceptionPlugin:
         self._plugin_cfg = dict(plugin_cfg or {})
         self._confidence = float(plugin_cfg.get("confidence", 0.4))
         self._fps = int(plugin_cfg.get("fps", 12))
+        self._max_fps = int(plugin_cfg.get("max_fps") or 0)
         self._kpt_confidence = float(
             plugin_cfg.get("kpt_confidence", DEFAULT_THRESHOLDS["kpt_confidence"]))
         self._max_persons = int(plugin_cfg.get("max_persons", 5))
@@ -1072,9 +1560,30 @@ class PosePerceptionPlugin:
             str(plugin_cfg.get("action_backend", "hybrid")))
         self._action_min_score = float(
             plugin_cfg.get("action_min_score", DEFAULT_MIN_SCORE))
+        self._prenorm_mode = str(plugin_cfg.get("prenorm_mode", PRENORM_MODE))
+        self._min_motion = float(plugin_cfg.get("min_motion", MIN_MOTION))
+        self._action_modality = str(plugin_cfg.get("action_modality", "auto"))
+        self._strict_vocabulary = (
+            bool(plugin_cfg["strict_vocabulary"])
+            if "strict_vocabulary" in plugin_cfg and plugin_cfg["strict_vocabulary"] is not None
+            else None
+        )
+        self._tracker_timeout_s = float(plugin_cfg.get("tracker_timeout_s", 1.0))
         self._label_hold = int(plugin_cfg.get("label_hold", 3))
         self._activity_interval_s = float(
             plugin_cfg.get("activity_interval_s", 0.35))
+        self._activity_idle_flush_s = max(0.0, float(
+            plugin_cfg.get("activity_idle_flush_s") or 0.0))
+        self._activity_segment_pause_s = max(0.0, float(
+            plugin_cfg.get("activity_segment_pause_s") or 0.0))
+        self._activity_stall_backfill_s = max(0.0, float(
+            plugin_cfg.get("activity_stall_backfill_s") or 0.0))
+        self._activity_mode = str(os.environ.get("POSE_ACTIVITY_MODE") or
+                                  plugin_cfg.get("activity_mode", "rolling"))
+        self._window_maturity_s = float(
+            plugin_cfg.get("window_maturity_s", 0.0))
+        self._min_window_frames = int(
+            plugin_cfg.get("min_window_frames", 1))
         # Why a temporal backend may be unavailable, kept so `info` can say it
         # instead of the card looking like it chose the geometry on purpose.
         self._backend_fallback: Optional[str] = None
@@ -1096,6 +1605,13 @@ class PosePerceptionPlugin:
         self._hand_load_error: Optional[str] = None
         self._hand_model_lock = threading.Lock()
 
+        # Shared resident ST-GCN++ TensorRT engine so stop/start cycles and
+        # multi-topic instances reuse one CUDA context and buffer allocation.
+        self._action_model = None
+        self._action_model_lock = threading.Lock()
+        self._segment_model = None
+        self._segment_model_lock = threading.Lock()
+
         self._nodes: dict[str, _PoseNode] = {}
         self._instance_configs: dict[str, dict] = {}
         # What the camera feeding each instance said about its optics. `position`
@@ -1114,9 +1630,11 @@ class PosePerceptionPlugin:
 
     def _merged_config(self, node_key: str) -> dict:
         icfg = self._instance_configs.get(node_key, {})
+        raw_fps = int(icfg.get("fps", self._fps))
+        fps = min(raw_fps, self._max_fps) if self._max_fps > 0 else raw_fps
         merged = {
             "confidence": float(icfg.get("confidence", self._confidence)),
-            "fps": int(icfg.get("fps", self._fps)),
+            "fps": fps,
             "kpt_confidence": float(icfg.get("kpt_confidence", self._kpt_confidence)),
             "max_persons": int(icfg.get("max_persons", self._max_persons)),
             "publish_keypoints": (_keypoint_level(icfg["publish_keypoints"])
@@ -1130,9 +1648,30 @@ class PosePerceptionPlugin:
                 str(icfg.get("action_backend", self._action_backend))),
             "action_min_score": float(icfg.get("action_min_score",
                                                self._action_min_score)),
+            "prenorm_mode": str(icfg.get("prenorm_mode", self._prenorm_mode)),
+            "min_motion": float(icfg.get("min_motion", self._min_motion)),
+            "action_modality": str(icfg.get("action_modality", self._action_modality)),
+            "strict_vocabulary": (
+                bool(icfg["strict_vocabulary"])
+                if "strict_vocabulary" in icfg and icfg["strict_vocabulary"] is not None
+                else self._strict_vocabulary
+            ),
+            "tracker_timeout_s": float(icfg.get("tracker_timeout_s",
+                                                self._tracker_timeout_s)),
             "label_hold": int(icfg.get("label_hold", self._label_hold)),
             "activity_interval_s": float(icfg.get(
                 "activity_interval_s", self._activity_interval_s)),
+            "activity_idle_flush_s": max(0.0, float(icfg.get(
+                "activity_idle_flush_s", self._activity_idle_flush_s) or 0.0)),
+            "activity_segment_pause_s": max(0.0, float(icfg.get(
+                "activity_segment_pause_s", self._activity_segment_pause_s) or 0.0)),
+            "activity_stall_backfill_s": max(0.0, float(icfg.get(
+                "activity_stall_backfill_s", self._activity_stall_backfill_s) or 0.0)),
+            "activity_mode": str(icfg.get("activity_mode", self._activity_mode)),
+            "window_maturity_s": float(icfg.get(
+                "window_maturity_s", self._window_maturity_s)),
+            "min_window_frames": int(icfg.get(
+                "min_window_frames", self._min_window_frames)),
             "publish_gesture_events": bool(icfg.get(
                 "publish_gesture_events", self._publish_gesture_events)),
             "gesture_whitelist": (_gesture_whitelist(icfg["gesture_whitelist"])
@@ -1253,6 +1792,18 @@ class PosePerceptionPlugin:
             min_score=merged["gesture_min_score"],
         )
 
+    def _ensure_action_model(self):
+        """Load the skeleton-action TensorRT engine once and reuse it."""
+        if self._action_model is not None:
+            return self._action_model
+        with self._action_model_lock:
+            if self._action_model is not None:
+                return self._action_model
+            from plugins.pose_stgcn import load_action_engine
+
+            self._action_model = load_action_engine()
+            return self._action_model
+
     def _classifier_for(self, merged: dict):
         """Build the configured action backend.
 
@@ -1269,6 +1820,7 @@ class PosePerceptionPlugin:
         if name == "rules":
             return build_backend("rules", thresholds=thresholds,
                                  action_window_s=merged["action_window_s"])
+
         try:
             return build_backend(
                 name,
@@ -1276,6 +1828,13 @@ class PosePerceptionPlugin:
                 action_window_s=merged["action_window_s"],
                 window_s=max(merged["action_window_s"], DEFAULT_WINDOW_S),
                 min_score=merged["action_min_score"],
+                prenorm_mode=merged["prenorm_mode"],
+                min_motion=merged["min_motion"],
+                modality=merged["action_modality"],
+                strict_vocabulary=merged["strict_vocabulary"],
+                window_maturity_s=merged["window_maturity_s"],
+                min_window_frames=merged["min_window_frames"],
+                engine_loader=self._ensure_action_model,
             )
         except Exception as error:  # noqa: BLE001 — the card must still work
             self._backend_fallback = (
@@ -1284,6 +1843,28 @@ class PosePerceptionPlugin:
             log.warning("[pose] %s", self._backend_fallback)
             return build_backend("rules", thresholds=thresholds,
                                  action_window_s=merged["action_window_s"])
+
+    def _segment_backend_for(self, merged: dict):
+        if merged["activity_mode"] != "segment" or merged["action_backend"] == "rules":
+            return None
+        from plugins.pose_segment import SegmentActionBackend
+        directory = os.environ.get("ACTION_SEGMENT_MODEL_DIR") or "/models/action-segment"
+        with self._segment_model_lock:
+            if self._segment_model is None:
+                model = SegmentActionBackend.from_directory(
+                    self._model, directory)
+                model.warmup(
+                    include_rgb=(os.environ.get("ACTION_SEGMENT_WARMUP_RGB") == "1")
+                )
+                self._segment_model = model
+        return SegmentActionBackend(
+            self._model, self._segment_model.body._engine,
+            self._segment_model.rgb_engine,
+            min_score=merged["action_min_score"], confidence=merged["confidence"],
+            ntu_rgb_weight=self._segment_model.ntu_rgb_weight,
+            crop_mode=self._segment_model.crop_mode,
+            router=self._segment_model.router,
+            rgb_head=self._segment_model.rgb_head)
 
     # ── engine ───────────────────────────────────────────────────────────
 
@@ -1321,12 +1902,17 @@ class PosePerceptionPlugin:
                 cv2.imshow = lambda *a, **k: None
                 cv2.waitKey = lambda *a, **k: 0
                 cv2.destroyAllWindows = lambda *a, **k: None
+            if hasattr(cv2, "setNumThreads"):
+                try:
+                    cv2.setNumThreads(1)
+                except Exception:
+                    pass
 
             from plugins.vision_runtime import VisionEngineSession
 
             engine_path = self._resolve_engine()
             log.info(f"[pose] loading engine: {engine_path}")
-            self._model = VisionEngineSession(engine_path)
+            self._model = VisionEngineSession(engine_path, shared_scratch=True)
             log.info(f"[pose] engine loaded: {self._model_name} "
                      f"input={self._model.input_size}, "
                      f"{N_KEYPOINTS} keypoints")
@@ -1339,7 +1925,8 @@ class PosePerceptionPlugin:
         dropping back to PyTorch silently would cost ~8x per frame and look like
         nothing was wrong (measured for vop on an Orin NX).
         """
-        configured = (self._model_name or "").strip()
+        configured = (os.environ.get("POSE_ENGINE_PATH") or
+                      self._model_name or "").strip()
         if configured.endswith(".engine") and os.path.isfile(configured):
             return configured
 
@@ -1623,6 +2210,11 @@ class PosePerceptionPlugin:
                 publish_overlay=merged["publish_overlay"],
                 label_hold=merged["label_hold"],
                 activity_interval_s=merged["activity_interval_s"],
+                activity_idle_flush_s=merged["activity_idle_flush_s"],
+                activity_segment_pause_s=merged["activity_segment_pause_s"],
+                activity_stall_backfill_s=merged["activity_stall_backfill_s"],
+                segment_backend=self._segment_backend_for(merged),
+                tracker_timeout_s=merged["tracker_timeout_s"],
                 gesture_tracker=self._gesture_tracker_for(merged),
                 publish_gesture_events=merged["publish_gesture_events"],
                 hand_channel=self._hand_channel_for(merged),
@@ -1653,6 +2245,9 @@ class PosePerceptionPlugin:
         # ROS node name leak and the next start trips "Publisher already
         # registered".
         dispose_node(self._executor, node, label=f"pose/{node_key}")
+        # Drop the last local reference before collecting retired ROS node cycles.
+        del node
+        gc.collect()
         return result
 
     def _loading_camera_info(self, args: dict, instance_id: str) -> dict:
@@ -1707,12 +2302,20 @@ class PosePerceptionPlugin:
 
         elif action == "list_actions":
             effective = self._effective_backend()
+            vocab_size = 126 if self._strict_vocabulary else 60
+            with self._nodes_lock:
+                for node in self._nodes.values():
+                    learned = getattr(node._classifier, "learned", node._classifier)
+                    if getattr(learned, "vocab_size", 60) == 126:
+                        vocab_size = 126
+                        break
             return {
                 "ok": True,
                 "backend": effective,
                 # Two vocabularies, because two questions are being answered.
                 "postures": sorted(POSTURE_LABELS_ZH),
-                "activities": (action_vocabulary() if effective != "rules" else []),
+                "activities": (action_vocabulary(vocab_size)
+                               if effective != "rules" else []),
                 "backend_note": (
                     "hybrid：posture（身体是什么姿势）来自关键点几何，单帧可判；"
                     "activity（人在做什么）来自 ST-GCN++，用它自己的 NTU-60 词表，"
@@ -1797,6 +2400,8 @@ class PosePerceptionPlugin:
                 "publish_bbox": node._publish_bbox,
                 "publish_overlay": node._publish_overlay,
                 "detect_count": node._detect_count,
+                "activity_mode": "segment" if node._segment_backend is not None else "rolling",
+                "segments_recognized": node._segment_count,
                 "persons_last_frame": node._person_count,
                 "last_actions": dict(node._last_actions),
                 "gesture_output": (node._gesture_topic
@@ -2112,10 +2717,31 @@ class PosePerceptionPlugin:
             self._action_backend = self._migrate_backend(str(cfg["action_backend"]))
         if "action_min_score" in cfg:
             self._action_min_score = float(cfg["action_min_score"])
+        if "prenorm_mode" in cfg:
+            self._prenorm_mode = str(cfg["prenorm_mode"])
+        if "min_motion" in cfg:
+            self._min_motion = float(cfg["min_motion"])
+        if "action_modality" in cfg:
+            self._action_modality = str(cfg["action_modality"])
+        if "strict_vocabulary" in cfg:
+            self._strict_vocabulary = bool(cfg["strict_vocabulary"])
+        if "tracker_timeout_s" in cfg:
+            self._tracker_timeout_s = float(cfg["tracker_timeout_s"])
         if "label_hold" in cfg:
             self._label_hold = int(cfg["label_hold"])
         if "activity_interval_s" in cfg:
             self._activity_interval_s = float(cfg["activity_interval_s"])
+        if "activity_idle_flush_s" in cfg:
+            self._activity_idle_flush_s = max(0.0, float(
+                cfg["activity_idle_flush_s"] or 0.0))
+        if "activity_segment_pause_s" in cfg:
+            self._activity_segment_pause_s = max(0.0, float(
+                cfg["activity_segment_pause_s"] or 0.0))
+        if "activity_stall_backfill_s" in cfg:
+            self._activity_stall_backfill_s = max(0.0, float(
+                cfg["activity_stall_backfill_s"] or 0.0))
+        if "activity_mode" in cfg:
+            self._activity_mode = str(cfg["activity_mode"])
         for key in _THRESHOLD_KEYS:
             if key in cfg:
                 self._plugin_cfg[key] = cfg[key]
