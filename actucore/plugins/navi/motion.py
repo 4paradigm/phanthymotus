@@ -134,6 +134,7 @@ class MotionCheck:
     first_hit: int | None
     swept_bounds: tuple[tuple[float, float], tuple[float, float]]
     terminal_distance: float | None
+    obstacle_cost: float | None = None
 
 
 def _ramp_arclength(start, end, dt):
@@ -353,7 +354,7 @@ def _layers_in_sweep(evidence, bounds):
 
 def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
                     original_goal, stop_distance_m, terminal_boundary=None, prepared_layers=None,
-                    cull_obstacles=False):
+                    cull_obstacles=False, score_clearance=False):
     """Check the complete stop. supported_region is a pair of lower/upper (f,r) corners.
 
     first_hit is the earliest occupied/remembered contact sample. terminal_distance
@@ -391,16 +392,18 @@ def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
     if cull_obstacles:
         occupied = _layers_in_sweep(occupied, bounds)
         remembered = _layers_in_sweep(remembered, bounds)
+    clearance_samples = np.full(len(f), np.inf) if score_clearance else None
     if prepared_layers is not None:
         clearance, first_hit, reason = prepared_layers.clearance(
-            poses, f, r, yaw, front, rear, width, sweep_padding)
+            poses, f, r, yaw, front, rear, width, sweep_padding, clearance_samples)
     else:
         clearance, first_hit, reason = math.inf, None, None
         for evidence, collision in ((occupied, "footprint_collision"), (remembered, "remembered_obstacle")):
             # Several registered views can have different grid axes and alignment errors.
             for obstacles in evidence if isinstance(evidence, tuple) else (evidence,):
                 distance, hit = local_path.rectangle_clearance(
-                    poses, local_path.occupied_squares(obstacles), front, rear, width, padding=sweep_padding)
+                    poses, local_path.occupied_squares(obstacles), front, rear, width, padding=sweep_padding,
+                    clearance_samples=clearance_samples)
                 clearance = min(clearance, distance)
                 if hit is not None and (first_hit is None or hit < first_hit):
                     reason, first_hit = collision, hit
@@ -419,7 +422,9 @@ def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
         extent_f = length * abs(c) + width * abs(s) + np.maximum(np.r_[0., interval_f], np.r_[interval_f, 0.])
         extent_r = length * abs(s) + width * abs(c) + np.maximum(np.r_[0., interval_r], np.r_[interval_r, 0.])
         layers = prepared_layers or local_path.PreparedObstacleLayers(occupied, remembered)
-        refined = layers.axis_clearance(f, r, extent_f, extent_r, first_hit)
+        if clearance_samples is not None:
+            clearance_samples.fill(np.inf)
+        refined = layers.axis_clearance(f, r, extent_f, extent_r, first_hit, clearance_samples)
         if refined > 1e-10:
             clearance, first_hit, reason = refined, None, None
     if not trace.stopped:
@@ -444,7 +449,11 @@ def evaluate_motion(trace, *, footprint, occupied, remembered, supported_region,
             reason = "target_standoff"
     # Culled layers can contain the closest obstacle, but cannot overlap the sweep.
     clearance = min(clearance, 0.) if cull_obstacles else clearance
-    return MotionCheck(reason is None, reason, clearance, first_hit, bounds, terminal_distance)
+    obstacle_cost = None
+    if reason is None and clearance_samples is not None:
+        costs = local_path._clearance_shortfall(np.maximum(clearance_samples, 0.), local_path.SOFT_CLEARANCE_M)
+        obstacle_cost = .7 * float(costs.max()) + .3 * float(costs.mean())
+    return MotionCheck(reason is None, reason, clearance, first_hit, bounds, terminal_distance, obstacle_cost)
 
 
 def minimum_target_distance(trace, goal):

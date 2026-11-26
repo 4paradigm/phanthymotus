@@ -303,6 +303,61 @@ def test_retained_route_budget_does_not_start_searching_alternate_paths(monkeypa
     assert not any(candidate["values"])
 
 
+@pytest.mark.parametrize("new_target_generation", [False, True])
+def test_unavailable_published_route_stops_and_never_searches_for_a_replacement(monkeypatch, new_target_generation):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    first = card.next_command()
+    assert card._stage_command(first, card._output_epoch)
+    route = card._state.committed_route
+    follow = policy._dwa_detour
+    attempt = []
+
+    def reject_route(depth, config, state, reference, *args, **kwargs):
+        attempt.append(kwargs.get("follow_published", False))
+        state.dwa_trace["fallback_reason"] = "no_admissible_candidates"
+        return None
+
+    monkeypatch.setattr(policy, "_dwa_detour", reject_route)
+    for stamp, vx in ((1100, first["values"][0]), (1200, 0.)):
+        advance_snapshot(snapshot, clock, stamp, vx=vx)
+        stop = card.next_command()
+        assert not any(stop["values"])
+        assert card._stage_command(stop, card._output_epoch)
+        assert not any(packets[-1]["values"])
+        assert card._state.committed_route is route
+    assert attempt == [True, True]
+    assert card._state.route_in_view.points == route.route_points
+
+    monkeypatch.setattr(policy, "_dwa_detour", follow)
+    advance_snapshot(snapshot, clock, 1300, vx=0.)
+    if new_target_generation:
+        card._state.tracker.track.generation += 1
+        objects, depth, odom, _ = snapshot[0]
+        snapshot[0] = dict(objects, timestamp=1.3), depth, odom, 1300
+    renewed = card.next_command()
+    assert card._state.dwa_trace["retained_route"]
+    assert card._stage_command(renewed, card._output_epoch)
+    assert packets[-1]["values"][0] > 0.
+
+
+@pytest.mark.parametrize("remaining, exit_ahead, locked", [(.03, False, False), (.08, False, False),
+                                                          (.08, True, True), (.12, False, True)])
+def test_committed_route_releases_at_the_end_only_after_passage_exit(monkeypatch, remaining, exit_ahead, locked):
+    card, _, _, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    state = card._state
+    # Match the residual forward and lateral offsets observed near route ends.
+    route = replace(state.committed_route, route_points=((-0.8, -.08), (remaining, -.08)),
+                    passage_exit=((.3, -.1), (.3, .1)) if exit_ahead else None)
+    state.committed_route = state.published_dwa_route = route
+    depth = snapshot[0][1]
+
+    policy._follow_published_route(depth, card._config, state, card._config.local_geometry,
+                                   2., 0., foreground=True)
+    assert state.committed_route is (route if locked else None)
+
+
 @pytest.mark.parametrize("next_depth", ["expired", "clear", "obstacle"])
 def test_expired_depth_leaves_the_sent_packet_until_its_original_deadline(monkeypatch, next_depth):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
@@ -958,7 +1013,7 @@ def test_queued_dwa_stops_on_cancellation_or_new_obstacle(monkeypatch, body, eve
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
 @pytest.mark.parametrize("live_target", [True, False], ids=["live", "remembered"])
 @pytest.mark.parametrize("obstacle", [True, False], ids=["blocked", "clear"])
-def test_real_tick_accepts_fresh_input_without_a_second_swept_collision_veto(monkeypatch, body, live_target, obstacle):
+def test_real_tick_checks_new_depth_at_publication(monkeypatch, body, live_target, obstacle):
     calls = observe_selector(monkeypatch)
     card, packets, clock, snapshot = observation_card(monkeypatch, body=body, live_target=live_target)
     publish = card._publish_command
@@ -972,8 +1027,9 @@ def test_real_tick_accepts_fresh_input_without_a_second_swept_collision_veto(mon
     card._tick()
     assert calls and any(choice is not None for _, choice in calls)
     assert packets
-    if not any(packets[-1]["values"]):
-        assert obstacle and card._dwa_publication["reason"] == "occluded_prefix"
+    if obstacle:
+        assert not any(packets[-1]["values"])
+        assert card._dwa_publication["reason"] == "footprint_collision"
         return
     accepted = [choice for _, choice in calls if choice is not None][-1]
     assert len(packets) == 1
@@ -2388,16 +2444,19 @@ def test_pose_reset_during_publication_cannot_shift_the_checked_scene(monkeypatc
 
 @pytest.mark.parametrize("body", [True, False])
 @pytest.mark.parametrize("obstacle", [True, False])
-def test_feedback_recheck_does_not_veto_swept_obstacles(monkeypatch, body, obstacle):
+def test_feedback_recheck_uses_current_occupancy_for_the_swept_body(monkeypatch, body, obstacle):
     card, _, clock, snapshot, message = selected_card(monkeypatch, body=body, live_target=True)
     check = card._staged_dwa_command[1].forward_check
-    advance_snapshot(snapshot, clock, 1050, obstacle=obstacle, vx=.105)
+    advance_snapshot(snapshot, clock, 1050, vx=.105)
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    occupied[local_path.START[0] + 2, local_path.START[1]] = obstacle
+    monkeypatch.setattr(local_path.DepthProjection, "grid_for", lambda *args, **kwargs: (~occupied, occupied))
     monkeypatch.setattr(policy, "dwa_trace_visible", lambda *_args, **_kwargs: True)
     diagnostics = {}
     verified = card._recheck_dwa_motion(check, message["values"], 800, clock[0], snapshot[0], renew=False,
                                         diagnostics=diagnostics)
-    assert verified is not None and verified[2]
-    assert diagnostics.get("reason") is None
+    assert verified is not None and verified[2] is not obstacle
+    assert diagnostics.get("reason") == ("footprint_collision" if obstacle else None)
 
 
 @pytest.mark.parametrize("change,compact,stationary", [
@@ -3074,7 +3133,7 @@ def test_route_controller_keeps_an_updated_target_range_on_later_depth(monkeypat
 
 
 @pytest.mark.parametrize("new_obstacle", [False, True])
-def test_timer_hands_lost_target_to_search_inside_the_active_window(monkeypatch, new_obstacle):
+def test_timer_keeps_the_committed_route_when_the_target_disappears(monkeypatch, new_obstacle):
     card, packets, _, snapshot, feed = tracked_route_card(monkeypatch)
     work = card._scheduled_command
     cutoff = min(work.expires_ms, work.repeat_until[0])
@@ -3092,7 +3151,8 @@ def test_timer_hands_lost_target_to_search_inside_the_active_window(monkeypatch,
         assert len(packets) == 1 and work.expires_ms == cutoff
         assert card._state.reacquire_generation is not None
         card._tick()
-        assert len(packets) == 2 and packets[-1]["values"][5] != 0.
+        assert len(packets) == 2 and not any(packets[-1]["values"])
+        assert card._state.committed_route is work.dwa_origin.acceptance
 
 
 @pytest.mark.parametrize("change", ["clear", "obstacle", "cancelled", "expired"])

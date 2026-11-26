@@ -48,7 +48,7 @@ def _score(options, command, trace, checked):
         command, trace, checked, reference, options["previous"],
         half_width=.3025,
         limits=(options["x_limit"], options["y_limit"], options["yaw_limit"]),
-        progress_scale=.2, target=options["target"])
+        progress_scale=.2)
 
 
 @pytest.mark.parametrize("budgeted", [False, True], ids=["direct", "decision-budget"])

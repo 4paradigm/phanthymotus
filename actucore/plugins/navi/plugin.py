@@ -2701,8 +2701,8 @@ class NaviPlugin:
             point = local_path.target_in_grid(geometry, *live_point)
             front_constraint = tuple(view.points(point)), view.error(math.hypot(*point))
         result = motion.evaluate_motion(
-            prediction, terminal_boundary=boundary, footprint=guard.footprint, occupied=(),
-            remembered=(), supported_region=local_path.SUPPORTED_REGION, original_goal=None,
+            prediction, terminal_boundary=boundary, footprint=guard.footprint, occupied=occupied,
+            remembered=remembered, supported_region=local_path.SUPPORTED_REGION, original_goal=None,
             stop_distance_m=0.)
         if (check.target == "person" and (live_person_front or (
                 live_point is None and guard.front_required and not guard.probe_region))):
@@ -3005,8 +3005,7 @@ class NaviPlugin:
                 if accepted.route_points and accepted.motion_guard.pose is not None:
                     self._state.published_dwa_route = accepted
             committed = self._state.committed_route
-            if (self._state.published_dwa_route is None and committed is not None
-                    and self._state.dwa_trace.get("wait_for_committed_route")):
+            if self._state.published_dwa_route is None and committed is not None:
                 self._state.published_dwa_route = committed
             if self._config.local_controller == "dwa" and self._wire_twist is not None:
                 # A preview or an expired candidate did not change the chassis
@@ -4046,8 +4045,11 @@ class NaviPlugin:
             positions = pose.points([point[:2] for point in future_path[:prediction.moving_count]])
             if not dwa.stays_on_route(route, positions, guard.footprint.half_width):
                 return None
+        cells = local_path.front_corner_sweep_grid(
+            projection.frame, geometry, policy_mod._keepout_m(config), grid[1],
+            guard_blind_sides=not config.use_obstacle_history)
         result = motion.evaluate_motion(
-            prediction, footprint=guard.footprint, occupied=(), remembered=(),
+            prediction, footprint=guard.footprint, occupied=(registration.squares(cells),), remembered=(),
             supported_region=local_path.SUPPORTED_REGION, original_goal=None,
             stop_distance_m=0., terminal_boundary=motion.TravelBudget(room))
         front = None

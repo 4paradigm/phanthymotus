@@ -16,6 +16,7 @@ UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 CARDINAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
 STEPS = CARDINAL_STEPS + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 RESOLUTION = .05
+SOFT_CLEARANCE_M = .25
 MIN_OBSTACLE_HEIGHT_M = .02
 LOW_OBSTACLE_HEIGHT_M = .10
 LOW_COMPONENT_AREA_M2 = .05
@@ -1106,7 +1107,8 @@ def occupied_squares(occupied):
     return ObstacleSquares(np.column_stack((FORWARD[rows, cols], RIGHT[rows, cols])), 0.)
 
 
-def rectangle_clearance(poses, squares, front, rear, width, *, padding=0., cell_size=RESOLUTION):
+def rectangle_clearance(poses, squares, front, rear, width, *, padding=0., cell_size=RESOLUTION,
+                        clearance_samples=None):
     """Minimum Euclidean separation and first contact sample for closed rectangles.
 
     The chassis is expressed about its reference pose. Work in the obstacle
@@ -1132,7 +1134,8 @@ def rectangle_clearance(poses, squares, front, rear, width, *, padding=0., cell_
         dx, dy = ox - x[0], oy - y[0]
         u = np.maximum(abs(c[0]*dx + s[0]*dy) - length, 0.)
         v = np.maximum(abs(-s[0]*dx + c[0]*dy) - width, 0.)
-        cutoff = max(float(np.hypot(u, v).min()) - padding[0], 0.) + padding.max() + 1e-10
+        score_range = SOFT_CLEARANCE_M if clearance_samples is not None else 0.
+        cutoff = max(float(np.hypot(u, v).min()) - padding[0], score_range) + padding.max() + 1e-10
         ex, ey = length*abs(c) + width*abs(s) + half, length*abs(s) + width*abs(c) + half
         gap_x = np.maximum(0., np.maximum((x-ex).min() - ox, ox - (x+ex).max()))
         gap_y = np.maximum(0., np.maximum((y-ey).min() - oy, oy - (y+ey).max()))
@@ -1165,6 +1168,8 @@ def rectangle_clearance(poses, squares, front, rear, width, *, padding=0., cell_
                 distance2 = np.minimum(distance2, np.minimum(du*du + dv*dv, px*px + py*py))
             distance = np.sqrt(np.where(overlap, 0., distance2))
         nearest = distance.min(axis=1) - padding[start:end]
+        if clearance_samples is not None:
+            np.minimum(clearance_samples[start:end], nearest, out=clearance_samples[start:end])
         hits = np.flatnonzero(nearest <= 1e-10)
         if hits.size:
             return 0., start + int(hits[0])
@@ -1203,7 +1208,7 @@ class PreparedObstacleLayers:
         self.native_shapes = (np.isfinite(self.error).all() and np.isfinite(sx).all() and np.isfinite(sy).all()
                               and all(square.centers.dtype == np.float64 for square, _ in self.layers))
 
-    def axis_clearance(self, f, r, extent_f, extent_r, first_hit):
+    def axis_clearance(self, f, r, extent_f, extent_r, first_hit, clearance_samples=None):
         """Prove separation using grid-axis bounds, including each source's cell size and registration."""
         cell = ((abs(self.cos_yaws) + abs(self.sin_yaws)) * (RESOLUTION / 2) + self.error)[self.layer_index]
         df = abs(f[first_hit] - self.grid_f) - extent_f[first_hit] - cell
@@ -1214,18 +1219,22 @@ class PreparedObstacleLayers:
         minimum = np.hypot(df.clip(0.), dr.clip(0.)).min()
         df = np.maximum((f-extent_f).min()-self.grid_f, self.grid_f-(f+extent_f).max()) - cell
         dr = np.maximum((r-extent_r).min()-self.grid_r, self.grid_r-(r+extent_r).max()) - cell
-        nearby = np.flatnonzero((df <= minimum) & (dr <= minimum))
+        cutoff = max(minimum, SOFT_CLEARANCE_M) if clearance_samples is not None else minimum
+        nearby = np.flatnonzero((df <= cutoff) & (dr <= cutoff))
         batch = max(1, _PREPARED_PAIR_BUDGET // len(f))
         for start in range(0, len(nearby), batch):
             indices = nearby[start:start+batch]
             df = abs(f[:, None] - self.grid_f[indices]) - extent_f[:, None] - cell[indices]
             dr = abs(r[:, None] - self.grid_r[indices]) - extent_r[:, None] - cell[indices]
-            minimum = min(minimum, np.hypot(df.clip(0.), dr.clip(0.)).min())
+            nearest = np.hypot(df.clip(0.), dr.clip(0.)).min(axis=1)
+            minimum = min(minimum, float(nearest.min()))
+            if clearance_samples is not None:
+                np.minimum(clearance_samples, nearest, out=clearance_samples)
             if minimum <= _CONTACT_EPS:
                 break
         return float(minimum)
 
-    def clearance(self, poses, f, r, yaw, front, rear, width, padding):
+    def clearance(self, poses, f, r, yaw, front, rear, width, padding, clearance_samples=None):
         if not self.layers:
             return math.inf, None, None
         # The scalar evaluator chooses its aligned-distance formula per block.
@@ -1240,7 +1249,8 @@ class PreparedObstacleLayers:
             clearance, first_hit, cause = math.inf, None, None
             for squares, reason in self.layers:
                 distance, hit = rectangle_clearance(
-                    poses, squares, front, rear, width, padding=padding)
+                    poses, squares, front, rear, width, padding=padding,
+                    clearance_samples=clearance_samples)
                 clearance = min(clearance, distance)
                 if hit is not None and (first_hit is None or hit < first_hit):
                     first_hit, cause = hit, reason
@@ -1270,6 +1280,8 @@ class PreparedObstacleLayers:
         if hits.size:
             return 0., 0, self.layers[ids[hits[0]]][1]
         minimum = float(first.min())
+        if clearance_samples is not None:
+            clearance_samples[0] = minimum
         if len(f) == 1:
             return minimum, None, None
 
@@ -1282,7 +1294,8 @@ class PreparedObstacleLayers:
         gy = np.maximum(0., np.maximum((y-ey).min(axis=0)[ids] - self.oy,
                                        self.oy - (y+ey).max(axis=0)[ids]))
         gap = np.hypot(gx, gy)
-        keep = np.flatnonzero(gap <= max(minimum, _CONTACT_EPS) + cell_pad + _CONTACT_EPS)
+        score_range = SOFT_CLEARANCE_M if clearance_samples is not None else _CONTACT_EPS
+        keep = np.flatnonzero(gap <= max(minimum, score_range) + cell_pad + _CONTACT_EPS)
         axis_aligned_tail = np.all(s[1:] == 0., axis=0)
         # Distance from one real cell vertex at the terminal pose to the body
         # bounds the full-trace minimum from above. Use it only for pruning;
@@ -1304,7 +1317,7 @@ class PreparedObstacleLayers:
                                              np.maximum(abs(dy[aligned]) - width - half, 0.))
             upper = witness - (padding[-1] + cell_error[keep])
             upper_bound = min(minimum, float(upper.min()) + _CONTACT_EPS)
-            keep = keep[gap[keep] <= max(upper_bound, _CONTACT_EPS) + cell_pad[keep] + _CONTACT_EPS]
+            keep = keep[gap[keep] <= max(upper_bound, score_range) + cell_pad[keep] + _CONTACT_EPS]
         first_hit, hit_layer = len(f), len(self.layers)
         batch = max(1, _PREPARED_PAIR_BUDGET // (len(f) - 1))
         for start in range(0, len(keep), batch):
@@ -1316,7 +1329,7 @@ class PreparedObstacleLayers:
             dy = self.oy[cell] - y[1:stop, layer]
             gap_x = np.maximum(abs(dx) - ex[1:stop, layer], 0.)
             gap_y = np.maximum(abs(dy) - ey[1:stop, layer], 0.)
-            limit = max(min(minimum, upper_bound), _CONTACT_EPS) + cell_pad[cell] + _CONTACT_EPS
+            limit = max(min(minimum, upper_bound), score_range) + cell_pad[cell] + _CONTACT_EPS
             row, col = np.nonzero(gap_x*gap_x + gap_y*gap_y <= limit*limit)
             if not row.size:
                 continue
@@ -1326,6 +1339,8 @@ class PreparedObstacleLayers:
                                             c[time_index, source], s[time_index, source],
                                             axis_aligned_tail[source], length, half, width) - (padding[time_index] + cell_error[cell[col]])
             minimum = min(minimum, float(distance.min()))
+            if clearance_samples is not None:
+                np.minimum.at(clearance_samples, time_index, distance)
             hits = np.flatnonzero(distance <= _CONTACT_EPS)
             if hits.size:
                 i = hits[0]  # Pose-major and source-major order within each slab.
@@ -1488,7 +1503,7 @@ def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tole
                                          heading_tolerance=heading_tolerance).size
 
 
-def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half_width, start, target):
+def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half_width, start, target, stop):
     """Weight the measured corridor midpoint or the tangents of a compact blocker."""
     cols = np.arange(occupied.shape[1])
     left = np.maximum.accumulate(np.where(occupied, cols, -1), axis=1)
@@ -1550,9 +1565,9 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
             else:
                 passing_start = min(passing_start, first_contact)
         body_clear = obstacle_end + math.hypot(geometry.rear, half_width)
-        # The measured face can hide the back of the obstacle. Stay alongside
-        # until the far side of the expanded circle as well as rear clearance.
+        # Extend the passing lane when there is room to blend before the stop ring.
         rear_clear = max(body_clear, radius)
+        rear_clear += min(body_half_width, max(0., target_range - stop - half_width - rear_clear))
         slope = radius / math.sqrt(target_range**2 - radius**2)
         lane_min = abs(normal) @ (span / 2) + half_width + RESOLUTION
         passing_offset = np.clip((target_range - body_clear) * slope + 2 * RESOLUTION, lane_min, radius)
@@ -1622,16 +1637,16 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     # occupied squares and the complete oriented footprint to a stop.
     allowed = clearance > half_width - RESOLUTION
     allowed[start] = True
-    desired = geometry.front + geometry.rear
-    cost = 3. * _clearance_shortfall(np.maximum(0., clearance - half_width), desired)
+    obstacle_cost = 2. * _clearance_shortfall(np.maximum(0., clearance - half_width), SOFT_CLEARANCE_M)
     # Rejoin the original approach line when the obstruction ends. Otherwise
     # any point on the standoff circle, even far to the side, is equally good.
     dx, dy = target[0] - (approach_origin[0] + pivot), target[1] - approach_origin[1]
     length = max(RESOLUTION, math.hypot(dx, dy))
     lateral = abs((FORWARD-target[0])*dy - (RIGHT-target[1])*dx) / length
-    cost += .5 * lateral / max(.15, half_width)
+    cost = .5 * lateral / max(.15, half_width)
     cost, tangent_goal = _detour_shape_cost(cost, occupied, blockers, geometry, half_width,
-                                           body_half_width or half_width, start, target)
+                                           body_half_width or half_width, start, target, stop)
+    cost += obstacle_cost
     if previous:
         distance = np.full_like(clearance, np.inf)
         for f, r in previous:
