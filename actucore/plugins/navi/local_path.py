@@ -1621,7 +1621,7 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
                                            body_half_width or half_width, start, target)
     if tangent_goal is not None:
         # Keep charging for nearby cells along a compact obstacle's tangents.
-        cost += 2. * _clearance_shortfall(gap, .25)
+        cost += 2. * _clearance_shortfall(gap, .30)
     if previous:
         distance = np.full_like(clearance, np.inf)
         for f, r in previous:

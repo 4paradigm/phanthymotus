@@ -674,6 +674,8 @@ def test_a_star_applies_short_range_clearance_after_detour_shape(monkeypatch):
     assert local_path.clearance_route((~occupied, occupied), _geometry(), .27, (3., 0.), .60, (0., 0.))
     extra = scores["route"] - scores["shape"]
     assert extra[np.isclose(f, 1.5) & np.isclose(r, .45)].item() > 0.
+    # A cell 28 cm beyond the footprint still incurs the new shortfall.
+    assert extra[np.isclose(f, 1.5) & np.isclose(r, .65)].item() == pytest.approx(2. * (1. - .28 / .30) ** 2)
     assert extra[np.isclose(f, 1.5) & np.isclose(r, .70)].item() == 0.
 
 
