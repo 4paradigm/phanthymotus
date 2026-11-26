@@ -14,7 +14,6 @@ import json
 import math
 import re
 import time
-from contextvars import ContextVar
 
 import config
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError
@@ -37,11 +36,6 @@ _FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
 # 历史会把不同人的对话混在一起，可能把 A 的上下文答给 B。
 _CHAT_HISTORY_LIMIT = 12
 _CHAT_HISTORY_TEXT_MAX = 500
-
-# Set by the LLM dispatcher for scoped viewer turns. Context-local rather than an
-# argument supplied by the model, so concurrent turns/calls cannot widen it.
-viewer_reply_scope: ContextVar[tuple[frozenset[str], frozenset[str]] | None] = ContextVar(
-    'viewer_reply_scope', default=None)
 
 # Bot-to-Bot 主动发起（trusted_bot_id 路径）的粗粒度频率熔断。PR #134 的设计里
 # 明确没有轮次/时间熔断，靠双方"是否还有具体任务"自觉停止——这里加一层兜底，
@@ -223,12 +217,6 @@ def uses_trusted_bots(platform: str) -> bool:
     if cls is not None:
         return bool(getattr(cls, 'USES_TRUSTED_BOTS', False))
     return platform in _TRUSTED_BOTS_FALLBACK
-
-
-def scopes_conversations(platform: str) -> bool:
-    """Whether this adapter requires conversation-scoped turns and viewer history."""
-    return (isinstance(platform, str)
-            and bool(getattr(_ADAPTER_CLASSES.get(platform), 'SCOPED_CONVERSATIONS', False)))
 
 
 # ── Manager ──────────────────────────────────────────────────────────────────
@@ -755,12 +743,12 @@ class ChannelManager:
                     acl.upsert_user(msg.platform, msg.user_id, msg.display_name, role=default_role)
                     user = acl.get_user(msg.platform, msg.user_id)
                 else:
-                    if msg.notify_pending_approval is not None:
-                        await msg.notify_pending_approval()
-                    elif adapter := self._adapters.get(msg.channel_id):
+                    adapter = self._adapters.get(msg.channel_id)
+                    if adapter:
                         await adapter.send_message(OutboundMessage(
                             chat_id=msg.chat_id,
-                            text='Pending approval. An admin has been notified.'
+                            text='Pending approval. An admin has been notified.',
+                            reply_to_message_id=msg.message_id,
                         ))
                     return
 
@@ -770,18 +758,6 @@ class ChannelManager:
             if not allowed:
                 return  # 静默丢弃
 
-        # Long-connection media can require an early reply and a download. Do
-        # both only after the channel and sender have passed authorization.
-        if msg.prepare is not None:
-            await msg.prepare()
-
-        if scopes_conversations(msg.platform):
-            from channel import context
-            if not context.is_authorized({'_channel_scope': (
-                    msg.platform, msg.channel_id, msg.chat_id, msg.user_id,
-                    user['role'], private_chat)}):
-                return
-
         # 4. Store last conversation context for reply routing (persisted)
         self._set_last_context(
             msg.channel_id, msg.chat_id, msg.user_id,
@@ -790,9 +766,8 @@ class ChannelManager:
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
         )
-        if not scopes_conversations(msg.platform):
-            self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
-                                       user_label=msg.display_name or msg.user_id)
+        self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
+                                   user_label=msg.display_name or msg.user_id)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
@@ -857,9 +832,6 @@ class ChannelManager:
                               trusted_bot_id: str = '') -> str:
         """Send text and/or attachments to the source message's exact chat context.
         Called by channel_reply tool dispatch."""
-        scope = viewer_reply_scope.get()
-        if scope is not None and (channel_id not in scope[0] or source_message_id not in scope[1]):
-            return 'Error: viewer replies must target the current channel and message.'
         if source_message_id and trusted_bot_id:
             return 'Error: provide source_message_id or trusted_bot_id, not both; no message was sent.'
 
@@ -993,7 +965,9 @@ class ChannelManager:
             result = f'Reply sent to {channel_id} ({"; ".join(parts) or "empty"})'
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
-            if not mention_open_id and not scopes_conversations(adapter.platform):
+            if not mention_open_id:
+                # Bot-to-bot mentions aren't this chat's own human-facing conversation —
+                # keep the recap scoped to the human/channel side of the exchange.
                 self._record_chat_exchange(channel_id, chat_id, 'assistant', text)
             return result
         except PartialSendError as e:

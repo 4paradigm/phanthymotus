@@ -737,14 +737,6 @@ class Subagent:
 
         return placeholder
 
-    def _check_channel_origin(self):
-        from channel import context
-        origin = self.spec.metadata.get('_channel_origin')
-        if origin and not context.is_active(origin):
-            reason = 'originating Channel conversation is no longer authorized'
-            self.cancel(reason)
-            raise PermissionError(reason)
-
     async def _dispatch_tool(self, name: str, args: dict) -> str:
         """Dispatch a tool call and return result text."""
         # Subagent system tools
@@ -766,7 +758,6 @@ class Subagent:
                 await event_bus.enqueue(
                     source=f'subagent:{self.id}/report',
                     text=progress,
-                    channel_origin=self.spec.metadata.get('_channel_origin'),
                 )
             else:
                 # 非紧急：存入 DB 供 memory_recall 检索，不触发 main agent
@@ -809,7 +800,6 @@ class Subagent:
                                        self._cancel_event,
                                        want=_bar_want, scoped=True,
                                        concurrent=_parallel)
-                self._check_channel_origin()
                 result = await mcp_client.call_tool(name, args)
                 self._note_action_id(result)
                 if isinstance(result, dict):
@@ -835,7 +825,6 @@ class Subagent:
                 if _sys_tool_needs_barrier(name):
                     await _acp_barrier(f'subagent:{self.id}/{name}',
                                        self._cancel_event, scoped=False)
-                self._check_channel_origin()
                 fn = _event_instance._sys_tools[name]['object']
                 result = await fn(**args)
                 if isinstance(result, list):

@@ -14,13 +14,6 @@ import config
 LOG_PATH = pathlib.Path('./resource/log')
 
 
-def error_message(error: Exception) -> str:
-    """Bound diagnostics and omit image bytes echoed by a model service."""
-    message = re.sub(r'data:image/[^;,\s]+;base64,[A-Za-z0-9+/=_-]+',
-                     '[image data omitted]', str(error), flags=re.IGNORECASE)
-    return message if len(message) <= 2000 else message[:2000] + '…(truncated)'
-
-
 def _prepare_messages(messages: list[dict]) -> list[dict]:
     """Move tool images to a user message after the complete tool-result batch."""
     prepared = []
@@ -807,7 +800,7 @@ class Client():
                 return msg
             except Exception as e:
                 elapsed = time.perf_counter() - t0
-                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {error_message(e)}')
+                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
                 raise
             finally:
                 # CancelledError 走不到上面的 except（它是 BaseException），
@@ -862,7 +855,7 @@ class Client():
                 return msg
             except Exception as e:
                 elapsed = time.perf_counter() - t0
-                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {error_message(e)}')
+                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
                 raise
 
         async def _go(client, model, think_mode: bool, attempt: int = 0,

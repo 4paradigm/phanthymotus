@@ -22,7 +22,6 @@ import typing
 import log
 import config
 import client
-from client.llm import error_message
 import event
 import event_bus
 import collector
@@ -86,8 +85,8 @@ def _decoded_json(value):
 def _tool_content(result):
     """一个 tool role 消息的 `content`，保证是服务端收得下的形状。
 
-    tool 消息的 content 应为字符串或文本 content part 数组；图片数组由 client.llm
-    在请求前转为 user 图像消息。`_dispatch` 的返回值并不都是字符串：barrier 被打断时它返回
+    OpenAI 的 schema 里 tool 消息的 content 只能是字符串（或多模态 content part
+    数组）。而 `_dispatch` 的返回值并不都是字符串：barrier 被打断时它返回
     `{"status": "not_dispatched", "reason": ...}` 这样的 dict，之前原样塞进
     content，请求就被上游以 400 拒掉。
 
@@ -103,7 +102,7 @@ def _tool_content(result):
     """
     if isinstance(result, str):
         return result
-    # 保留 content parts，由模型客户端统一处理图片和消息顺序。
+    # 多模态 content part 数组（图片等）是 schema 允许的另一种形状，原样放行。
     if isinstance(result, list):
         return result
     if result is None:
@@ -420,36 +419,6 @@ def _trigger_channel_ids(trigger_event: dict) -> list[str]:
     return ids
 
 
-def _steering_messages(trigger_event: dict, events: list[dict]) -> list[dict]:
-    """Keep shared steering; scoped Channels require matching reply authority."""
-    scoped_turn = bool(trigger_event.get('_scoped_channel_event'))
-    accepted = []
-    for ev in events:
-        defer = trigger_event.get('_bot_channel_event') or collector.has_bot_channel_event([ev])
-        if scoped_turn:
-            scope = collector.channel_scope([ev])
-            defer = defer or (trigger_event.get('_viewer_channel_event')
-                             or trigger_event.get('_chat_only_channel')
-                             or (collector._is_channel_event(ev)
-                                 and (scope is None or scope != trigger_event.get('_channel_scope'))))
-        else:
-            defer = defer or collector._is_scoped_channel_event(ev)
-        if defer:
-            collector.defer_priority([ev])
-            continue
-        accepted.append(ev)
-    if scoped_turn:
-        for key, values in (
-            ('_channel_message_ids', collector.channel_message_ids(accepted)),
-            ('_channel_image_paths', collector.channel_image_paths(accepted)),
-        ):
-            current = trigger_event.setdefault(key, [])
-            current.extend(value for value in values if value not in current)
-    return [{'role': 'user', 'content':
-             f'[system notification source={ev.get("source", "")}]\n{ev.get("text", "")}'}
-            for ev in accepted]
-
-
 def _channel_tool_retry_message(trigger_event: dict, round_idx: int, text: str,
                                 retry_consumed: bool = False) -> str:
     """首轮渠道回复漏掉工具调用时，给模型一次纠正机会。"""
@@ -640,16 +609,12 @@ _VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
 })
 
 
-def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True,
-                                     viewer_has_images: bool = False) -> bool:
+def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True) -> bool:
     """Shared allow-list for turns that must not mutate or actuate: untrusted-bot
     Channel turns, and (see _viewer_channel_restricted) viewer-role human Channel
     turns. May read state and reply, nothing else — viewer additionally gets the
     read-only system tools (search, history/memory recall)."""
     if not name.startswith('mcp__'):
-        if name == 'Read':
-            # Dispatch additionally restricts the path to this batch's images.
-            return not bot_restricted and viewer_has_images
         allowed = _BOT_READ_ONLY_SYSTEM_TOOLS if bot_restricted else _VIEWER_READ_ONLY_SYSTEM_TOOLS
         return name in allowed
     if name == 'mcp__channel__channel_reply':
@@ -660,47 +625,6 @@ def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True,
     return bool(meta and meta.get('type') in ('sensor', 'resource'))
 
 
-def _viewer_image_read_allowed(trigger_event: dict, args: dict) -> bool:
-    """Allow Read only for an image attached to the current Channel batch."""
-    if not isinstance(args, dict):
-        return False
-    path = args.get('file_path')
-    paths = trigger_event.get('_channel_image_paths')
-    if not isinstance(path, str) or not path or not isinstance(paths, list):
-        return False
-    try:
-        from channel.store import is_inbound_media
-        target = pathlib.Path(path).resolve()
-        return is_inbound_media(target) and any(
-            isinstance(candidate, str) and candidate and pathlib.Path(candidate).resolve() == target
-            for candidate in paths
-        )
-    except (OSError, RuntimeError, ValueError):
-        return False
-
-
-def _viewer_channel_reply_allowed(trigger_event: dict, args: dict) -> bool:
-    """Viewer replies may target this turn and attach only its inbound images."""
-    if not isinstance(args, dict):
-        return False
-    source_ids = trigger_event.get('_channel_message_ids')
-    source_id = args.get('source_message_id')
-    if (not isinstance(source_ids, list) or not isinstance(source_id, str)
-            or not source_id or source_id not in source_ids):
-        return False
-    if args.get('trusted_bot_id') or args.get('mention_open_id') or args.get('expect_reply'):
-        return False
-    files = args.get('files') or []
-    if not isinstance(files, list):
-        return False
-    for item in files:
-        path = item if isinstance(item, str) else (
-            item.get('path') or item.get('file_path') if isinstance(item, dict) else None)
-        if not _viewer_image_read_allowed(trigger_event, {'file_path': path}):
-            return False
-    return True
-
-
 def _bot_channel_restricted(trigger_event: dict) -> bool:
     return bool(trigger_event.get('_bot_channel_event')) and not bool(
         trigger_event.get('_trusted_bot_channel_event')
@@ -708,7 +632,15 @@ def _bot_channel_restricted(trigger_event: dict) -> bool:
 
 
 def _viewer_channel_restricted(trigger_event: dict) -> bool:
-    """Apply the viewer-role policy selected by the collector for this batch."""
+    """True when every human Channel message in this turn's batch came from a
+    'viewer' (or role-less) ACL user — no operator/owner present to justify
+    unlocking actuator/processor tools.
+
+    Before this, channel/acl.py's role levels were never enforced anywhere in
+    the dispatch path — `user_role` was only informational text handed to the
+    LLM. Any auto-approved Channel user could ask the model to call any bound
+    tool, actuators included, regardless of their recorded ACL role.
+    """
     return bool(trigger_event.get('_viewer_channel_event'))
 
 
@@ -1007,7 +939,7 @@ def _context_pressured(pressure, ratio: float) -> bool:
     return bool(context_tokens) and prompt_tokens >= ratio * context_tokens
 
 
-async def _compress_turns(turns: list[list[dict]], *, cancel_event=None) -> str | None:
+async def _compress_turns(turns: list[list[dict]]) -> str:
     """用 LLM 压缩旧的 turns 为文本摘要。"""
     text = _turns_to_text(turns)
     # 截断过长的输入（避免压缩请求本身溢出）
@@ -1021,15 +953,12 @@ async def _compress_turns(turns: list[list[dict]], *, cancel_event=None) -> str 
                 {'role': 'user', 'content': _COMPRESS_PROMPT + text},
             ],
             tool_list=[],
-            **({'cancel_event': cancel_event} if cancel_event is not None else {}),
         )
-        summary = summary_response.get('content')
-        return summary if isinstance(summary, str) and summary.strip() else None
-    except TurnCancelled:
-        raise
+        return summary_response.get('content', '') or '[历史摘要] （压缩失败，无内容）'
     except Exception as e:
         print(f'[decision] compress failed: {e}')
-        return None
+        # 压缩失败时，回退到简单截断
+        return f'[历史摘要] 之前有 {len(turns)} 轮对话，因压缩失败仅保留最近内容。'
 
 
 # ── 主动播报（framework-generated progress narration）─────────────────────────
@@ -1469,7 +1398,7 @@ _REWRITE_SUMMARY_PROMPT = """将以下两段历史摘要合并为一段简洁摘
 """
 
 
-async def _rewrite_summary(old: str, new: str, budget: int = 5000, *, cancel_event=None) -> str | None:
+async def _rewrite_summary(old: str, new: str, budget: int = 5000) -> str:
     """合并两段摘要为固定预算内的单一摘要。"""
     try:
         resp = await client.call(
@@ -1478,20 +1407,15 @@ async def _rewrite_summary(old: str, new: str, budget: int = 5000, *, cancel_eve
                 {'role': 'user', 'content': _REWRITE_SUMMARY_PROMPT.format(budget=budget, old=old, new=new)},
             ],
             tool_list=[],
-            **({'cancel_event': cancel_event} if cancel_event is not None else {}),
         )
-        result = resp.get('content')
-        if not isinstance(result, str) or not result.strip():
-            return None
+        result = resp.get('content', '') or new
         # 硬上限兜底
         if len(result) > budget * 2:
             result = result[:budget * 2]
         return result
-    except TurnCancelled:
-        raise
     except Exception as e:
         print(f'[decision] rewrite_summary failed: {e}')
-        return None
+        return new  # 失败时只保留新摘要
 
 
 # ── detailed_info 系统工具实现 ────────────────────────────────────────────────────
@@ -1505,8 +1429,7 @@ async def _search_history(
 ) -> str:
     """搜索历史对话记录。当需要回忆过去的对话内容、查找之前讨论过的话题时使用。"""
     import chat_history
-    results = chat_history.search(query, limit=limit,
-                                  context_key=chat_history.current_channel_context.get())
+    results = chat_history.search(query, limit=limit)
     if not results:
         return '未找到相关历史记录。'
     lines = []
@@ -1525,8 +1448,6 @@ async def _memory_recall(
     """从记忆库检索历史信息。包含过去的对话、subagent 分析结论等。当需要回顾历史状态、查找之前的任务结果时使用。"""
     import time as _time
     from config import _get_conn
-    import chat_history
-    channel_context = chat_history.current_channel_context.get()
 
     results = []
     now = _time.time()
@@ -1543,7 +1464,7 @@ async def _memory_recall(
             pass
 
     # 搜索 subagent_conclusions
-    if source in ('all', 'subagent') and channel_context is None:
+    if source in ('all', 'subagent'):
         try:
             with _get_conn() as conn:
                 # 分词搜索：将 query 按空格拆分，每个关键词都必须匹配（AND 逻辑）
@@ -1578,8 +1499,7 @@ async def _memory_recall(
     if source in ('all', 'conversation'):
         try:
             import chat_history
-            hist_results = chat_history.search(query, limit=limit,
-                                               context_key=channel_context)
+            hist_results = chat_history.search(query, limit=limit)
             for r in hist_results:
                 if time_cutoff > 0 and r['ts'] < time_cutoff:
                     continue
@@ -1623,31 +1543,11 @@ async def _raw_input_info(
 _event_instance: 'Event | None' = None
 
 
-def _channel_history_key(trigger_event: dict) -> str | None:
-    from channel.context import history_context
-    return history_context(trigger_event) if trigger_event.get('_scoped_channel_event') else None
-
-
-def _recent_context_turns(max_turns: int) -> list[list[dict]]:
-    from channel import context as channel_context
-    if channel_context.history_context(channel_context.current.get()) is not None:
-        import chat_history
-        origin = channel_context.capture()
-        if origin is None:
-            return []
-        session = chat_history.get_channel_session(
-            channel_context.context_key(origin), limit=max_turns,
-            session_id=origin['_channel_session_id'])
-        if not session:
-            return []
-        summary = [[{'role': 'user', 'content': session['summary']}]] if session['summary'] else []
-        return summary + session['turns']
-    return _event_instance._turns[-max_turns:] if _event_instance else []
-
-
 def get_recent_context(max_turns: int = 5) -> str:
     """返回最近 N 轮 main agent 的 assistant 输出摘要，供 bg subagent 同步上下文。"""
-    recent = _recent_context_turns(max_turns)
+    if not _event_instance or not _event_instance._turns:
+        return ''
+    recent = _event_instance._turns[-max_turns:]
     lines = []
     for turn in recent:
         for msg in turn:
@@ -1668,7 +1568,9 @@ def get_recent_context_rich(max_turns: int = 20, max_chars: int = 6000) -> str:
     策略：20 轮内，纯字符串提取，不额外调 LLM。包含用户消息、
     assistant 决策文本、tool 结果（含 subagent_result 返回值）。
     """
-    recent = _recent_context_turns(max_turns)
+    if not _event_instance or not _event_instance._turns:
+        return ''
+    recent = _event_instance._turns[-max_turns:]
     parts = []
     total = 0
     truncated = False
@@ -1716,13 +1618,6 @@ class Event:
         self._sys_tools:   dict       = {}
         self._summary: str | None     = None  # 压缩后的历史摘要
         self._session_id: str | None  = None  # chat history session
-        self._channel_session_id: str | None = None
-        self._channel_turn_index: int = 0
-        self._channel_context_key: str = ''
-        self._channel_turns: list[list[dict]] = []
-        self._channel_summary: str = ''
-        self._channel_summary_through: int = -1
-        self._channel_turn_indexes: list[int] = []
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
         # 每清空一次历史 +1。凡是「先读出 _turns、await 一次 LLM、再写回」的代码
         # （压缩、溢出重试）和 turn 结束时的保存，都拿它判断中途有没有被清过 ——
@@ -2032,12 +1927,6 @@ class Event:
         """事件驱动：通过 collector 批量获取事件，每批跑一轮推理。"""
         while True:
             ev = await collector.next_trigger()
-            from channel import context as channel_context
-            if ev.get('_channel_origin') and not channel_context.is_active(ev['_channel_origin']):
-                continue
-            scoped_turn = bool(ev.get('_scoped_channel_event'))
-            if scoped_turn and not channel_context.is_authorized(ev):
-                continue
             self._chat_only_active = bool(ev.get('_chat_only_channel'))
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
@@ -2051,17 +1940,12 @@ class Event:
             reconsider_ev = asyncio.Event()
             collector.set_reconsider_event(reconsider_ev)
             collector.set_turn_priority(1 if ev.get('_urgent') else 0)
-            collector.set_turn_scope(ev)
             collector.set_busy(True)
             # Publish this turn's cancel signal so tools that block for a long time
             # can honour it. peer_delegate holds an HTTP connection for the remote
             # task's whole duration, and the checks below only run between rounds.
             from peer.delegation import current_cancel_event as _cancel_ctx
             _cancel_token = _cancel_ctx.set(cancel_ev)
-            import chat_history
-            _history_token = chat_history.current_channel_context.set(
-                _channel_history_key(ev))
-            _origin_token = channel_context.current.set(ev if scoped_turn else None)
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev, reconsider_event=reconsider_ev)
             except TurnCancelled:
@@ -2071,67 +1955,51 @@ class Event:
                     'content': '[turn interrupted by user message]',
                 })
                 # 中止正在进行的 TTS 播放和动作
-                if not (self._chat_only_active or (scoped_turn and _channel_tool_restricted(ev))):
+                if not self._chat_only_active:
                     await self._interrupt_active_outputs()
                 await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                message = error_message(e)
-                print(f'[decision] error in _one_turn: {message}')
+                print(f'[decision] error in _one_turn: {e}')
                 # Fire on_error hook (LED feedback etc.)
-                if not (self._chat_only_active or ev.get('_bot_channel_event')
-                        or (scoped_turn and ev.get('_viewer_channel_event'))):
+                if not self._chat_only_active and not ev.get('_bot_channel_event'):
                     import hooks
                     asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
                 self._current_turn.append({
                     'role': 'assistant',
-                    'content': f'[错误] {type(e).__name__}: {message}',
+                    'content': f'[错误] {type(e).__name__}: {e}',
                 })
-                await push_event({'type': 'error', 'payload': {'message': message}})
+                await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
                 _cancel_ctx.reset(_cancel_token)
-                chat_history.current_channel_context.reset(_history_token)
-                channel_context.current.reset(_origin_token)
                 self._turn_cancel = None
                 collector.set_cancel_event(None)
                 collector.set_reconsider_event(None)
                 collector.set_busy(False)
-                collector.set_turn_scope(None)
                 # Fire on_idle hook (LED state reset etc.)
-                if not (self._chat_only_active or ev.get('_bot_channel_event')
-                        or (scoped_turn and ev.get('_viewer_channel_event'))):
+                if not self._chat_only_active and not ev.get('_bot_channel_event'):
                     import hooks as _hooks_idle
                     asyncio.create_task(_hooks_idle.fire('on_idle'))
-                # Bot input stays out of shared history; Scoped Channel history selection
-                # is handled by _save_current_turn.
-                # Do not persist a turn invalidated by a history clear.
+                # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
+                # 这一轮跑的时候历史被清过，就不存：它属于被清掉的那段对话。
                 if (self._current_turn and not ev.get('_bot_channel_event')
                         and turn_gen == self._history_gen):
                     self._save_current_turn(ev)
                 self._chat_only_active = False
 
-    def forget_conversation(self, *, channel_only: bool = False) -> None:
+    def forget_conversation(self) -> None:
         """丢掉内存里的对话上下文，并让正在跑的 turn 停下、不落盘。
 
         只删数据库不够：`_build_history()` 读的是 `_turns` / `_summary`，模型会继续
         拿已删的对话做决定。正在跑的 turn 也要停 —— 它的 history 在开头就拼好了，
         不停下就会带着旧上下文把剩下的 LLM 调用和工具调用跑完。
-        channel_only 用于单独删除当前渠道会话，保留主代理自己的历史。
         """
         self._history_gen += 1
-        if not channel_only:
-            self._turns = []
-            self._summary = None
-            self._session_id = None
-        self._channel_session_id = None
-        self._channel_turn_index = 0
-        self._channel_context_key = ''
-        self._channel_turns = []
-        self._channel_turn_indexes = []
-        self._channel_summary = ''
-        self._channel_summary_through = -1
+        self._turns = []
+        self._summary = None
+        self._session_id = None
         self._current_turn = []
         self._context_pressure = None
         if self._turn_cancel is not None:
@@ -2158,36 +2026,25 @@ class Event:
         不存在 —— 手动刷新也刷不出来，因为要刷的行还没有。这里按当前 turn 索引 upsert，
         turn 结束时 `_save_current_turn` 再写同一个索引覆盖掉（那一份已 compact）。
         """
-        if not self._current_turn or (trigger_event and trigger_event.get('_bot_channel_event')):
+        if not self._current_turn:
             return
         import chat_history
         try:
-            if trigger_event and _channel_history_key(trigger_event) is not None:
-                if (not self._channel_session_id or self._channel_context_key
-                        != collector.channel_context_key(trigger_event)):
-                    return
-                session_id, turn_index = self._channel_session_id, self._channel_turn_index
-            else:
-                if not self._session_id:
-                    self._session_id = chat_history.create_session(chat_history.KIND_MAIN)
-                session_id, turn_index = self._session_id, len(self._turns)
+            if not self._session_id:
+                self._session_id = chat_history.create_session(chat_history.KIND_MAIN)
             # 存盘的是截断过的副本 —— 和 turn 结束时那一份同一个规则，也避免把整轮
             # 未截断的 tool result 每轮重写一遍。原 turn 不能动，LLM 还要用完整内容。
             chat_history.save_turn(
-                session_id, turn_index, _compact_turn(self._current_turn))
+                self._session_id, len(self._turns), _compact_turn(self._current_turn))
             if trigger_event:
                 summary_text = trigger_event.get('text', '') or trigger_event.get('source', '')
                 if summary_text:
-                    chat_history.update_summary(session_id, summary_text)
+                    chat_history.update_summary(self._session_id, summary_text)
         except Exception as e:
             print(f'[chat_history] flush_turn failed: {e}')
 
     def _save_current_turn(self, trigger_event: dict):
         """保存 _current_turn 到内存历史 + SQLite。"""
-        if _channel_history_key(trigger_event) is not None:
-            # Restricted input stays out of the full-control agent's active history.
-            self._flush_current_turn(trigger_event)
-            return
         # 保存前 compact：截断大 tool results，减少 tier1 历史占用
         turn = _compact_turn(self._current_turn)
         self._current_turn[:] = turn
@@ -2213,96 +2070,26 @@ class Event:
 
     # ── 单轮推理 ─────────────────────────────────────────────────────────────
 
-    def _build_history(self, *, turns: list[list[dict]] | None = None,
-                       summary: str | None = None) -> list[dict]:
+    def _build_history(self) -> list[dict]:
         """从 _turns 构建 L3 历史（tiered retention: tier1 全量 + tier2 降质 + summary）。"""
         llm_cfg = config.main.get('event', {}).get('llm', {})
         tier1 = llm_cfg.get('tier1_turns', 6)
         tier2 = llm_cfg.get('tier2_turns', 8)
 
-        selected = self._turns if turns is None else turns
-        n = len(selected)
-        recent = selected[-tier1:] if n > tier1 else selected
-        medium = selected[max(0, n - tier1 - tier2):max(0, n - tier1)]
+        n = len(self._turns)
+        recent = self._turns[-tier1:] if n > tier1 else self._turns
+        medium = self._turns[max(0, n - tier1 - tier2):max(0, n - tier1)]
 
         history = []
         # 前置历史摘要（如果有）
-        selected_summary = self._summary if turns is None else summary
-        if selected_summary:
-            history.append({'role': 'user', 'content': selected_summary})
+        if self._summary:
+            history.append({'role': 'user', 'content': self._summary})
             history.append({'role': 'assistant', 'content': '好的，我已了解之前的对话背景。'})
         for turn in medium:
             history.extend(_degrade_turn(turn))
         for turn in recent:
             history.extend(turn)
         return _sanitize(_scrub(history))
-
-
-    def _load_channel_history(self, trigger_event: dict) -> list[dict]:
-        self._channel_session_id = None
-        self._channel_turn_index = 0
-        self._channel_context_key = collector.channel_context_key(trigger_event)
-        self._channel_turns = []
-        self._channel_turn_indexes = []
-        self._channel_summary = ''
-        self._channel_summary_through = -1
-        if not trigger_event.get('_scoped_channel_event') or not self._channel_context_key:
-            return []
-        import chat_history
-        if _channel_history_key(trigger_event) is None:
-            if not self._session_id:
-                self._session_id = chat_history.create_session(chat_history.KIND_MAIN)
-            trigger_event['_channel_session_id'] = self._session_id
-            return []
-        origin = trigger_event.get('_channel_origin') or {}
-        last = chat_history.get_channel_session(
-            self._channel_context_key, limit=None, session_id=origin.get('_channel_session_id'))
-        if last:
-            self._channel_session_id = last['session_id']
-            self._channel_turn_index = last['next_turn_index']
-            self._channel_turns = [_sanitise_turn(turn) for turn in last['turns']]
-            self._channel_turn_indexes = last['turn_indexes']
-            self._channel_summary = last['summary']
-            self._channel_summary_through = last['summarized_through']
-        elif not origin:
-            self._channel_session_id = chat_history.create_session(
-                chat_history.KIND_CHANNEL, context_key=self._channel_context_key)
-        trigger_event['_channel_session_id'] = self._channel_session_id
-        return self._build_history(turns=self._channel_turns, summary=self._channel_summary)
-
-    async def _maybe_compress_channel(self, *, force: bool = False):
-        if not self._channel_session_id:
-            return
-        import chat_history
-        llm_cfg = config.main.get('event', {}).get('llm', {})
-        keep = max(2, llm_cfg.get('tier1_turns', 6) + llm_cfg.get('tier2_turns', 8))
-        turns = self._channel_turns
-        if force:
-            keep = max(1, min(keep, len(turns) // 2))
-        if len(turns) <= keep:
-            return
-        if (not force and len(turns) <= keep + 2
-                and _estimate_chars(turns) <= llm_cfg.get('compress_threshold_chars', 80000)):
-            return
-        gen = self._history_gen
-        session_id, key = self._channel_session_id, self._channel_context_key
-        old_through = self._channel_summary_through
-        through = self._channel_turn_indexes[-keep - 1]
-        cancel_args = {'cancel_event': self._turn_cancel} if self._turn_cancel is not None else {}
-        summary = await _compress_turns(turns[:-keep], **cancel_args)
-        if not summary:
-            return
-        if self._channel_summary and gen == self._history_gen:
-            summary = await _rewrite_summary(self._channel_summary, summary,
-                                             llm_cfg.get('summary_max_chars', 5000), **cancel_args)
-        if (gen != self._history_gen or not summary
-                or not chat_history.save_channel_summary(
-                    session_id, key, summary, through=through, expected_through=old_through)):
-            return
-        self._channel_summary = summary
-        self._channel_summary_through = through
-        self._channel_turns = turns[-keep:]
-        self._channel_turn_indexes = self._channel_turn_indexes[-keep:]
 
     async def _maybe_compress(self):
         """检查历史是否需要压缩（基于轮数或字符数），压缩旧轮次为 rolling summary。"""
@@ -2343,15 +2130,11 @@ class Event:
         print(f'[decision] compressing history: {len(old_turns)} old turns, keeping {max_kept} recent')
         gen = self._history_gen
         summary = await _compress_turns(old_turns)
-        if not summary:
-            return
         # Rolling summary: 合并旧摘要（固定预算重写，而非无限拼接）
         if self._summary and gen == self._history_gen:
             summary = await _rewrite_summary(self._summary, summary, summary_budget)
         if gen != self._history_gen:
             print('[decision] history cleared during compression — discarding summary')
-            return
-        if not summary:
             return
 
         self._summary = summary
@@ -2538,20 +2321,7 @@ class Event:
                         reconsider_event: asyncio.Event | None = None):
         import time as _time
         from uuid import uuid4
-        from channel import context as channel_context
-
-        def check_authorization():
-            if (trigger_event.get('_scoped_channel_event')
-                    and not channel_context.is_authorized(trigger_event)):
-                raise TurnCancelled('Channel authorization changed')
-
         _turn_t0 = _time.perf_counter()
-        channel_history = self._load_channel_history(trigger_event)
-        scoped_channel_history = _channel_history_key(trigger_event) is not None
-        if scoped_channel_history:
-            await self._maybe_compress_channel()
-            channel_history = self._build_history(turns=self._channel_turns,
-                                                  summary=self._channel_summary)
         bot_restricted = _bot_channel_restricted(trigger_event)
         viewer_restricted = _viewer_channel_restricted(trigger_event)
         from channel import chat_only
@@ -2559,9 +2329,6 @@ class Event:
         if chat_only_turn:
             reconsider_event = None
         tool_restricted = chat_only_turn or bot_restricted or viewer_restricted
-        scoped_viewer = viewer_restricted and bool(trigger_event.get('_scoped_channel_event'))
-        viewer_has_images = scoped_viewer and bool(trigger_event.get('_channel_image_paths'))
-        side_effects_restricted = chat_only_turn or bot_restricted or scoped_viewer
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
 
@@ -2631,7 +2398,7 @@ class Event:
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
-        if not side_effects_restricted:
+        if not (chat_only_turn or bot_restricted):
             asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
@@ -2639,7 +2406,7 @@ class Event:
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
         # has_blocking_pendings 而不是 get_pending_actions：只有音乐在播时，没有任何
         # 东西需要打断，不该在每个用户 turn 上跑一遍清扫。
-        if (mcp_client.has_blocking_pendings() and not side_effects_restricted
+        if (mcp_client.has_blocking_pendings() and not (chat_only_turn or bot_restricted)
                 and not _trigger_is_self_originated(trigger_event)):
             # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
             # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
@@ -2679,13 +2446,11 @@ class Event:
         elif tool_restricted:
             system_tools = [
                 tool for tool in system_tools
-                if _restricted_channel_tool_allowed(tool['schema']['name'], bot_restricted=bot_restricted,
-                                                    viewer_has_images=viewer_has_images)
+                if _restricted_channel_tool_allowed(tool['schema']['name'], bot_restricted=bot_restricted)
             ]
             bound_schemas = [
                 schema for schema in bound_schemas
-                if _restricted_channel_tool_allowed(schema['name'], bot_restricted=bot_restricted,
-                                                    viewer_has_images=viewer_has_images)
+                if _restricted_channel_tool_allowed(schema['name'], bot_restricted=bot_restricted)
             ]
         all_tool_list = (
             [{'type': 'function', 'function': t['schema']} for t in system_tools]
@@ -2710,7 +2475,6 @@ class Event:
         round_idx = 0
         total_rounds = 0
         channel_reply_retry_consumed = False
-        overflow_retry_consumed = False
 
         async def _no_output_guard(text: str) -> bool:
             """turn 要结束了，但它从头到尾一次都没出过声 —— 再给一轮。
@@ -2760,13 +2524,11 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            # Only restricted scoped Channel turns select a separate history.
-            history = (channel_history if scoped_channel_history
-                       else [] if bot_restricted else self._build_history())
+            history = [] if bot_restricted else self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
             current_history = history + _sanitize(_scrub(turn_messages))
 
-            if not turn_messages:
+            if round_idx == 0:
                 # 首轮：加入 L4 触发事件（含 L2 动态快照）
                 messages = prompt_mod.build(
                     system_msg    = frozen_system,
@@ -2806,14 +2568,15 @@ class Event:
             # 取消检查点：在耗时的 LLM 调用前检查是否被用户消息中断
             if cancel_event and cancel_event.is_set():
                 raise TurnCancelled("Interrupted before LLM call")
-            check_authorization()
             if reconsider_event is not None and reconsider_event.is_set():
                 # 已经有高优先级 steering 在等——不用真的发一次请求再被打断，
                 # 直接原地重新构建（走下面 except RoundReconsider 同一条处理）。
                 reconsider_event.clear()
                 _steered_pre = await collector.drain_steering()
                 if _steered_pre:
-                    turn_messages.extend(_steering_messages(trigger_event, _steered_pre))
+                    for sev in _steered_pre:
+                        turn_messages.append({'role': 'user', 'content':
+                            f'[system notification source={sev.get("source", "")}]\n{sev.get("text", "")}'})
                     print(f'[decision] reconsider pending before request, steered {len(_steered_pre)} message(s)')
                 continue
 
@@ -2838,7 +2601,9 @@ class Event:
                 reconsider_event.clear()
                 _steered_inflight = await collector.drain_steering()
                 if _steered_inflight:
-                    turn_messages.extend(_steering_messages(trigger_event, _steered_inflight))
+                    for sev in _steered_inflight:
+                        turn_messages.append({'role': 'user', 'content':
+                            f'[system notification source={sev.get("source", "")}]\n{sev.get("text", "")}'})
                     print(f'[decision] llm call reconsidered, steered {len(_steered_inflight)} message(s) into retry')
                 round_idx += 1
                 total_rounds += 1
@@ -2846,39 +2611,40 @@ class Event:
             except Exception as e:
                 from client.llm import LLMErrorKind, _classify_error
                 kind, _ = _classify_error(e)
-                if kind == LLMErrorKind.CONTEXT_OVERFLOW and not overflow_retry_consumed:
-                    # Retry through the normal loop so cancellation/steering
-                    # stays active and the triggering request is not appended twice.
-                    if scoped_channel_history and channel_history:
-                        await self._maybe_compress_channel(force=True)
-                        reduced = self._build_history(turns=self._channel_turns,
-                                                      summary=self._channel_summary)
-                        reduced = _sanitize(_scrub(_trim(reduced, max_messages=10, max_images=1)))
-                        if reduced == channel_history:
-                            raise
-                        channel_history = reduced
-                        print('[decision] context overflow — reduced scoped channel history')
-                    elif len(self._turns) > 2 and not bot_restricted and not scoped_channel_history:
-                        print('[decision] context overflow — force compressing history')
+                if kind == LLMErrorKind.CONTEXT_OVERFLOW and round_idx == 0:
+                    # 上下文溢出：强制压缩后重试一次
+                    print(f'[decision] context overflow — force compressing history')
+                    if len(self._turns) > 2 and not bot_restricted:
                         gen = self._history_gen
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
-                        if not summary:
-                            raise
                         if self._summary and gen == self._history_gen:
                             llm_cfg = config.main.get('event', {}).get('llm', {})
                             budget = llm_cfg.get('summary_max_chars', 5000)
                             summary = await _rewrite_summary(self._summary, summary, budget)
-                        if not summary:
-                            raise
                         # 压缩期间历史被清过：不写回，cancel_event 已置位，这一轮马上会停
                         if gen == self._history_gen:
                             self._summary = summary
                             self._turns = self._turns[-2:]
+                        # 重建 history 并重试（复用冻结的 system）
+                        history = self._build_history()
+                        current_history = history + _sanitize(_scrub(turn_messages))
+                        messages = prompt_mod.build(
+                            system_msg    = frozen_system,
+                            message_list  = current_history,
+                            trigger_event = trigger_event,
+                        )
+                        trigger_user_msg = messages[-1]
+                        turn_messages.clear()
+                        turn_messages.append(trigger_user_msg)
+                        response = await client.call(
+                            message_list = messages,
+                            tool_list    = all_tool_list,
+                            trace_id     = _trace_id,
+                            caller_info  = {'agent_type': 'main_agent'},
+                        )
                     else:
                         raise
-                    overflow_retry_consumed = True
-                    continue
                 else:
                     raise
             turn_messages.append(response)
@@ -2921,10 +2687,9 @@ class Event:
             _usage = response.get('_usage')
             if _usage:
                 # 本机模型答的这一轮：记下 prompt 占了它上下文的多少，轮末据此提前压缩
-                if not scoped_channel_history:
-                    self._context_pressure = (
-                        (_usage.get('prompt_tokens') or 0, _usage.get('context_tokens'))
-                        if _usage.get('served_by') == 'modelhub' else None)
+                self._context_pressure = (
+                    (_usage.get('prompt_tokens') or 0, _usage.get('context_tokens'))
+                    if _usage.get('served_by') == 'modelhub' else None)
                 _turn_usage['prompt_tokens'] += _usage.get('prompt_tokens') or 0
                 _turn_usage['completion_tokens'] += _usage.get('completion_tokens') or 0
                 _turn_usage['total_tokens'] += _usage.get('total_tokens') or 0
@@ -2968,22 +2733,12 @@ class Event:
                 })
 
                 if chat_only_turn:
-                    check_authorization()
                     result = await chat_only.dispatch(name, args, trigger_event)
-                elif tool_restricted and not _restricted_channel_tool_allowed(
-                        name, bot_restricted=bot_restricted, viewer_has_images=viewer_has_images):
+                elif tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
                         'mutating, actuator, processor, or delegated execution tools.'
-                    )
-                elif scoped_viewer and name == 'Read' and not _viewer_image_read_allowed(trigger_event, args):
-                    result = 'Error: a viewer may only read images attached to the current Channel messages.'
-                elif (scoped_viewer and name == 'mcp__channel__channel_reply'
-                      and not _viewer_channel_reply_allowed(trigger_event, args)):
-                    result = (
-                        'Error: viewer replies must use a current source_message_id, cannot '
-                        'contact other bots, and may only attach images from this turn.'
                     )
                 elif (bot_restricted and name == 'mcp__channel__channel_reply'
                       and not _bot_channel_reply_allowed(args, bot_reply_source_ids)):
@@ -3021,7 +2776,6 @@ class Event:
                         else:
                             result = _not_dispatched(name, _barrier_result)
                     else:
-                        check_authorization()
                         result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 只等与本次调用资源冲突的 pending（见 _needs_barrier）
@@ -3046,23 +2800,12 @@ class Event:
                         result = _not_dispatched(name, _barrier_result)
                         _reconsidered = (_barrier_result.get('status') == 'reconsidering')
                     else:
-                        check_authorization()
                         args['_trace_id'] = _trace_id
                         args['_cancel_event'] = cancel_event
                         # Inject instance_id from canvas binding (multiInstance tools need it)
                         if name in self._bound_instance_ids and 'instance_id' not in args:
                             args['instance_id'] = self._bound_instance_ids[name]
-                        if scoped_viewer and name == 'mcp__channel__channel_reply':
-                            from channel.manager import viewer_reply_scope
-                            channel_ids = frozenset(_trigger_channel_ids(trigger_event))
-                            message_ids = frozenset(trigger_event.get('_channel_message_ids') or [])
-                            scope_token = viewer_reply_scope.set((channel_ids, message_ids))
-                            try:
-                                result = await mcp_client.call_tool(name, args)
-                            finally:
-                                viewer_reply_scope.reset(scope_token)
-                        else:
-                            result = await mcp_client.call_tool(name, args)
+                        result = await mcp_client.call_tool(name, args)
                         # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
                         if not _bar_needed and mcp_client.get_pending_actions():
                             import hooks as _hooks
@@ -3173,7 +2916,9 @@ class Event:
                 turn_messages.pop()
                 _steered_void = await collector.drain_steering()
                 if _steered_void:
-                    turn_messages.extend(_steering_messages(trigger_event, _steered_void))
+                    for sev in _steered_void:
+                        turn_messages.append({'role': 'user', 'content':
+                            f'[system notification source={sev.get("source", "")}]\n{sev.get("text", "")}'})
                     print(f'[decision] round voided by reconsider, steered {len(_steered_void)} message(s) into retry')
                 if reconsider_event is not None:
                     reconsider_event.clear()
@@ -3274,14 +3019,26 @@ class Event:
             # ── Steering: 检查是否有用户消息需要注入 ─────────────────────────
             steered = [] if chat_only_turn else await collector.drain_steering()
             if steered:
-                steering_messages = _steering_messages(trigger_event, steered)
-                if steering_messages:
-                    turn_messages.extend(steering_messages)
+                deferred = [
+                    sev for sev in steered
+                    if bot_restricted or collector.has_bot_channel_event([sev])
+                ]
+                if deferred:
+                    collector.defer_priority(deferred)
+                    steered = [sev for sev in steered if sev not in deferred]
+                if steered:
+                    for sev in steered:
+                        s_text = sev.get('text', '')
+                        s_source = sev.get('source', '')
+                        turn_messages.append({
+                            'role': 'user',
+                            'content': f'[system notification source={s_source}]\n{s_text}',
+                        })
                     await push_event({'type': 'turn_steered', 'payload': {
-                        'count': len(steering_messages),
+                        'count': len(steered),
                         'sources': [s.get('source', '') for s in steered],
                     }})
-                    print(f'[decision] steered {len(steering_messages)} user message(s) into current turn')
+                    print(f'[decision] steered {len(steered)} user message(s) into current turn')
 
             # 汇报的回灌在这里排空 —— 和 steering 同一个安全点。定时器可能在
             # assistant(tool_calls) 已入列、tool 结果还没入列的窗口触发，那时当场 append
@@ -3328,8 +3085,7 @@ class Event:
             await push_event({'type': 'error', 'payload': {'message': f'[decision] {_missed_warn}'}})
 
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
-        if not scoped_channel_history:
-            await self._maybe_compress()
+        await self._maybe_compress()
 
         # 发布决策到 /decision_core DDS topic
         import ros2_bridge

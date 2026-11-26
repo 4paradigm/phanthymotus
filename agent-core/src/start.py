@@ -315,6 +315,11 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
+                'display_description': (
+                    'Outbound gateway for messaging channels: sends text or supported files from '
+                    'decision_core to the source conversation or a configured trusted bot. '
+                    'For a reply, use the triggering message_id as source_message_id.'
+                ),
                 'description': (
                     'Send a reply on a messaging platform (Feishu / Telegram / Slack / WeCom). '
                     'This is the ONLY way those users receive anything from you — text left in '
@@ -342,10 +347,7 @@ def _register_core_mcp(silent=False):
                     'sensor/resource tools, read-only tools (WebSearch, search_history, memory_recall, '
                     'raw_input_info) plus this one — actuator/processor/delegated tools are rejected; '
                     'reply with what you can read or look up, and say so if the request needs an action '
-                    'you cannot take. '
-                    'WeCom viewers may additionally use Read for images attached to their current '
-                    'messages. Their replies must use a current message ID, cannot contact other bots, '
-                    'and may attach only images from the current turn.'
+                    'you cannot take.'
                 ),
                 'inputSchema': {
                     'type': 'object',
@@ -734,7 +736,6 @@ async def acp_complete(request: fastapi.Request):
     # 回收掉，回收之后 _pending_silent 里就查不到了，于是一句「播完了」的回执会被
     # 当成新消息唤醒一个 turn。
     silent = mcp_client.completion_is_silent(action_id)
-    channel_origin = mcp_client.action_channel_origin(action_id)
 
     # 通道1: 解锁 sync() 等待
     mcp_client.mark_action_complete(action_id, body)
@@ -747,7 +748,6 @@ async def acp_complete(request: fastapi.Request):
         source=f'acp:{action_id}',
         text=json.dumps(_event, ensure_ascii=False),
         payload=dict(_event),
-        channel_origin=channel_origin,
     )
 
     return {'ok': True, 'action_id': action_id}

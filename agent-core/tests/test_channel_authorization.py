@@ -23,14 +23,13 @@ class BotChannelAuthorizationTest(unittest.TestCase):
         channel_manager._trusted_bot_messages.clear()
 
     def test_bot_marker_and_trust_batches(self):
-        identity = {'channel_id': 'feishu_test', 'chat_id': 'oc_group', 'user_id': 'sender'}
         human = {
             'source': 'dds:/channel/request/feishu_test',
-            'text': json.dumps({**identity, 'sender_type': 'user'}),
+            'text': json.dumps({'sender_type': 'user'}),
         }
         bot = {
             'source': 'dds:/channel/request/feishu_test',
-            'text': json.dumps({**identity, 'sender_type': 'bot', 'message_id': 'om_bot'}),
+            'text': json.dumps({'sender_type': 'bot', 'message_id': 'om_bot'}),
         }
 
         self.assertFalse(collector.has_bot_channel_event([human]))
@@ -45,7 +44,7 @@ class BotChannelAuthorizationTest(unittest.TestCase):
             **bot, 'text': '[]',
         }]))
         self.assertEqual(collector.bot_channel_message_ids([bot]), ['om_bot'])
-        batches = collector._split_by_authorization([human, bot, human])
+        batches = collector._split_by_bot_trust([human, bot, human])
         self.assertEqual([len(batch) for batch in batches], [1, 1, 1])
         self.assertEqual(
             [collector.has_bot_channel_event(batch) for batch in batches],

@@ -4,7 +4,6 @@ import json
 import re
 import time
 import uuid
-from contextvars import ContextVar
 
 from config import _get_conn
 
@@ -12,14 +11,9 @@ from config import _get_conn
 KIND_MAIN = 'main'
 KIND_SUBAGENT = 'subagent'
 KIND_BG_SUBAGENT = 'bg_subagent'
-KIND_CHANNEL = 'channel'
-
-# None is shared main memory; an empty key is an unidentifiable Channel input.
-# Set by the dispatcher, never supplied by a model tool argument.
-current_channel_context: ContextVar[str | None] = ContextVar('channel_history_context', default=None)
 
 
-def create_session(kind: str = KIND_MAIN, *, context_key: str = '') -> str:
+def create_session(kind: str = KIND_MAIN) -> str:
     """Create a new chat session, return its ID.
 
     `kind` separates the main agent's own conversation from delegated ones, so the
@@ -28,8 +22,8 @@ def create_session(kind: str = KIND_MAIN, *, context_key: str = '') -> str:
     sid = str(uuid.uuid4())
     with _get_conn() as conn:
         conn.execute(
-            'INSERT INTO chat_sessions (id, started_at, kind, context_key) VALUES (?, ?, ?, ?)',
-            (sid, time.time(), kind, context_key)
+            'INSERT INTO chat_sessions (id, started_at, kind) VALUES (?, ?, ?)',
+            (sid, time.time(), kind)
         )
         conn.commit()
     return sid
@@ -59,11 +53,9 @@ def save_turn(session_id: str, turn_index: int, turn_messages: list[dict]):
         else:
             cursor = conn.execute(
                 'INSERT INTO chat_messages (session_id, turn_index, messages, created_at, updated_at) '
-                'SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM chat_sessions WHERE id = ?)',
-                (session_id, turn_index, blob, now, now, session_id)
+                'VALUES (?, ?, ?, ?, ?)',
+                (session_id, turn_index, blob, now, now)
             )
-            if not cursor.rowcount:
-                return  # A concurrent history deletion must not leave orphan messages.
             rowid = cursor.lastrowid
         conn.execute(
             'UPDATE chat_sessions SET ended_at = ?, '
@@ -171,7 +163,10 @@ def get_session_turns(session_id: str) -> list[dict]:
 
 def delete_session(session_id: str):
     """Delete a session and all its messages."""
-    delete_sessions([session_id])
+    with _get_conn() as conn:
+        conn.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
+        conn.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
+        conn.commit()
 
 
 def delete_sessions(session_ids: list[str]):
@@ -180,7 +175,6 @@ def delete_sessions(session_ids: list[str]):
         return
     placeholders = ','.join('?' * len(session_ids))
     with _get_conn() as conn:
-        conn.execute('BEGIN IMMEDIATE')
         conn.execute(f'DELETE FROM chat_messages WHERE session_id IN ({placeholders})', session_ids)
         conn.execute(f'DELETE FROM chat_sessions WHERE id IN ({placeholders})', session_ids)
         conn.commit()
@@ -214,7 +208,6 @@ def clear_all():
     with _get_conn() as conn:
         conn.execute('DELETE FROM chat_messages')
         conn.execute('DELETE FROM chat_sessions')
-        conn.execute("DELETE FROM config WHERE key = 'channel_chat_history'")
         try:
             conn.execute('DELETE FROM chat_messages_fts')
         except Exception:
@@ -252,31 +245,19 @@ def rebuild_fts():
         conn.commit()
 
 
-def search(query: str, limit: int = 10, *, context_key: str | None = None) -> list[dict]:
-    """Search shared history, or one restricted conversation when explicitly scoped."""
-    if context_key == '':
-        return []  # An unidentified Channel input has no authorized history.
+def search(query: str, limit: int = 10) -> list[dict]:
+    """全文搜索历史对话。"""
     with _get_conn() as conn:
         _ensure_fts(conn)
         try:
-            params = [query]
-            if context_key is not None:
-                where = ' AND cs.kind = ? AND cs.context_key = ?'
-                params.extend([KIND_CHANNEL, context_key])
-            else:
-                where = ' AND cs.kind != ?'
-                params.append(KIND_CHANNEL)
-            params.append(limit)
             rows = conn.execute('''
                 SELECT cm.session_id, cm.turn_index, cm.messages, cm.created_at
                 FROM chat_messages_fts fts
                 JOIN chat_messages cm ON cm.id = fts.rowid
-                JOIN chat_sessions cs ON cs.id = cm.session_id
-                WHERE fts.content MATCH ?
-            ''' + where + '''
+                WHERE fts MATCH ?
                 ORDER BY rank
                 LIMIT ?
-            ''', params).fetchall()
+            ''', (query, limit)).fetchall()
         except Exception:
             return []
     results = []
@@ -297,54 +278,6 @@ def search(query: str, limit: int = 10, *, context_key: str | None = None) -> li
 
 
 # ── 重启续跑 ──────────────────────────────────────────────────────────────────
-
-def get_channel_session(context_key: str, limit: int | None = 18, *,
-                        session_id: str | None = None) -> dict | None:
-    """Restore only this sender's same-platform, same-role Channel conversation."""
-    if not context_key:
-        return None
-    with _get_conn() as conn:
-        query = ('SELECT id, rolling_summary, summarized_through FROM chat_sessions '
-                 'WHERE kind=? AND context_key=?')
-        params = [KIND_CHANNEL, context_key]
-        if session_id is not None:
-            query += ' AND id=?'
-            params.append(session_id)
-        row = conn.execute(query + ' ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 1', params).fetchone()
-    if not row:
-        return None
-    sid, summary, through = row
-    with _get_conn() as conn:
-        next_index = conn.execute(
-            'SELECT COALESCE(MAX(turn_index), -1)+1 FROM chat_messages WHERE session_id=?', (sid,),
-        ).fetchone()[0]
-        query = ('SELECT turn_index, messages FROM chat_messages WHERE session_id=? AND turn_index>? '
-                 'ORDER BY turn_index DESC')
-        params = [sid, through]
-        if limit is not None:
-            query += ' LIMIT ?'
-            params.append(limit)
-        rows = conn.execute(
-            query, params,
-        ).fetchall()
-    return {'session_id': sid, 'next_turn_index': next_index,
-            'summary': summary or '', 'summarized_through': through,
-            'turn_indexes': [row[0] for row in reversed(rows)],
-            'turns': [json.loads(row[1]) for row in reversed(rows)]}
-
-
-def save_channel_summary(session_id: str, context_key: str, summary: str, *,
-                         through: int, expected_through: int) -> bool:
-    """Advance a scoped summary without recreating deleted or changed sessions."""
-    with _get_conn() as conn:
-        cursor = conn.execute(
-            'UPDATE chat_sessions SET rolling_summary=?, summarized_through=? '
-            'WHERE id=? AND kind=? AND context_key=? AND summarized_through=?',
-            (summary, through, session_id, KIND_CHANNEL, context_key, expected_through),
-        )
-        conn.commit()
-        return cursor.rowcount == 1
-
 
 def get_last_session_turns(limit: int = 10) -> dict | None:
     """获取主代理最近一个 session 的最后 N 轮，用于重启续跑。

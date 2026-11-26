@@ -1319,7 +1319,7 @@ function _showDetail(mcp, tool, opts = {}) {
   const topicInData  = opts.topicIn  || (typeof tool === 'object' ? tool.topic_in  : null) || [];
   const topicOutData = opts.topicOut || (typeof tool === 'object' ? tool.topic_out : null) || [];
   const schema       = typeof tool === 'object' && tool.inputSchema ? JSON.stringify(tool.inputSchema, null, 2) : null;
-  const description  = typeof tool === 'object' ? tool.description : null;
+  const description  = typeof tool === 'object' ? (tool.display_description || tool.description) : null;
 
   const topicIn  = topicInData.map(t => `<li><code title="${_esc(t.topic || '?')}">${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');
   const topicOut = topicOutData.map(t => `<li><code title="${_esc(t.topic || '?')}">${_esc(t.topic || '?')}</code> <span class="detail-fmt">${_esc(t.format || '')}</span></li>`).join('');

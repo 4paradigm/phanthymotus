@@ -6,7 +6,8 @@ channel/adapters/wecom.py — WeCom (企业微信) 智能机器人长连接适�
 只需出网，不需要公网 IP 或回调域名。图片素材需按消息中的密钥解密。
 
 与 feishu.py 一样，由官方 SDK 接收长连接消息，适配器负责归一化消息、
-去重、附件落盘及 ChannelAdapter 生命周期。企微回复走 SDK 的 reply_stream。
+去重、附件落盘及 ChannelAdapter 生命周期。企微回复走 SDK 的 reply_stream，
+每次直接发送完成的回复，不提前创建“正在处理”流。
 图片 HTTP 下载保留 aiohttp 的代理、超时与大小限制，解密调用 SDK 的 decrypt_file。
 Requires: wecom-aibot-python-sdk >= 1.0.2
 
@@ -52,7 +53,6 @@ DISCONNECT_TIMEOUT = 6           # SDK 的 WebSocket close_timeout 为 5s
 DEDUP_MAX = 512                  # 去重窗口，照抄 feishu.py
 REQ_ID_MAX = 512                 # msgid → req_id 映射容量
 REPLY_WINDOW = 24 * 60 * 60      # 24 小时回复窗口
-STREAM_WINDOW = 10 * 60          # 单条流式消息从首次发送起最多 10 分钟
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 IMAGE_MAX_ITEMS = 10
 IMAGE_UPLOAD_CHUNK_BYTES = 512 * 1024
@@ -107,9 +107,6 @@ class WecomError(RuntimeError):
 class _ReplyContext:
     req_id: str
     received_at: float
-    stream_id: str
-    stream_started_at: float | None = None
-    stream_finished: bool = False
 
 
 def _image_type(data: bytes) -> tuple[str, str]:
@@ -146,20 +143,6 @@ def _image_failure_reason(error: Exception) -> str:
     return 'image_error'
 
 
-def _progress_failure_reason(error: Exception) -> str:
-    """Return a safe platform error code when available for troubleshooting."""
-    if isinstance(error, WecomError):
-        message = str(error)
-        code = re.fullmatch(r'WeCom reply rejected \(errcode=(-?\d{1,10})\)\.', message)
-        if code:
-            return f'errcode={code[1]}'
-        if 'ACK timed out' in message:
-            return 'ack_timeout'
-        if 'not connected' in message or 'connection closed' in message:
-            return 'disconnected'
-    return f'error_type={type(error).__name__}'
-
-
 def _decrypt_image(data: bytes, aeskey: str) -> bytes:
     """Validate the envelope, then use the official SDK's public decryptor."""
     from aibot import decrypt_file
@@ -184,7 +167,6 @@ class WecomAdapter(ChannelAdapter):
     SUPPORTED_FILE_KINDS = (KIND_IMAGE,)
     SUPPORTS_BOT_TO_BOT = False
     USES_TRUSTED_BOTS = False
-    SCOPED_CONVERSATIONS = True
 
     def __init__(self, channel_id: str, platform: str, config: dict,
                  on_message: OnMessageCallback):
@@ -199,7 +181,6 @@ class WecomAdapter(ChannelAdapter):
         self._sdk_logger = _SdkLogger()
         self._taken_over = False
         self._last_error = ''
-        self._progress_failures = 0
         self._image_download_failures = 0
         self._message_failures = 0
         self._invalid_message_drops = 0
@@ -210,7 +191,8 @@ class WecomAdapter(ChannelAdapter):
         self._seen_set: set[str] = set()
         self._duplicate_drops = 0
 
-        # Only authorized callbacks are retained; streams have a shorter lifecycle.
+        # Transport metadata only: ACL, conversation recap and reply routing remain
+        # in ChannelManager, as they do for Feishu.
         self._msgid_to_req: OrderedDict[str, _ReplyContext] = OrderedDict()
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
@@ -492,7 +474,7 @@ class WecomAdapter(ChannelAdapter):
                                 name=f'image{ext}', mime=mime, fallback_ext=ext)
 
     async def _prepare_images(self, msg: InboundMessage, images: list) -> None:
-        """Materialize media only after the channel and sender are authorized."""
+        """Parse and store attachments before the manager callback, as in Feishu."""
         failures = 0
         for image in images[:IMAGE_MAX_ITEMS]:
             try:
@@ -549,31 +531,11 @@ class WecomAdapter(ChannelAdapter):
             expect_reply=None,
         )
 
-        from aibot import generate_req_id
-        context = _ReplyContext(req_id, time.time(), generate_req_id('stream'))
-
-        async def prepare_authorized_message():
-            # Called by ChannelManager only after channel activation and ACL.
-            self._msgid_to_req[msg_id] = context
-            while len(self._msgid_to_req) > REQ_ID_MAX:
-                self._msgid_to_req.popitem(last=False)
-            try:
-                await self._send_progress(msg_id)
-            except Exception as e:
-                # The callback still reaches the normal message path; that path
-                # will report any subsequent reply failure to its caller.
-                self._progress_failures += 1
-                if self._progress_failures == 1 or self._progress_failures % 100 == 0:
-                    print('[wecom] progress reply failed: '
-                          f'count={self._progress_failures} reason={_progress_failure_reason(e)}')
-            if parsed['images']:
-                await self._prepare_images(msg, parsed['images'])
-
-        async def notify_pending_approval():
-            await self._send_reply(context, 'Pending approval. Please contact an admin.')
-
-        msg.prepare = prepare_authorized_message
-        msg.notify_pending_approval = notify_pending_approval
+        self._msgid_to_req[msg_id] = _ReplyContext(req_id, time.time())
+        while len(self._msgid_to_req) > REQ_ID_MAX:
+            self._msgid_to_req.popitem(last=False)
+        if parsed['images']:
+            await self._prepare_images(msg, parsed['images'])
         await self._on_message(msg)
 
     # ── 出站 ────────────────────────────────────────────────────────────────
@@ -592,10 +554,6 @@ class WecomAdapter(ChannelAdapter):
             'No reply context for this message: the inbound req_id is unknown or '
             'expired. The user must send a new message first.'
         )
-
-    async def _send_progress(self, message_id: str) -> None:
-        context = self._lookup_reply_context(message_id)
-        await self._send_reply(context, '正在处理…', finish=False)
 
     async def send_message(self, msg: OutboundMessage) -> None:
         """回复原消息。失败必须抛异常，让上层如实回报给 LLM / 用户。"""
@@ -633,10 +591,7 @@ class WecomAdapter(ChannelAdapter):
         if msg.image_caption:
             captions.append(msg.image_caption)
         content = '\n'.join(part for part in [msg.text, *captions] if part)
-        # Finish the existing progress stream before sending standalone media;
-        # otherwise the client's "processing" indicator remains visible.
-        if (content or (not context.stream_finished and context.stream_started_at is not None
-                        and time.monotonic() - context.stream_started_at < STREAM_WINDOW)):
+        if content:
             await self._send_reply(context, content)
         sent = ['text'] if content else []
         failures = []
@@ -656,30 +611,14 @@ class WecomAdapter(ChannelAdapter):
                 raise PartialSendError(sent, failures)
             raise WecomError('; '.join(failures))
 
-    async def _send_reply(self, context: _ReplyContext, text: str, *,
-                          finish: bool = True) -> None:
-        async def send(client):
-            # Selection and finalization run under the existing per-req_id lock.
-            # Concurrent replies cannot both refresh the stream one just finished.
-            from aibot import generate_req_id
-            now = time.monotonic()
-            if (context.stream_finished or (context.stream_started_at is not None
-                    and now - context.stream_started_at >= STREAM_WINDOW)):
-                context.stream_id = generate_req_id('stream')
-                context.stream_started_at = None
-                context.stream_finished = False
-            if context.stream_started_at is None:
-                context.stream_started_at = now
-            return await client.reply_stream(
-                {'headers': {'req_id': context.req_id}}, stream_id=context.stream_id,
-                content=text, finish=finish,
-            )
-
-        def acknowledged():
-            context.stream_finished = finish
-
+    async def _send_reply(self, context: _ReplyContext, text: str) -> None:
+        from aibot import generate_req_id
         await self._send_request(
-            context.req_id, send, on_ack=acknowledged,
+            context.req_id,
+            lambda client: client.reply_stream(
+                {'headers': {'req_id': context.req_id}}, stream_id=generate_req_id('stream'),
+                content=text, finish=True,
+            ),
         )
 
     async def _send_body(self, req_id: str, body: dict, cmd: str | None = None) -> dict:
@@ -718,7 +657,7 @@ class WecomAdapter(ChannelAdapter):
             raise WecomError('WeCom image upload did not return a media ID.')
         return media_id
 
-    async def _send_request(self, req_id: str, send, *, on_ack=None) -> dict:
+    async def _send_request(self, req_id: str, send) -> dict:
         client = self._client
         if self.status() != 'connected':
             raise WecomError('Cannot send: WeCom adapter is not connected.')
@@ -747,8 +686,6 @@ class WecomAdapter(ChannelAdapter):
                     raise WecomError(f'WeCom reply rejected ({_sdk_error_detail(e)}).') from None
                 if not isinstance(ack, dict) or ack.get('errcode') != 0 or _frame_req_id(ack) != req_id:
                     raise WecomError('WeCom reply returned an invalid or rejected ACK.')
-                if on_ack is not None:
-                    on_ack()
                 return ack
         finally:
             remaining = self._reply_lock_users[req_id] - 1

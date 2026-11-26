@@ -147,7 +147,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         'CREATE TABLE IF NOT EXISTS chat_sessions '
         '(id TEXT PRIMARY KEY, started_at REAL NOT NULL, ended_at REAL, '
         'summary TEXT DEFAULT \'\', turn_count INTEGER DEFAULT 0, '
-        'kind TEXT DEFAULT \'main\', context_key TEXT DEFAULT \'\')'
+        'kind TEXT DEFAULT \'main\')'
     )
     conn.execute(
         'CREATE TABLE IF NOT EXISTS chat_messages '
@@ -161,16 +161,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     # Columns added after the tables shipped; existing DBs need them backfilled.
     for table, column, ddl in (
         ('chat_sessions', 'kind', 'kind TEXT DEFAULT \'main\''),
-        ('chat_sessions', 'context_key', 'context_key TEXT DEFAULT \'\''),
-        ('chat_sessions', 'rolling_summary', 'rolling_summary TEXT DEFAULT \'\''),
-        ('chat_sessions', 'summarized_through', 'summarized_through INTEGER DEFAULT -1'),
         ('chat_messages', 'updated_at', 'updated_at REAL'),
     ):
         try:
             conn.execute(f'ALTER TABLE {table} ADD COLUMN {ddl}')
         except sqlite3.OperationalError:
             pass  # already present
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_cs_context ON chat_sessions(kind, context_key)')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS channel_users (
             platform TEXT NOT NULL,

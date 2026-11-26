@@ -63,13 +63,6 @@ class InboundMessage:
     chat_type: str = ''        # p2p | group
     mentions: list[dict] = field(default_factory=list)
     expect_reply: bool | None = None  # 机器人协作消息是否明确要求继续 @
-    # Some platforms must acknowledge a message before downloading its media.
-    # The manager invokes this only after checking that the sender is allowed.
-    prepare: Callable[[], Awaitable[None]] | None = field(default=None, repr=False, compare=False)
-    # Long-connection adapters may reply to a pending-approval request without
-    # retaining that unapproved sender's routing state in the authorized cache.
-    notify_pending_approval: Callable[[], Awaitable[None]] | None = field(
-        default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -83,7 +76,6 @@ class OutboundMessage:
     # 兼容旧调用方：直接给字节的图片
     image_bytes: bytes | None = None
     image_caption: str = ''
-    # 原消息 ID：用于原位回复，也用于长连接平台找回该消息的请求上下文。
     reply_to_message_id: str = ''
 
 
@@ -126,10 +118,6 @@ class ChannelAdapter(ABC):
     # 所以 lan channel 不该出现 trusted_bots 字段。
     USES_TRUSTED_BOTS: bool = False
 
-    # Split human turns by conversation, sender and authority. Restricted turns
-    # retain their own history; operators may still use the shared main history.
-    SCOPED_CONVERSATIONS: bool = False
-
     def __init__(self, channel_id: str, platform: str, config: dict,
                  on_message: OnMessageCallback):
         self.channel_id = channel_id
@@ -166,7 +154,7 @@ class ChannelAdapter(ABC):
         return (self._running, '' if self._running else 'adapter not running')
 
     def should_auto_reconnect(self) -> bool:
-        """是否允许 watchdog 自动重连；需要人工处理的状态可由子类禁止。"""
+        """需要人工处理的连接状态可由适配器禁止自动重连。"""
         return True
 
     def status(self) -> str:

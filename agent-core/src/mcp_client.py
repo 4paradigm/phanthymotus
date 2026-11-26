@@ -50,7 +50,6 @@ _pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeou
 _pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
 _pending_resources: dict[str, frozenset | None] = {}  # action_id → 占用的物理通道
 _pending_owner: dict[str, str] = {}               # action_id → 发起它的 agent 上下文
-_pending_channel_origins: dict[str, dict | None] = {}
 
 # action_id → 这个动作是不是「后台的」。后台动作仍然**占用**它申报的通道（
 # resource_actually_busy 照样算它忙），但任何人都不**等**它：一首四分钟的歌不该把
@@ -71,7 +70,7 @@ _pending_silent: dict[str, bool] = {}
 _PENDING_TABLE_NAMES: tuple[str, ...] = (
     '_pending_actions', '_pending_started', '_pending_results', '_pending_timeouts',
     '_pending_tools', '_pending_resources', '_pending_owner',
-    '_pending_background', '_pending_silent', '_pending_channel_origins',
+    '_pending_background', '_pending_silent',
 )
 
 
@@ -154,13 +153,6 @@ def mark_action_complete(action_id: str, payload: dict) -> bool:
     _pending_actions[action_id].set()
     _notify_settled(action_id)
     return True
-
-
-def action_channel_origin(action_id: str) -> dict | None:
-    """Read before marking complete: a barrier may immediately retire the action."""
-    if action_id in _pending_channel_origins:
-        return _pending_channel_origins[action_id]
-    return (_action_outcomes.get(action_id) or {}).get('channel_origin')
 
 
 # ── 次序：谁发起的动作 ────────────────────────────────────────────────────────
@@ -383,9 +375,6 @@ _action_outcomes: "collections.OrderedDict[str, dict]" = collections.OrderedDict
 
 def _record_outcome(action_id: str, status: str) -> None:
     entry = {'status': status, 'tool': _pending_tools.get(action_id, '')}
-    origin = _pending_channel_origins.get(action_id)
-    if origin:
-        entry['channel_origin'] = origin
     _action_outcomes.pop(action_id, None)
     _action_outcomes[action_id] = entry
     while len(_action_outcomes) > _ACTION_OUTCOME_CAP:
@@ -473,6 +462,25 @@ def _to_openai_schema(mcp_id: str, tool: dict) -> list[dict]:
     return schemas
 
 
+def declared_read_only(tool: dict, action: str | None = None) -> bool | None:
+    """Whether a tool (or one of its split actions) declares that it only reads.
+
+    `True`/`False` when declared, `None` when not — the caller then falls back on
+    its own rule. An action's `readOnly` in `x-action-params` wins over the
+    tool-wide MCP annotation `annotations.readOnlyHint`.
+
+    The layer rule in `peer/tools.py` takes the whole perception layer as
+    read-only, which stopped being true once a perception card could also delete
+    data: `table_db`'s `drop_table` and `delete` sit beside `select` on one card.
+    """
+    if action is not None:
+        action_def = ((tool.get('inputSchema') or {}).get('x-action-params') or {}).get(action) or {}
+        if isinstance(action_def.get('readOnly'), bool):
+            return action_def['readOnly']
+    hint = (tool.get('annotations') or {}).get('readOnlyHint')
+    return hint if isinstance(hint, bool) else None
+
+
 # ── 连接单个 MCP ───────────────────────────────────────────────────────────────
 
 async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> None:
@@ -512,6 +520,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
                         'has_config_schema': bool(tool.get('configSchema')),
                         'completion': raw_input_schema.get('x-completion'),
                         'resource': parse_resources(raw_input_schema.get('x-resource')),
+                        'read_only': declared_read_only(tool),
                     }
                 else:
                     # 拆分：多个 sub-schemas
@@ -530,6 +539,7 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
                         }
                         # 解析 action name（最后一段 __）
                         action_name = schema['name'].split('__')[-1]
+                        tool_meta[schema['name']]['read_only'] = declared_read_only(tool, action_name)
                         split_map[schema['name']] = {
                             'tool': tool['name'],
                             'action': action_name,
@@ -654,13 +664,11 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                             text    = raw
                             payload = {}
 
-                        channel_origin = None
                         # ACP: action_complete 事件 → 解锁 sync() 等待
                         msg_type = msg.get('type') if isinstance(msg, dict) else None
                         if msg_type == 'action_complete':
                             action_id = msg.get('action_id') or payload.get('action_id')
                             if action_id:
-                                channel_origin = action_channel_origin(action_id)
                                 # 和 /api/acp/complete 一样：先问静默，再标记完成。
                                 if completion_is_silent(action_id):
                                     if isinstance(msg, dict):
@@ -673,7 +681,6 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                             source  = f'mcp:{mcp_id}',
                             text    = text,
                             payload = payload,
-                            channel_origin = channel_origin,
                         )
         except asyncio.CancelledError:
             return
@@ -1277,8 +1284,6 @@ def _register_pending(action_id: str, *, tool_name: str, meta: dict,
     _pending_resources[action_id] = resource
     _pending_started[action_id] = time.time()
     _pending_owner[action_id] = current_agent_context.get()
-    from channel import context as channel_context
-    _pending_channel_origins[action_id] = channel_context.capture()
     _pending_timeouts[action_id] = timeout
     # 显式写入而不是「只有 True 才写」：这两张表按 action_id 分表，而 action_id 会被
     # 复用（测试夹具里尤其如此），留着上一轮的值就是串味。

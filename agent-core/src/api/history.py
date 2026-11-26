@@ -28,12 +28,10 @@ def get_session(session_id: str):
 
 
 def _forget_if_current(session_ids: list[str]) -> None:
-    """删除当前会话时，同时取消该轮并丢弃内存上下文。"""
+    """删的是主代理正在用的会话，就连内存里的上下文一起丢掉 —— 否则模型照样看得到。"""
     import event
     if event.llm._session_id and event.llm._session_id in session_ids:
         event.llm.forget_conversation()
-    elif event.llm._channel_session_id and event.llm._channel_session_id in session_ids:
-        event.llm.forget_conversation(channel_only=True)
 
 
 @router.delete('/sessions/{session_id}')
