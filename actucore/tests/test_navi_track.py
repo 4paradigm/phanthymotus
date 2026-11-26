@@ -147,6 +147,23 @@ def test_the_coast_expires_rather_than_running_for_ever():
     assert "外推已不可信" in tracker.last_reason
 
 
+def test_retained_target_can_reassociate_within_the_observation_motion_budget():
+    config = _cfg(max_obs_age_ms=500)
+    tracker = T.Tracker()
+    original = _feed(tracker, _detections(_obj(name="person")), target="person", config=config)
+
+    def feed(detections, dt):
+        return tracker.step(detections=detections, depth=_depth(), target="person",
+                            config=config, ego=STILL, dt=dt, retain_identity=True)
+
+    assert feed(_detections(), 1.3) is None
+    # A two-metre sideways jump cannot consume the whole occlusion as a
+    # movement allowance. A smaller displacement from the same person can.
+    assert feed(_detections(_obj(name="person", bearing=1.)), .1) is None
+    assert feed(_detections(_obj(name="person", bearing=.5)), .1) is original
+    assert original.observed
+
+
 def test_re_acquisition_rebuilds_velocity_from_the_two_observations():
     """OC-SORT's observation-centric re-update.
 

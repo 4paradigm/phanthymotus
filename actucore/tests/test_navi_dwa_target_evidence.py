@@ -1181,3 +1181,93 @@ def test_slow_duplicate_plan_uses_independent_new_target_and_physical_check(monk
         assert not packets
         assert card._dwa_publication["reason"] == "publish_expired"
     assert not card._state.tracker.track.accepted_detection
+
+
+def test_expired_person_track_does_not_adopt_a_distant_detection_during_detour(monkeypatch):
+    card, _, clock, snapshot, first = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(first, card._output_epoch)
+    state = card._state
+    assert state.committed_route.locks_detour
+    original = state.tracker.track
+    objects = snapshot[0][0]
+    original_person = objects["objects"][0]
+
+    stamp = 2300
+    advance_snapshot(snapshot, clock, stamp, vx=0.)
+    _, depth, odom, _ = snapshot[0]
+    device = dict(original_person, position=[-.95, -.6])
+    snapshot[0] = dict(objects, timestamp=stamp / 1000, objects=[device]), depth, odom, stamp
+    card.next_command()
+
+    assert state.tracker.track is original
+    assert not original.drivable
+    advance_snapshot(snapshot, clock, stamp + 100, vx=0.)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=(stamp + 100) / 1000), depth, odom, stamp + 100
+    card.next_command()
+    assert state.tracker.track is original and original.observed
+
+
+def test_live_person_outside_stop_ring_overrides_expired_detour_position(monkeypatch):
+    from dataclasses import replace
+
+    import numpy as np
+
+    card, _, _, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    state = card._state
+    state.goal_anchor = replace(state.goal_anchor, x=.25, y=0.)
+    objects, depth, odom, receipt = snapshot[0]
+    snapshot[0] = objects, dict(depth, map=np.full_like(depth["map"], 5.)), odom, receipt
+
+    packet = card.next_command()
+
+    assert card._last_decision.distance_m == pytest.approx(5.)
+    assert packet["values"][0] > 0. and not state.arrived
+
+
+@pytest.mark.parametrize("moving", [False, True])
+def test_held_detour_processes_fresh_brake_feedback_before_pursuit(monkeypatch, moving):
+    card, _, clock, snapshot, first = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(first, card._output_epoch)
+    state = card._state
+    committed = state.committed_route
+    assert committed.locks_detour
+    scan = state.active_scan
+    scan.hold_for_replan("主动观察：深度暂不可用，停车后重规划")
+
+    advance_snapshot(snapshot, clock, 1100, vx=.24 if moving else 0.)
+    packet = card.next_command()
+
+    assert not any(packet["values"])
+    assert state.committed_route is committed
+    assert scan.phase == ("brake_for_replan" if moving else "idle")
+    if not moving:
+        advance_snapshot(snapshot, clock, 1200, vx=0.)
+        resumed = card.next_command()
+        assert resumed["values"][0] > 0.
+        assert state.dwa_trace["retained_route"]
+
+
+def test_committed_detour_replans_when_old_odometry_frame_cannot_register(monkeypatch):
+    from dataclasses import replace
+
+    card, _, clock, snapshot, first = selected_card(monkeypatch, body=False, live_target=True)
+    assert card._stage_command(first, card._output_epoch)
+    card._cancel_scheduled_motion(stop=(1050, "停稳后复查路线", False),
+                                  dwa_reason="footprint_collision")
+    state = card._state
+    committed = state.committed_route
+    old_pose = replace(committed.motion_guard.pose, frame=("navi_relative", object()))
+    stale = replace(committed, motion_guard=replace(committed.motion_guard, pose=old_pose))
+    state.committed_route = stale
+    advance_snapshot(snapshot, clock, 1100, vx=0.)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = dict(objects, timestamp=1.1), depth, odom, 1100
+
+    candidate = card.next_command()
+
+    assert state.committed_route is not stale
+    assert candidate["values"][0] > 0.
+    assert not state.dwa_trace.get("retained_route")
+    guard = card._last_decision.dwa_acceptance.motion_guard
+    assert guard.pose.frame != old_pose.frame and guard.check.accepted and guard.trace.stopped

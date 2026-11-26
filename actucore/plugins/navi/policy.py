@@ -1896,10 +1896,16 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if recovering and state.target == "person" and not (fresh_recovery or same_receipt):
         # Out-of-order receipts cannot vote for confirming a person.
         detections = None
+    committed = state.committed_route
+    retained_target = (state.tracker.track is not None and committed is not None
+                       and committed.locks_detour and committed.motion_guard is not None
+                       and state.tracker.track.generation == committed.motion_guard.generation
+                       and state.target == "person" and config.local_controller == "dwa")
     track = state.tracker.step(detections=detections, depth=depth,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt,
-                               receipt_ms=objects_ms if recovering and state.target == "person" else 0)
+                               receipt_ms=objects_ms if recovering and state.target == "person" else 0,
+                               retain_identity=retained_target)
     if (config.local_controller == "dwa" and isinstance(track, Track) and track.observed
             and track.accepted_detection and track.range_known and track.source is not None):
         if track.measured_range_m is not None and track.navigation_range_known and objects_ms:
@@ -1988,6 +1994,10 @@ def _decide(detections, depth, odom, config: Config, state: State,
             return Decision(_twist(0., 0., 0.), AVOIDING, "绕行目标的无反馈推算已达上限，停车")
 
         if math.hypot(anchor.x, anchor.y) <= config.arrival_distance_m + 1e-6:
+            if freeze_goal and target_fix is not None and target_fix[0] > config.arrival_distance_m + 1e-6:
+                # A live range for the same target disproves the estimated
+                # arrival. Subsequent approach still checks the current sweep.
+                state.goal_anchor = anchor = None
             scan = state.active_scan
             if scan.active or scan.result_frame or scan.exhausted or state.detour_leg is not None:
                 _reset_detour_route(state)
@@ -2162,6 +2172,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 state.committed_route = state.published_dwa_route = published = None
             elif depth is None or geometry is None or not scan.current_frame:
                 return Decision(_twist(0., 0., 0.), BLIND, "绕行：保留原路线，等待可用深度")
+            elif (scan.phase == "brake_for_replan"
+                  and _dwa_unavailable_reason(depth, config, state, recovery=True) is None):
+                # Pursuit is unavailable during the hold. Let the brake
+                # phase consume fresh feedback without giving up the route.
+                command = _observation_command(scan, geometry, config, state, odom, dt, control_period_s, depth)
+                if command.replanned_turn:
+                    state.view_detour = None
+                return Decision(_twist(0., 0., 0.), AVOIDING, command.reason)
             else:
                 distance = bearing = None
                 if anchor is not None and anchor.generation == published.motion_guard.generation:
@@ -3975,6 +3993,10 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
         transform = dwa_registration(guard.pose, current, guard.checked_ms, now, geometry,
                                      (scan.motion, state.commanded), reference=dwa_pose_reference(scan, state.dwa_odom))
     except DwaFrameMismatch:
+        if locked:
+            # The old route cannot be checked in the new motion frame. Keep
+            # the target and let normal planning use the current observation.
+            state.committed_route = state.published_dwa_route = None
         return None
     exit_line = (tuple(map(tuple, transform.points(previous.passage_exit)))
                  if previous.passage_exit is not None else None)

@@ -615,7 +615,7 @@ class Tracker:
     # ── the tick ─────────────────────────────────────────────────────────────
 
     def step(self, *, detections, depth, target: str, config, ego, dt: float,
-             ego_measured: bool = True, receipt_ms: int = 0):
+             ego_measured: bool = True, receipt_ms: int = 0, retain_identity: bool = False):
         """Predict, associate, update. Returns the track if it may drive, else None.
 
         `ego` is our own twist as (vx, vy, wz) in the body frame. `ego_measured`
@@ -636,10 +636,15 @@ class Tracker:
             front_limit = config.depth_age_limit_ms if config.local_planning else config.max_obs_age_ms
             if track.front_age_s > front_limit / 1000:
                 track.front_fix = None
-            # Apply the limit before association, even when a late new frame
-            # arrives on this tick. It may start a new track after expiry.
-            if track.drivable and track.since_obs_s > config.max_coast_s:
-                self.track = None
+            # Expiry always ends coasting. A committed detour may still use
+            # the original position to associate fresh observations.
+            if track.since_obs_s > config.max_coast_s:
+                if retain_identity:
+                    track.state = LOST
+                    track.front_fix = None
+                    track.mean[2:] = 0.
+                else:
+                    self.track = None
                 expired = True
                 self.last_reason = (f"目标消失超过 {config.max_coast_s:.1f}s，"
                                     "外推已不可信，放弃轨迹")
@@ -664,7 +669,13 @@ class Tracker:
         track = self.track
         position = track.position if track is not None else None
         candidates = _candidates(detections, depth, target, config, position)
-        matched = (_associate(candidates, config, position, track.cov, track.since_obs_s, track.hue)
+        association_age = track.since_obs_s if track is not None else 0.
+        if expired and track is not None:
+            # A fresh metric match can account for one observation window
+            # of motion, even if the original target was hidden much longer.
+            candidates = [candidate for candidate in candidates if candidate["range_measured"]]
+            association_age = min(association_age, config.max_obs_age_ms / 1000)
+        matched = (_associate(candidates, config, position, track.cov, association_age, track.hue)
                    if track is not None else _associate(candidates, config, None))
 
         self.matched_detections = detections if matched is not None else None
@@ -786,7 +797,7 @@ class Tracker:
             return
 
         track = self.track
-        was_coasting = track.state == COASTING
+        was_coasting = track.state in (COASTING, LOST)
 
         if was_coasting and track.last_obs is not None and track.since_obs_s > 1e-6:
             # OC-SORT's observation-centric re-update, in the form this state

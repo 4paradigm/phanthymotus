@@ -1198,6 +1198,7 @@ class NaviPlugin:
             # the search direction and the stuck timer both refer to a target
             # that is no longer being chased.
             self._publish_stop_if_moving()
+            self._cancel_active_action("导航被新指令替换")
             obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State(target=target)
             self._state.active_scan.obstacles = obstacles
@@ -1214,7 +1215,7 @@ class NaviPlugin:
             # and the completion later refers back to it. Reading it out of
             # `args` — which is what this did first — finds nothing, so no
             # pending is ever registered and no completion can be matched.
-            self._acp_action_id = f"navi_{uuid.uuid4().hex[:12]}"
+            action_id = self._acp_action_id = f"navi_{uuid.uuid4().hex[:12]}"
             arrival = {"stop_distance_m": self._config.stop_distance_m,
                        "stop_tolerance_m": self._config.stop_tolerance_m,
                        "arrival_distance_m": self._config.arrival_distance_m}
@@ -1224,7 +1225,7 @@ class NaviPlugin:
                # Without it in the reply the action completes instantly as far
                # as the barrier is concerned, and the completion POST below
                # later refers to an id nobody is waiting on.
-               "action_id": self._acp_action_id,
+               "action_id": action_id,
                **arrival,
                "degraded": self._degradations()}
 
@@ -1269,16 +1270,11 @@ class NaviPlugin:
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
-            action_id, self._acp_action_id = self._acp_action_id, ""
-            target = self._state.target
             self._publish_stop_if_moving()
+            self._cancel_active_action("用户停止导航")
             obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State()
             self._state.active_scan.obstacles = obstacles
-            if action_id:
-                result = {"status": "cancelled", "reason": "用户停止导航", "target": target}
-                threading.Thread(target=self._post_acp, args=(action_id, "failed", result),
-                                 daemon=True, name="navi_acp").start()
         return {"state": "running", "message": "已停止导航，卡片仍在运行"}
 
     def _halt(self, halted: bool):
@@ -1314,6 +1310,7 @@ class NaviPlugin:
             if not self._running:
                 return {"state": "idle"}
             self._publish_stop_if_moving()
+            self._cancel_active_action("导航卡片已停止")
             self._running = False
             self._paused = False
             node, self._node = self._node, None
@@ -5961,6 +5958,14 @@ class NaviPlugin:
         except Exception:                                     # noqa: BLE001
             measured = None
         return best, measured
+
+    def _cancel_active_action(self, reason: str):
+        """Settle the replaced or stopped action while the caller holds _lock."""
+        action_id, self._acp_action_id = self._acp_action_id, ""
+        if action_id:
+            result = {"status": "cancelled", "reason": reason, "target": self._state.target}
+            threading.Thread(target=self._post_acp, args=(action_id, "failed", result),
+                             daemon=True, name="navi_acp").start()
 
     def _maybe_complete(self):
         """Report the outcome once, on arrival **or** failure.

@@ -1291,6 +1291,48 @@ def test_each_navigate_to_gets_a_fresh_action_id():
     assert first["action_id"] != second["action_id"]
 
 
+@pytest.mark.parametrize("action", ["navigate_to", "stop_navigation", "stop"])
+def test_ending_active_navigation_reports_its_action_once(monkeypatch, action):
+    import queue
+
+    card = _card()
+    card._running = True
+    delivered = queue.Queue()
+    monkeypatch.setattr(card, "_post_acp", lambda *args: delivered.put(args))
+    first = card.dispatch("navi", {"action": "navigate_to", "target": "chair"})
+    replacement = card.dispatch("navi", {"action": action, "target": "person"})
+
+    action_id, status, result = delivered.get(timeout=.5)
+    assert (action_id, status, result["target"], result["status"]) == (
+        first["action_id"], "failed", "chair", "cancelled")
+
+    if action == "navigate_to":
+        card._last_decision = navi_plugin.policy_mod.Decision(
+            None, navi_plugin.policy_mod.ARRIVED, "target reached")
+        card._maybe_complete()
+        action_id, status, result = delivered.get(timeout=.5)
+        assert (action_id, status, result["target"]) == (replacement["action_id"], "completed", "person")
+    card._maybe_complete()
+    assert delivered.empty()
+
+
+def test_overlapping_navigate_calls_return_their_own_action_ids(monkeypatch):
+    card = _card()
+    card._running = True
+    second = {}
+    monkeypatch.setattr(card, "_post_acp", lambda *args: None)
+
+    def start_second(message, *args):
+        if message == "navi navigate_to: target=%r" and args == ("chair",):
+            second.update(card.dispatch("navi", {"action": "navigate_to", "target": "person"}))
+
+    monkeypatch.setattr(navi_plugin.log, "info", start_second)
+    first = card.dispatch("navi", {"action": "navigate_to", "target": "chair"})
+
+    assert first["action_id"] != second["action_id"]
+    assert card._acp_action_id == second["action_id"]
+
+
 def test_the_visible_list_stays_small_under_full_colour():
     """`publish_color: full` carries twelve numbers per object, and this reply
     goes into LLM context whole, every time it is called. On r1_sz it reached
