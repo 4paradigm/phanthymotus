@@ -1,14 +1,10 @@
 """`control/*` must reach ControlRenderer, in every view that picks one.
 
-There is no build step and no JS test runner here, so a renderer that exists but
-was never added to a RENDERERS array fails silently and looks exactly like the
-feature not being written: the topic falls through to ActivityRenderer or the KV
-panel and shows a `values` array as one long line of numbers.
-
-Three views each keep their own array — detail-panel, dashboard,
-monitor-dashboard — and the one that gets forgotten is the one nobody had open
-while testing. This is a text check rather than a real DOM test because a text
-check is what catches that.
+The detail panel and monitor dashboard import the shared renderer registry;
+the legacy dashboard still declares its own RENDERERS array. Check each view's
+actual registration source so a missing renderer cannot silently fall through
+to ActivityRenderer or the KV panel. Shared views must keep importing the
+registry rather than maintaining another copy of its list.
 
 The ordering assertion matters as much as the membership one: `RENDERERS.find`
 takes the first match, and TextRenderer answers to a broad enough hint that a
@@ -22,6 +18,7 @@ import unittest
 
 WEB = pathlib.Path(__file__).resolve().parents[1] / 'web' / 'js'
 VIEWS = ('detail-panel.js', 'dashboard.js', 'monitor-dashboard.js')
+SHARED_VIEWS = ('detail-panel.js', 'monitor-dashboard.js')
 
 
 def _renderers_array(source: str) -> list:
@@ -32,12 +29,36 @@ def _renderers_array(source: str) -> list:
 
 
 class ControlRendererRegistration(unittest.TestCase):
+    def _registration_source(self, view):
+        path = WEB / view
+        source = path.read_text()
+        if view in SHARED_VIEWS:
+            self.assertRegex(
+                source,
+                r"import\s*\{\s*RENDERERS\s*\}\s*from\s*"
+                r"['\"]\./renderers/registry\.js['\"]",
+                f'{view} must import the shared RENDERERS registry',
+            )
+            path = WEB / 'renderers' / 'registry.js'
+            source = path.read_text()
+        return path, source
+
     def test_every_view_imports_and_lists_it(self):
         for view in VIEWS:
-            source = (WEB / view).read_text()
             with self.subTest(view=view):
-                self.assertIn('renderers/control.js', source,
-                              f'{view} does not import ControlRenderer')
+                path, source = self._registration_source(view)
+                control_import = re.search(
+                    r"import\s*\{\s*ControlRenderer\s*\}\s*from\s*"
+                    r"['\"]([^'\"]+)['\"]", source,
+                )
+                self.assertIsNotNone(
+                    control_import, f'{view}: {path.name} does not import ControlRenderer',
+                )
+                self.assertEqual(
+                    (path.parent / control_import.group(1)).resolve(),
+                    (WEB / 'renderers' / 'control.js').resolve(),
+                    f'{view}: ControlRenderer must come from renderers/control.js',
+                )
                 self.assertIn('ControlRenderer', _renderers_array(source),
                               f'{view} imports ControlRenderer but never lists it, '
                               f'so control/* still falls through')
@@ -45,8 +66,9 @@ class ControlRendererRegistration(unittest.TestCase):
     def test_it_is_tried_before_the_catch_all_renderers(self):
         """`find` takes the first match; a broad renderer ahead of it wins."""
         for view in VIEWS:
-            names = _renderers_array((WEB / view).read_text())
             with self.subTest(view=view):
+                _, source = self._registration_source(view)
+                names = _renderers_array(source)
                 index = names.index('ControlRenderer')
                 for catch_all in ('TextRenderer', 'ActivityRenderer'):
                     if catch_all in names:
