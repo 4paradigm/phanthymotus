@@ -3541,7 +3541,7 @@ def test_same_detector_exposure_keeps_original_range_when_depth_advances(monkeyp
         assert card._dwa_publication["reason"] in {"target_missing", "target_standoff", "footprint_collision"}
 
 
-@pytest.mark.parametrize("change", ["clear", "different_goal", "near_person"])
+@pytest.mark.parametrize("change", ["clear", "different_goal", "near_person", "clear_track_only", "near_track_only"])
 def test_first_detour_freezes_its_measured_goal_before_publish(monkeypatch, change):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=True)
     state, config = card._state, card._config
@@ -3556,24 +3556,27 @@ def test_first_detour_freezes_its_measured_goal_before_publish(monkeypatch, chan
                            capture_ms=stamp), target="person", config=config, ego=(0., 0., 0.),
                            ego_measured=True, dt=.1)
     snapshot[0] = objects, depth, odom, 900
-    if change == "different_goal":
+    if change in ("different_goal", "clear_track_only", "near_track_only"):
         remember = policy._remember_detour_goal
         def move_goal(*args):
             remember(*args)
-            if state.goal_anchor is not None:
+            if change.endswith("track_only"):
+                state.goal_anchor = None
+            elif state.goal_anchor is not None:
                 state.goal_anchor.x += .2
         monkeypatch.setattr(policy, "_remember_detour_goal", move_goal)
     message = card.next_command()
     check = card._staged_dwa_command[1].forward_check
     assert check.planning_guard.association is None and not check.renewable
-    assert check.planning_guard.measured_target is not None and state.goal_anchor is not None
+    assert check.planning_guard.measured_target is not None
+    assert (state.goal_anchor is None) == change.endswith("track_only")
     clock[0] = 1010
-    if change == "near_person":
+    if change in ("near_person", "near_track_only"):
         depth = dict(depth, map=depth["map"].copy())
         depth["map"][:150] = config.stop_distance_m
     snapshot[0] = dict(objects, timestamp=1.01), depth, odom, 1010
     card._publish_command(message)
-    if change == "clear":
+    if change in ("clear", "clear_track_only"):
         assert packets[-1]["values"] == message["values"] and message["values"][0] > 0
         assert packets[-1]["stamp_ms"] + packets[-1]["ttl_ms"] <= check.motion_guard.deadline_ms
     else:

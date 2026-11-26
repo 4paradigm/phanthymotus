@@ -705,22 +705,27 @@ def _front_blind_sides(geometry, half_width):
 
 
 def front_flank_observations(projection, geometry, half_width):
-    """Return immediate collision and wider passing evidence for each side."""
+    """Return near, passing, and still-visible flank evidence for each side."""
     reach = _front_sweep_reach(geometry, half_width)
-    passing_reach = max(reach, geometry.rear + RESOLUTION)
-    if not ((projection.frame > 0.) & (projection.frame <= passing_reach + RESOLUTION / 2)).any():
-        return (False, False), (False, False)
+    passing_reach = max(reach, geometry.rear + half_width)
+    visible_reach = passing_reach + half_width
+    no_flanks = (False, False)
+    if not ((projection.frame > 0.) & (projection.frame <= visible_reach + RESOLUTION / 2)).any():
+        return no_flanks, no_flanks, no_flanks
     grid = projection.grid_for(geometry, require_valid_depth=True, check_free_space=False)
     if grid is None:
-        return (False, False), (False, False)
+        return no_flanks, no_flanks, no_flanks
     forward = grid[1] & (FORWARD >= 0.)
     radius_sq = FORWARD**2 + RIGHT**2
     close = (forward & (radius_sq <= reach**2)
              & (abs(RIGHT) >= max(RESOLUTION, half_width - 2 * RESOLUTION)))
-    passing = forward & (radius_sq <= passing_reach**2) & (abs(RIGHT) >= half_width)
+    flanks = forward & (abs(RIGHT) >= half_width)
+    passing = flanks & (radius_sq <= passing_reach**2)
+    visible = flanks & (radius_sq <= visible_reach**2)
     sides = (RIGHT < 0., RIGHT > 0.)
     return (tuple(bool((close & side).any()) for side in sides),
-            tuple(np.count_nonzero(passing & side) >= 2 for side in sides))
+            tuple(np.count_nonzero(passing & side) >= 2 for side in sides),
+            tuple(np.count_nonzero(visible & side) >= 2 for side in sides))
 
 
 def front_flank_guard(geometry, half_width, left, right):
@@ -1444,27 +1449,28 @@ def segment_clear(occupied, geometry, half_width, angle, length, *, heading_tole
                                          heading_tolerance=heading_tolerance).size
 
 
-def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half_width, start, target):
-    """Weight the measured corridor midpoint or the tangents of a compact blocker."""
+def _measured_passage_cost(occupied, half_width):
     cols = np.arange(occupied.shape[1])
     left = np.maximum.accumulate(np.where(occupied, cols, -1), axis=1)
     right = np.minimum.accumulate(np.where(occupied, cols, len(cols))[:, ::-1], axis=1)[:, ::-1]
     opening = ((left >= 0) & (right < len(cols))
                & ((right - left - 1) * RESOLUTION >= 2 * half_width - 1e-9))
     midline_error = abs(cols - (left + right) / 2) * RESOLUTION
-    cost = np.where(opening, 8. * np.square(midline_error / half_width), cost)
+    return opening, np.where(opening, 8. * np.square(midline_error / half_width), 0.)
+
+
+def _detour_shape_cost(cost, free, occupied, blockers, geometry, half_width, body_half_width, start, target):
+    """Weight the measured corridor midpoint or the tangents of a compact blocker."""
+    opening, midline_cost = _measured_passage_cost(occupied, half_width)
+    cost = np.where(opening, midline_cost, cost)
     if not len(blockers[0]):
         return cost, None, None
     pivot = (geometry.front - geometry.rear) / 2
     nearest = np.hypot(FORWARD[blockers] - pivot, RIGHT[blockers]).argmin()
-    row, col = (int(axis[nearest]) for axis in blockers)
-    # A measured opening beside the blocker is more informative than a circle
-    # around a jamb or wall. Its traversability is still decided by the caller.
-    if (opening[row, :] & (abs(cols - col) * RESOLUTION <= 3 * half_width)).any():
-        return cost, None, None
+    seed = tuple(int(axis[nearest]) for axis in blockers)
     remaining = set(zip(*np.nonzero(occupied)))
-    remaining.remove((row, col))
-    component = [(row, col)]
+    remaining.remove(seed)
+    component = [seed]
     for row, col in component:
         for dr, dc in STEPS:
             neighbor = row + dr, col + dc
@@ -1478,6 +1484,17 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     body_width = 2 * body_half_width
     if max(span) > 3 * body_width:
         return cost, None, None
+    # A jamb clipped by the camera can look like a compact box. Keep the
+    # measured opening unless a chassis-wide strip is also visible outside it.
+    blocker_row, blocker_col = seed
+    cols = np.arange(occupied.shape[1])
+    if (opening[blocker_row] & (abs(cols - blocker_col) * RESOLUTION <= 3 * half_width)).any():
+        outer = free[blocker_row] & ~opening[blocker_row] & ~occupied[blocker_row]
+        width = math.ceil(2 * half_width / RESOLUTION)
+        left = outer[max(0, low[1] - width):low[1]]
+        right = outer[high[1] + 1:high[1] + 1 + width]
+        if not any(strip.size == width and strip.all() for strip in (left, right)):
+            return cost, None, None
     center = ((low + high) / 2 - START) * RESOLUTION
     forward, lateral = center[0] - pivot, center[1]
     distance = math.hypot(forward, lateral)
@@ -1607,7 +1624,7 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     length = max(RESOLUTION, math.hypot(dx, dy))
     lateral = abs((FORWARD-target[0])*dy - (RIGHT-target[1])*dx) / length
     cost += .5 * lateral / max(.15, half_width)
-    cost, tangent_goal, blocker_exit = _detour_shape_cost(cost, occupied, blockers, geometry, half_width,
+    cost, tangent_goal, blocker_exit = _detour_shape_cost(cost, free, occupied, blockers, geometry, half_width,
                                                          body_half_width or half_width, start, target)
     if tangent_goal is not None:
         # Keep charging for nearby cells along a compact obstacle's tangents.
@@ -1838,6 +1855,9 @@ def _checked_translation(frame, ground, geometry, half_width, ahead, side, max_a
         padded = np.pad(~footprint_clear, 1, constant_values=True)
         cell_cost = .05 * (padded[:-2, 1:-1].astype(float) + padded[2:, 1:-1]
                            + padded[1:-1, :-2] + padded[1:-1, 2:])
+    if finite_turn and body_half_width is not None:
+        _, midline_cost = _measured_passage_cost(occupied, half_width)
+        cell_cost = .25 * midline_cost if cell_cost is None else cell_cost + .25 * midline_cost
     find_path = partial(shortest_path, cell_cost=cell_cost)
     allowed = footprint_clear.copy()
     allowed[:row_zero, :] = False

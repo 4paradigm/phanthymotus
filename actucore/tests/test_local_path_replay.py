@@ -722,6 +722,21 @@ def test_opening_connects_to_visible_corridor_without_turning_inside_jambs():
     assert all(f >= through[-1][0] - 1e-8 for f, _ in joined.points[len(through):])
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_bypass_centres_between_the_box_and_a_measured_opposite_wall(side):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                    (480, 420, 243), .20, half_length=.23, at_front=True)
+    beside = (replay.FORWARD >= .8) & (replay.FORWARD <= 1.6)
+    occupied = beside & ((abs(replay.RIGHT) <= .11) | np.isclose(replay.RIGHT, side * .85))
+    route = replay._checked_translation(
+        None, None, geometry, .22, .8, side, 500, velocity_limits=None,
+        target=(2.6, 0., .60, .05), projected_grid=(~occupied, occupied),
+        body_half_width=.20, allow_unknown=True, finite_turn=True)
+
+    middle = [side * r for f, r in route.points if .95 <= f <= 1.25]
+    assert middle and min(middle) >= .425 and max(middle) <= .525
+
+
 def test_opening_handoff_tracker_keeps_positive_drive():
     from plugins.navi import policy
 

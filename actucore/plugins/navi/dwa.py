@@ -482,6 +482,11 @@ def pursuit_cost(command, previous, nominal_speed, yaw_limit, check):
     return change + .75 * (1. - speed_fraction) + _obstacle_score(check) * (1. + speed_fraction)
 
 
+def pursuit_options(yaw_limit, lateral, scales=ROUTE_SPEED_SCALES):
+    headings = (yaw_limit, (0., 0.)) if lateral and any(yaw_limit) else (yaw_limit,)
+    return product(headings, scales)
+
+
 def score_candidate(command, trace, check, reference, previous, *, half_width, limits,
                     progress_scale, target, segments=None, initial_position=None, guidance=False):
     """Score the held part of a physically admissible trace on one reference."""
@@ -701,10 +706,14 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         segments = _route_segments(points)
         best = None
         best_cost = math.inf
-        for scale in ROUTE_SPEED_SCALES[:min(slots, len(ROUTE_SPEED_SCALES) - int(transition_slot))]:
-            if budget.expired():
+        swept_into_obstacle = False
+        scales = ROUTE_SPEED_SCALES[:len(ROUTE_SPEED_SCALES) - int(transition_slot)]
+        for steering, scale in pursuit_options(yaw_limit, bool(y_speed), scales):
+            if budget.expired() or diag["sampled_candidates"] >= slots:
                 break
-            tracked = track_route(points, x_speed * scale, horizon, yaw_limit,
+            if steering != yaw_limit and (best is not None or not swept_into_obstacle):
+                break
+            tracked = track_route(points, x_speed * scale, horizon, steering,
                                   body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
                                   yaw_floor=floors[3], view_bearing=view_bearing)
             if tracked is None:
@@ -724,6 +733,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             diag["physical_evaluations"] += 1
             check = context.evaluate(prediction)
             if not check.accepted:
+                swept_into_obstacle |= bool(command[2] and check.reason == "footprint_collision")
                 rejected[check.reason] = rejected.get(check.reason, 0) + 1
                 continue
             poses = prediction.camera_poses if footprint_mode == "camera_approx" else prediction.body_poses

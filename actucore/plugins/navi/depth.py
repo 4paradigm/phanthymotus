@@ -126,10 +126,25 @@ def sample_box(depth_m: np.ndarray, bbox_norm) -> float | None:
 
 def front_surface(depth_m, bbox_norm, intrinsics, ground=None):
     """Project the nearest coherent patch in a detection box to (forward, left)."""
+    return _person_surface(depth_m, bbox_norm, intrinsics, ground)[0]
+
+
+def person_box_measurement(depth_m, box, intrinsics, ground=None):
+    """Exclude a foreground layer only when the coherent surface identifies an occluder."""
+    measured = sample_box(depth_m, box)
+    if measured is None:
+        return None, None
+    point, split = _person_surface(depth_m, box, intrinsics, ground)
+    if split is not None and measured < split:
+        measured = float(point[0])
+    return measured, point
+
+
+def _person_surface(depth_m, bbox_norm, intrinsics, ground):
     rows, cols = _box_slices(depth_m.shape, bbox_norm)
     patch = depth_m[rows, cols]
     if min(patch.shape) < 3:
-        return None
+        return None, None
     valid = np.isfinite(patch) & (patch > 0.)
     if ground is not None:
         valid &= ~ground[rows, cols]
@@ -138,7 +153,7 @@ def front_surface(depth_m, bbox_norm, intrinsics, ground=None):
     high = windows.max(axis=(-2, -1))
     supported = high - low <= .08
     if not supported.any():
-        return None
+        return None, None
     centre = windows[:, :, 1, 1]
     fx, cx = intrinsics.for_width(depth_m.shape[1])
     ray = (np.arange(cols.start + 1, cols.stop - 1) - cx) / fx
@@ -146,6 +161,7 @@ def front_surface(depth_m, bbox_norm, intrinsics, ground=None):
     row, col = np.unravel_index(np.argmin(horizontal_range), horizontal_range.shape)
     middle = centre.shape[0] // 2
     bottom = 3 * centre.shape[0] // 4
+    occluded_below = None
     if middle > 0 and row >= middle:
         # A low occluder can enter a person's box without belonging to the
         # person. Require a separate measured upper surface, and for a near
@@ -161,11 +177,12 @@ def front_surface(depth_m, bbox_norm, intrinsics, ground=None):
                 if centre[row, col] < split <= upper.min():
                     if row < bottom and not np.any(supported[-1, [0, -1]] & (centre[-1, [0, -1]] < split)):
                         continue
+                    occluded_below = split
                     horizontal_range[centre < split] = np.inf
                     row, col = np.unravel_index(np.argmin(horizontal_range), horizontal_range.shape)
                     break
     forward = float(centre[row, col])
-    return np.array([forward, -forward * ray[col]])
+    return np.array([forward, -forward * ray[col]]), occluded_below
 
 
 def sample_point(depth_m: np.ndarray, position, window: float = 0.05) -> float | None:

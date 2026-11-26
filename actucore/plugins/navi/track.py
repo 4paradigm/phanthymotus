@@ -403,7 +403,7 @@ def _candidates(detections, depth, target: str, config, position) -> list:
     out = []
     for obj in target_objects(detections, target, config):
         bearing_rad = policy_mod._bearing(obj) * config.half_fov_rad
-        range_m = policy_mod.target_distance(obj, depth, config)
+        range_m, surface = policy_mod._target_measurement(obj, depth, config)
         measured = range_m is not None
         if not measured:
             # No depth at this object — a hole in the map, or the summary
@@ -420,6 +420,7 @@ def _candidates(detections, depth, target: str, config, position) -> list:
             "hue": policy_mod.hue_of(obj),
             "name": obj.get("name") or "",
             "range_measured": measured,
+            "surface": surface,
             "range_m": range_m,
         })
     return out
@@ -503,10 +504,7 @@ def _gate_cost(position, cov, since_obs_s, hue, candidate, config):
     return cost
 
 
-def _front_point(depth, box, config, reference, has_fix, range_known, position, dt):
-    from .depth import front_surface
-
-    point = front_surface(depth["map"], box, config.depth_intrinsics, depth.get("ground"))
+def _front_point(point, config, reference, has_fix, range_known, position, dt):
     if point is None:
         return
 
@@ -588,7 +586,11 @@ def match_observation(snapshot, detections, depth, *, ego_motion, elapsed_s, tar
         corrected, _ = _correct(mean, cov, candidate, config)
         front_limit = config.depth_age_limit_ms if config.local_planning else config.max_obs_age_ms
         has_fix = snapshot.has_front_fix and snapshot.front_age_s + elapsed_s <= front_limit / 1000
-        surface = _front_point(depth, box, config, reference, has_fix, True, corrected[:2], elapsed_s)
+        surface = candidate["surface"]
+        if candidate["name"].lower() != "person":
+            from .depth import front_surface
+            surface = front_surface(depth["map"], box, config.depth_intrinsics, depth.get("ground"))
+        surface = _front_point(surface, config, reference, has_fix, True, corrected[:2], elapsed_s)
         if surface is None:
             return (TargetMatch(snapshot.generation, source, None, None, _image_region(candidate["obj"]))
                     if allow_missing_surface else None)
@@ -677,7 +679,8 @@ class Tracker:
                 if matched["name"].lower() == "person" and box and config.depth_intrinsics is not None:
                     self.track.front_required = True
                 self.track.front_box = tuple(box) if self.track.front_required and box else None
-                self._update_front(depth, config, dt, matched["range_m"])
+                measurement = (matched["range_m"], matched["surface"]) if matched["name"].lower() == "person" else None
+                self._update_front(depth, config, dt, measurement)
             if (self.track.accepted_detection and not self.track.front_required and matched["range_measured"]
                     and depth is not None and depth.get("map") is not None
                     and not depth.get("capture_invalid")):
@@ -693,7 +696,7 @@ class Tracker:
 
         return self.track if (self.track and self.track.drivable) else None
 
-    def _update_front(self, depth, config, dt, range_m=None):
+    def _update_front(self, depth, config, dt, measurement=None):
         """Measure the associated person in the newest usable depth image."""
         track = self.track
         box = track.front_box
@@ -714,13 +717,14 @@ class Tracker:
                          or track.since_obs_s * 1000 >= config.max_obs_age_ms
                          or not 0 <= depth_age_ms < min(config.depth_age_limit_ms, config.max_obs_age_ms)):
             return
-        point = _front_point(depth, box, config, track.front_reference, track.front_fix is not None,
+        if measurement is None:
+            from .depth import person_box_measurement
+            measurement = person_box_measurement(depth["map"], box, intrinsics, depth.get("ground"))
+        range_m, surface = measurement
+        point = _front_point(surface, config, track.front_reference, track.front_fix is not None,
                              track.range_known, track.position, dt)
         if point is None:
             return
-        if range_m is None:
-            from .depth import sample_box
-            range_m = sample_box(depth["map"], box)
         if coasting:
             # The remembered crop can contain a new foreground object. Both
             # the box range and the coherent front must agree with the

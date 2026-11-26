@@ -1108,3 +1108,20 @@ def test_compact_detour_exit_follows_the_tangent_toward_the_target():
     exit_leg = [(forward, right) for forward, right in route.topology if forward >= 2.5]
     assert len(exit_leg) >= 4
     assert all(abs(abs(right) - (goal-forward)*slope) <= .1 for forward, right in exit_leg)
+
+
+@pytest.mark.parametrize("visible_outside", [False, True])
+def test_compact_blocker_beside_an_opening_needs_visible_room_on_its_outer_side(visible_outside):
+    forward, right = local_path.FORWARD, local_path.RIGHT
+    face = np.isclose(forward, 1.5)
+    occupied = face & (((right >= -.10) & (right <= .30)) | ((right <= -.80) & (right >= -1.10)))
+    free = ~occupied
+    if not visible_outside:
+        free &= right < .30
+    route = local_path.clearance_route((free, occupied), _geometry(), .22, (3.0, 0.), .60,
+                                       (0., 0.), body_half_width=.20)
+    assert route is not None
+    assert (route.blocker_exit is not None) == visible_outside
+    if visible_outside:
+        passing = next(r for f, r in route.topology if f >= 1.5)
+        assert passing > .30 + .20

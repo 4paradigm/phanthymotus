@@ -1322,25 +1322,24 @@ def _bearing(obj) -> float:
 
 
 def target_distance(obj, depth, config: Config) -> float | None:
-    """How far the chosen object is, by whatever the depth source allows.
+    return _target_measurement(obj, depth, config)[0]
 
-    `bbox` is much better than a centre point — it samples the whole object
-    rather than one patch that may land on a gap — so it is used when vop
-    publishes it. Both paths return None rather than a guess.
-    """
+
+def _target_measurement(obj, depth, config):
+    """Sample the steering range and the independent physical standoff point together."""
     if depth is None:
-        return None
+        return None, None
     from . import depth as depth_mod
 
     if depth.get("map") is not None:
         bbox = obj.get("bbox_norm")
+        if bbox and config.depth_intrinsics is not None and (obj.get("name") or "").lower() == "person":
+            return depth_mod.person_box_measurement(depth["map"], bbox, config.depth_intrinsics, depth.get("ground"))
         if bbox:
-            return depth_mod.sample_box(depth["map"], bbox)
-        return depth_mod.sample_point(depth["map"], obj.get("position") or [0, 0])
-    # Summary-only gives the nearest obstacle in the target's band. It can
-    # constrain motion but cannot confirm the distance to the target.
-    bands = depth.get("bands") or {}
-    return bands.get(_band_of(_bearing(obj)))
+            return depth_mod.sample_box(depth["map"], bbox), None
+        return depth_mod.sample_point(depth["map"], obj.get("position") or [0, 0]), None
+    # Summary-only evidence can constrain motion but cannot confirm the target range.
+    return (depth.get("bands") or {}).get(_band_of(_bearing(obj))), None
 
 
 def _band_of(bearing: float) -> str:
@@ -3551,6 +3550,19 @@ def dwa_measured_target(track, geometry, now_ms, depth_age_ms, registration, *, 
     return tuple(view.points(point)), view.error(math.hypot(*point))
 
 
+def dwa_depth_origin(depth, received_ms):
+    source = depth.get("obstacle_driver_ms")
+    if source is not None:
+        return source, depth.get("obstacle_driver_pose")
+    return min(received_ms, depth.get("capture_ms") or received_ms), depth.get("obstacle_capture_pose")
+
+
+def _blind_passing_flanks(depth, config, now_ms):
+    hold_ms = config.depth_age_limit_ms + config.watchdog_ms
+    return tuple(stamp is not None and 0 <= now_ms - stamp < hold_ms
+                 for stamp in depth.get("blind_passing_flank_ms", (None, None)))
+
+
 def dwa_front_flank_guard(depth, config, geometry, now_ms):
     if geometry.front != 0. or config.use_obstacle_history:
         return ()
@@ -3558,19 +3570,38 @@ def dwa_front_flank_guard(depth, config, geometry, now_ms):
     hold_ms = config.depth_age_limit_ms + config.watchdog_ms
     active = tuple(stamp is not None and 0 <= now_ms - stamp < hold_ms
                    for stamp in depth.get("front_flank_ms", (None, None)))
-    if not any(active):
-        return ()
-    return (local_path.front_flank_guard(geometry, _keepout_m(config), *active),)
+    blind = _blind_passing_flanks(depth, config, now_ms)
+    keep = _keepout_m(config)
+    near = (local_path.front_flank_guard(geometry, keep, *active),) if any(active) else ()
+    # The wider flank first constrains expansion into that side. Its last
+    # return did not justify treating the edge of the chassis as occupied.
+    passing = tuple(missing and not close for missing, close in zip(blind, active))
+    if any(passing):
+        near += (local_path.front_flank_guard(geometry, keep + 2 * local_path.RESOLUTION, *passing),)
+    return near
 
 
 def passing_speed_limit(depth, config, now_ms, speed):
     """Delay acceleration on an admitted route after a measured flank goes blind."""
-    hold_ms = config.depth_age_limit_ms + config.watchdog_ms
-    if any(stamp is not None and 0 <= now_ms - stamp < hold_ms
-           for stamp in depth.get("blind_passing_flank_ms", ())):
+    if any(_blind_passing_flanks(depth, config, now_ms)):
         (floor, maximum), _ = _local_velocity_limits(config, 1.)
         return min(speed, max(floor, maximum * dwa.ROUTE_SPEED_SCALES[-1]))
     return speed
+
+
+def dwa_depth_layers(depth, cells, received_ms, view, registration, config):
+    if depth.get("obstacle_driver_ms") is None:
+        return (view.squares(cells),)
+    # Driver receive time is an estimate of observation timing. Keep the
+    # latest receipt geometry, and reserve the distance already travelled
+    # toward obstacles in the observed forward corridor.
+    receipt = registration(received_ms, depth.get("obstacle_capture_pose")).squares(cells)
+    speed = config.vx_max
+    stopping_reach = speed * dwa_hold(config, 0.) + speed**2 / (2 * config.motion_braking[0])
+    reach = max(config.approach_check_distance_m, stopping_reach + math.hypot(view.forward, view.right))
+    ahead = (cells & (FORWARD >= 0.) & (FORWARD <= reach)
+             & (abs(RIGHT) <= _keepout_m(config) + local_path.RESOLUTION))
+    return (receipt, view.squares(ahead)) if ahead.any() else (receipt,)
 
 
 def _dwa_motion_inputs(depth, config, state, geometry, target, motion, *, corner_only=False):
@@ -3605,11 +3636,11 @@ def _dwa_motion_inputs(depth, config, state, geometry, target, motion, *, corner
         observed, remembered = (dwa_obstacles(scan, sources, geometry, registration)
                                 if config.use_obstacle_history else ((), ()))
         if raw is not None or not config.use_obstacle_history:
-            capture = depth.get("capture_ms") or sources.current_frame
             cells = (local_path.front_corner_sweep_grid(
                 state.dwa_projection.frame, geometry, _keepout_m(config), raw[1],
                 guard_blind_sides=not config.use_obstacle_history) if raw is not None else grid[1])
-            observed += (registration(capture, depth.get("obstacle_capture_pose")).squares(cells),)
+            view = registration(*dwa_depth_origin(depth, sources.current_frame))
+            observed += dwa_depth_layers(depth, cells, sources.current_frame, view, registration, config)
             observed += dwa_front_flank_guard(depth, config, geometry, now_ms)
     except DwaFrameMismatch:
         return None, "geometry_mismatch"
@@ -3962,19 +3993,53 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
         travel = limit * (guard.prediction_horizon_s + limit / (2 * config.motion_braking[0]))
         if math.hypot(*point) - error <= config.stop_distance_m + travel:
             speed_limit = max(floor, approach_speed)
+    route_error = transform.error(math.hypot(*previous.route_points[-1]))
+    if (locked and (blocker_exit is not None or exit_line is not None)
+            and not local_path.passage_ahead(blocker_exit) and not local_path.passage_ahead(exit_line)):
+        # After the crossing, scale the pursuit samples to the remaining
+        # route before predicting them. Clipping each held speed afterwards
+        # can give all four samples the same insufficient braking room.
+        tail_limit = max(0., remaining - route_error) / guard.prediction_horizon_s
+        speed_limit = tail_limit if speed_limit is None else min(speed_limit, tail_limit)
     proposal = _dwa_detour(depth, config, state, route, distance, bearing, speed_limit=speed_limit,
-                           follow_published=True, route_error=transform.error(math.hypot(*previous.route_points[-1])),
+                           follow_published=True, route_error=route_error,
                            corner_only=corner_only)
-    if proposal is None:
-        if (locked and not local_path.passage_ahead(exit_line) and not local_path.passage_ahead(blocker_exit)
-                and remaining <= 5 * local_path.RESOLUTION
-                and track is not None and track.observed
-                and state.dwa_trace.get("rejected", {}).keys() == {"insufficient_room"}
-                and _target_corridor_clear(depth, config, scan, distance, bearing)):
-            # The route has no room for another full braking window. Hand
-            # its clear tail to normal target approach, which checks its own sweep.
+    if (proposal is None and locked and not local_path.passage_ahead(blocker_exit)
+            and remaining <= 5 * local_path.RESOLUTION
+            and distance is not None and bearing is not None and track is not None and track.observed
+            and state.dwa_trace.get("rejected", {}).keys() == {"insufficient_room"}
+            and _target_corridor_clear(depth, config, scan, distance, bearing)):
+        if not local_path.passage_ahead(exit_line):
+            # The passage is clear and the route has no room for another
+            # braking window. Normal target approach checks its own sweep.
             state.committed_route = state.published_dwa_route = None
             return None
+        keep = _keepout_m(config)
+        margin = keep + local_path.RESOLUTION / 2
+        (left_f, left_r), (right_f, right_r) = exit_line
+        if (not config.use_obstacle_history and not route.corridor_corner and not corner_only
+                and left_r <= -margin and right_r >= margin
+                and 0 <= now - observation_ms(depth, scan.current_frame)
+                < min(config.depth_age_limit_ms, config.max_feedback_gap_ms)):
+            # Continue forward through the same opening. Ground observations
+            # may start beyond the nearby blind area of the front camera.
+            exit_forward = left_f - left_r * (right_f - left_f) / (right_r - left_r)
+            target_f, _ = local_path.target_in_grid(
+                geometry, distance * math.cos(bearing), distance * math.sin(bearing))
+            target_room = target_f - config.stop_distance_m
+            _, max_vx = _local_velocity_limits(config, 1.)[0]
+            forward = min(target_room, max(.45, max_vx * guard.prediction_horizon_s))
+            _, occupied = scan.observed_grid()
+            center = local_path.START[1]
+            along = FORWARD[:, center]
+            supported = scan.views[-1][2][:, center] & (along >= forward - local_path.RESOLUTION / 2)
+            if (forward > exit_forward + local_path.RESOLUTION
+                    and (supported & (along <= min(target_room, forward + geometry.half_length))).any()
+                    and local_path.segment_clear(occupied, geometry, keep, 0., forward)):
+                continuation = replace(route, points=((0., 0.), (forward, 0.)))
+                proposal = _dwa_detour(depth, config, state, continuation, distance, bearing,
+                                       speed_limit=speed_limit, follow_published=True)
+    if proposal is None:
         if (remaining > 2 * local_path.RESOLUTION
                 and state.dwa_trace.get("fallback_reason") == "search_deadline"):
             state.dwa_trace["wait_for_committed_route"] = True
@@ -4412,6 +4477,13 @@ def _near_sweep_hits(config, scan, odom, state, twist):
     return scan.near_motion_hits(geometry, config.half_width_m, horizon, velocities)
 
 
+def camera_arc_obstacles(depth, config, geometry, now_ms, cells, previous, residual):
+    driver_ms = depth.get("obstacle_driver_ms")
+    occupied = (local_path.occupied_squares(cells) if driver_ms is None else
+                dwa_registration(None, None, driver_ms, now_ms, geometry, (previous, residual)).squares(cells))
+    return (occupied,) + dwa_front_flank_guard(depth, config, geometry, now_ms)
+
+
 def camera_arc_clear(geometry, config, command, previous, residual, admission_s, *,
                      occupied, route_room=None):
     """Check the full stopping sweep against the latest depth and route room."""
@@ -4535,7 +4607,8 @@ def _preview_corridor_corner(depth, config, state, geometry, distance, bearing):
         control_ms = depth.get("control_ms") or scan.current_frame
         if not 0 <= control_ms - observation_ms(depth, scan.current_frame) < config.depth_age_limit_ms:
             return None
-        occupied = (local_path.occupied_squares(grid[1]),) + dwa_front_flank_guard(depth, config, geometry, control_ms)
+        occupied = camera_arc_obstacles(depth, config, geometry, control_ms, grid[1],
+                                        state.commanded, state.command_tail)
         command = camera_route_command(route, config, target, config.vx_max, state.commanded,
                                        state.command_tail, state.dwa_admission_ms / 1000,
                                        occupied=occupied, require_turn=False)
@@ -4557,7 +4630,8 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
     if target is not None and target[0] <= 0.:
         return None
     grid = scan.observed_grid()
-    occupied = (local_path.occupied_squares(grid[1]),) + dwa_front_flank_guard(depth, config, geometry, control_ms)
+    occupied = camera_arc_obstacles(depth, config, geometry, control_ms, grid[1],
+                                    state.commanded, state.command_tail)
     admission = state.dwa_admission_ms / 1000
     keep = state.published_camera_passage
     track = state.tracker.track

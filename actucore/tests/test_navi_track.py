@@ -758,3 +758,23 @@ def test_readonly_person_match_requires_a_continuous_front_return(near_patch):
         assert match.range_m == live.measured_range_m
         assert T.match_observation(snapshot, observed, dict(depth, source_frame_id=299),
                                    ego_motion=STILL, elapsed_s=.1, target="person", config=config) is None
+
+
+@pytest.mark.parametrize("foreground", [True, False])
+def test_steering_range_and_physical_front_use_the_same_occluder_classification(foreground):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.depth import sample_box
+
+    cfg = _cfg(confirm_hits=1, depth_intrinsics=HorizontalIntrinsics(80, 60., 40.))
+    tracker = T.Tracker()
+    box = (.25, 0., .75, 1.)
+    person = dict(_obj("person"), bbox_norm=box)
+    image = np.full((60, 80), 3.0 if foreground else .53)
+    image[38:, :] = .53
+    assert sample_box(image, box) == pytest.approx(.53)
+    for source, stamp in ((1, 100), (2, 200), (2, 300)):
+        track = _feed(tracker, _stamped(source, person), config=cfg, target="person",
+                      depth={"map": image, "frame_id": stamp})
+    expected = 3.0 if foreground else .53
+    assert track.measured_range_m == pytest.approx(expected)
+    assert track.measured_point.standoff_point[0] == pytest.approx(expected)
