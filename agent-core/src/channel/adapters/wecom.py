@@ -60,9 +60,6 @@ IMAGE_DOWNLOAD_TIMEOUT = 10
 # Host observed in published WeCom intelligent-bot image callback examples.
 WECOM_IMAGE_HOST = 'ww-aibot-img-1258476243.cos.ap-guangzhou.myqcloud.com'
 
-# 群聊正文里的 @ 前缀，例如 "@Bumi 助手 挥个手"
-_AT_PREFIX_RE = re.compile(r'^\s*@[^\s]+\s*')
-
 
 def _frame_req_id(frame: dict) -> str:
     headers = frame.get('headers', {})
@@ -528,12 +525,13 @@ class WecomAdapter(ChannelAdapter):
 
         text = parsed['text']
         if parsed['chat_type'] == 'group':
-            # 剥掉群聊正文里的 @机器人名；配置了 bot_name 时只剥那一个，否则剥任意 @前缀
+            # 只剥已知的机器人名称，保留其他成员的 @ 和未知前缀。
             bot_name = str(self.config.get('bot_name', '') or '').strip()
-            if bot_name and text.lstrip().startswith('@' + bot_name):
-                text = text.lstrip()[len('@' + bot_name):].lstrip()
-            else:
-                text = _AT_PREFIX_RE.sub('', text, count=1)
+            prefix = '@' + bot_name
+            stripped = text.lstrip()
+            if (bot_name and stripped.startswith(prefix)
+                    and (len(stripped) == len(prefix) or stripped[len(prefix)].isspace())):
+                text = stripped[len(prefix):].lstrip()
 
         msg = InboundMessage(
             platform='wecom',

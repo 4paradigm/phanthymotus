@@ -22,6 +22,7 @@ import typing
 import log
 import config
 import client
+from client.llm import error_message
 import event
 import event_bus
 import collector
@@ -85,8 +86,8 @@ def _decoded_json(value):
 def _tool_content(result):
     """一个 tool role 消息的 `content`，保证是服务端收得下的形状。
 
-    OpenAI 的 schema 里 tool 消息的 content 只能是字符串（或多模态 content part
-    数组）。而 `_dispatch` 的返回值并不都是字符串：barrier 被打断时它返回
+    tool 消息的 content 应为字符串或文本 content part 数组；图片数组由 client.llm
+    在请求前转为 user 图像消息。`_dispatch` 的返回值并不都是字符串：barrier 被打断时它返回
     `{"status": "not_dispatched", "reason": ...}` 这样的 dict，之前原样塞进
     content，请求就被上游以 400 拒掉。
 
@@ -102,7 +103,7 @@ def _tool_content(result):
     """
     if isinstance(result, str):
         return result
-    # 多模态 content part 数组（图片等）是 schema 允许的另一种形状，原样放行。
+    # 保留 content parts，由模型客户端统一处理图片和消息顺序。
     if isinstance(result, list):
         return result
     if result is None:
@@ -2035,7 +2036,8 @@ class Event:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                print(f'[decision] error in _one_turn: {e}')
+                message = error_message(e)
+                print(f'[decision] error in _one_turn: {message}')
                 # Fire on_error hook (LED feedback etc.)
                 if not (self._chat_only_active or ev.get('_bot_channel_event') or ev.get('_viewer_channel_event')):
                     import hooks
@@ -2043,9 +2045,9 @@ class Event:
                 # 把错误也记入本轮消息
                 self._current_turn.append({
                     'role': 'assistant',
-                    'content': f'[错误] {type(e).__name__}: {e}',
+                    'content': f'[错误] {type(e).__name__}: {message}',
                 })
-                await push_event({'type': 'error', 'payload': {'message': str(e)}})
+                await push_event({'type': 'error', 'payload': {'message': message}})
             finally:
                 _cancel_ctx.reset(_cancel_token)
                 chat_history.current_channel_context.reset(_history_token)
@@ -2066,17 +2068,22 @@ class Event:
                     self._save_current_turn(ev)
                 self._chat_only_active = False
 
-    def forget_conversation(self) -> None:
+    def forget_conversation(self, *, channel_only: bool = False) -> None:
         """丢掉内存里的对话上下文，并让正在跑的 turn 停下、不落盘。
 
         只删数据库不够：`_build_history()` 读的是 `_turns` / `_summary`，模型会继续
         拿已删的对话做决定。正在跑的 turn 也要停 —— 它的 history 在开头就拼好了，
         不停下就会带着旧上下文把剩下的 LLM 调用和工具调用跑完。
+        channel_only 用于单独删除当前渠道会话，保留主代理自己的历史。
         """
         self._history_gen += 1
-        self._turns = []
-        self._summary = None
-        self._session_id = None
+        if not channel_only:
+            self._turns = []
+            self._summary = None
+            self._session_id = None
+        self._channel_session_id = None
+        self._channel_turn_index = 0
+        self._channel_context_key = ''
         self._current_turn = []
         self._context_pressure = None
         if self._turn_cancel is not None:

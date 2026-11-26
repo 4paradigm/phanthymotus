@@ -59,9 +59,11 @@ def save_turn(session_id: str, turn_index: int, turn_messages: list[dict]):
         else:
             cursor = conn.execute(
                 'INSERT INTO chat_messages (session_id, turn_index, messages, created_at, updated_at) '
-                'VALUES (?, ?, ?, ?, ?)',
-                (session_id, turn_index, blob, now, now)
+                'SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM chat_sessions WHERE id = ?)',
+                (session_id, turn_index, blob, now, now, session_id)
             )
+            if not cursor.rowcount:
+                return  # A concurrent history deletion must not leave orphan messages.
             rowid = cursor.lastrowid
         conn.execute(
             'UPDATE chat_sessions SET ended_at = ?, '
@@ -169,10 +171,40 @@ def get_session_turns(session_id: str) -> list[dict]:
 
 def delete_session(session_id: str):
     """Delete a session and all its messages."""
-    with _get_conn() as conn:
-        conn.execute('DELETE FROM chat_messages WHERE session_id = ?', (session_id,))
-        conn.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
-        conn.commit()
+    delete_sessions([session_id])
+
+
+def _delete_channel_recaps(conn, session_ids: list[str], placeholders: str):
+    """Remove the legacy recap for each deleted human Channel identity."""
+    contexts = conn.execute(
+        f'SELECT context_key FROM chat_sessions WHERE id IN ({placeholders}) AND kind = ?',
+        [*session_ids, KIND_CHANNEL],
+    ).fetchall()
+    if not contexts:
+        return
+    row = conn.execute("SELECT value FROM config WHERE key = 'channel_chat_history'").fetchone()
+    if not row:
+        return
+    history = json.loads(row[0])
+    if not isinstance(history, dict):
+        return
+    for (context_key,) in contexts:
+        try:
+            scope = json.loads(context_key)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(scope, list) or len(scope) != 6:
+            continue
+        _, channel_id, chat_id, user_id, user_role, _ = scope
+        channel = history.get(channel_id, {})
+        if not isinstance(channel, dict) or not isinstance(channel.get(chat_id), list):
+            continue
+        channel[chat_id] = [entry for entry in channel[chat_id]
+                            if not (isinstance(entry, dict) and entry.get('user_id') == user_id
+                                    and entry.get('user_role') == user_role
+                                    and entry.get('sender_type') == 'user')]
+    conn.execute("UPDATE config SET value = ? WHERE key = 'channel_chat_history'",
+                 (json.dumps(history, ensure_ascii=False),))
 
 
 def delete_sessions(session_ids: list[str]):
@@ -181,6 +213,8 @@ def delete_sessions(session_ids: list[str]):
         return
     placeholders = ','.join('?' * len(session_ids))
     with _get_conn() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        _delete_channel_recaps(conn, session_ids, placeholders)
         conn.execute(f'DELETE FROM chat_messages WHERE session_id IN ({placeholders})', session_ids)
         conn.execute(f'DELETE FROM chat_sessions WHERE id IN ({placeholders})', session_ids)
         conn.commit()
@@ -214,6 +248,7 @@ def clear_all():
     with _get_conn() as conn:
         conn.execute('DELETE FROM chat_messages')
         conn.execute('DELETE FROM chat_sessions')
+        conn.execute("DELETE FROM config WHERE key = 'channel_chat_history'")
         try:
             conn.execute('DELETE FROM chat_messages_fts')
         except Exception:

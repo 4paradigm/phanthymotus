@@ -14,6 +14,45 @@ import config
 LOG_PATH = pathlib.Path('./resource/log')
 
 
+def error_message(error: Exception) -> str:
+    """Bound diagnostics and omit image bytes echoed by a model service."""
+    message = re.sub(r'data:image/[^;,\s]+;base64,[A-Za-z0-9+/=_-]+',
+                     '[image data omitted]', str(error), flags=re.IGNORECASE)
+    return message if len(message) <= 2000 else message[:2000] + '…(truncated)'
+
+
+def _prepare_messages(messages: list[dict]) -> list[dict]:
+    """Move tool images to a user message after the complete tool-result batch."""
+    prepared = []
+    pending_images = []
+    for message in messages:
+        if message.get('role') != 'tool' and pending_images:
+            prepared.append({'role': 'user', 'content': pending_images})
+            pending_images = []
+        content = message.get('content')
+        if isinstance(content, list):
+            # Also accept images saved or produced before image_url used an object.
+            content = [
+                {**part, 'image_url': {'url': part['image_url']}}
+                if part.get('type') == 'image_url' and isinstance(part.get('image_url'), str)
+                else part for part in content
+            ]
+            images = [part for part in content if part.get('type') == 'image_url']
+            if message.get('role') == 'tool' and images:
+                pending_images.append({
+                    'type': 'text',
+                    'text': f'[Image output from tool call {message.get("tool_call_id", "")}]',
+                })
+                pending_images.extend(images)
+                content = [part for part in content if part.get('type') != 'image_url']
+                content = content or '[Image output attached below.]'
+            message = {**message, 'content': content}
+        prepared.append(message)
+    if pending_images:
+        prepared.append({'role': 'user', 'content': pending_images})
+    return prepared
+
+
 # ── 流式参数 ──────────────────────────────────────────────────────────────────
 #
 # 为什么必须流式：`stream=False` 时，在整个响应体到齐之前没有任何信号，于是
@@ -625,6 +664,8 @@ class Client():
         model_override: 'str | None' = None,
     ) -> dict:
 
+        message_list = _prepare_messages(message_list)
+
         def _extra(client, think_mode: bool) -> dict:
             # think_mode 只决定发哪一组：关掉，还是开着但压到最低档。两组共用
             # 同一条「被 400 点名就撤掉」的降级记账。
@@ -766,7 +807,7 @@ class Client():
                 return msg
             except Exception as e:
                 elapsed = time.perf_counter() - t0
-                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
+                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {error_message(e)}')
                 raise
             finally:
                 # CancelledError 走不到上面的 except（它是 BaseException），
@@ -821,7 +862,7 @@ class Client():
                 return msg
             except Exception as e:
                 elapsed = time.perf_counter() - t0
-                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
+                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {error_message(e)}')
                 raise
 
         async def _go(client, model, think_mode: bool, attempt: int = 0,
