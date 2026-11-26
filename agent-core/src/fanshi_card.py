@@ -179,11 +179,19 @@ def _current(instance, settings, generation):
         return False
 
 
+async def _current_async(instance, settings, generation):
+    current = await asyncio.to_thread(_current, instance, settings, generation)
+    # Stop/config can run while the worker is reading SQLite. Recheck lifecycle
+    # state on the event loop before submitting the next part.
+    return (current and _generation[instance] == generation
+            and _active.get(instance) == settings[:2])
+
+
 async def _send_direct(instance, settings, generation, action_id, payload):
     planned = _split_payload(payload)
     parts = []
     for kind, request in planned:
-        if not _current(instance, settings, generation):
+        if not await _current_async(instance, settings, generation):
             outcome = _reply('cancelled', '提交前卡片停止或配置改变，本部分未发送。')
             attempted = False
         else:
@@ -220,15 +228,18 @@ async def handle(args):
     action = args.get('action', 'send')
     if action == 'config' and not instance:
         # Shared canvas settings are applied without an instance_id.
+        running_generations = {running: _generation[running] for running in _active}
         try:
-            settings = _read_settings()
+            settings = await asyncio.to_thread(_read_settings)
         except (ValueError, OSError, RelayError):
-            for running in list(_active):
-                _generation[running] += 1
-            _active.clear()
+            for running, generation in running_generations.items():
+                if _generation[running] == generation:
+                    _active.pop(running, None)
+                    _generation[running] += 1
             return _reply('failed', '配置无效，请检查 Webhook、群 ID 或统一服务接入文件。', adapter_ok=False)
-        for running in list(_active):
-            if _active[running] != settings[:2]:
+        for running, generation in running_generations.items():
+            if (_generation[running] == generation
+                    and _active.get(running) != settings[:2]):
                 _active.pop(running, None)
                 _generation[running] += 1
         return _reply('configured', '配置已校验，未发送测试消息。', adapter_ok=True)
@@ -258,12 +269,16 @@ async def handle(args):
         return copy.deepcopy(_jobs[instance].get(action_id, cached))
     if action not in ('start', 'config', 'send'):
         return _reply('failed', '不支持的动作。')
+    generation = _generation[instance]
     try:
-        settings = _read_settings()
+        settings = await asyncio.to_thread(_read_settings)
     except (ValueError, OSError, RelayError):
-        _active.pop(instance, None)
-        _generation[instance] += 1
+        if _generation[instance] == generation:
+            _active.pop(instance, None)
+            _generation[instance] += 1
         return _reply('failed', '配置无效：请保存 HTTPS Webhook 和群 ID，或检查统一服务接入文件。')
+    if _generation[instance] != generation:
+        return _reply('cancelled', '读取配置期间卡片停止或配置改变，本次操作已取消。')
     if action in ('start', 'config'):
         if _active.get(instance) != settings[:2]:
             _active.pop(instance, None)
@@ -277,7 +292,6 @@ async def handle(args):
         return _reply('failed', '请保存配置并启动画布项目；配置改变后需要重新启动卡片。')
     if instance in _busy:
         return _reply('failed', '上一条消息仍在处理，请先查询结果。')
-    generation = _generation[instance]
     _busy.add(instance)
     try:
         # Validate the complete group before posting even its first text part.
@@ -287,11 +301,11 @@ async def handle(args):
             return _reply('failed', str(exc))
         except OSError:
             return _reply('failed', '图片不存在或不可读，请使用 Agent Core 中可访问的实际路径。')
-        if not _current(instance, settings, generation):
+        if not await _current_async(instance, settings, generation):
             return _reply('cancelled', '准备发送期间卡片停止或配置改变，未提交消息。')
         key = settings[:2]
         async with _locks.setdefault(key, asyncio.Lock()):
-            if not _current(instance, settings, generation):
+            if not await _current_async(instance, settings, generation):
                 return _reply('cancelled', '等待期间卡片停止或配置改变，未提交消息。')
             if settings[0] == 'direct':
                 recent = _recent[key]

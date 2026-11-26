@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -102,6 +103,137 @@ class FanshiCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved, result)
         saved['parts'].clear()
         self.assertEqual(len(card._jobs['A'][result['action_id']]['parts']), 2)
+
+    async def test_slow_settings_reads_allow_other_coroutines_to_advance(self):
+        await self.start()
+        loop = asyncio.get_running_loop()
+        pending_reads = asyncio.Queue()
+        progressed = []
+        read_settings = card._read_settings
+
+        def slow_read():
+            release = threading.Event()
+            loop.call_soon_threadsafe(pending_reads.put_nowait, release)
+            # Only another coroutine can release this simulated database wait.
+            progressed.append(release.wait(2))
+            return read_settings()
+
+        async def other_work():
+            while True:
+                release = await pending_reads.get()
+                await asyncio.sleep(0)
+                release.set()
+
+        worker = asyncio.create_task(other_work())
+        try:
+            with patch.object(card, '_read_settings', side_effect=slow_read):
+                result = await self.send(image_path=str(self.photo))
+        finally:
+            worker.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await worker
+
+        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual(self.post.await_count, 2)
+        self.assertTrue(progressed)
+        self.assertTrue(all(progressed), 'A settings read blocked the event loop')
+
+    async def test_stop_during_settings_check_does_not_send_next_part(self):
+        await self.start()
+        loop = asyncio.get_running_loop()
+        entered, release = asyncio.Event(), threading.Event()
+        read_settings = card._read_settings
+
+        def slow_read():
+            settings = read_settings()
+            if self.post.await_count == 1:
+                loop.call_soon_threadsafe(entered.set)
+                release.wait(2)
+            return settings
+
+        with patch.object(card, '_read_settings', side_effect=slow_read):
+            task = asyncio.create_task(self.send(image_path=str(self.photo)))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                await card.handle({'action': 'stop', 'instance_id': 'A'})
+            finally:
+                release.set()
+                result = await task
+
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(result['parts'][1]['status'], 'cancelled')
+        self.assertEqual(self.post.await_count, 1)
+
+    async def test_stop_during_initial_settings_read_cancels_operation(self):
+        for action, restart in (('start', False), ('send', True), ('config', True)):
+            with self.subTest(action=action):
+                await card.handle({'action': 'stop', 'instance_id': 'A'})
+                if action != 'start':
+                    await self.start()
+                loop = asyncio.get_running_loop()
+                entered, release = asyncio.Event(), threading.Event()
+                read_settings = card._read_settings
+                first_read = True
+
+                def slow_read():
+                    nonlocal first_read
+                    settings = read_settings()
+                    if first_read:
+                        first_read = False
+                        loop.call_soon_threadsafe(entered.set)
+                        release.wait(2)
+                    return settings
+
+                with patch.object(card, '_read_settings', side_effect=slow_read):
+                    task = asyncio.create_task(card.handle({
+                        'action': action, 'instance_id': 'A', 'text': 'test'}))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 2)
+                        await card.handle({'action': 'stop', 'instance_id': 'A'})
+                        if restart:
+                            await self.start()
+                    finally:
+                        release.set()
+                        result = await task
+
+                self.assertEqual(result['status'], 'cancelled')
+                self.assertEqual('A' in card._active, restart)
+                self.post.assert_not_called()
+
+    async def test_stale_shared_config_read_preserves_new_start(self):
+        for invalid in (False, True):
+            with self.subTest(invalid=invalid):
+                await self.start()
+                loop = asyncio.get_running_loop()
+                entered, release = asyncio.Event(), threading.Event()
+                read_settings = card._read_settings
+                first_read = True
+
+                def slow_read():
+                    nonlocal first_read
+                    settings = read_settings()
+                    if first_read:
+                        first_read = False
+                        loop.call_soon_threadsafe(entered.set)
+                        release.wait(2)
+                        if invalid:
+                            raise ValueError('Stale invalid configuration')
+                    return settings
+
+                with patch.object(card, '_read_settings', side_effect=slow_read):
+                    task = asyncio.create_task(card.handle({'action': 'config'}))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 2)
+                        self.settings['group_id'] = str(int(self.settings['group_id']) + 1)
+                        await self.start()
+                        current = card._active['A']
+                    finally:
+                        release.set()
+                        result = await task
+
+                self.assertEqual(result['status'], 'failed' if invalid else 'configured')
+                self.assertEqual(card._active.get('A'), current)
+                self.post.assert_not_called()
 
     async def test_image_only_retains_mention(self):
         await self.start()
