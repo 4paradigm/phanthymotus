@@ -609,6 +609,23 @@ def corridor_corner_route(grid, geometry, half_width, target):
         angle = math.atan2(r, f)
         return bool(((abs(angles - angle) <= .05) & (ranges >= math.hypot(f, r) + RESOLUTION)).any())
 
+    def checked_turn(side, exit_f, radius):
+        entry = exit_f - radius
+        if entry < 0. or not visible(pivot + exit_f, side * (radius + half_width)):
+            return None, 0.
+        approach = [(f, 0., 0.) for f in np.arange(0., entry, RESOLUTION)]
+        curve = [(entry + radius * math.sin(a), side * radius * (1 - math.cos(a)), side * a)
+                 for a in np.linspace(0., math.pi / 2, math.ceil(radius * math.pi / (2 * RESOLUTION)) + 1)]
+        leaving = [(exit_f, side * (radius + r), side * math.pi / 2)
+                   for r in np.linspace(0., half_width, math.ceil(half_width / RESOLUTION) + 1)[1:]]
+        path = (*approach, *curve, *leaving)
+        poses = tuple((pivot + f, r, yaw) for f, r, yaw in path)
+        front, rear = (geometry.half_length, geometry.half_length) if pivot else (geometry.front, geometry.rear)
+        gap, hit = rectangle_clearance(poses, obstacles, front, rear, half_width, padding=RESOLUTION / 2)
+        if hit is not None:
+            return None, 0.
+        return Detour(None, tuple((float(f), float(r)) for f, r, _ in path), geometry, corridor_corner=True), gap
+
     routes = []
     for side in sides:
         for row in planes:
@@ -622,23 +639,17 @@ def corridor_corner_route(grid, geometry, half_width, target):
             exit_f = plane - pivot - max(half_width, geometry.half_length) - 2 * RESOLUTION
             for scale in (2., 1.5, 1.):
                 radius = scale * half_width
-                entry = exit_f - radius
-                length = half_width
-                if entry < 0. or not visible(pivot + exit_f, side * (radius + length)):
+                route, gap = checked_turn(side, exit_f, radius)
+                if route is None:
                     continue
-                approach = [(f, 0., 0.) for f in np.arange(0., entry, RESOLUTION)]
-                curve = [(entry + radius * math.sin(a), side * radius * (1 - math.cos(a)), side * a)
-                         for a in np.linspace(0., math.pi / 2, math.ceil(radius * math.pi / (2 * RESOLUTION)) + 1)]
-                leaving = [(exit_f, side * (radius + r), side * math.pi / 2)
-                           for r in np.linspace(0., length, math.ceil(length / RESOLUTION) + 1)[1:]]
-                path = (*approach, *curve, *leaving)
-                poses = tuple((pivot + f, r, yaw) for f, r, yaw in path)
-                front, rear = (geometry.half_length, geometry.half_length) if pivot else (geometry.front, geometry.rear)
-                _, hit = rectangle_clearance(poses, obstacles, front, rear, half_width, padding=RESOLUTION / 2)
-                if hit is None:
-                    routes.append(Detour(None, tuple((float(f), float(r)) for f, r, _ in path), geometry,
-                                         corridor_corner=True))
-                    break
+                # A legal turn can still skim the end wall. Compare an earlier
+                # turn on the same side while its exit is visible and reachable.
+                if gap < half_width:
+                    earlier, earlier_gap = checked_turn(side, exit_f - half_width, radius)
+                    if earlier is not None and earlier_gap > gap:
+                        route = earlier
+                routes.append(route)
+                break
             else:
                 continue
             break

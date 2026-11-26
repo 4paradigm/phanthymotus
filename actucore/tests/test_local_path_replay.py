@@ -775,3 +775,37 @@ def test_corridor_corner_previews_the_observed_exit_around_a_wall():
     assert route.points[-1][1] > .6
     assert all(a[0] <= b[0] for a, b in zip(route.points, route.points[1:]))
     assert replay.corridor_corner_route((~side_wall, side_wall), geometry, .30, (.80, 1.02)) is None
+
+
+@pytest.mark.parametrize("side", [-1, 1])
+def test_corner_prefers_standoff_when_an_earlier_exit_is_clear(side):
+    geometry = replay.camera_square(HorizontalIntrinsics(640, 315., 337.), (480, 420., 243.),
+                                    .20, half_length=.23, at_front=True)
+    side_wall = (abs(replay.RIGHT + side * .55) < .026) & (replay.FORWARD > 0.)
+    box = (abs(replay.FORWARD - 1.70) < .026) & (abs(replay.RIGHT) <= .25)
+    occupied = side_wall | box
+    width = .22
+
+    def route_for(grid):
+        return replay.corridor_corner_route((~grid, grid), geometry, width, (3., side * .3))
+
+    route = route_for(occupied)
+    assert route is not None
+    # Measure the same turning footprint used by the corner preview.
+    radius = abs(route.points[-1][1]) - width
+    entry = route.points[-1][0] - radius
+    poses = [(f - geometry.half_length, r, side * np.arctan2(
+        np.clip((f - entry) / radius, 0., 1.), np.clip(1. - abs(r) / radius, 0., 1.)))
+             for f, r in route.points]
+    gap, hit = replay.rectangle_clearance(poses, replay.occupied_squares(occupied),
+                                          .23, .23, width, padding=replay.RESOLUTION / 2)
+    assert hit is None and gap >= width / 2
+
+    # A post in the earlier arc leaves the original, later turn usable.
+    exit_strip = abs(replay.RIGHT - side * .65) < .035
+    post = exit_strip & (abs(replay.FORWARD - .98) < .035)
+    later = route_for(occupied | post)
+    assert later is not None and later.points[-1][0] > route.points[-1][0]
+
+    blocked = exit_strip & (abs(replay.FORWARD - 1.) < .4)
+    assert route_for(occupied | blocked) is None
