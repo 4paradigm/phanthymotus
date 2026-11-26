@@ -164,6 +164,24 @@ def test_retained_target_can_reassociate_within_the_observation_motion_budget():
     assert original.observed
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_retained_person_does_not_jump_across_the_camera_after_expiry(side):
+    config = _cfg(local_controller="dwa")
+    tracker = T.Tracker()
+
+    def feed(bearing, dt):
+        detections = _detections() if bearing is None else _detections(_obj(name="person", bearing=bearing))
+        return tracker.step(detections=detections, depth=_depth(.85), target="person",
+                            config=config, ego=STILL, dt=dt, retain_identity=True)
+
+    original = feed(.9 * side, .1)
+    assert original.observed
+    assert feed(None, 1.3) is None
+    assert feed(-.8 * side, .1) is None
+    assert feed(.75 * side, .1) is original
+    assert original.observed
+
+
 def test_re_acquisition_rebuilds_velocity_from_the_two_observations():
     """OC-SORT's observation-centric re-update.
 

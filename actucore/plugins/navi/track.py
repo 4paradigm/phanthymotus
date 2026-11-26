@@ -673,7 +673,12 @@ class Tracker:
         if expired and track is not None:
             # A fresh metric match can account for one observation window
             # of motion, even if the original target was hidden much longer.
-            candidates = [candidate for candidate in candidates if candidate["range_measured"]]
+            # Start from the predicted re-entry edge when the target is out
+            # of view. Nearby boxes across the image can pass the metric gate.
+            half_fov = config.half_fov_rad
+            reentry = min(half_fov, max(-half_fov, polar_of(position)[1]))
+            candidates = [candidate for candidate in candidates if candidate["range_measured"]
+                          and abs(polar_of(candidate["point"])[1] - reentry) <= half_fov]
             association_age = min(association_age, config.max_obs_age_ms / 1000)
         matched = (_associate(candidates, config, position, track.cov, association_age, track.hue)
                    if track is not None else _associate(candidates, config, None))

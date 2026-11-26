@@ -468,6 +468,28 @@ def test_speed_gap_checks_previous_route_by_prediction(monkeypatch, blocked):
         assert card._wire_twist == (initial["values"][0], initial["values"][1], initial["values"][5])
 
 
+def test_speed_gap_does_not_renew_through_retained_close_obstacle(monkeypatch):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    initial, = packets
+    work = card._scheduled_command
+    deadline = work.expires_ms
+    stamp = deadline - 40
+    advance_snapshot(snapshot, clock, stamp)
+    objects, depth, odom, _ = snapshot[0]
+    snapshot[0] = objects, depth, dict(odom, vx=None, vy=None, wz=None), stamp
+    scan = card._state.active_scan
+    origin = work.forward_check.motion_guard.pose
+    obstacle = np.isclose(local_path.FORWARD, .10) & np.isclose(local_path.RIGHT, 0.)
+    scan.near_obstacles.remember(origin, obstacle)
+    scan.near_projection = NearProjection(obstacle, local_path.occupied_squares(obstacle), origin, origin.stamp_ms)
+
+    card._dispatch_command()
+    assert packets == [initial]
+    assert work.expires_ms == deadline
+
+
 @pytest.mark.parametrize("new_depth", ["clear", "obstacle", "missing", "repeated"])
 def test_predicted_route_can_send_after_the_original_deadline(monkeypatch, new_depth):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)

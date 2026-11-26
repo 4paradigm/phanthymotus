@@ -2148,7 +2148,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 vantage = scan.views[-1][1]
                 if not scan._already_observed(vantage, 0.):
                     scan.observed_vantages.append(vantage)
-        if (config.use_obstacle_history and config.scan_geometry is None
+        if ((config.use_obstacle_history or config.local_controller == "dwa") and config.scan_geometry is None
                 and geometry is not None and geometry.horizontal is not None):
             target_range = (track.range_m if track is not None and track.range_known else math.inf)
             if anchor is not None:
@@ -2158,7 +2158,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
             approaching = (feedback is not None and (track is not None or anchor is not None)
                            and max(feedback[0], state.commanded[0]) > STILL_LINEAR)
             near_hold = scan.update_near_obstacles(scan_depth, geometry, obstacle_pose, _keepout_m(config), reach,
-                                                   approaching=approaching)
+                                                   approaching=approaching, include_sides=config.use_obstacle_history)
+            if not config.use_obstacle_history:
+                # Retain confirmed obstacles for the sweep. Route visibility
+                # still comes from the newest exposure.
+                scan.near_free = None
             if near_hold is not None:
                 return Decision(_twist(0., 0., 0.), AVOIDING, near_hold.reason)
         if scan.gap_recheck is not None:
@@ -3652,7 +3656,7 @@ def _dwa_motion_inputs(depth, config, state, geometry, target, motion, *, corner
 
     try:
         observed, remembered = (dwa_obstacles(scan, sources, geometry, registration)
-                                if config.use_obstacle_history else ((), ()))
+                                if config.use_obstacle_history else ((), dwa_remembered(sources, registration)))
         if raw is not None or not config.use_obstacle_history:
             cells = (local_path.front_corner_sweep_grid(
                 state.dwa_projection.frame, geometry, _keepout_m(config), raw[1],

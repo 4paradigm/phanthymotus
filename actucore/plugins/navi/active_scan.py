@@ -904,7 +904,7 @@ class ActiveScan:
     def near_projection_pose(self):
         return self.near_projection.origin
 
-    def update_near_obstacles(self, depth, geometry, pose, half_width, lookahead, *, approaching):
+    def update_near_obstacles(self, depth, geometry, pose, half_width, lookahead, *, approaching, include_sides=True):
         memory = self.near_obstacles
         pose = self._near_pose(pose)
         if pose is None:
@@ -937,7 +937,7 @@ class ActiveScan:
                     if front.any():
                         nearest = FORWARD[front].min()
                         selected = front & (FORWARD <= nearest + 2 * RESOLUTION)
-                if self.keep_physical_views:
+                if self.keep_physical_views and include_sides:
                     # Side faces leave the front field of view during a detour.
                     # Accumulate the same multi-exposure votes for nearby faces
                     # outside the straight corridor, with the existing clear rule.

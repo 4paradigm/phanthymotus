@@ -2367,7 +2367,7 @@ class NaviPlugin:
         occupied = policy_mod.dwa_depth_layers(depth, cells, depth_ms, view, registration, self._config)
         occupied += policy_mod.dwa_front_flank_guard(depth, self._config, geometry, now_ms)
         if not self._config.use_obstacle_history:
-            remembered = ()
+            remembered = policy_mod.dwa_remembered(sources, registration)
         elif sources.views and sources.current_frame:
             rolling, remembered = policy_mod.dwa_obstacles(scan, sources, geometry, registration)
             occupied += rolling
@@ -4155,6 +4155,23 @@ class NaviPlugin:
         registration = policy_mod.dwa_registration(None, None, source_ms, now_ms, geometry, rates)
         occupied = (registration.squares(grid[1]),) + policy_mod.dwa_front_flank_guard(
             depth, config, geometry, now_ms)
+        scan = state.active_scan
+        remembered = ()
+        if scan.near_obstacles.has_occupied:
+            if scan.near_projection.origin is None:
+                return None
+            sources = policy_mod.dwa_scene_sources(scan, now_ms, odom)
+            current = policy_mod.dwa_grid_pose(sources, geometry, now_ms, odom)
+            reference = policy_mod.dwa_pose_reference(sources, odom)
+
+            def register_near(stamp, *, grid_pose):
+                return policy_mod.dwa_registration(grid_pose, current, stamp, now_ms, geometry, rates,
+                                                    reference=reference)
+
+            try:
+                remembered = policy_mod.dwa_remembered(sources, register_near)
+            except policy_mod.DwaFrameMismatch:
+                return None
         if direct:
             travel = speed * (config.watchdog_ms + deadline_ms - now_ms + 50) / 1000
             travel += speed ** 2 / (2 * config.motion_braking[0])
@@ -4175,7 +4192,7 @@ class NaviPlugin:
             if self._person_front_too_close(prediction, fronts, geometry, registration, config.stop_distance_m):
                 return None
             if not motion.evaluate_motion(
-                    prediction, footprint=footprint, occupied=occupied, remembered=(),
+                    prediction, footprint=footprint, occupied=occupied, remembered=remembered,
                     supported_region=local_path.SUPPORTED_REGION, original_goal=None,
                     stop_distance_m=0., terminal_boundary=motion.TravelBudget(room)).accepted:
                 return None
@@ -4216,7 +4233,7 @@ class NaviPlugin:
             if not dwa.stays_on_route(route, positions, guard.footprint.half_width):
                 return None
         result = motion.evaluate_motion(
-            prediction, footprint=guard.footprint, occupied=occupied, remembered=(),
+            prediction, footprint=guard.footprint, occupied=occupied, remembered=remembered,
             supported_region=local_path.SUPPORTED_REGION, original_goal=None,
             stop_distance_m=0., terminal_boundary=motion.TravelBudget(room))
         fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
