@@ -2979,7 +2979,8 @@ class NaviPlugin:
                 if accepted.route_points and accepted.motion_guard.pose is not None:
                     self._state.published_dwa_route = accepted
             committed = self._state.committed_route
-            if self._state.published_dwa_route is None and committed is not None:
+            if (self._state.published_dwa_route is None and committed is not None
+                    and self._state.dwa_trace.get("wait_for_committed_route")):
                 self._state.published_dwa_route = committed
             if self._config.local_controller == "dwa" and self._wire_twist is not None:
                 # A preview or an expired candidate did not change the chassis
@@ -3962,15 +3963,12 @@ class NaviPlugin:
             rates += (guard.measured,)
         bounds = tuple(tuple(bound(axis) for axis in zip(*rates)) for bound in (min, max))
         speed = max(math.hypot(*v[:2]) for v in rates)
-        history = (odom or {}).get("velocity_history")
-        if history is None:
-            # A stale latest sample does not invalidate the earlier measured
-            # part of the interval. The uncovered tail uses the wire twist.
-            with self._obs_lock:
-                history = tuple(self._velocity_history)
         unobserved_travel = 0.
         if target_pending:
-            unobserved_travel = odom_mod.travel_since(history, target_ms, now_ms, config.max_feedback_gap_ms, command)
+            # A slowing feedback sample cannot add back distance that could
+            # already have been travelled before this check.
+            speed_cap = math.hypot(config.vx_max, config.vy_max if config.use_lateral else 0.)
+            unobserved_travel = (now_ms - target_ms) * max(speed, speed_cap) / 1000
         motion_room = policy_mod.MAX_PREDICTED_DETOUR_TRAVEL_M - unobserved_travel
         if direct:
             travel = speed * (config.watchdog_ms + deadline_ms - now_ms + 50) / 1000
@@ -4000,8 +3998,7 @@ class NaviPlugin:
             return None
         # Consume the unseen translation from the original path. Camera
         # frames can refresh collision evidence, but cannot reset this room.
-        travelled = odom_mod.travel_since(history, guard.checked_ms, now_ms, config.max_feedback_gap_ms, command)
-        room = dwa.remaining_route_length(route) - travelled
+        room = dwa.remaining_route_length(route) - elapsed * speed
         room -= anchor.error(math.hypot(*route[-1]))
         if target_pending:
             room = min(room, motion_room)

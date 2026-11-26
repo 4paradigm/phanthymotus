@@ -667,12 +667,10 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                        if footprint_mode == "camera_approx" else (0., 0.))
         lookahead = max(.45, x_speed * horizon)
         segments = _route_segments(points)
-        attempts = min(slots, 3 - int(transition_slot))
-        speeds = [x_speed * scale for scale in (1., .75, .5)[:attempts]]
-        for index, nominal in enumerate(speeds):
+        for scale in (1., .75, .5)[:min(slots, 3 - int(transition_slot))]:
             if budget.expired():
                 break
-            tracked = track_route(points, nominal, horizon, yaw_limit,
+            tracked = track_route(points, x_speed * scale, horizon, yaw_limit,
                                   body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
                                   yaw_floor=floors[3])
             if tracked is None:
@@ -684,14 +682,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             diag["sampled_candidates"] += 1
             diag["considered_candidates"] += 1
             prediction = context.predict(command)
-            available = room - route_error
-            required = prediction.body_travel_m + prediction.delay_travel_error
-            if required > available:
+            if prediction.body_travel_m + prediction.delay_travel_error > room - route_error:
                 rejected["insufficient_room"] = rejected.get("insufficient_room", 0) + 1
-                if index + 1 == attempts < slots and available > 0.:
-                    # Try one slower pursuit on the same route. Check the
-                    # complete stop again with the measured incoming speed.
-                    speeds.append(math.hypot(*command[:2]) * min(.9, available / required))
                 continue
             if budget.expired():
                 break

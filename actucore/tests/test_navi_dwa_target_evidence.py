@@ -962,12 +962,11 @@ def test_tick_checks_search_when_target_lost_before_first_send(monkeypatch, body
         assert packet["values"][5] != 0
 
 
-def test_target_loss_between_planning_and_publish_does_not_replace_the_route(monkeypatch):
+def test_active_route_hands_off_to_checked_search_without_a_zero(monkeypatch):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
     card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
     assert card._stage_command(card.next_command(), card._output_epoch)
     assert len(packets) == 1 and packets[0]["values"][0] > 0.
-    route = card._state.committed_route
     advance_snapshot(snapshot, clock, 1050)
     objects, depth, odom, _ = snapshot[0]
     snapshot[0] = dict(objects, timestamp=1.05), depth, odom, 1050
@@ -986,8 +985,7 @@ def test_target_loss_between_planning_and_publish_does_not_replace_the_route(mon
     card._tick()
     assert not card._last_error
     assert len(packets) == 2
-    assert not any(packets[1]["values"])
-    assert card._state.committed_route is route
+    assert packets[1]["values"][:5] == [0.] * 5 and packets[1]["values"][5] != 0.
 
 
 @pytest.mark.parametrize("update", ["confirmed", "duplicate", "unrelated", "obstacle",

@@ -65,23 +65,6 @@ def planar_feedback(odom):
     return motion if all(v is not None for v in motion) else None
 
 
-def travel_since(history, start_ms, now_ms, max_gap_ms, command):
-    """Integrate measured planar travel, filling uncovered time with the wire twist."""
-    commanded_speed = math.hypot(*command[:2])
-    distance = (now_ms - start_ms) * commanded_speed
-    for (before, source, earlier), (after, next_source, later) in zip(history, history[1:]):
-        lo, hi = max(start_ms, before), min(now_ms, after)
-        if (lo >= hi or earlier is None or later is None or after - before > max_gap_ms
-                or (source is not None and next_source is not None
-                    and not 0 < next_source - source <= max_gap_ms)):
-            continue
-        speed = math.hypot(*earlier[:2])
-        change = math.hypot(*later[:2]) - speed
-        average = speed + change * ((lo + hi) / 2 - before) / (after - before)
-        distance += (hi - lo) * (average - commanded_speed)
-    return max(0., distance / 1000)
-
-
 @dataclass(frozen=True)
 class PlanarPose:
     stamp_ms: int

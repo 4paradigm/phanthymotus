@@ -1523,63 +1523,49 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     if max(span) > 3 * body_width:
         return cost, None
     center = ((low + high) / 2 - START) * RESOLUTION
-    from_center = np.array((pivot, 0.)) - center
-    distance = math.hypot(*from_center)
-    # Circumscribe the occupied cells, then add two full chassis widths.
-    radius = math.hypot(*span) / 2 + 2 * body_width
+    forward, lateral = center[0] - pivot, center[1]
+    distance = math.hypot(forward, lateral)
+    # Circumscribe the occupied cells, then add three chassis half widths.
+    radius = math.hypot(*span) / 2 + 3 * body_half_width
+    if distance <= radius:
+        return cost, None
+    bearing = math.atan2(lateral, forward)
+    offset = math.asin(radius / distance)
+    tangents = [angle for angle in (bearing - offset, bearing + offset) if abs(angle) <= math.pi / 2]
+    if not tangents:
+        return cost, None
+    f = FORWARD - FORWARD[start]
+    r = RIGHT - RIGHT[start]
+    travel = np.hypot(f, r)
+    heading = np.arctan2(r, f)
+    error = np.minimum.reduce([np.square(heading - angle) for angle in tangents])
+    entry_length = max(.45, geometry.front + geometry.rear)
+    weight = np.clip((entry_length + RESOLUTION - travel) / RESOLUTION, 0., 1.)
+    cost = np.where(opening, cost, (1. - weight) * cost + weight * 8. * error)
+
     to_target = np.asarray(target) - center
     target_range = math.hypot(*to_target)
-    tangent_goal = None
-    if target_range > radius:
-        # Keep the passing lane from the entrance tangent through rear
-        # clearance, measured along the obstacle-to-target axis.
-        direction = to_target / target_range
-        normal = np.array((-direction[1], direction[0]))
-        forward, right = FORWARD - center[0], RIGHT - center[1]
-        along = forward * direction[0] + right * direction[1]
-        across = abs(forward * normal[0] + right * normal[1])
-        obstacle_end = abs(direction) @ (span / 2)
-        passing_start = -obstacle_end - geometry.front
-        if distance > radius:
-            ratio = radius / distance
-            first_contact = (ratio**2 * (from_center @ direction)
-                             - ratio * math.sqrt(1. - ratio**2) * abs(from_center @ normal))
-            # Leave room to enter the lane on a nearly sideways tangent.
-            if distance < 1.3 * radius:
-                passing_start = max(passing_start, first_contact)
-            else:
-                passing_start = min(passing_start, first_contact)
-        body_clear = obstacle_end + math.hypot(geometry.rear, half_width)
-        # The measured face can hide the back of the obstacle. Stay alongside
-        # until the far side of the expanded circle as well as rear clearance.
-        rear_clear = max(body_clear, radius)
-        slope = radius / math.sqrt(target_range**2 - radius**2)
-        lane_min = abs(normal) @ (span / 2) + half_width + RESOLUTION
-        passing_offset = np.clip((target_range - body_clear) * slope + 2 * RESOLUTION, lane_min, radius)
-        blend = np.clip((along - rear_clear) / half_width, 0., 1.)
-        desired = passing_offset + blend * ((target_range - along) * slope - passing_offset)
-        exit_error = abs(across - desired)
-        guide = (along >= passing_start) & (along <= target_range) & ~opening
-        cost = np.where(guide, 8. * np.square(exit_error / half_width), cost)
-        tangent_goal = guide & (along >= rear_clear) & (exit_error <= RESOLUTION)
-
-    if distance > radius:
-        bearing = math.atan2(-from_center[1], -from_center[0])
-        offset = math.asin(radius / distance)
-        tangents = [angle for angle in (bearing - offset, bearing + offset) if abs(angle) <= math.pi / 2]
-        if tangents:
-            f, r = FORWARD - FORWARD[start], RIGHT - RIGHT[start]
-            travel = np.hypot(f, r)
-            heading = np.arctan2(r, f)
-            error = np.minimum.reduce([np.square(heading - angle) for angle in tangents])
-            entry_length = max(.45, geometry.front + geometry.rear)
-            weight = np.clip((entry_length + RESOLUTION - travel) / RESOLUTION, 0., 1.)
-            # A nearly sideways tangent can force the route backwards to
-            # reach the passing lane. Keep its preference proportional to
-            # the forward room it leaves.
-            weight *= min(1., 2 * math.cos(offset)**2)
-            cost = np.where(opening, cost, (1. - weight) * cost + weight * 8. * error)
-    return cost, tangent_goal
+    if target_range <= radius:
+        return cost, None
+    # Use the obstacle-to-target axis so rotating the camera does not move
+    # the point at which the chassis has passed the measured obstacle.
+    direction = to_target / target_range
+    normal = np.array((-direction[1], direction[0]))
+    forward, right = FORWARD - center[0], RIGHT - center[1]
+    along = forward * direction[0] + right * direction[1]
+    across = abs(forward * normal[0] + right * normal[1])
+    rear_clear = abs(direction) @ (span / 2) + math.hypot(geometry.rear, half_width)
+    slope = radius / math.sqrt(target_range**2 - radius**2)
+    lane_min = abs(normal) @ (span / 2) + half_width + RESOLUTION
+    passing_offset = np.clip((target_range - rear_clear) * slope + 2 * RESOLUTION, lane_min, radius)
+    blend = np.clip((along - rear_clear) / half_width, 0., 1.)
+    tangent_offset = (target_range - along) * slope
+    desired = passing_offset + blend * (tangent_offset - passing_offset)
+    exit_error = abs(across - desired)
+    cost = np.where((along >= 0.) & (along <= target_range) & ~opening,
+                    8. * np.square(exit_error / half_width), cost)
+    exit_region = (along >= rear_clear) & (along <= target_range) & ~opening
+    return cost, exit_region & (exit_error <= RESOLUTION)
 
 
 def clearance_route(grid, geometry, half_width, target, stop, approach_origin, previous=(), *,

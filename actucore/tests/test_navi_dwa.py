@@ -81,27 +81,6 @@ def test_retained_route_sweeps_an_executable_yaw_when_pursuit_falls_below_the_fl
     assert choice.check.reason is None
 
 
-@pytest.mark.parametrize("visible", [True, False])
-def test_short_retained_route_checks_a_slower_stop_without_changing_path(visible):
-    route = ((-.30, .02), (.04, .025), (.216, .006), (.387, -.028), (.555, -.077))
-    checked = []
-
-    def validate(command, trajectory, duration):
-        checked.append(command)
-        return dwa.CandidateCheck(visible, "occluded_prefix")
-
-    diag = {}
-    choice = _run(route, follow_published=True, horizon=1.75, latency_s=.25, route_error=.075,
-                  measured=(.2525, 0., .071), previous=(.25, 0., .058),
-                  target=None, diagnostics=diag, validate_candidate=validate)
-    assert diag["rejected"]["insufficient_room"] == 3
-    assert checked and 0. < checked[-1][0] < .25
-    if visible:
-        assert choice is not None and choice.command == checked[-1]
-    else:
-        assert choice is None and diag["rejected"]["occluded_prefix"] == 1
-
-
 @pytest.mark.parametrize("side", [-1., 1.])
 @pytest.mark.parametrize("arc_clear", [False, True])
 def test_a_bent_route_sweeps_the_declared_turn_floor_before_sending(side, arc_clear):
@@ -978,7 +957,7 @@ def test_isolated_blocker_detour_enters_on_expanded_circle_tangent():
     box = (abs(f - 1.95) <= .201) & (abs(r) <= .251)
     route = local_path.clearance_route((~box, box), _geometry(), .30, (3.05, 0.), .60, (0., 0.),
                                        body_half_width=.25)
-    radius = math.hypot(.225, .275) + 2 * (2 * .25)
+    radius = math.hypot(.225, .275) + 3 * .25
     angle = math.asin(radius / 1.95)
     forward, right = route.points[1]
     assert abs(math.atan2(right, forward)) == pytest.approx(angle, abs=.09)
@@ -1018,10 +997,8 @@ def test_box_detour_holds_passing_lane_until_the_rear_clears():
     route = local_path.clearance_route((~occupied, occupied), geometry, .30, (3.25, 0.), .60,
                                        (0., 0.), body_half_width=.25)
     assert route is not None
-    radius = math.hypot(.425, .325) + 2 * (2 * .25)
-    first_tangent = 1.60 - radius**2 / 1.60
     clear_at = float(f[occupied].max()) + local_path.RESOLUTION / 2 + geometry.rear
-    side = [abs(right) for forward, right in route.topology if first_tangent <= forward < clear_at]
+    side = [abs(right) for forward, right in route.topology if 1.60 <= forward < clear_at]
     assert len(side) > 2
     assert all(after >= before - 1e-9 for before, after in zip(side, side[1:]))
 
@@ -1033,8 +1010,8 @@ def test_compact_detour_exit_follows_the_tangent_toward_the_target():
     route = local_path.clearance_route((~occupied, occupied), _geometry(), .30, (goal, 0.), .60,
                                        (0., 0.), body_half_width=.25)
     assert route is not None
-    radius = math.hypot(.325, .175) + 2 * (2 * .25)
+    radius = math.hypot(.325, .175) + 3 * .25
     slope = math.tan(math.asin(radius / (goal - box_center)))
-    exit_leg = [(forward, right) for forward, right in route.topology if forward >= box_center + radius + .30]
+    exit_leg = [(forward, right) for forward, right in route.topology if forward >= 2.5]
     assert len(exit_leg) >= 4
     assert all(abs(abs(right) - (goal-forward)*slope) <= .1 for forward, right in exit_leg)
