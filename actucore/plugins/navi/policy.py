@@ -768,6 +768,7 @@ class State:
     published_camera_passage: CameraPassage | None = None
     committed_route: DwaAcceptance | None = None
     parking_hold_generation: int | None = None
+    parking_target_generation: int | None = None
     route_in_view: Detour | None = None
     dwa_handoff_yaw_step: float = 0.
     dwa_motion_guard: DwaMotionGuard | None = None
@@ -1715,6 +1716,10 @@ def _parking_alignment(depth, config, state, odom, distance, bearing, measured, 
     if depth.get("map") is None or (not observed and state.goal_anchor is None):
         return Decision(stop, AVOIDING, "已到预计停车范围，等待实际测距",
                         distance_m=distance, bearing=bearing)
+    track = state.tracker.track
+    if (config.local_controller == "dwa" and state.target == "person" and track is not None
+            and observed and measured is not None and measured <= config.arrival_distance_m + 1e-6):
+        state.parking_target_generation = track.generation
     parking_range = measured if measured is not None else distance
     if parking_range < config.arrival_min_distance_m - 1e-6:
         return Decision(stop, AVOIDING, "已在目标停车圆环内侧，保持停车",
@@ -1897,10 +1902,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
         # Out-of-order receipts cannot vote for confirming a person.
         detections = None
     committed = state.committed_route
-    retained_target = (state.tracker.track is not None and committed is not None
-                       and committed.locks_detour and committed.motion_guard is not None
-                       and state.tracker.track.generation == committed.motion_guard.generation
-                       and state.target == "person" and config.local_controller == "dwa")
+    current_track = state.tracker.track
+    # The measured parking target outlives the detour that brought us to it.
+    retained_target = (current_track is not None and state.target == "person" and config.local_controller == "dwa"
+                       and (current_track.generation == state.parking_target_generation
+                            or (committed is not None and committed.locks_detour and committed.motion_guard is not None
+                                and current_track.generation == committed.motion_guard.generation)))
     track = state.tracker.step(detections=detections, depth=depth,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt,
@@ -3879,8 +3886,14 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     yaw_limit = (0., 0.) if branch == "direct" else (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
     track = state.tracker.track
     view_bearing = None
-    if (config.use_lateral and branch in ("route", "reachable_prefix") and target_bearing is not None
-            and not any(ref.corridor_corner or ref.passage_exit is not None for ref in routes)):
+    lateral_detour = (config.use_lateral and branch in ("route", "reachable_prefix")
+                      and not any(ref.corridor_corner or ref.passage_exit is not None for ref in routes))
+    camera_detour = lateral_detour and mode == "camera_approx"
+    if camera_detour and inputs.footprint.clearance_margin_m < local_path.RESOLUTION:
+        # Reserve a full cell around the estimated footprint during open detours.
+        # Measured openings keep the existing footprint and corridor checks.
+        inputs = replace(inputs, footprint=replace(inputs.footprint, clearance_margin_m=local_path.RESOLUTION))
+    if lateral_detour and target_bearing is not None:
         yaw_limit = dwa.view_yaw_limits(yaw_limit, target_bearing, config.half_fov_rad,
                                         inputs.prediction_horizon_s)
         if (track is not None and track.observed and abs(target_bearing) > config.half_fov_rad / 2
@@ -3922,6 +3935,7 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         diagnostics=diagnostics, alternate_routes=tuple(ref.points for ref in alternates),
         candidate_budget=state.dwa_budget, motion_frame=(scan.motion_frame, inputs.pose), guidance=guidance,
         follow_published=follow_published, route_error=route_error,
+        steering_horizon=config.dwa_horizon_s if camera_detour else None,
         handoff_yaw_step=state.dwa_handoff_yaw_step if not visual else 0.,
         retry_from_rest=(recovery and scan.dwa_failures > 0 and not any(inputs.previous)
                          and math.hypot(*inputs.measured[:2]) <= config.scan_odom_linear_tolerance_mps))
@@ -4078,6 +4092,25 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
                 proposal = _dwa_detour(depth, config, state, continuation, distance, bearing,
                                        speed_limit=speed_limit, follow_published=True)
     if proposal is None:
+        reason = state.dwa_trace.get("fallback_reason")
+        blocked = state.dwa_trace.get("rejected", {}).keys() & {"footprint_collision", "remembered_obstacle"}
+        if (locked and config.use_lateral and not config.use_obstacle_history and geometry.front == 0.
+                and exit_line is None and not route.corridor_corner and not corner_only
+                and reason in ("no_admissible_candidates", "initial_remembered_overlap") and blocked
+                and distance is not None and bearing is not None and current_target_observed(state)
+                and track.generation == guard.generation and scan.new_dwa_view()):
+            scan.dwa_failures += 1
+            # Repeated fresh sweeps can invalidate a committed path. Keep the
+            # old route until a replacement passes a complete sweep from rest.
+            if (scan.dwa_failures >= 3 and math.hypot(*scan.motion[:2]) <= STILL_LINEAR
+                    and abs(scan.motion[2]) <= STILL_YAW):
+                ahead = projected_forward_clearance(scan.grid()[1], geometry, config)
+                if ahead is not None and ahead + FORWARD_CLEARANCE_MARGIN_M < distance:
+                    side = state.escape_side or 1.
+                    replanned = _start_detour_segment(depth, config, state, geometry, ahead, (side, -side),
+                                                     distance, bearing, closest=True, dwa_only=True)
+                    if isinstance(replanned, tuple):
+                        return replanned
         if (remaining > 2 * local_path.RESOLUTION
                 and state.dwa_trace.get("fallback_reason") == "search_deadline"):
             state.dwa_trace["wait_for_committed_route"] = True

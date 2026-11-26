@@ -53,6 +53,17 @@ def observe_selector(monkeypatch):
     return calls
 
 
+def test_lateral_camera_detour_checks_an_extra_footprint_margin(monkeypatch):
+    config, state, depth, odom = observation_case(body=False, attempted=False)
+    config.use_lateral = True
+    calls = observe_selector(monkeypatch)
+    policy.step(detections=None, depth=depth, odom=odom, config=config, state=state, dt=.1)
+    assert calls
+    choices = [kwargs["footprint"] for kwargs, _ in calls]
+    assert any(footprint.clearance_margin_m == local_path.RESOLUTION for footprint in choices)
+    assert config.clearance_margin_m == pytest.approx(.02)
+
+
 def card_for_case(monkeypatch, config, state, depth, odom):
     packets = []
     card = plugin.NaviPlugin({}, executor=None)

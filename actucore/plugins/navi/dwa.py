@@ -433,7 +433,7 @@ def view_yaw_limits(limits, bearing, half_fov, horizon):
 
 
 def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None, yaw_floor=0.,
-                view_bearing=None):
+                view_bearing=None, steering_horizon=None):
     """Track the finite visible polyline in the current forward/right grid."""
     segments = _route_segments(points)
     remaining = remaining_route_length(points, segments=segments)
@@ -453,7 +453,8 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
         # Preserve the requested curvature at a tight bend when yaw saturates.
         yaw_cap = -yaw_limit[0] if r > 0. else yaw_limit[1]
         speed = min(speed, yaw_cap * (f * f + r * r) / (2. * abs(r)))
-    vx, vy, wz = _preferred_command(((0., 0.), (f, r)), speed, horizon, yaw_limit, differential=not lateral)
+    turn_horizon = horizon if steering_horizon is None else steering_horizon
+    vx, vy, wz = _preferred_command(((0., 0.), (f, r)), speed, turn_horizon, yaw_limit, differential=not lateral)
     if 0. < abs(wz) < yaw_floor:
         # A lateral offset resolved by the grid needs steering, even at low speed.
         minimum = math.copysign(yaw_floor, wz)
@@ -462,7 +463,7 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
     if lateral and view_bearing is not None and wz * view_bearing >= 0.:
         # Sideways translation follows the route while the chassis keeps the
         # camera on the target. The caller still sweeps this exact twist.
-        correction = -math.copysign(max(yaw_floor, abs(view_bearing) / (2. * horizon)), view_bearing)
+        correction = -math.copysign(max(yaw_floor, abs(view_bearing) / (2. * turn_horizon)), view_bearing)
         if yaw_limit[0] <= correction <= yaw_limit[1]:
             wz = correction
     return (vx, vy, wz), remaining
@@ -551,7 +552,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            supported_region=None, terminal_boundary=None, occupied=None, alternate_routes=(),
            candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None,
            measured_standoff_m=None, preferred_standoff_m=None, view_bearing=None,
-           guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0., retry_from_rest=False) -> Choice | None:
+           guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0., retry_from_rest=False,
+           steering_horizon=None) -> Choice | None:
     """Select a legal target velocity whose complete predicted stop is admissible.
 
     Routes, occupied cells and targets share the current grid frame. Each
@@ -621,7 +623,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     clearance_costs = tuple(local_path.route_clearance_cost(ref, route_obstacles, geometry, half_width) for ref in routes)
     route_cost_sum = tuple(change + clearance for change, clearance in zip(route_costs, clearance_costs))
     nominal = min(max(x_speed, y_speed), .35)
-    preferred = tuple(_preferred_command(ref, nominal, horizon, yaw_limit,
+    turn_horizon = horizon if steering_horizon is None else steering_horizon
+    preferred = tuple(_preferred_command(ref, nominal, turn_horizon, yaw_limit,
                                          differential=guidance and not y_speed and footprint_mode == "body")
                       for ref in references)
 
@@ -715,7 +718,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 break
             tracked = track_route(points, x_speed * scale, horizon, steering,
                                   body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
-                                  yaw_floor=floors[3], view_bearing=view_bearing)
+                                  yaw_floor=floors[3], view_bearing=view_bearing, steering_horizon=steering_horizon)
             if tracked is None:
                 break
             command, room = tracked

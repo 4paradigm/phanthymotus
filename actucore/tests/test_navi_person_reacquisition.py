@@ -2,6 +2,7 @@
 import numpy as np
 import pytest
 
+from plugins.navi import policy
 from test_navi_dwa_publish import advance_snapshot, observation_card
 
 
@@ -102,6 +103,28 @@ def test_new_depth_can_finish_recovery_between_detector_frames(monkeypatch):
     assert card._last_decision.dwa_acceptance is not None
     card._publish_command(command)
     assert packets[-1]["values"][0] > 0.
+
+
+def test_confirmed_person_cannot_be_replaced_during_parking_alignment(monkeypatch):
+    card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card.next_command()
+    state = card._state
+    original = state.tracker.track
+    assert state.dwa_target_receipt[0] == original.generation
+    # Parking alignment can outlive the route that brought the robot to the ring.
+    state.committed_route = state.published_dwa_route = state.goal_anchor = None
+    _, depth, odom, _ = snapshot[0]
+    policy._parking_alignment(depth, card._config, state, odom, .78, .8, .78, True)
+    other = {"name": "person", "position": [.85, -.6], "confidence": .95}
+
+    for stamp in range(1100, 2601, 100):
+        advance_snapshot(snapshot, clock, stamp, vx=0.)
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = {"timestamp": stamp / 1000, "objects": [other]}, depth, odom, stamp
+        card.next_command()
+
+    assert state.tracker.track is original
+    assert not original.observed
 
 
 @pytest.mark.parametrize("stale_stamp,stale_receipt", [(1.04, 1060), (1.06, 1040)])

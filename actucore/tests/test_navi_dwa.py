@@ -48,6 +48,17 @@ def test_lateral_route_chooses_lateral_velocity_and_keeps_original_target():
     assert choice.progress > 0.
 
 
+def test_route_turning_horizon_does_not_change_the_braking_room_limit():
+    route = ((0., 0.), (.4, .3))
+    settings = dict(body_origin=(0., 0.), lateral=True, lookahead_m=.45)
+    previous, room = dwa.track_route(route, .30, 2.4, (-.8, .8), **settings)
+    command, same_room = dwa.track_route(route, .30, 2.4, (-.8, .8),
+                                        steering_horizon=1.2, **settings)
+    assert same_room == room
+    assert command[:2] == pytest.approx(previous[:2])
+    assert command[2] == pytest.approx(2 * previous[2])
+
+
 @pytest.mark.parametrize("side", [-1., 1.])
 @pytest.mark.parametrize("follow_published", [False, True])
 def test_lateral_detour_keeps_steering_authority_toward_the_target(side, follow_published):

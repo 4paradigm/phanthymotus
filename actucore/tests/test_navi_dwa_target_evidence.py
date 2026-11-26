@@ -1271,3 +1271,32 @@ def test_committed_detour_replans_when_old_odometry_frame_cannot_register(monkey
     assert not state.dwa_trace.get("retained_route")
     guard = card._last_decision.dwa_acceptance.motion_guard
     assert guard.pose.frame != old_pose.frame and guard.check.accepted and guard.trace.stopped
+
+
+def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypatch):
+    from plugins.navi import policy
+
+    card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    state = card._state
+    route = state.committed_route
+    assert route.locks_detour and route.passage_exit is None
+
+    def blocked(*args, **kwargs):
+        state.dwa_trace.update(fallback_reason="no_admissible_candidates", rejected={"footprint_collision": 4})
+        return None
+
+    replans = []
+    monkeypatch.setattr(policy, "_dwa_detour", blocked)
+    monkeypatch.setattr(policy, "projected_forward_clearance", lambda *args: 1.)
+    monkeypatch.setattr(policy, "_start_detour_segment", lambda *args, **kwargs: replans.append(args))
+    for stamp, depth_stamp in ((1100, 1100), (1200, 1100), (1300, 1300), (1400, 1400)):
+        advance_snapshot(snapshot, clock, stamp, vx=0.)
+        objects, depth, odom, _ = snapshot[0]
+        depth.update(frame_id=depth_stamp, source_frame_id=depth_stamp, capture_ms=depth_stamp)
+        snapshot[0] = dict(objects, timestamp=stamp / 1000), depth, odom, stamp
+        card.next_command()
+        assert len(replans) == int(stamp == 1400)
+        assert state.committed_route is route

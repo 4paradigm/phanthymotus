@@ -4674,8 +4674,9 @@ class NaviPlugin:
         track = self._state.tracker.track
         view_bearing = None
         blocker_exit = origin.acceptance.blocker_exit
-        if (cfg.use_lateral and origin.acceptance.locks_detour and not origin.acceptance.corridor_corner
-                and origin.acceptance.passage_exit is None and track is not None
+        camera_detour = (cfg.use_lateral and origin.acceptance.locks_detour
+                         and not origin.acceptance.corridor_corner and origin.acceptance.passage_exit is None)
+        if (camera_detour and track is not None
                 and track.generation == original.generation and track.observed and track.navigation_range_known):
             yaw_limit = dwa.view_yaw_limits(yaw_limit, track.bearing_rad, cfg.half_fov_rad,
                                             original.prediction_horizon_s)
@@ -4693,7 +4694,8 @@ class NaviPlugin:
             tracked = dwa.track_route(
                 points, nominal * scale, original.prediction_horizon_s, steering,
                 body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral,
-                yaw_floor=cfg.floor_wz_moving, view_bearing=view_bearing)
+                yaw_floor=cfg.floor_wz_moving, view_bearing=view_bearing,
+                steering_horizon=cfg.dwa_horizon_s if camera_detour and check.geometry.front == 0. else None)
             if tracked is None:
                 break
             (vx, vy, wz), room = tracked
