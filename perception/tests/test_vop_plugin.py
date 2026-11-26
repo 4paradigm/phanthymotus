@@ -25,6 +25,7 @@ from vision_stubs import (  # noqa: F401
 )
 
 import plugins.vop as vop_plugin  # noqa: E402
+from plugins.vop_tracking import _Track  # noqa: E402
 from plugins.vision_runtime import LetterboxMeta  # noqa: E402
 
 
@@ -379,7 +380,38 @@ def test_low_confidence_detections_are_dropped():
     assert json.loads(pub.messages[0])["objects"] == []
 
 
-def test_stream_can_publish_tracking_preview_with_bboxes_disabled():
+@pytest.mark.parametrize("source_fps,target_fps,expected", [
+    (9, 10, 90), (15, 10, 100), (16, 10, 100),
+    (15, 15, 150), (16, 15, 150), (30, 15, 150),
+])
+def test_frame_throttle_keeps_its_rate_with_camera_jitter(
+        monkeypatch, source_fps, target_fps, expected):
+    import math
+
+    now = 10.0
+    monkeypatch.setattr(
+        vop_plugin, "time", SimpleNamespace(time=time.time, monotonic=lambda: now)
+    )
+    node = vop_plugin._VOPNode(
+        "/cam/rgb", _FakeModel(), confidence=0.3, fps=target_fps, node_suffix="frame_throttle"
+    )
+    message = _FakeCompressedImage()
+    accepted = 0
+    for index in range(source_fps * 10):
+        now = 10 + index / source_fps + 0.0015 * math.sin(index * 2.4)
+        node._image_cb(message)
+        if not node._frame_queue.empty():
+            assert node._frame_queue.get_nowait() is message
+            accepted += 1
+    assert expected - 1 <= accepted <= expected + 1
+
+
+@pytest.mark.parametrize("width,height,preview_width,preview_height", [
+    (200, 100, 200, 100),
+    (1600, 800, 960, 480),
+])
+def test_stream_can_publish_tracking_preview_with_bboxes_disabled(
+        width, height, preview_width, preview_height):
     import cv2
 
     plugin, executor = _plugin(
@@ -387,7 +419,7 @@ def test_stream_can_publish_tracking_preview_with_bboxes_disabled():
         model=_FakeModel(rows=[[40, 40, 100, 90, 0.9, 1]]),
     )
     node = _node_with(plugin, executor)
-    source = _FakeCompressedImage(frame_bytes(200, 100))
+    source = _FakeCompressedImage(frame_bytes(width, height))
     source.header.stamp = 123456
     source.header.frame_id = "camera_rgb_optical_frame"
     node._image_cb(source)
@@ -403,11 +435,50 @@ def test_stream_can_publish_tracking_preview_with_bboxes_disabled():
     assert info["topic_out"][1] == {"topic": image_pub.topic, "format": "image/jpeg"}
     jpeg = image_pub.messages[0]
     image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-    assert image.shape == (100, 200, 3)
+    assert image.shape == (preview_height, preview_width, 3)
     # The label touches the top edge. Its text rasterization and JPEG
     # artifacts differ across OpenCV builds, so check the unobstructed edge.
-    bottom_edge = image[88:93, 48:93]
-    assert np.count_nonzero(bottom_edge.max(axis=2) > 100) >= 40
+    y = round(90 * preview_height / height)
+    x0, x1 = (round(x * preview_width / width) for x in (48, 93))
+    bottom_edge = image[y - 2:y + 3, x0:x1]
+    assert np.count_nonzero(bottom_edge.max(axis=2) > 100) >= x1 - x0
+
+
+def test_independent_track_filter_matches_the_dense_kalman_update():
+    box = np.array([10., 20., 60., 100.])
+    track = _Track(box, class_id=0, now=0.0)
+    mean = np.array([35., 60., 50., 80., 0., 0., 0., 0.])
+    covariance = np.diag([8. ** 2] * 4 + [80. ** 2] * 4)
+    identity = np.eye(8)
+    observe = identity[:4]
+    previous = 0.0
+    for now, offsets in [(0.15, [4, 3, 7, 1]), (0.5, [11, -2, 8, 4]), (1.0, [21, 1, 19, 7])]:
+        dt = now - previous
+        transition = identity.copy()
+        transition[:4, 4:] = np.eye(4) * dt
+        acceleration = np.vstack((np.eye(4) * (dt ** 2 / 2), np.eye(4) * dt))
+        covariance = transition @ covariance @ transition.T + mean[3] ** 2 * (
+            acceleration @ acceleration.T
+        )
+        mean = transition @ mean
+        track.predict(now)
+        np.testing.assert_allclose(track.mean, mean, atol=1e-10)
+
+        observed_box = box + offsets
+        measurement = np.r_[(observed_box[:2] + observed_box[2:]) / 2,
+                            observed_box[2:] - observed_box[:2]]
+        noise = np.eye(4) * (0.05 * measurement[3]) ** 2
+        cross = covariance @ observe.T
+        gain = np.linalg.solve(observe @ cross + noise, cross.T).T
+        mean += gain @ (measurement - observe @ mean)
+        residual = identity - gain @ observe
+        covariance = residual @ covariance @ residual.T + gain @ noise @ gain.T
+        track.correct(observed_box, now)
+        np.testing.assert_allclose(track.mean, mean, atol=1e-10)
+        np.testing.assert_allclose(track._position_variance, covariance.diagonal()[:4])
+        np.testing.assert_allclose(track._velocity_variance, covariance.diagonal()[4:])
+        np.testing.assert_allclose(track._position_velocity_covariance, covariance[:4, 4:].diagonal())
+        previous = now
 
 
 def test_info_declares_overlay_for_configured_instance_before_start():

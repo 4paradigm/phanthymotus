@@ -411,7 +411,7 @@ class _VOPNode(Node):
         self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
-        self._last_inference_time = 0.0
+        self._next_frame_time: Optional[float] = None
         self._detect_count = 0
         self._tracker = VOPTracker()
         self._running = False
@@ -482,9 +482,16 @@ class _VOPNode(Node):
 
     def _image_cb(self, msg: CompressedImage):
         now = time.monotonic()
-        if now - self._last_inference_time < self._frame_interval:
-            return
-        self._last_inference_time = now
+        due = self._next_frame_time
+        if due is not None:
+            # Small camera-arrival jitter should not halve the effective rate
+            # when the configured FPS matches that of the camera.
+            tolerance = min(0.005, self._frame_interval / 10)
+            if now < due - tolerance:
+                return
+            if now >= due + self._frame_interval:
+                due = now
+        self._next_frame_time = (now if due is None else due) + self._frame_interval
         # Drop old frame if queue full (no backpressure)
         try:
             self._frame_queue.put_nowait(msg)
@@ -538,6 +545,11 @@ class _VOPNode(Node):
         palette = ((67, 220, 250), (230, 167, 71), (110, 225, 110),
                    (190, 114, 244), (250, 190, 95), (112, 148, 255))
         height, width = frame.shape[:2]
+        if width > 960:
+            preview_height = max(1, round(height * 960 / width))
+            frame = cv2.resize(frame, (960, preview_height), interpolation=cv2.INTER_AREA)
+            boxes = boxes * np.array([960 / width, preview_height / height] * 2)
+            height, width = preview_height, 960
         scale = max(0.5, width / 1920)
         stroke = max(2, round(scale * 3))
         for box, obj in zip(boxes, objects):

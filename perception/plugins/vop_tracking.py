@@ -11,8 +11,6 @@ import numpy as np
 
 
 LOW_CONFIDENCE = 0.1
-_IDENTITY = np.eye(8)
-_OBSERVE = _IDENTITY[:4]
 
 
 class _Track:
@@ -22,7 +20,12 @@ class _Track:
         self.active = True
         self.mean = np.r_[self._measurement(box), np.zeros(4)]
         scale = max(self.mean[3], 1.0)
-        self.covariance = np.diag([(.1 * scale) ** 2] * 4 + [scale ** 2] * 4)
+        # Each measured axis and its velocity form an independent 2x2 block.
+        # Keep those blocks separately to avoid a tiny threaded BLAS solve
+        # for every detection on Jetson.
+        self._position_variance = np.full(4, (0.1 * scale) ** 2)
+        self._velocity_variance = np.full(4, scale ** 2)
+        self._position_velocity_covariance = np.zeros(4)
 
     @staticmethod
     def _measurement(box: np.ndarray) -> np.ndarray:
@@ -36,24 +39,34 @@ class _Track:
 
     def predict(self, now: float) -> None:
         dt = now - self.predicted_at
-        transition = _IDENTITY.copy()
-        transition[np.arange(4), np.arange(4, 8)] = dt
-        acceleration = np.vstack((np.eye(4) * (dt ** 2 / 2), np.eye(4) * dt))
-        scale = max(self.mean[3], 1.0)
-        self.mean = transition @ self.mean
-        self.covariance = (transition @ self.covariance @ transition.T
-                           + scale ** 2 * (acceleration @ acceleration.T))
+        acceleration_variance = max(self.mean[3], 1.0) ** 2
+        position_step = dt ** 2 / 2
+        self.mean[:4] += dt * self.mean[4:]
+        self._position_variance += (
+            2 * dt * self._position_velocity_covariance
+            + dt ** 2 * self._velocity_variance
+            + acceleration_variance * position_step ** 2
+        )
+        self._position_velocity_covariance += (
+            dt * self._velocity_variance + acceleration_variance * position_step * dt
+        )
+        self._velocity_variance += acceleration_variance * dt ** 2
         self.predicted_at = now
 
     def correct(self, box: np.ndarray, now: float) -> None:
         measurement = self._measurement(box)
-        noise = np.eye(4) * max(0.05 * measurement[3], 0.1) ** 2
-        cross_covariance = self.covariance @ _OBSERVE.T
-        innovation_covariance = _OBSERVE @ cross_covariance + noise
-        gain = np.linalg.solve(innovation_covariance, cross_covariance.T).T
-        self.mean += gain @ (measurement - _OBSERVE @ self.mean)
-        residual = _IDENTITY - gain @ _OBSERVE
-        self.covariance = residual @ self.covariance @ residual.T + gain @ noise @ gain.T
+        noise = max(0.05 * measurement[3], 0.1) ** 2
+        innovation_variance = self._position_variance + noise
+        position_gain = self._position_variance / innovation_variance
+        velocity_gain = self._position_velocity_covariance / innovation_variance
+        innovation = measurement - self.mean[:4]
+        self.mean[:4] += position_gain * innovation
+        self.mean[4:] += velocity_gain * innovation
+        self._velocity_variance -= velocity_gain * self._position_velocity_covariance
+        # Equivalent to the Joseph update for each independent block, with
+        # no subtraction of nearly equal position variances.
+        self._position_velocity_covariance *= noise / innovation_variance
+        self._position_variance = position_gain * noise
         self.last_seen = now
         self.active = True
 

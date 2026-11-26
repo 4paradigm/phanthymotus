@@ -3222,6 +3222,9 @@ Enable `publish_overlay` on a VOP instance to watch the tracked boxes and
 `class #ID` labels on the same video frame. The second output
 `<input>/objects/overlay_img` is an `image/jpeg` stream. It is off by default
 to avoid the extra JPEG encode and works independently of `publish_bbox`.
+The preview is resized to at most 960 pixels wide before drawing and encoding.
+The detector input and the coordinates in the JSON output retain their original
+meaning.
 
 Two knobs govern what one detected object costs on the topic. **They affect the
 stream only** — `recognize` / `recognize_by_url` always answer in full, because
