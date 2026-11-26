@@ -2,8 +2,8 @@
 
 A Channel-level policy (``chat_only`` on the channel config), never a platform
 one: it narrows what a turn may *do*. Such turns share the system prompt and
-environment; human Channel conversation history is scoped by sender and role,
-as it is for other Channel turns.
+environment, while their history is scoped by sender and role. Ordinary
+operator/owner Channel turns use the main agent's shared history.
 """
 
 

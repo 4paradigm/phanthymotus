@@ -386,7 +386,7 @@ class SubagentManager:
             agent.cancel('originating Channel conversation is no longer authorized')
         origin_token = channel_context.current.set(origin)
         history_token = chat_history.current_channel_context.set(
-            channel_context.context_key(origin) if origin else None)
+            channel_context.history_context(origin))
         agent_id = agent.id
         try:
             result = await agent.run(self._llm_client)

@@ -537,46 +537,6 @@ def _split_by_authorization(events: list[dict]) -> list[list[dict]]:
     return batches
 
 
-def _chat_history_blocks(batch: list[dict]) -> str:
-    """Prepend each distinct (channel_id, chat_id)'s own recent recap (see
-    channel/manager.py:get_chat_history) ahead of this batch's <event> blocks.
-
-    This recap is an upgrade fallback for conversations without a persisted
-    scoped session. The dispatcher omits it when full Channel history is restored.
-    """
-    from channel.manager import manager as channel_manager
-    seen = set()
-    blocks = []
-    for payload in _channel_payloads(batch):
-        channel_id = payload.get('channel_id')
-        chat_id = payload.get('chat_id')
-        if not isinstance(channel_id, str) or not isinstance(chat_id, str):
-            continue
-        if not channel_id or not chat_id or (channel_id, chat_id) in seen:
-            continue
-        seen.add((channel_id, chat_id))
-        user_id = payload.get('user_id')
-        user_role = payload.get('user_role')
-        sender_type = payload.get('sender_type') or 'user'
-        if not user_id:
-            continue
-        # Filter before applying the recap limit; another sender's traffic
-        # must not hide entries which are still retained for this user.
-        history = channel_manager.get_chat_history(
-            channel_id, chat_id, user_id=user_id, user_role=user_role, sender_type=sender_type)
-        if not history:
-            continue
-        lines = []
-        for entry in history:
-            label = f' ({entry["user_label"]})' if entry.get('user_label') else ''
-            lines.append(f'{entry.get("role", "user")}{label}: {entry.get("text", "")}')
-        blocks.append(
-            f'<chat_history channel="{channel_id}" chat_id="{chat_id}">\n'
-            + '\n'.join(lines) + '\n</chat_history>'
-        )
-    return '\n'.join(blocks)
-
-
 def _build_trigger(batch: list[dict], urgent: bool) -> dict:
     channel_ids = []
     for payload in _channel_payloads(batch):
@@ -608,7 +568,6 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_viewer_channel_event': has_viewer_only_channel_event(batch),
         '_channel_event': any(_is_channel_event(event) for event in batch),
         '_channel_scope': channel_scope(batch),
-        '_channel_trigger_text': formatted,
         '_channel_message_ids': channel_message_ids(batch),
         '_channel_image_paths': channel_image_paths(batch),
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
@@ -1038,13 +997,15 @@ async def _drain_loop():
                 import hooks
                 asyncio.create_task(hooks.fire('on_kws_wakeup'))
 
-        # Ring buffer 始终存储（所有事件，供 raw_input_info 查询）
-        if '_channel_origin' not in ev:
+        # Restricted followups stay out of the shared raw-input/BG context.
+        restricted_origin = ('_channel_origin' in ev
+                             and context.history_context(ev['_channel_origin']) is not None)
+        if not restricted_origin:
             if source not in _source_ring:
                 _source_ring[source] = deque(maxlen=ring_size)
             _source_ring[source].append(ev)
 
-        if priority <= 0 and '_channel_origin' in ev:
+        if priority <= 0 and restricted_origin:
             continue  # A silent Channel completion must not enter shared BG context.
 
         if priority > 0:

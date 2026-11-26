@@ -36,13 +36,6 @@ _FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
 viewer_reply_scope: ContextVar[tuple[frozenset[str], frozenset[str]] | None] = ContextVar(
     'viewer_reply_scope', default=None)
 
-# 单个 chat 自己的最近往来回顾——独立于全局共享的 `self._turns`（event/llm.py）。
-# agent-core 的对话历史是进程级单例，不区分 channel/chat_id/user；飞书本身也不
-# 替应用保留多轮上下文语义。没有这一层，两个人几乎同时私聊/群聊时，模型看到的
-# 历史会把不同人的对话混在一起，可能把 A 的上下文答给 B。
-_CHAT_HISTORY_LIMIT = 12
-_CHAT_HISTORY_TEXT_MAX = 500
-
 # Bot-to-Bot 主动发起（trusted_bot_id 路径）的粗粒度频率熔断。PR #134 的设计里
 # 明确没有轮次/时间熔断，靠双方"是否还有具体任务"自觉停止——这里加一层兜底，
 # 避免可信 Bot 之间因为逻辑错误互相无限 @ 下去，把 LLM 拖入死循环。
@@ -285,60 +278,6 @@ class ChannelManager:
         window.append(now)
         self._mention_rate[key] = window
         return True
-
-    # ── Per-chat context recap ───────────────────────────────────────────────
-    #
-    # 独立于 event/llm.py 里进程级共享的 `self._turns`：那条历史线不区分
-    # channel/chat_id/user，这里额外维护"这个会话自己的最近往来"，随 trigger
-    # 一起喂给模型，降低不同会话上下文被混用的风险（详见模块顶部注释）。
-
-    def _record_chat_exchange(self, channel_id: str, chat_id: str, role: str, text: str, *,
-                              user_label: str = '', user_id: str = '',
-                              user_role: str = '', sender_type: str = ''):
-        if not channel_id or not chat_id or not text:
-            return
-        all_history = config.main.get('channel_chat_history', {})
-        if not isinstance(all_history, dict):
-            all_history = {}
-        channel_history = all_history.get(channel_id, {})
-        if not isinstance(channel_history, dict):
-            channel_history = {}
-        entries = channel_history.get(chat_id, [])
-        if not isinstance(entries, list):
-            entries = []
-        entries = entries + [{
-            'role': role,
-            'text': text[:_CHAT_HISTORY_TEXT_MAX],
-            'user_label': user_label,
-            'user_id': user_id,
-            'user_role': user_role,
-            'sender_type': sender_type,
-            'ts': time.time(),
-        }]
-        channel_history[chat_id] = entries[-_CHAT_HISTORY_LIMIT:]
-        all_history[channel_id] = channel_history
-        config.main['channel_chat_history'] = all_history
-
-    def get_chat_history(self, channel_id: str, chat_id: str, limit: int = 6, *,
-                         user_id: str | None = None, user_role: str | None = None,
-                         sender_type: str | None = None) -> list[dict]:
-        """Return this chat's own recent exchanges (oldest first), independent of the
-        shared global turn history."""
-        all_history = config.main.get('channel_chat_history', {})
-        if not isinstance(all_history, dict):
-            return []
-        channel_history = all_history.get(channel_id, {})
-        if not isinstance(channel_history, dict):
-            return []
-        entries = channel_history.get(chat_id, [])
-        if not isinstance(entries, list):
-            return []
-        valid = [e for e in entries if isinstance(e, dict) and isinstance(e.get('text'), str)]
-        if user_id is not None:
-            valid = [e for e in valid if e.get('user_id') == user_id
-                     and e.get('user_role') == user_role
-                     and e.get('sender_type') == sender_type]
-        return valid[-limit:]
 
     # ── Persistent conversation context ──────────────────────────────────────
 

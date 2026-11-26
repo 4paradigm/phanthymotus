@@ -17,6 +17,18 @@ def context_key(origin: dict) -> str:
     return json.dumps(scope, ensure_ascii=False, separators=(',', ':'))
 
 
+def history_context(origin: dict | None) -> str | None:
+    """Full-control turns share main memory; restricted turns use their own history."""
+    if origin is None:
+        return None
+    key = context_key(origin)
+    if key:
+        scope = origin['_channel_scope']
+        if scope[4] in ('operator', 'owner') and not scope[5]:
+            return None
+    return key  # An unknown Channel identity must not fall back to shared memory.
+
+
 def capture(origin: dict | None = None) -> dict | None:
     """Copy routing fields only; never retain the mutable trigger or its text."""
     origin = current.get() if origin is None else origin
@@ -52,6 +64,12 @@ def is_active(origin: dict) -> bool:
             or channel.get('platform') != platform or bool(channel.get('chat_only')) != chat_only):
         return False
     with config._get_conn() as conn:
+        if history_context(origin) is None:
+            return conn.execute(
+                "SELECT 1 FROM chat_sessions WHERE id=? AND (kind='main' "
+                "OR (kind='channel' AND context_key=?))",
+                (origin['_channel_session_id'], context_key(origin)),
+            ).fetchone() is not None
         return conn.execute(
             "SELECT 1 FROM chat_sessions WHERE id=? AND kind='channel' AND context_key=?",
             (origin['_channel_session_id'], context_key(origin)),
