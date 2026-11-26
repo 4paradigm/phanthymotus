@@ -694,6 +694,10 @@ plugins:
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0
 
+  cross_view_object_consistency:
+    enabled: true
+    topic: /perception/cross_view_object_consistency/state
+
   measure:
     # 物体可见宽高测量：接 VOP 的 data/json 和一路米制深度图，输出距离、
     # 可见宽高，并可把 bbox/尺寸画到相机 JPEG 上。

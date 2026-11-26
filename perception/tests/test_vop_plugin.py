@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -623,7 +624,10 @@ def test_published_payload_carries_count_and_latency():
         model=_FakeModel(rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 1]]))
     plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
-    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    message = _FakeCompressedImage(frame_bytes(200, 100))
+    message.header.frame_id = "bench_camera@capture"
+    message.header.stamp = SimpleNamespace(sec=10, nanosec=20)
+    node._image_cb(message)
 
     pub = node.publishers[0]
     assert _wait_until(lambda: bool(pub.messages))
@@ -635,6 +639,8 @@ def test_published_payload_carries_count_and_latency():
     # `timestamp` keeps its name — face calls it `ts`, but renaming vop's would
     # break every existing reader of {topic}/objects.
     assert "timestamp" in payload
+    assert payload["source"] == {"frame_id": "bench_camera@capture", "stamp_ns": 10_000_000_020}
+    assert payload["source_size"] == [200, 100]
 
 
 def test_an_empty_detection_still_reports_count_zero():
