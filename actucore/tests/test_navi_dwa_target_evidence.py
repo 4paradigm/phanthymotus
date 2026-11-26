@@ -1,6 +1,5 @@
 """A DWA renewal needs actual evidence for the requested target."""
 from copy import deepcopy
-from dataclasses import replace
 
 import pytest
 
@@ -587,47 +586,6 @@ def test_measured_target_limits_motion_independently_of_fixed_anchor(monkeypatch
     assert anchor.x == 5.6
 
 
-@pytest.mark.parametrize("associated_front", [False, True], ids=["range-only", "person-front"])
-def test_dwa_rejects_motion_into_a_measured_person_front(monkeypatch, associated_front):
-    from plugins.navi import policy
-
-    card, _, _, snapshot, _ = selected_card(monkeypatch, body=True, live_target=True)
-    _, depth, _, _ = snapshot[0]
-    state, config = card._state, card._config
-    track = state.tracker.track
-    track.front_required = associated_front
-    track.measured_point = replace(track.measured_point,
-                                   standoff_point=(.45, 0.) if associated_front else None)
-    state.dwa_budget = None
-    route = state.view_detour
-
-    proposal = policy._dwa_detour(depth, config, state, route, state.goal_anchor.x, 0.)
-
-    assert (proposal is None) is associated_front
-    if associated_front:
-        assert state.dwa_trace["rejected"]["target_standoff"] > 0
-
-
-def test_nearer_associated_person_front_vetoes_first_packet(monkeypatch):
-    from plugins.navi.track import TargetMatch
-
-    card, packets, clock, snapshot, message = selected_card(monkeypatch, body=True, live_target=True)
-    first_check = card._staged_dwa_command[1].forward_check
-    track = card._state.tracker.track
-    advance_snapshot(snapshot, clock, 1010)
-    objects, depth, odom, _ = snapshot[0]
-    snapshot[0] = dict(objects, timestamp=1.01), depth, odom, 1010
-    monkeypatch.setattr(card, "_dwa_target_match", lambda *a, **kw: TargetMatch(
-        track.generation, 1.01, (5., 0.), 5., standoff_point=(.45, 0.)))
-
-    card._publish_command(message)
-
-    packet, = packets
-    assert first_check.motion_guard.check.accepted
-    assert not any(packet["values"])
-    assert card._dwa_publication["reason"] == "target_standoff"
-
-
 @pytest.mark.parametrize("body", [True, False], ids=["body-pose", "camera-twist-history"])
 def test_association_uses_the_motion_at_the_detector_observation(monkeypatch, body):
     import math
@@ -1004,12 +962,11 @@ def test_tick_checks_search_when_target_lost_before_first_send(monkeypatch, body
         assert packet["values"][5] != 0
 
 
-def test_target_loss_between_planning_and_publish_does_not_replace_the_route(monkeypatch):
+def test_active_route_hands_off_to_checked_search_without_a_zero(monkeypatch):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
     card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
     assert card._stage_command(card.next_command(), card._output_epoch)
     assert len(packets) == 1 and packets[0]["values"][0] > 0.
-    route = card._state.committed_route
     advance_snapshot(snapshot, clock, 1050)
     objects, depth, odom, _ = snapshot[0]
     snapshot[0] = dict(objects, timestamp=1.05), depth, odom, 1050
@@ -1028,8 +985,7 @@ def test_target_loss_between_planning_and_publish_does_not_replace_the_route(mon
     card._tick()
     assert not card._last_error
     assert len(packets) == 2
-    assert not any(packets[1]["values"])
-    assert card._state.committed_route is route
+    assert packets[1]["values"][:5] == [0.] * 5 and packets[1]["values"][5] != 0.
 
 
 @pytest.mark.parametrize("update", ["confirmed", "duplicate", "unrelated", "obstacle",
@@ -1135,11 +1091,8 @@ def test_visible_person_without_front_fix(monkeypatch, scene, can_advance, vx_ma
         if scene == "short_detour":
             assert len(attempts) == 1 and clock[0] == 1120
             assert state.dwa_trace["branch"] == "visual_probe"
-        elif scene == "detour":
-            assert state.dwa_trace["branch"] == "visual_probe"
-            assert card._last_decision.dwa_acceptance.motion_guard.check.min_clearance_m > 0.
         else:
-            assert packets[-1]["values"][5] == 0.
+            assert bool(packets[-1]["values"][5]) == (scene == "detour")
     elif update == "moved_person":
         assert not packets
         assert card._dwa_publication["reason"] == "stale_observation"

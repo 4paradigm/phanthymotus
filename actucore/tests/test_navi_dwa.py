@@ -40,30 +40,6 @@ def test_non_lateral_never_issues_vy():
     assert choice.progress > 0.
 
 
-def test_motion_cost_uses_the_fixed_normalized_weights():
-    score = dwa.CandidateScore(path=.2, progress=.3, obstacle=.4, smooth=.5,
-                               heading=.6, velocity=.7)
-    assert score.total == pytest.approx(.22*.2 + .33*.3 + .20*.4 + .07*.5 + .10*.6 + .08*.7)
-
-
-def test_clearance_score_accounts_for_how_long_the_robot_is_close():
-    command = (.25, 0., 0.)
-    geometry = _geometry()
-    _, point = _grid(obstacles=((.55, .35),))
-    _, wall = _grid(obstacles=tuple((round(x, 2), .35) for x in np.arange(-.30, .85, .05)))
-
-    def check(grid):
-        context = dwa.MotionContext(command, command, 1., 0., geometry,
-                                    dwa.FootprintSpec(.30, .30, .26, 0., "body"),
-                                    grid, (), None, None, 0.)
-        return context.check(command)[1]
-
-    single, prolonged = check(point), check(wall)
-    assert single.accepted and prolonged.accepted
-    assert single.min_clearance_m == pytest.approx(prolonged.min_clearance_m)
-    assert 0. < dwa._obstacle_score(single) < dwa._obstacle_score(prolonged) <= 1.
-
-
 def test_lateral_route_chooses_lateral_velocity_and_keeps_original_target():
     choice = _run(((0.,0.),(0.,-.35),(.45,-.35)), lateral=True)
     assert choice is not None
@@ -123,19 +99,6 @@ def test_a_bent_route_sweeps_the_declared_turn_floor_before_sending(side, arc_cl
         assert choice.command == expected and choice.check.accepted
     else:
         assert choice is None
-
-
-def test_short_retained_route_reduces_speed_after_the_endpoint_cap():
-    diagnostics = {}
-    choice = _run(((0., 0.), (.24, 0.)), follow_published=True,
-                  target=None, measured=(0., 0., 0.), previous=(0., 0., 0.),
-                  horizon=1.6, latency_s=.3, floors=(.05, .08, .7, .04),
-                  diagnostics=diagnostics)
-
-    assert diagnostics["rejected"]["insufficient_room"] >= 1
-    assert choice is not None and choice.check.accepted
-    assert 0. < choice.command[0] < .24 / 1.6
-    assert choice.trace.body_travel_m + choice.trace.delay_travel_error <= .24
 
 
 @pytest.mark.parametrize("blocked", [False, True])
@@ -618,7 +581,7 @@ def test_camera_rotation_is_not_body_translation_progress():
     assert toward.command == away.command == command
     assert toward.progress == away.progress == 0.
     assert toward.score == pytest.approx(away.score)
-    assert toward.components.velocity == away.components.velocity == 0.
+    assert toward.components.goal == away.components.goal == 0.
 
 
 def test_bounded_physics_keeps_exhaustive_winner_and_shadow_validation():
@@ -675,7 +638,7 @@ def test_distant_goal_gets_early_clearance_around_a_visible_obstacle():
 
 def test_dwa_prefers_clearance_beyond_the_hard_footprint():
     route = ((0., 0.), (.65, 0.), (1., 0.))
-    close = _run(route, grid=_grid(obstacles=[(.4, .50)]))
+    close = _run(route, grid=_grid(obstacles=[(.4, .55)]))
     wider = _run(route, grid=_grid(obstacles=[(.4, .6)]))
     assert close.check.accepted and wider.check.accepted
     assert close.components.obstacle > wider.components.obstacle == 0.
@@ -819,7 +782,7 @@ def test_guidance_penalizes_driving_parallel_to_an_offset_lane():
         score, _, _ = dwa.score_candidate(
             command, trace, None, ((0., offset), (.7, offset)), command,
             half_width=.26, limits=((0., .15), (0., 0.), (-1., 1.)),
-            progress_scale=.2, guidance=True)
+            progress_scale=.2, target=None, guidance=True)
         return score.heading
 
     assert heading(.10) > heading(0.)
@@ -832,7 +795,7 @@ def test_slow_entry_arc_can_gain_heading_before_half_a_cell_of_progress():
     def score(side):
         return dwa.score_candidate(cmd, trace, None, ((0., 0.), (.4, side * .4)), cmd,
                                    half_width=.26, limits=((0., .15), (0., 0.), (-1., 1.)),
-                                   progress_scale=.2)
+                                   progress_scale=.2, target=None)
     good, progress, _ = score(-1)
     assert 0 < progress < local_path.RESOLUTION / 2 and good is not None
     assert score(1)[0] is None
@@ -994,7 +957,7 @@ def test_isolated_blocker_detour_enters_on_expanded_circle_tangent():
     box = (abs(f - 1.95) <= .201) & (abs(r) <= .251)
     route = local_path.clearance_route((~box, box), _geometry(), .30, (3.05, 0.), .60, (0., 0.),
                                        body_half_width=.25)
-    radius = math.hypot(.225, .275) + 2 * (2 * .25)
+    radius = math.hypot(.225, .275) + 3 * .25
     angle = math.asin(radius / 1.95)
     forward, right = route.points[1]
     assert abs(math.atan2(right, forward)) == pytest.approx(angle, abs=.09)
@@ -1034,28 +997,21 @@ def test_box_detour_holds_passing_lane_until_the_rear_clears():
     route = local_path.clearance_route((~occupied, occupied), geometry, .30, (3.25, 0.), .60,
                                        (0., 0.), body_half_width=.25)
     assert route is not None
-    radius = math.hypot(.425, .325) + 2 * (2 * .25)
-    first_tangent = 1.60 - radius**2 / 1.60
     clear_at = float(f[occupied].max()) + local_path.RESOLUTION / 2 + geometry.rear
-    side = [abs(right) for forward, right in route.topology if first_tangent <= forward < clear_at]
+    side = [abs(right) for forward, right in route.topology if 1.60 <= forward < clear_at]
     assert len(side) > 2
     assert all(after >= before - 1e-9 for before, after in zip(side, side[1:]))
 
 
 def test_compact_detour_exit_follows_the_tangent_toward_the_target():
     f, r = local_path.FORWARD, local_path.RIGHT
-    box_center, goal = 1.10, 3.75
+    box_center, goal = 1.25, 3.75
     occupied = (abs(f - box_center) <= .301) & (abs(r) <= .151)
     route = local_path.clearance_route((~occupied, occupied), _geometry(), .30, (goal, 0.), .60,
                                        (0., 0.), body_half_width=.25)
     assert route is not None
-    radius = math.hypot(.325, .175) + 2 * (2 * .25)
-    clear_at = box_center + radius + .25
-    passing = [abs(right) for forward, right in route.topology
-               if box_center + radius - .15 <= forward < clear_at]
-    assert len(passing) > 2
-    assert max(passing) - min(passing) <= local_path.RESOLUTION + 1e-9
+    radius = math.hypot(.325, .175) + 3 * .25
     slope = math.tan(math.asin(radius / (goal - box_center)))
-    exit_leg = [(forward, right) for forward, right in route.topology if forward >= clear_at + .30]
+    exit_leg = [(forward, right) for forward, right in route.topology if forward >= 2.5]
     assert len(exit_leg) >= 4
     assert all(abs(abs(right) - (goal-forward)*slope) <= .1 for forward, right in exit_leg)

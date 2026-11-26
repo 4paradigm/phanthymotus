@@ -19,7 +19,7 @@ import numpy as np
 
 from . import local_path
 from .motion import (FootprintSpec, MotionCheck, MotionTrace, Pose, Twist, _DEFAULT_ACCELERATION, _DEFAULT_BRAKING,
-                     evaluate_motion, minimum_footprint_distance, minimum_target_distance, predict_motion, stopping_horizon)
+                     evaluate_motion, minimum_target_distance, predict_motion, stopping_horizon)
 
 
 MAX_SEARCH_CANDIDATES = 64
@@ -38,7 +38,7 @@ class CandidateScore:
     obstacle: float
     smooth: float
     heading: float
-    velocity: float
+    goal: float
     route_change: float = 0.
     route_clearance: float = 0.
 
@@ -48,8 +48,7 @@ class CandidateScore:
 
     @property
     def total(self):
-        return (.33 * self.progress + .22 * self.path + .20 * self.obstacle
-                + .10 * self.heading + .08 * self.velocity + .07 * self.smooth)
+        return self.path + self.progress + self.obstacle + self.smooth + self.heading + self.goal
 
 
 @dataclass(frozen=True)
@@ -80,25 +79,13 @@ def _array_key(array):
     return array.shape, array.dtype.str, array.tobytes()
 
 
-def check_measured_standoff(trace, checked, measured_target, stop_distance, *, footprint=None):
+def check_measured_standoff(trace, checked, measured_target, stop_distance):
     """Apply the measured target's spacing to the same complete physical trace."""
     if checked.accepted and measured_target is not None:
         point, registration_error = measured_target
-        if footprint is None:
-            clear = minimum_target_distance(trace, point) >= stop_distance + registration_error - 1e-10
-        else:
-            clear = person_standoff_clear(trace, measured_target, stop_distance, footprint)
-        if not clear:
+        if minimum_target_distance(trace, point) < stop_distance + registration_error - 1e-10:
             return replace(checked, accepted=False, reason="target_standoff")
     return checked
-
-
-def person_standoff_clear(trace, measured_target, camera_range, footprint):
-    """Convert the camera-range tolerance to a minimum front-edge clearance."""
-    point, registration_error = measured_target
-    camera_forward = 0. if footprint.mode == "camera_approx" else trace.camera_offset[0]
-    front_gap = max(footprint.clearance_margin_m, camera_range - max(0., footprint.front - camera_forward))
-    return minimum_footprint_distance(trace, point, footprint) >= front_gap + registration_error - 1e-10
 
 
 @dataclass(frozen=True)
@@ -122,7 +109,6 @@ class MotionContext:
     terminal_boundary: object = None
     frame: tuple = ()
     measured_target: tuple | None = None
-    measured_standoff_m: float | None = None
 
     def key(self):
         g = self.geometry
@@ -135,7 +121,7 @@ class MotionContext:
                 tuple(self.target) if self.target is not None else None, self.stop_distance,
                 tuple(self.acceleration), tuple(self.braking),
                 tuple(self.rotation_center) if self.rotation_center is not None else None,
-                self.terminal_boundary, self.frame, self.measured_target, self.measured_standoff_m)
+                self.terminal_boundary, self.frame, self.measured_target)
 
     @property
     def response_key(self):
@@ -170,11 +156,8 @@ class MotionContext:
             prediction, footprint=self.footprint, occupied=self.occupied, remembered=self.remembered,
             supported_region=self.supported_region, original_goal=self.target,
             stop_distance_m=self.stop_distance, terminal_boundary=self.terminal_boundary,
-            prepared_layers=self.prepared_layers, score_clearance=True)
-        spacing = self.measured_standoff_m
-        return check_measured_standoff(prediction, checked, self.measured_target,
-                                       self.stop_distance if spacing is None else spacing,
-                                       footprint=self.footprint if spacing is not None else None)
+            prepared_layers=self.prepared_layers)
+        return check_measured_standoff(prediction, checked, self.measured_target, self.stop_distance)
 
     def check(self, command):
         prediction = self.predict(command)
@@ -465,16 +448,13 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
 
 def _obstacle_score(check):
     # Only rank sweeps that already passed the hard footprint checks.
-    if check.obstacle_cost is not None:
-        return check.obstacle_cost
-    return float(local_path._clearance_shortfall(max(0., check.min_clearance_m), local_path.SOFT_CLEARANCE_M))
+    return 1.5 * max(0., .30 - check.min_clearance_m) / .30
 
 
 def score_candidate(command, trace, check, reference, previous, *, half_width, limits,
-                    progress_scale, segments=None, initial_position=None, guidance=False,
-                    reference_speed=None, retained=False):
+                    progress_scale, target, segments=None, initial_position=None, guidance=False):
     """Score the held part of a physically admissible trace on one reference."""
-    poses = trace.camera_poses if trace.mode == "camera_approx" and any(command[:2]) else trace.body_poses
+    poses = trace.camera_poses if trace.mode == "camera_approx" else trace.body_poses
     if segments is None:
         segments = _route_segments(reference)
     end_pose = poses[trace.moving_count - 1]
@@ -498,29 +478,29 @@ def score_candidate(command, trace, check, reference, previous, *, half_width, l
     entering_turn = (command[0] > 0. and command[2] != 0. and progress > 0.
                      and math.dist(start_body[:2], end_body[:2]) <= local_path.RESOLUTION
                      and initial_error - heading_error >= .05)
-    if progress < (1e-10 if retained else .025) and not (turns_toward_route or entering_turn):
+    if progress < .025 and not (turns_toward_route or entering_turn):
         return None, progress, "insufficient_progress"
     errors = [_project_to_route(p[:2], reference, segments)[1] for p in poses[:trace.moving_count:4]]
     # A front camera traces an arc while the chassis turns toward the route.
     # Keep that deviation as a score; the complete footprint still checks the turn.
-    if not (retained or turns_toward_route) and (error > max(.24, .75 * half_width)
-                                                or max(errors, default=0.) > max(.30, half_width)):
+    if not turns_toward_route and (error > max(.24, .75 * half_width)
+                                  or max(errors, default=0.) > max(.30, half_width)):
         return None, progress, "off_route"
 
-    path = min(1., (.7 * sum(errors) / len(errors) + .3 * error) / .4)
-    along_route = min(1., max(0., 1. - progress / progress_scale))
+    path = 3.0 * (sum(errors) / len(errors)) / max(.15, half_width)
+    along_route = -2.0 * progress / progress_scale
     obstacle = 0. if check is None else _obstacle_score(check)
     x_limit, y_limit, yaw_limit = limits
-    speed_limit = math.hypot(x_limit[1], max(abs(y_limit[0]), y_limit[1]))
-    linear_change = math.hypot(command[0] - previous[0], command[1] - previous[1])
-    angular_change = abs(command[2] - previous[2])
-    smooth = (.4 * min(1., linear_change / max(.1, speed_limit))
-              + .6 * min(1., angular_change / max(.2, yaw_limit[1] - yaw_limit[0])))
-    heading = heading_error / math.pi
-    nominal = min(.35, speed_limit) if reference_speed is None else reference_speed
-    nominal *= max(0., math.cos(initial_error))
-    velocity = min(1., abs(math.hypot(*command[:2]) - nominal) / max(.1, speed_limit))
-    return CandidateScore(path, along_route, obstacle, smooth, heading, velocity), progress, None
+    smooth = .6 * (abs(command[0] - previous[0]) / max(.1, x_limit[1])
+                   + abs(command[1] - previous[1]) / max(.1, max(abs(y_limit[0]), y_limit[1]))
+                   + abs(command[2] - previous[2]) / max(.2, max(abs(yaw_limit[0]), yaw_limit[1])))
+    heading = .45 * heading_error / max(.15, half_width) if guidance else .5 * heading_error / math.pi
+    goal = 0.
+    if target is not None:
+        initial_range = math.dist(start_body[:2], target)
+        end_range = math.dist(end_body[:2], target)
+        goal = .25 * (end_range - initial_range) / max(1., initial_range)
+    return CandidateScore(path, along_route, obstacle, smooth, heading, goal), progress, None
 
 
 def select(*, route, grid, geometry, half_width=None, measured, previous,
@@ -534,7 +514,6 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            footprint: FootprintSpec | None = None, latency_s=0., remembered=None,
            supported_region=None, terminal_boundary=None, occupied=None, alternate_routes=(),
            candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None,
-           measured_standoff_m=None,
            guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0., retry_from_rest=False) -> Choice | None:
     """Select a legal target velocity whose complete predicted stop is admissible.
 
@@ -625,7 +604,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     obstacles = local_path.occupied_squares(grid[1]) if occupied is None else occupied
     context = MotionContext(measured, previous, horizon, latency_s, geometry, footprint, obstacles, remembered,
                             supported_region, target, stop_distance, acceleration, braking, rotation_center,
-                            terminal_boundary, motion_frame, measured_target, measured_standoff_m)
+                            terminal_boundary, motion_frame, measured_target)
 
     def interpolate(choice, room=math.inf):
         if not (transition_slot or entry_slot) or choice is None or not any(choice.command[:2]) or budget.expired():
@@ -663,7 +642,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         reference = points if follow_published else references[choice.reference_index]
         components, progress, _ = score_candidate(
             command, prediction, None, reference, previous, half_width=half_width, limits=limits,
-            progress_scale=progress_scale, guidance=guidance, retained=follow_published)
+            progress_scale=progress_scale, target=target, guidance=guidance)
         if components is None or progress < choice.progress - local_path.RESOLUTION / 2:
             return choice
         diag["physical_evaluations"] += 1
@@ -688,13 +667,10 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                        if footprint_mode == "camera_approx" else (0., 0.))
         lookahead = max(.45, x_speed * horizon)
         segments = _route_segments(points)
-        room = remaining_route_length(points, segments=segments)
-        nominal = min(x_speed, room / horizon)
-        best_pursuit = None
         for scale in (1., .75, .5)[:min(slots, 3 - int(transition_slot))]:
             if budget.expired():
                 break
-            tracked = track_route(points, nominal * scale, horizon, yaw_limit,
+            tracked = track_route(points, x_speed * scale, horizon, yaw_limit,
                                   body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
                                   yaw_floor=floors[3])
             if tracked is None:
@@ -722,21 +698,15 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 if not visible.accepted:
                     rejected[visible.reason] = rejected.get(visible.reason, 0) + 1
                     continue
-            components, progress, reason = score_candidate(
-                command, prediction, check, points, previous, half_width=half_width, limits=limits,
-                progress_scale=progress_scale, segments=segments, guidance=guidance,
-                reference_speed=nominal, retained=True)
-            if components is None:
-                rejected[reason] = rejected.get(reason, 0) + 1
+            start = _project_to_route(prediction.body_poses[0][:2], points, segments)[0]
+            progress = _project_to_route(prediction.body_poses[prediction.moving_count - 1][:2], points, segments)[0] - start
+            if progress <= 0.:
                 continue
-            diag["admissible_candidates"] += 1
-            if best_pursuit is None or components.total < best_pursuit.score:
-                best_pursuit = Choice(command, poses[:prediction.moving_count], components.total, progress,
-                                      check.min_clearance_m, prediction, check, components)
-        if best_pursuit is not None:
-            count = diag["admissible_candidates"]
-            diag.update(reference_scores=count, scores_by_reference=[count], reason=None)
-            return interpolate(best_pursuit, room - route_error)
+            components = CandidateScore(0., -progress, _obstacle_score(check), 0., 0., 0.)
+            diag.update(admissible_candidates=1, reference_scores=1, scores_by_reference=[1], reason=None)
+            choice = Choice(command, poses[:prediction.moving_count], components.total, progress,
+                            check.min_clearance_m, prediction, check, components)
+            return interpolate(choice, room - route_error)
         diag["reason"] = "search_deadline" if budget.expired() else "no_admissible_candidates"
         return None
     outcomes = budget.for_context(context)
@@ -833,7 +803,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             scores_by_reference[index] += 1
             components, progress, reason = score_candidate(
                 cmd, prediction, None, reference, previous, half_width=half_width, limits=limits,
-                progress_scale=progress_scale, segments=segments_by_reference[index],
+                progress_scale=progress_scale, target=target, segments=segments_by_reference[index],
                 initial_position=initial_positions[index], guidance=guidance)
             if components is not None:
                 components = replace(components, route_change=route_costs[index], route_clearance=clearance_costs[index])
@@ -886,7 +856,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
 
     # Collision cost is nonnegative. Only skip when neither route smoothness
     # nor the tracking score can beat an already physically admitted winner.
-    score_band = .33 * local_path.RESOLUTION / progress_scale
+    score_band = local_path.RESOLUTION / progress_scale
     def ranking_bound(entry):
         (route_change, score, index, ordinal), _, cmd, _, _ = entry
         if cmd == previous and cmd[0] > 0. and (cmd[1] or cmd[2]):
@@ -928,7 +898,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                               check.min_clearance_m, prediction, check, components, index)
     if (retained is not None and best is not None and retained.reference_index == best.reference_index
             and math.dist(retained.trajectory[-1][:2], best.trajectory[-1][:2])
-                + half_width * abs(retained.trajectory[-1][2] - best.trajectory[-1][2]) <= local_path.RESOLUTION
+                + half_width * abs(retained.trajectory[-1][2] - best.trajectory[-1][2]) <= local_path.RESOLUTION / 2
             and retained.progress >= best.progress - local_path.RESOLUTION / 2
             and retained.score <= best.score + score_band):
         best = retained
