@@ -76,7 +76,7 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
         # 过滤掉，agent-core 的 api/system.py:_check_update_sync 会默默报「已是最新」。
         #
         # cards 与 src/start.py:_register_core_mcp() 里注册的两个内建 internal MCP 设备
-        # （AgentCore 的 decision_core，Channel 的 channel_request/channel_reply）手动保持
+        # （AgentCore 的 decision_core，Channel 的 channel_request/channel_reply/fanshi_message_send）手动保持
         # 一致 —— 这些卡片不是走真实 MCP HTTP 进程暴露的，是 agent-core 启动时自己注册的，
         # 新增/改名时记得同步这里。decision_core 的 type 是 controller（既不是可以绕过
         # barrier 的 sensor/resource，也不是普通 actuator/processor，见
@@ -100,7 +100,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                     {\"name\": \"remote_audio\", \"type\": \"sensor\"},
                     {\"name\": \"remote_image\", \"type\": \"sensor\"},
                     {\"name\": \"channel_request\", \"type\": \"sensor\"},
-                    {\"name\": \"channel_reply\", \"type\": \"actuator\"}
+                    {\"name\": \"channel_reply\", \"type\": \"actuator\"},
+                    {\"name\": \"fanshi_message_send\", \"type\": \"actuator\"}
                 ]
             }")
 
