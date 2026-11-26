@@ -2451,6 +2451,22 @@ def test_search_speed_does_not_use_the_target_bearing_gain(gain):
     assert decision.values[5] == pytest.approx(-0.3)
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_follow_leads_a_target_moving_toward_the_edge(side):
+    config = _cfg(vx_max=.5, wz_max=1., use_lateral=False, vy_max=0.)
+    sim = Sim(range_m=2.5, config=config)
+    state = _state()
+    sim.run(state, 6)
+    sim.velocity[:] = (.20, -side * 1.3)
+
+    peak_bearing = 0.
+    for _ in range(30):
+        decision = sim.run(state, 1)
+        peak_bearing = max(peak_bearing, abs(sim.relative()[1] / config.half_fov_rad))
+        assert decision.values[0] > 0.
+    assert peak_bearing < .48
+
+
 def test_obstacle_gap_turns_keep_their_nominal_gain_and_do_not_claim_tracking_gain(monkeypatch):
     config = _cfg(use_lateral=False, stop_distance_m=0.3, floor_wz=0.0)
     monkeypatch.setattr(P, "_clearance", lambda *args, **kwargs:

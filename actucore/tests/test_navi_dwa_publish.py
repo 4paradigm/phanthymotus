@@ -958,7 +958,7 @@ def test_queued_dwa_stops_on_cancellation_or_new_obstacle(monkeypatch, body, eve
 @pytest.mark.parametrize("body", [True, False], ids=["direct", "scheduled"])
 @pytest.mark.parametrize("live_target", [True, False], ids=["live", "remembered"])
 @pytest.mark.parametrize("obstacle", [True, False], ids=["blocked", "clear"])
-def test_real_tick_accepts_fresh_input_without_a_second_swept_collision_veto(monkeypatch, body, live_target, obstacle):
+def test_real_tick_resweeps_depth_received_before_publication(monkeypatch, body, live_target, obstacle):
     calls = observe_selector(monkeypatch)
     card, packets, clock, snapshot = observation_card(monkeypatch, body=body, live_target=live_target)
     publish = card._publish_command
@@ -972,8 +972,9 @@ def test_real_tick_accepts_fresh_input_without_a_second_swept_collision_veto(mon
     card._tick()
     assert calls and any(choice is not None for _, choice in calls)
     assert packets
-    if not any(packets[-1]["values"]):
-        assert obstacle and card._dwa_publication["reason"] == "occluded_prefix"
+    if obstacle:
+        assert not any(packets[-1]["values"])
+        assert card._dwa_publication["reason"] == "footprint_collision"
         return
     accepted = [choice for _, choice in calls if choice is not None][-1]
     assert len(packets) == 1
@@ -2365,7 +2366,7 @@ def test_pose_reset_during_publication_cannot_shift_the_checked_scene(monkeypatc
 
 @pytest.mark.parametrize("body", [True, False])
 @pytest.mark.parametrize("obstacle", [True, False])
-def test_feedback_recheck_does_not_veto_swept_obstacles(monkeypatch, body, obstacle):
+def test_feedback_recheck_vetoes_obstacles_in_the_swept_footprint(monkeypatch, body, obstacle):
     card, _, clock, snapshot, message = selected_card(monkeypatch, body=body, live_target=True)
     check = card._staged_dwa_command[1].forward_check
     advance_snapshot(snapshot, clock, 1050, obstacle=obstacle, vx=.105)
@@ -2373,8 +2374,8 @@ def test_feedback_recheck_does_not_veto_swept_obstacles(monkeypatch, body, obsta
     diagnostics = {}
     verified = card._recheck_dwa_motion(check, message["values"], 800, clock[0], snapshot[0], renew=False,
                                         diagnostics=diagnostics)
-    assert verified is not None and verified[2]
-    assert diagnostics.get("reason") is None
+    assert verified is not None and verified[2] == (not obstacle)
+    assert diagnostics.get("reason") == ("footprint_collision" if obstacle else None)
 
 
 @pytest.mark.parametrize("change,compact,stationary", [
@@ -2773,11 +2774,13 @@ def test_blocked_candidate_brakes_only_if_outgoing_motion_is_also_blocked(
         assert len(packets) == 1 and card._scheduled_command is previous
         assert (previous.expires_ms, previous.expires_at, previous.repeat_until) == window
 
-def tracked_route_card(monkeypatch):
+def tracked_route_card(monkeypatch, *, latest_depth_only=False):
     """A sent route on measured poses, and a feeder for later odometry reports."""
     from plugins.navi.odom import PlanarPose
 
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    if latest_depth_only:
+        card._config.use_obstacle_history = False
     card._descriptor["rate"]["watchdog_ms"] = card._config.watchdog_ms = 500
     _, depth, odom, _ = snapshot[0]
     pose = PlanarPose(1000, ("odom",), 0., 0., 0.)
@@ -3714,6 +3717,39 @@ def test_duplicate_detection_keeps_evidence_for_an_association_miss(monkeypatch)
     assert card._scheduled_command is work
     assert packets[-1]["seq"] > retained["seq"]
     assert packets[-1]["values"] == retained["values"]
+
+
+@pytest.mark.parametrize("scene", ["clear", "blocked", "newer_depth", "newer_blocked"])
+def test_short_target_loss_resweeps_the_previous_route(monkeypatch, scene):
+    card, packets, clock, snapshot, feed = tracked_route_card(monkeypatch, latest_depth_only=True)
+    work = card._scheduled_command
+    previous, = packets
+    frame = snapshot[0][1]["map"].copy()
+    if scene == "blocked":
+        frame[220:370, 302:338] = .15
+    feed(1180, previous["values"][0], frame=frame)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = {"timestamp": 1.18, "objects": []}, depth, odom, 1180
+    if scene.startswith("newer"):
+        check = card._check_predicted_outgoing_route
+
+        def check_with_arriving_depth(*args, **kwargs):
+            proof = check(*args, **kwargs)
+            if proof is not None and clock[0] == 1180:
+                latest = frame.copy()
+                if scene == "newer_blocked":
+                    latest[220:370, 302:338] = .15
+                feed(1190, previous["values"][0], frame=latest)
+            return proof
+
+        monkeypatch.setattr(card, "_check_predicted_outgoing_route", check_with_arriving_depth)
+
+    card._dispatch_command()
+
+    assert len(packets) == 2
+    assert packets[-1]["values"] == ([0.] * 6 if "blocked" in scene else previous["values"])
+    if scene == "newer_depth":
+        assert packets[-1]["obs_stamp_ms"] == 1190
 
 
 

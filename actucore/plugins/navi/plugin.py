@@ -2698,10 +2698,13 @@ class NaviPlugin:
         if live_point is not None:
             point = local_path.target_in_grid(geometry, *live_point)
             front_constraint = tuple(view.points(point)), view.error(math.hypot(*point))
+        checking_route = route_room is not None or corner_route is not None
         result = motion.evaluate_motion(
-            prediction, terminal_boundary=boundary, footprint=guard.footprint, occupied=(),
-            remembered=(), supported_region=local_path.SUPPORTED_REGION, original_goal=None,
-            stop_distance_m=0.)
+            prediction, terminal_boundary=boundary, footprint=guard.footprint,
+            occupied=occupied, remembered=remembered,
+            supported_region=local_path.SUPPORTED_REGION, original_goal=None, stop_distance_m=0.)
+        if checking_route:
+            result = dwa.check_measured_standoff(prediction, result, front_constraint, config.stop_distance_m)
         if result.accepted and memory_first_send:
             # Reappearing detections still need a front measurement for association.
             for person in target_objects(objects, "person", config):
@@ -3970,6 +3973,8 @@ class NaviPlugin:
             speed_cap = math.hypot(config.vx_max, config.vy_max if config.use_lateral else 0.)
             unobserved_travel = (now_ms - target_ms) * max(speed, speed_cap) / 1000
         motion_room = policy_mod.MAX_PREDICTED_DETOUR_TRAVEL_M - unobserved_travel
+        registration = policy_mod.dwa_registration(None, None, depth_ms, now_ms, geometry, rates)
+        occupied = (registration.squares(grid[1]),)
         if direct:
             travel = speed * (config.watchdog_ms + deadline_ms - now_ms + 50) / 1000
             travel += speed ** 2 / (2 * config.motion_braking[0])
@@ -3978,9 +3983,21 @@ class NaviPlugin:
             if travel >= room or (obstacle is not None and
                     obstacle + policy_mod.FORWARD_CLEARANCE_MARGIN_M < check.distance_m and obstacle <= travel):
                 return None
+            mode = "body" if config.scan_geometry is not None else "camera_approx"
+            footprint = motion.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
+                                            config.clearance_margin_m, mode)
+            prediction = motion.predict_motion(measured, previous, command,
+                                               hold_s=(config.watchdog_ms + deadline_ms - now_ms + 50) / 1000,
+                                               latency_s=0., geometry=geometry, mode=mode,
+                                               acceleration=config.motion_acceleration, braking=config.motion_braking,
+                                               initial_bounds=bounds)
+            if not motion.evaluate_motion(
+                    prediction, footprint=footprint, occupied=occupied, remembered=(),
+                    supported_region=local_path.SUPPORTED_REGION, original_goal=None,
+                    stop_distance_m=0., terminal_boundary=motion.TravelBudget(room)).accepted:
+                return None
             return _PredictedRouteCheck(work, _motion_inputs(*snapshot[:3]), objects_ms, observation_ms,
                                         deadline_ms, depth_ms, coast_end_ms, bounds)
-        registration = policy_mod.dwa_registration(None, None, depth_ms, now_ms, geometry, rates)
         end = max(work.expires_ms, work.message["stamp_ms"] + work.message["ttl_ms"] + config.watchdog_ms,
                   deadline_ms + config.watchdog_ms if renew else now_ms)
         prediction = motion.predict_motion(command, command, command, hold_s=(end - now_ms + 50) / 1000,
@@ -4016,7 +4033,7 @@ class NaviPlugin:
             if not dwa.stays_on_route(route, positions, guard.footprint.half_width):
                 return None
         result = motion.evaluate_motion(
-            prediction, footprint=guard.footprint, occupied=(), remembered=(),
+            prediction, footprint=guard.footprint, occupied=occupied, remembered=(),
             supported_region=local_path.SUPPORTED_REGION, original_goal=None,
             stop_distance_m=0., terminal_boundary=motion.TravelBudget(room))
         if not result.accepted:
@@ -4083,8 +4100,17 @@ class NaviPlugin:
         return written
 
     def _continue_without_target(self, work, now_ms):
-        if work is None or not self._continue_predicted_route(
-                work, self._observation_snapshot(with_capture_timing=True), now_ms, target_pending=True):
+        if work is None:
+            return False
+        continued = self._continue_predicted_route(
+            work, self._observation_snapshot(with_capture_timing=True), now_ms, target_pending=True)
+        if continued is None and self._scheduled_command is work:
+            # One newer depth frame can overtake the sweep. Check it before
+            # abandoning the already admitted action.
+            continued = self._continue_predicted_route(
+                work, self._observation_snapshot(with_capture_timing=True),
+                int(time.time() * 1000), target_pending=True)
+        if not continued:
             return False
         self._state.commanded = self._wire_twist
         self._state.commanded_vx = self._wire_twist[0]
@@ -4433,34 +4459,44 @@ class NaviPlugin:
                 original.pose, current, original.checked_ms, now_ms, check.geometry,
                 (measured, self._wire_twist or measured), reference=policy_mod.dwa_pose_reference(scan, odom))
         except policy_mod.DwaFrameMismatch:
-            tracked = None
             diagnostics["reason"] = "geometry_mismatch"
-        else:
-            cfg = self._config
+            return None, None
+        cfg = self._config
+        points = transform.points(origin.acceptance.route_points)
+        nominal = math.hypot(*origin.acceptance.command[:2])
+        route_error = transform.error(math.hypot(*origin.acceptance.route_points[-1]))
+        yaw_limit = (-policy_mod._scan_yaw_rate(cfg, 1.), policy_mod._scan_yaw_rate(cfg, -1.))
+        checked = values = previous_values = None
+        for scale in dwa.ROUTE_SPEED_SCALES:
             tracked = dwa.track_route(
-                transform.points(origin.acceptance.route_points), math.hypot(*origin.acceptance.command[:2]),
-                original.prediction_horizon_s, (-policy_mod._scan_yaw_rate(cfg, 1.), policy_mod._scan_yaw_rate(cfg, -1.)),
+                points, nominal * scale, original.prediction_horizon_s, yaw_limit,
                 body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral,
                 yaw_floor=cfg.floor_wz_moving)
-        values = checked = None
-        if tracked is None:
-            diagnostics.setdefault("reason", "route_end")
-        else:
+            if tracked is None:
+                break
             (vx, vy, wz), room = tracked
-            (_, max_x), (_, max_y) = policy_mod._local_velocity_limits(cfg, -1. if vy > 0. else 1.)
-            values = [min(vx, max_x), math.copysign(min(abs(vy), max_y), vy), 0., 0., 0., wz]
-            values = policy_mod.apply_deadband(values, self._deadband_for(values))
-            room -= transform.error(math.hypot(*origin.acceptance.route_points[-1]))
-            if not any(values[:2]) or room <= 0.:
-                diagnostics["reason"] = "route_end"
-            else:
-                checked = self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot, renew=renew,
-                                                   diagnostics=diagnostics, scan=scan,
-                                                   route_room=room, packet_deadline_ms=packet_deadline_ms,
-                                                   cover_slower_feedback=(cover_slower_feedback or target_refresh or
-                                                                          self._goal_beyond_local_grid(origin)),
-                                                   target_refresh=target_refresh)
-                values = diagnostics.pop("visual_command", values)
+            (_, max_x), (_, max_y) = policy_mod._local_velocity_limits(cfg, -1. if vy > 0 else 1.)
+            candidate = [min(vx, max_x), math.copysign(min(abs(vy), max_y), vy), 0., 0., 0., wz]
+            candidate = policy_mod.apply_deadband(candidate, self._deadband_for(candidate))
+            if not any(candidate[:2]) or room <= route_error:
+                break
+            if candidate == previous_values:
+                continue
+            previous_values = candidate
+            diagnostics.pop("reason", None)
+            checked = self._recheck_dwa_motion(
+                check, candidate, max_age, now_ms, snapshot, renew=renew, diagnostics=diagnostics, scan=scan,
+                route_room=room - route_error, packet_deadline_ms=packet_deadline_ms,
+                cover_slower_feedback=(cover_slower_feedback or target_refresh or self._goal_beyond_local_grid(origin)),
+                target_refresh=target_refresh)
+            values = diagnostics.pop("visual_command", candidate)
+            if (checked is None or checked[2] or not wz or diagnostics.get("reason") not in
+                    ("insufficient_room", "outside_grid", "footprint_collision", "occluded_prefix", "target_standoff")):
+                break
+            if int(time.time() * 1000) >= packet_deadline_ms:
+                break
+        if values is None:
+            diagnostics.setdefault("reason", "route_end")
         return checked, values
 
     def _repeat_dwa_command(self, work):

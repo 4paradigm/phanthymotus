@@ -23,6 +23,7 @@ from .motion import (FootprintSpec, MotionCheck, MotionTrace, Pose, Twist, _DEFA
 
 
 MAX_SEARCH_CANDIDATES = 64
+ROUTE_SPEED_SCALES = (1., .75, .5, .25)
 
 
 @dataclass(frozen=True)
@@ -667,7 +668,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                        if footprint_mode == "camera_approx" else (0., 0.))
         lookahead = max(.45, x_speed * horizon)
         segments = _route_segments(points)
-        for scale in (1., .75, .5)[:min(slots, 3 - int(transition_slot))]:
+        for scale in ROUTE_SPEED_SCALES[:min(slots, len(ROUTE_SPEED_SCALES) - int(transition_slot))]:
             if budget.expired():
                 break
             tracked = track_route(points, x_speed * scale, horizon, yaw_limit,

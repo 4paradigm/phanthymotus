@@ -2323,10 +2323,18 @@ def _decide(detections, depth, odom, config: Config, state: State,
     live = anchor is None and track.observed
     yaw_gain = (config.response_yaw_gain if config.response_yaw_gain is not None
                 else config.k_yaw)
-    # Pure proportional steering. odom.wz remains an observation for
-    # ego-motion tracking, but is never fed back into the command as a hidden
-    # D-like term.
-    raw_wz = _clamp(-yaw_gain * bearing, config.wz_max)
+    steering_bearing = bearing
+    if (config.local_controller == "dwa" and live and isinstance(track, Track)
+            and track.range_known and track.hits >= config.confirm_hits + 2):
+        x, y, vx_target, vy_target = track.mean
+        range_sq = x * x + y * y
+        if range_sq > 0. and abs(bearing) > config.align_tol / 2:
+            # The tracker has already removed ego motion. Lead outward target
+            # motion for a fraction of a second while the detection is live.
+            rate = (y * vx_target - x * vy_target) / (range_sq * max(1e-6, config.half_fov_rad))
+            if bearing * rate > 0. and abs(rate) >= .1:
+                steering_bearing = _clamp(bearing + _clamp(.35 * rate, .25), 1.)
+    raw_wz = _clamp(-yaw_gain * steering_bearing, config.wz_max)
 
     within = distance is not None and distance <= config.arrival_distance_m + 1e-6
     if freeze_goal and target_fix is not None and target_fix[0] <= config.arrival_distance_m + 1e-6:
@@ -2355,7 +2363,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     # presented as "the person is right there and the only thing moving is wz".
     # Scaling keeps the intent — turn first when badly off — without the
     # threshold.
-    align = _alignment_scale(bearing, config)
+    align = _alignment_scale(steering_bearing, config)
     if align <= 0.0:
         state.commanded_vx = 0.0
         state.avoidance_yaw_override = False
@@ -3559,7 +3567,7 @@ def _dwa_context(inputs, geometry, config, motion_frame):
     return dwa.MotionContext(
         inputs.measured, inputs.previous, inputs.prediction_horizon_s,
         (inputs.deadline_ms - inputs.checked_ms) / 1000, geometry, inputs.footprint,
-        (), (), local_path.SUPPORTED_REGION, inputs.goal, 0.,
+        inputs.observed, (), local_path.SUPPORTED_REGION, inputs.goal, 0.,
         acceleration=config.motion_acceleration, braking=config.motion_braking,
         frame=(motion_frame, inputs.pose))
 
@@ -3736,7 +3744,7 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     trace["select_calls"] += 1
     proposed = dwa.select(
         route=route.points, grid=grid, geometry=geometry, footprint=inputs.footprint,
-        occupied=(), supported_region=local_path.SUPPORTED_REGION,
+        occupied=inputs.observed, supported_region=local_path.SUPPORTED_REGION,
         latency_s=(inputs.deadline_ms - inputs.checked_ms) / 1000,
         measured=inputs.measured, previous=inputs.previous, x_limit=(0., max(0., limit_x)),
         y_limit=(0., 0.) if branch == "direct" else (-right_vy, left_vy),

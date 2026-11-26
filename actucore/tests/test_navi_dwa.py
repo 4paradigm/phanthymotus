@@ -81,6 +81,15 @@ def test_retained_route_sweeps_an_executable_yaw_when_pursuit_falls_below_the_fl
     assert choice.check.reason is None
 
 
+def test_retained_short_route_creeps_through_a_bend():
+    choice = _run(((0., 0.), (.23, .0805)), follow_published=True, lateral=False,
+                  measured=(.1, 0., 0.), previous=(.1, 0., 0.), target=None,
+                  floors=(.08, 0., .4, .06))
+
+    assert choice is not None and choice.check.accepted
+    assert 0. < choice.command[0] < .25 and choice.command[2] < 0.
+
+
 @pytest.mark.parametrize("side", [-1., 1.])
 @pytest.mark.parametrize("arc_clear", [False, True])
 def test_a_bent_route_sweeps_the_declared_turn_floor_before_sending(side, arc_clear):
