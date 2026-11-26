@@ -340,15 +340,12 @@ def _register_core_mcp(silent=False):
                     'elsewhere in your shared history and must not be attributed to this one. '
                     'If the triggering user_role is "viewer" (read-only), you will only be offered '
                     'sensor/resource tools, read-only tools (WebSearch, search_history, memory_recall, '
-                    'raw_input_info), Read for images attached to the current Channel messages, '
-                    'plus this one — actuator/processor/delegated tools are rejected; '
-                    'viewer replies must use the current message ID, cannot contact other bots, '
-                    'and may attach only images from the current message. '
-                    'to answer questions about an inbound image, first use Read on its path from '
-                    'the triggering event; a file path alone is not image content. If Read fails '
-                    'or vision input is disabled, say that you cannot see the image. '
+                    'raw_input_info) plus this one — actuator/processor/delegated tools are rejected; '
                     'reply with what you can read or look up, and say so if the request needs an action '
-                    'you cannot take.'
+                    'you cannot take. '
+                    'WeCom viewers may additionally use Read for images attached to their current '
+                    'messages. Their replies must use a current message ID, cannot contact other bots, '
+                    'and may attach only images from the current turn.'
                 ),
                 'inputSchema': {
                     'type': 'object',

@@ -1,4 +1,4 @@
-"""Channel history must preserve shared operator memory and restricted conversations."""
+"""Shared channel recaps coexist with WeCom conversation history."""
 
 import importlib
 import json
@@ -17,6 +17,7 @@ import chat_history
 import collector
 import config
 from channel import acl, context
+from channel.manager import ChannelManager
 from subagent.agent import Subagent
 from subagent.manager import SubagentManager
 from subagent.protocol import SubagentSpec
@@ -28,7 +29,7 @@ def trigger(role='viewer', *, user='alice', chat='chat', chat_only=False):
     return collector._build_trigger([{
         'source': 'dds:/channel/request/test', 'ts': 1,
         'text': json.dumps({
-            'platform': 'telegram', 'channel_id': 'test', 'chat_id': chat,
+            'platform': 'wecom', 'channel_id': 'test', 'chat_id': chat,
             'user_id': user, 'user_role': role, 'sender_type': 'user',
             'chat_only': chat_only, 'message_id': 'm1', 'text': 'CURRENTQUESTION',
         }),
@@ -44,11 +45,11 @@ class ChannelHistoryTest(unittest.IsolatedAsyncioTestCase):
         self.db_patch.start()
         self.config_patch = mock.patch.object(config, 'main', {
             'event': {'llm': {}},
-            'channel_configs': [{'id': 'test', 'platform': 'telegram', 'enabled': True}],
+            'channel_configs': [{'id': 'test', 'platform': 'wecom', 'enabled': True}],
         })
         self.config_patch.start()
         self.previous_event = llm._event_instance
-        acl.upsert_user('telegram', 'alice', role='operator')
+        acl.upsert_user('wecom', 'alice', role='operator')
 
     def tearDown(self):
         llm._event_instance = self.previous_event
@@ -134,9 +135,9 @@ class ChannelHistoryTest(unittest.IsolatedAsyncioTestCase):
         self.save(agent, event, 'TASK')
         origin = context.capture(event)
         self.assertTrue(context.is_active(origin))
-        acl.upsert_user('telegram', 'alice', role='blocked')
+        acl.upsert_user('wecom', 'alice', role='blocked')
         self.assertFalse(context.is_active(origin))
-        acl.upsert_user('telegram', 'alice', role='operator')
+        acl.upsert_user('wecom', 'alice', role='operator')
         chat_history.delete_session(agent._session_id)
         self.assertFalse(context.is_active(origin))
 
@@ -263,6 +264,89 @@ class ChannelHistoryTest(unittest.IsolatedAsyncioTestCase):
                     await agent._maybe_compress()
                 self.assertEqual(agent._summary, 'EARLYSUMMARY')
                 self.assertEqual(agent._turns, original)
+
+
+class ChatHistoryIsolationTest(unittest.TestCase):
+    def setUp(self):
+        config.main['channel_chat_history'] = {}
+        self.manager = ChannelManager()
+
+    def test_different_chats_do_not_see_each_others_recap(self):
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '帮我查电量',
+                                           user_label='Alice')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'assistant', '电量 80%')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_b', 'user', '我刚才说的呢',
+                                           user_label='Bob')
+
+        a_history = self.manager.get_chat_history('feishu_r1', 'oc_a')
+        b_history = self.manager.get_chat_history('feishu_r1', 'oc_b')
+
+        self.assertEqual([e['text'] for e in a_history], ['帮我查电量', '电量 80%'])
+        self.assertEqual([e['text'] for e in b_history], ['我刚才说的呢'])
+        self.assertNotIn('电量', json.dumps(b_history, ensure_ascii=False))
+
+    def test_different_channels_with_same_chat_id_do_not_collide(self):
+        self.manager._record_chat_exchange('feishu_r1', 'oc_shared', 'user', 'r1 消息')
+        self.manager._record_chat_exchange('feishu_g1', 'oc_shared', 'user', 'g1 消息')
+
+        self.assertEqual(
+            [e['text'] for e in self.manager.get_chat_history('feishu_r1', 'oc_shared')],
+            ['r1 消息'],
+        )
+        self.assertEqual(
+            [e['text'] for e in self.manager.get_chat_history('feishu_g1', 'oc_shared')],
+            ['g1 消息'],
+        )
+
+    def test_rolling_window_keeps_only_the_most_recent_entries(self):
+        for i in range(20):
+            self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', f'msg{i}')
+
+        history = self.manager.get_chat_history('feishu_r1', 'oc_a', limit=100)
+        self.assertLessEqual(len(history), 12)
+        self.assertEqual(history[-1]['text'], 'msg19')
+        self.assertNotIn('msg0', [e['text'] for e in history])
+
+    def test_get_chat_history_respects_limit_and_unknown_chat_returns_empty(self):
+        for i in range(5):
+            self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', f'msg{i}')
+
+        self.assertEqual(len(self.manager.get_chat_history('feishu_r1', 'oc_a', limit=2)), 2)
+        self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_unknown'), [])
+        self.assertEqual(self.manager.get_chat_history('feishu_unknown', 'oc_a'), [])
+
+    def test_empty_text_is_not_recorded(self):
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '')
+        self.assertEqual(self.manager.get_chat_history('feishu_r1', 'oc_a'), [])
+
+    def test_build_trigger_injects_scoped_chat_history_block(self):
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'user', '帮我查电量',
+                                           user_label='Alice')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_a', 'assistant', '电量 80%')
+        self.manager._record_chat_exchange('feishu_r1', 'oc_b', 'user', '不相关的话',
+                                           user_label='Bob')
+
+        import channel.manager as manager_mod
+        original = manager_mod.manager
+        manager_mod.manager = self.manager
+        try:
+            trigger = collector._build_trigger([{
+                'source': 'dds:/channel/request/feishu_r1',
+                'text': json.dumps({
+                    'channel_id': 'feishu_r1', 'chat_id': 'oc_a',
+                    'sender_type': 'user', 'message_id': 'om_new',
+                    'text': '我刚才说的怎么样了',
+                }, ensure_ascii=False),
+                'ts': 1,
+            }], urgent=True)
+        finally:
+            manager_mod.manager = original
+
+        self.assertIn('<chat_history channel="feishu_r1" chat_id="oc_a">', trigger['text'])
+        self.assertIn('帮我查电量', trigger['text'])
+        self.assertIn('电量 80%', trigger['text'])
+        self.assertNotIn('不相关的话', trigger['text'])
+
 
 
 if __name__ == '__main__':

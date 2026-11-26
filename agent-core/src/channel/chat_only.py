@@ -1,9 +1,9 @@
 """Execution policy for Channels that may only answer their current chat.
 
 A Channel-level policy (``chat_only`` on the channel config), never a platform
-one: it narrows what a turn may *do*. Such turns share the system prompt and
-environment, while their history is scoped by sender and role. Ordinary
-operator/owner Channel turns use the main agent's shared history.
+one: it narrows what a turn may *do*, not what the model is told. Such turns
+share the system prompt, environment and conversation history with every
+other turn.
 """
 
 

@@ -1,4 +1,4 @@
-"""Server-owned origin of asynchronous work started by a Channel turn."""
+"""Server-owned origin of asynchronous work started by a WeCom turn."""
 
 import json
 from contextvars import ContextVar
@@ -18,13 +18,13 @@ def context_key(origin: dict) -> str:
 
 
 def history_context(origin: dict | None) -> str | None:
-    """Full-control turns share main memory; restricted turns use their own history."""
+    """Only restricted WeCom turns select a separate conversation history."""
     if origin is None:
         return None
     key = context_key(origin)
     if key:
         scope = origin['_channel_scope']
-        if scope[4] in ('operator', 'owner') and not scope[5]:
+        if scope[0] != 'wecom' or (scope[4] in ('operator', 'owner') and not scope[5]):
             return None
     return key  # An unknown Channel identity must not fall back to shared memory.
 
@@ -33,6 +33,8 @@ def capture(origin: dict | None = None) -> dict | None:
     """Copy routing fields only; never retain the mutable trigger or its text."""
     origin = current.get() if origin is None else origin
     if not isinstance(origin, dict) or not context_key(origin):
+        return None
+    if origin['_channel_scope'][0] != 'wecom':
         return None
     session_id = origin.get('_channel_session_id')
     message_ids = origin.get('_channel_message_ids')

@@ -42,9 +42,9 @@ class ViewerRoleAuthorizationTest(unittest.TestCase):
         # Missing/unknown role defaults to restricted (fail closed, not fail open).
         self.assertTrue(collector.has_viewer_only_channel_event([_human_payload('')]))
 
-    def test_mixed_batch_with_an_operator_message_is_restricted(self):
+    def test_mixed_batch_with_an_operator_message_is_not_restricted(self):
         batch = [_human_payload('viewer'), _human_payload('operator')]
-        self.assertTrue(collector.has_viewer_only_channel_event(batch))
+        self.assertFalse(collector.has_viewer_only_channel_event(batch))
 
     def test_bot_sender_does_not_count_as_a_human_viewer(self):
         bot_payload = {

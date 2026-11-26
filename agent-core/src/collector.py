@@ -277,8 +277,9 @@ def set_turn_priority(priority: int):
 
 
 def set_turn_scope(trigger: dict | None):
-    """Keep same-authority steering separate from isolated follow-up messages."""
+    """Apply conversation-scoped steering only to WeCom turns."""
     global _current_channel_scope, _current_turn_restricted
+    trigger = trigger if trigger and trigger.get('_wecom_channel_event') else None
     _current_channel_scope = trigger.get('_channel_scope') if trigger else None
     _current_turn_restricted = bool(trigger and (
         trigger.get('_bot_channel_event') or trigger.get('_viewer_channel_event')
@@ -288,6 +289,8 @@ def set_turn_scope(trigger: dict | None):
 def _can_steer(event: dict) -> bool:
     if _current_turn_restricted:
         return False
+    if _current_channel_scope is None:
+        return not (_is_wecom_event(event) or has_bot_channel_event([event]))
     if not _is_channel_event(event):
         return True
     scope = channel_scope([event])
@@ -421,6 +424,11 @@ def _human_channel_payloads(events: list[dict]) -> list[dict]:
             if payload.get('sender_type') not in ('bot', 'app')]
 
 
+def _is_wecom_event(event: dict) -> bool:
+    return any(payload.get('platform') == 'wecom'
+               for payload in _channel_payloads([event]))
+
+
 def channel_scope(events: list[dict]) -> tuple | None:
     """Identity and policy of a single authorized human Channel conversation."""
     payloads = _human_channel_payloads(events)
@@ -443,7 +451,11 @@ def channel_context_key(trigger: dict) -> str:
 
 
 def has_viewer_only_channel_event(events: list[dict]) -> bool:
-    """Fail closed if any human message is read-only, including mixed batches."""
+    """Keep the shared role policy; WeCom batches require one authority."""
+    if not any(_is_wecom_event(ev) for ev in events):
+        human_payloads = _human_channel_payloads(events)
+        return bool(human_payloads) and not any(
+            p.get('user_role') in ('operator', 'owner') for p in human_payloads)
     if any(_is_channel_event(ev) and not _channel_payloads([ev]) for ev in events):
         return True
     human_payloads = _human_channel_payloads(events)
@@ -504,16 +516,17 @@ def _bot_trust_class(events: list[dict]) -> int:
 
 
 def _split_by_authorization(events: list[dict]) -> list[list[dict]]:
-    """Separate channel messages by trust, role, conversation and sender, in order."""
+    """Preserve shared trust batches; split WeCom by conversation and authority."""
     batches: list[list[dict]] = []
     last_key = None
     for event in events:
-        if '_channel_origin' in event:
+        wecom_event = _is_wecom_event(event)
+        if not wecom_event:
+            key = ('shared', event.get('_chat_only_key') or _bot_trust_class([event]))
+        elif '_channel_origin' in event:
             origin = event['_channel_origin']
             key = ('channel-followup', channel_context_key(origin),
                    origin.get('_channel_session_id'))
-        elif not _is_channel_event(event):
-            key = ('non-channel',)
         else:
             payloads = _channel_payloads([event])
             payload = payloads[0] if payloads else {}
@@ -529,12 +542,49 @@ def _split_by_authorization(events: list[dict]) -> list[list[dict]]:
                 role_class = role if role in ('operator', 'owner') else 'viewer'
                 key = ('channel', trust, role_class, payload.get('platform'), channel,
                        chat, user, payload.get('chat_only') is True)
-        key = (event.get('_chat_only_key'), key)
+        if wecom_event:
+            key = (event.get('_chat_only_key'), key)
         if not batches or key != last_key:
             batches.append([])
         batches[-1].append(event)
         last_key = key
     return batches
+
+
+def _chat_history_blocks(batch: list[dict]) -> str:
+    """Prepend each distinct (channel_id, chat_id)'s own recent recap (see
+    channel/manager.py:get_chat_history) ahead of this batch's <event> blocks.
+
+    The shared global turn history (event/llm.py:self._turns) doesn't separate
+    by chat — this gives the model an explicit, scoped reminder of what this
+    exact conversation said, so it's less likely to answer person A with
+    context that only came from person B.
+    """
+    from channel.manager import manager as channel_manager
+    seen = set()
+    blocks = []
+    for payload in _channel_payloads(batch):
+        if payload.get('platform') == 'wecom':
+            continue
+        channel_id = payload.get('channel_id')
+        chat_id = payload.get('chat_id')
+        if not isinstance(channel_id, str) or not isinstance(chat_id, str):
+            continue
+        if not channel_id or not chat_id or (channel_id, chat_id) in seen:
+            continue
+        seen.add((channel_id, chat_id))
+        history = channel_manager.get_chat_history(channel_id, chat_id)
+        if not history:
+            continue
+        lines = []
+        for entry in history:
+            label = f' ({entry["user_label"]})' if entry.get('user_label') else ''
+            lines.append(f'{entry.get("role", "user")}{label}: {entry.get("text", "")}')
+        blocks.append(
+            f'<chat_history channel="{channel_id}" chat_id="{chat_id}">\n'
+            + '\n'.join(lines) + '\n</chat_history>'
+        )
+    return '\n'.join(blocks)
 
 
 def _build_trigger(batch: list[dict], urgent: bool) -> dict:
@@ -545,6 +595,7 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
             channel_ids.append(channel_id)
     bot_payloads = _bot_channel_payloads(batch)
     trusted_payloads = _trusted_bot_channel_payloads(batch)
+    history_text = _chat_history_blocks(batch)
     formatted = _format_priority_batch(batch)
     origin = batch[0].get('_channel_origin')
     if origin:
@@ -554,7 +605,7 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         }, ensure_ascii=False)
     trigger = {
         'source': 'collector',
-        'text': formatted,
+        'text': f'{history_text}\n{formatted}' if history_text else formatted,
         'payload': {
             'event_count': len(batch),
             'sources': [e['source'] for e in batch],
@@ -566,7 +617,7 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_bot_channel_event': bool(bot_payloads),
         '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
         '_viewer_channel_event': has_viewer_only_channel_event(batch),
-        '_channel_event': any(_is_channel_event(event) for event in batch),
+        '_wecom_channel_event': any(_is_wecom_event(event) for event in batch),
         '_channel_scope': channel_scope(batch),
         '_channel_message_ids': channel_message_ids(batch),
         '_channel_image_paths': channel_image_paths(batch),
@@ -997,15 +1048,16 @@ async def _drain_loop():
                 import hooks
                 asyncio.create_task(hooks.fire('on_kws_wakeup'))
 
-        # Restricted followups stay out of the shared raw-input/BG context.
+        # WeCom messages and restricted followups stay out of shared raw input.
         restricted_origin = ('_channel_origin' in ev
                              and context.history_context(ev['_channel_origin']) is not None)
-        if not restricted_origin:
+        wecom_input = '_channel_origin' not in ev and _is_wecom_event(ev)
+        if not (restricted_origin or wecom_input):
             if source not in _source_ring:
                 _source_ring[source] = deque(maxlen=ring_size)
             _source_ring[source].append(ev)
 
-        if priority <= 0 and restricted_origin:
+        if priority <= 0 and (restricted_origin or wecom_input):
             continue  # A silent Channel completion must not enter shared BG context.
 
         if priority > 0:
@@ -1067,14 +1119,14 @@ async def _drain_loop():
                     # Interrupt: 缓存事件并触发 cancel
                     _priority_pending.append(ev)
                     if (_cancel_event and not has_bot_channel_event([ev])
-                            and not has_viewer_only_channel_event([ev])):
+                            and not (_is_wecom_event(ev) and has_viewer_only_channel_event([ev]))):
                         _cancel_event.set()
                 else:
                     # Followup: 暂存，等 turn 结束后 drain（原有行为）
                     _priority_pending.append(ev)
                     if (priority > _current_turn_priority and _cancel_event
                             and not has_bot_channel_event([ev])
-                            and not has_viewer_only_channel_event([ev])):
+                            and not (_is_wecom_event(ev) and has_viewer_only_channel_event([ev]))):
                         _cancel_event.set()
         else:
             # ── P=0: 送 bg buffer ──

@@ -421,22 +421,30 @@ def _trigger_channel_ids(trigger_event: dict) -> list[str]:
 
 
 def _steering_messages(trigger_event: dict, events: list[dict]) -> list[dict]:
-    """Extend reply metadata only for messages with this turn's authority."""
+    """Keep shared steering; only WeCom requires matching reply authority."""
+    wecom_turn = bool(trigger_event.get('_wecom_channel_event'))
     accepted = []
     for ev in events:
-        scope = collector.channel_scope([ev])
-        if (trigger_event.get('_bot_channel_event') or trigger_event.get('_viewer_channel_event')
-                or trigger_event.get('_chat_only_channel') or (collector._is_channel_event(ev)
-                and (scope is None or scope != trigger_event.get('_channel_scope')))):
+        defer = trigger_event.get('_bot_channel_event') or collector.has_bot_channel_event([ev])
+        if wecom_turn:
+            scope = collector.channel_scope([ev])
+            defer = defer or (trigger_event.get('_viewer_channel_event')
+                             or trigger_event.get('_chat_only_channel')
+                             or (collector._is_channel_event(ev)
+                                 and (scope is None or scope != trigger_event.get('_channel_scope'))))
+        else:
+            defer = defer or collector._is_wecom_event(ev)
+        if defer:
             collector.defer_priority([ev])
             continue
         accepted.append(ev)
-    for key, values in (
-        ('_channel_message_ids', collector.channel_message_ids(accepted)),
-        ('_channel_image_paths', collector.channel_image_paths(accepted)),
-    ):
-        current = trigger_event.setdefault(key, [])
-        current.extend(value for value in values if value not in current)
+    if wecom_turn:
+        for key, values in (
+            ('_channel_message_ids', collector.channel_message_ids(accepted)),
+            ('_channel_image_paths', collector.channel_image_paths(accepted)),
+        ):
+            current = trigger_event.setdefault(key, [])
+            current.extend(value for value in values if value not in current)
     return [{'role': 'user', 'content':
              f'[system notification source={ev.get("source", "")}]\n{ev.get("text", "")}'}
             for ev in accepted]
@@ -700,7 +708,7 @@ def _bot_channel_restricted(trigger_event: dict) -> bool:
 
 
 def _viewer_channel_restricted(trigger_event: dict) -> bool:
-    """Restrict read-only or unknown-role channel input, including mixed batches."""
+    """Apply the viewer-role policy selected by the collector for this batch."""
     return bool(trigger_event.get('_viewer_channel_event'))
 
 
@@ -1597,12 +1605,9 @@ async def _raw_input_info(
     limit: typing.Annotated[int, "返回最近 N 条原始事件，默认 20"] = 20,
 ) -> str:
     """获取指定信息源的原始输入数据。当摘要信息不足以做决策时使用此工具深入查看原始事件。"""
-    if '/channel/request/' in source:
-        return 'Error: Channel messages are available only in their authorized turns.'
     events = collector.get_source_detail(source, limit=limit)
     if not events:
-        available = [item for item in collector.get_available_sources()
-                     if '/channel/request/' not in item]
+        available = collector.get_available_sources()
         return f'未找到 source={source} 的数据。当前可用 sources: {", ".join(available) if available else "(无)"}'
     # 格式化为详细 XML
     lines = []
@@ -1620,7 +1625,7 @@ _event_instance: 'Event | None' = None
 
 def _channel_history_key(trigger_event: dict) -> str | None:
     from channel.context import history_context
-    return history_context(trigger_event) if trigger_event.get('_channel_event') else None
+    return history_context(trigger_event) if trigger_event.get('_wecom_channel_event') else None
 
 
 def _recent_context_turns(max_turns: int) -> list[list[dict]]:
@@ -2030,6 +2035,7 @@ class Event:
             from channel import context as channel_context
             if ev.get('_channel_origin') and not channel_context.is_active(ev['_channel_origin']):
                 continue
+            wecom_turn = bool(ev.get('_wecom_channel_event'))
             self._chat_only_active = bool(ev.get('_chat_only_channel'))
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
@@ -2053,7 +2059,7 @@ class Event:
             import chat_history
             _history_token = chat_history.current_channel_context.set(
                 _channel_history_key(ev))
-            _origin_token = channel_context.current.set(ev if ev.get('_channel_event') else None)
+            _origin_token = channel_context.current.set(ev if wecom_turn else None)
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev, reconsider_event=reconsider_ev)
             except TurnCancelled:
@@ -2063,7 +2069,7 @@ class Event:
                     'content': '[turn interrupted by user message]',
                 })
                 # 中止正在进行的 TTS 播放和动作
-                if not (self._chat_only_active or _channel_tool_restricted(ev)):
+                if not (self._chat_only_active or (wecom_turn and _channel_tool_restricted(ev))):
                     await self._interrupt_active_outputs()
                 await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
@@ -2072,7 +2078,8 @@ class Event:
                 message = error_message(e)
                 print(f'[decision] error in _one_turn: {message}')
                 # Fire on_error hook (LED feedback etc.)
-                if not (self._chat_only_active or ev.get('_bot_channel_event') or ev.get('_viewer_channel_event')):
+                if not (self._chat_only_active or ev.get('_bot_channel_event')
+                        or (wecom_turn and ev.get('_viewer_channel_event'))):
                     import hooks
                     asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
@@ -2091,11 +2098,12 @@ class Event:
                 collector.set_busy(False)
                 collector.set_turn_scope(None)
                 # Fire on_idle hook (LED state reset etc.)
-                if not (self._chat_only_active or ev.get('_bot_channel_event') or ev.get('_viewer_channel_event')):
+                if not (self._chat_only_active or ev.get('_bot_channel_event')
+                        or (wecom_turn and ev.get('_viewer_channel_event'))):
                     import hooks as _hooks_idle
                     asyncio.create_task(_hooks_idle.fire('on_idle'))
-                # Lower-trust channel input must not enter shared history where
-                # another turn might interpret it with higher authority.
+                # Bot input stays out of shared history; WeCom history selection
+                # is handled by _save_current_turn.
                 # Do not persist a turn invalidated by a history clear.
                 if (self._current_turn and not ev.get('_bot_channel_event')
                         and turn_gen == self._history_gen):
@@ -2236,7 +2244,7 @@ class Event:
         self._channel_turn_indexes = []
         self._channel_summary = ''
         self._channel_summary_through = -1
-        if not trigger_event.get('_channel_event') or not self._channel_context_key:
+        if not trigger_event.get('_wecom_channel_event') or not self._channel_context_key:
             return []
         import chat_history
         if _channel_history_key(trigger_event) is None:
@@ -2542,7 +2550,9 @@ class Event:
         if chat_only_turn:
             reconsider_event = None
         tool_restricted = chat_only_turn or bot_restricted or viewer_restricted
-        viewer_has_images = viewer_restricted and bool(trigger_event.get('_channel_image_paths'))
+        wecom_viewer = viewer_restricted and bool(trigger_event.get('_wecom_channel_event'))
+        viewer_has_images = wecom_viewer and bool(trigger_event.get('_channel_image_paths'))
+        side_effects_restricted = chat_only_turn or bot_restricted or wecom_viewer
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
 
@@ -2612,7 +2622,7 @@ class Event:
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
-        if not tool_restricted:
+        if not side_effects_restricted:
             asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
@@ -2620,7 +2630,7 @@ class Event:
         # 刚刚由自己排上的音频。见 _trigger_is_self_originated。
         # has_blocking_pendings 而不是 get_pending_actions：只有音乐在播时，没有任何
         # 东西需要打断，不该在每个用户 turn 上跑一遍清扫。
-        if (mcp_client.has_blocking_pendings() and not tool_restricted
+        if (mcp_client.has_blocking_pendings() and not side_effects_restricted
                 and not _trigger_is_self_originated(trigger_event)):
             # 一处调用，两条路都走。这里原本自己 fire 一次 hook，再在 else 分支调
             # _interrupt_active_outputs —— 那个函数里又 fire 一次，所以没有绑定时
@@ -2741,8 +2751,7 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            # Only restricted Channel turns use a separate history. Full-control
-            # operators keep the main agent's shared conversation and task context.
+            # Only restricted WeCom turns select a separate history.
             history = (channel_history if scoped_channel_history
                        else [] if bot_restricted else self._build_history())
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
@@ -2957,9 +2966,9 @@ class Event:
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
                         'mutating, actuator, processor, or delegated execution tools.'
                     )
-                elif viewer_restricted and name == 'Read' and not _viewer_image_read_allowed(trigger_event, args):
+                elif wecom_viewer and name == 'Read' and not _viewer_image_read_allowed(trigger_event, args):
                     result = 'Error: a viewer may only read images attached to the current Channel messages.'
-                elif (viewer_restricted and name == 'mcp__channel__channel_reply'
+                elif (wecom_viewer and name == 'mcp__channel__channel_reply'
                       and not _viewer_channel_reply_allowed(trigger_event, args)):
                     result = (
                         'Error: viewer replies must use a current source_message_id, cannot '
@@ -3030,7 +3039,7 @@ class Event:
                         # Inject instance_id from canvas binding (multiInstance tools need it)
                         if name in self._bound_instance_ids and 'instance_id' not in args:
                             args['instance_id'] = self._bound_instance_ids[name]
-                        if viewer_restricted and name == 'mcp__channel__channel_reply':
+                        if wecom_viewer and name == 'mcp__channel__channel_reply':
                             from channel.manager import viewer_reply_scope
                             channel_ids = frozenset(_trigger_channel_ids(trigger_event))
                             message_ids = frozenset(trigger_event.get('_channel_message_ids') or [])

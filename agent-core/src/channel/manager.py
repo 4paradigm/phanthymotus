@@ -31,7 +31,14 @@ _TRUSTED_BOT_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 _FEISHU_CHAT_ID_RE = re.compile(r'oc_[A-Za-z0-9]+')
 _FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
 
-# Set by the LLM dispatcher for viewer turns. Context-local rather than an
+# 单个 chat 自己的最近往来回顾——独立于全局共享的 `self._turns`（event/llm.py）。
+# agent-core 的对话历史是进程级单例，不区分 channel/chat_id/user；飞书本身也不
+# 替应用保留多轮上下文语义。没有这一层，两个人几乎同时私聊/群聊时，模型看到的
+# 历史会把不同人的对话混在一起，可能把 A 的上下文答给 B。
+_CHAT_HISTORY_LIMIT = 12
+_CHAT_HISTORY_TEXT_MAX = 500
+
+# Set by the LLM dispatcher for WeCom viewer turns. Context-local rather than an
 # argument supplied by the model, so concurrent turns/calls cannot widen it.
 viewer_reply_scope: ContextVar[tuple[frozenset[str], frozenset[str]] | None] = ContextVar(
     'viewer_reply_scope', default=None)
@@ -279,6 +286,50 @@ class ChannelManager:
         self._mention_rate[key] = window
         return True
 
+    # ── Per-chat context recap ───────────────────────────────────────────────
+    #
+    # 独立于 event/llm.py 里进程级共享的 `self._turns`：那条历史线不区分
+    # channel/chat_id/user，这里额外维护"这个会话自己的最近往来"，随 trigger
+    # 一起喂给模型，降低不同会话上下文被混用的风险（详见模块顶部注释）。
+
+    def _record_chat_exchange(self, channel_id: str, chat_id: str, role: str, text: str, *,
+                              user_label: str = ''):
+        if not channel_id or not chat_id or not text:
+            return
+        all_history = config.main.get('channel_chat_history', {})
+        if not isinstance(all_history, dict):
+            all_history = {}
+        channel_history = all_history.get(channel_id, {})
+        if not isinstance(channel_history, dict):
+            channel_history = {}
+        entries = channel_history.get(chat_id, [])
+        if not isinstance(entries, list):
+            entries = []
+        entries = entries + [{
+            'role': role,
+            'text': text[:_CHAT_HISTORY_TEXT_MAX],
+            'user_label': user_label,
+            'ts': time.time(),
+        }]
+        channel_history[chat_id] = entries[-_CHAT_HISTORY_LIMIT:]
+        all_history[channel_id] = channel_history
+        config.main['channel_chat_history'] = all_history
+
+    def get_chat_history(self, channel_id: str, chat_id: str, limit: int = 6) -> list[dict]:
+        """Return this chat's own recent exchanges (oldest first), independent of the
+        shared global turn history."""
+        all_history = config.main.get('channel_chat_history', {})
+        if not isinstance(all_history, dict):
+            return []
+        channel_history = all_history.get(channel_id, {})
+        if not isinstance(channel_history, dict):
+            return []
+        entries = channel_history.get(chat_id, [])
+        if not isinstance(entries, list):
+            return []
+        valid = [e for e in entries if isinstance(e, dict) and isinstance(e.get('text'), str)]
+        return valid[-limit:]
+
     # ── Persistent conversation context ──────────────────────────────────────
 
     def _get_last_context(self) -> dict:
@@ -290,8 +341,7 @@ class ChannelManager:
 
     def _set_last_context(self, channel_id: str, chat_id: str, user_id: str, *,
                           message_id: str = '', sender_type: str = 'user',
-                          chat_type: str = '', expect_reply: bool | None = None,
-                          user_role: str = ''):
+                          chat_type: str = '', expect_reply: bool | None = None):
         """Persist conversation context for a channel.
 
         带 ts —— 「最近一次会话」必须靠时间戳判断：dict 就地更新不改插入顺序，
@@ -302,7 +352,6 @@ class ChannelManager:
             'user_id': user_id,
             'message_id': message_id,
             'sender_type': sender_type,
-            'user_role': user_role,
             'chat_type': chat_type,
             'expect_reply': expect_reply,
             'ts': time.time(),
@@ -705,8 +754,7 @@ class ChannelManager:
                     elif adapter := self._adapters.get(msg.channel_id):
                         await adapter.send_message(OutboundMessage(
                             chat_id=msg.chat_id,
-                            text='Pending approval. Please contact an admin.',
-                            reply_to_message_id=msg.message_id,
+                            text='Pending approval. An admin has been notified.'
                         ))
                     return
 
@@ -728,8 +776,10 @@ class ChannelManager:
             sender_type=msg.sender_type,
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
-            user_role=user['role'],
         )
+        if msg.platform != 'wecom':
+            self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
+                                       user_label=msg.display_name or msg.user_id)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
@@ -930,6 +980,8 @@ class ChannelManager:
             result = f'Reply sent to {channel_id} ({"; ".join(parts) or "empty"})'
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
+            if not mention_open_id and adapter.platform != 'wecom':
+                self._record_chat_exchange(channel_id, chat_id, 'assistant', text)
             return result
         except PartialSendError as e:
             # 部分成功：必须让 LLM 知道哪部分已经到了，否则它会把文本重发一遍

@@ -258,8 +258,7 @@ def _env_dynamic() -> str:
     # 已订阅的传感器数据源（排除 ASR，它已作为触发事件直接可见）
     import collector
     active_sources = [s for s in collector.get_available_sources()
-                      if s.startswith('dds:') and '/asr' not in s
-                      and '/channel/request/' not in s]
+                      if s.startswith('dds:') and '/asr' not in s]
     sensors_section = ''
     if active_sources:
         sensor_lines = [f'  <source name="{s}" />' for s in active_sources]
