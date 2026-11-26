@@ -300,6 +300,42 @@ def test_ground_is_excluded_from_obstacle_distance_but_retains_coverage():
     assert filtered_coverage == coverage
 
 
+@pytest.mark.parametrize("surface", ["slope", "step", "occluded_step", "tall_step", "gap", "leg"])
+def test_projection_only_extends_ground_across_a_continuous_shallow_surface(surface):
+    from plugins.navi import local_path
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    camera = HorizontalIntrinsics(640, 492, 319.5)
+    vertical = (480, 492, 229)
+    ray = (np.arange(D.HEIGHT) - 229) / 492 + .20
+    floor = 1.25 / np.maximum(ray, .001)
+    slope = .13
+    if surface in ("slope", "gap"):
+        far = (1.25 + 1.9 * slope) / np.maximum(ray + slope, .001)
+        surface_depth = np.minimum(floor, far)
+        if surface == "gap":
+            surface_depth[(floor >= 1.8) & (floor <= 2.25)] = np.nan
+    elif surface in ("step", "occluded_step", "tall_step"):
+        height = {"step": .08, "occluded_step": .06, "tall_step": .18}[surface]
+        top = (1.25 - height) / np.maximum(ray, .001)
+        riser = np.nan if surface == "occluded_step" else 3.05
+        surface_depth = np.where(top >= 3.05, top, np.where(floor >= 3.05, riser, floor))
+    else:
+        surface_depth = np.where(floor >= 3.20, 3.20, floor)
+    frame = np.broadcast_to(floor[:, None], (D.HEIGHT, D.WIDTH)).astype(np.float32).copy()
+    columns = slice(445, 480 if surface == "leg" else 550)
+    frame[:, columns] = surface_depth[:, None]
+    frame[frame > 4.] = np.nan
+
+    ground = D.ground_mask(frame, camera, vertical)
+    assert ground is not None
+    geometry = local_path.camera_square(camera, vertical, .30, at_front=True)
+    grid = local_path.project_observation(dict(map=frame, ground=ground), geometry)
+    roi = (local_path.FORWARD >= 3.15) & (local_path.FORWARD <= 3.45) & (
+        local_path.RIGHT >= .80) & (local_path.RIGHT <= 1.6)
+    assert bool(grid[1][roi].any()) == (surface != "slope")
+
+
 def test_ground_filter_preserves_raised_obstacles_and_rejects_a_wall():
     from plugins.navi.camera import HorizontalIntrinsics
 

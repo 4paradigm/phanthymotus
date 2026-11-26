@@ -359,6 +359,42 @@ def _floor_patch_evidence(frame, heights, pixels, intrinsics, optical_normal):
     return floor_above & floor_below, face
 
 
+def _continuous_far_floor(frame, ground, heights, hits):
+    """Extend a measured floor up columns with a shallow, continuous profile."""
+    # Keep the original classification in the near field, where a depth
+    # discontinuity smeared by the camera matters most to immediate braking.
+    max_height_error = .20
+    candidates = hits & (frame >= 3.) & (heights <= max_height_error)
+    if not candidates.any():
+        return None
+
+    # Across a short run the range must recede and the height change must
+    # match a low slope. Check adjacent returns too, so a fit cannot bridge
+    # missing depth or the riser between a floor and a raised platform.
+    span = max(2, frame.shape[0] // 30)
+    run = frame[:-span] - frame[span:]
+    rise = heights[:-span] - heights[span:]
+    shallow = (run > .025) & (abs(rise) <= .27 * run + .035)
+    # A majority of overlapping profiles must support the same local slope.
+    # This tolerates row-to-row depth noise without trusting a single pair.
+    support = np.pad(shallow.cumsum(axis=0, dtype=np.int32), ((1, 0), (0, 0)))
+    rows = np.arange(frame.shape[0] - 1)
+    start = np.minimum(np.maximum(0, rows - span // 2), len(shallow))
+    end = np.minimum(rows + 1, len(shallow))
+    supported = (end > start)[:, None] & (
+        support[end] - support[start] >= .65 * (end - start)[:, None])
+    run = frame[:-1] - frame[1:]
+    rise = heights[:-1] - heights[1:]
+    continuous = (run >= -.05) & (run <= .07) & (
+        abs(rise) <= .20 * np.maximum(run, 0.) + .035)
+    climb = continuous & supported & (heights[:-1] <= max_height_error)
+    floor = ground & (abs(heights) <= .014)
+    for row in range(len(climb) - 1, -1, -1):
+        floor[row] |= floor[row + 1] & climb[row]
+    corrected = candidates & floor
+    return corrected if corrected.any() else None
+
+
 class DepthGrid(tuple):
     """Planning visibility and occupancy, with stronger evidence for clearing memory."""
 
@@ -415,10 +451,14 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
                 above_floor = (y + optical_normal[0]*x + optical_normal[2]*frame - c) / normal[2]
     if above_floor is None:
         hits = valid & _floorless_hits(frame)
+        ignored_floor = None
     else:
         hits = valid & ~ground & (above_floor >= MIN_OBSTACLE_HEIGHT_M)
         if geometry.height is not None:
             hits &= above_floor <= geometry.height + .05
+        ignored_floor = _continuous_far_floor(frame, ground, above_floor, hits)
+        if ignored_floor is not None:
+            hits &= ~ignored_floor
     if max_hit_depth is not None and above_floor is None:
         valid &= frame <= max_hit_depth
         hits &= valid
@@ -442,12 +482,13 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
                              heights=above_floor[samples] if above_floor is not None else None,
                              floor_context=floor_context, floor_samples=floor_samples,
                              pixel_samples=samples if check_free_space and above_floor is not None else None,
+                             ignored_low_pixels=ignored_floor if check_free_space else None,
                              max_hit_depth=max_hit_depth if above_floor is not None else None)
 
 
 def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
                       check_free_space, heights, floor_context=None, floor_samples=None, pixel_samples=None,
-                      max_hit_depth=None):
+                      ignored_low_pixels=None, max_hit_depth=None):
     within_depth = z <= max_hit_depth if max_hit_depth is not None else None
     transform = geometry.base_from_optical
     body_f = x * transform[0, 0] + y * transform[0, 1] + z * transform[0, 2] + transform[0, 3]
@@ -474,7 +515,6 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     cell_ids = cells[0] * right.shape[1] + cells[1]
     counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
     occupied = counts >= 3
-    ignored_low_pixels = None
     removed = None
     raw_removed = None
     if heights is not None and possible_hits.any():
@@ -507,7 +547,8 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     if pixel_samples is not None and raw_removed is not None and raw_removed.any():
         votes = possible_hits & (heights < LOW_OBSTACLE_HEIGHT_M) & raw_removed[cells]
         if votes.any():
-            ignored_low_pixels = np.zeros(pixel_samples.shape, dtype=bool)
+            if ignored_low_pixels is None:
+                ignored_low_pixels = np.zeros(pixel_samples.shape, dtype=bool)
             ignored_low_pixels.flat[np.flatnonzero(pixel_samples)[in_grid][votes]] = True
     neighbors = _neighbor_count(occupied)
     ends = occupied & (neighbors == 1)
@@ -560,6 +601,8 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
         clear_samples, minimum_clear_samples = floor_samples[in_grid], 3
     clear_votes = np.bincount(cell_ids[clear_samples], minlength=right.size).reshape(right.shape)
     clear = clear_votes >= minimum_clear_samples
+    if ignored_low_pixels is not None:
+        possible_hits |= ignored_low_pixels[pixel_samples][in_grid]
     clear[cells[0][possible_hits], cells[1][possible_hits]] = False
     return DepthGrid(free, occupied, clear, ignored_low_pixels)
 
@@ -1568,6 +1611,35 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     return cost, exit_region & (exit_error <= RESOLUTION)
 
 
+def _round_grid_route(points, allowed, origin):
+    """Round grid corners only when the shortcut stays in the allowed cells."""
+    points = np.asarray(points, dtype=float)
+    steps = np.diff(points, axis=0)
+    directions = steps / np.linalg.norm(steps, axis=1)[:, None]
+    corners = np.linalg.norm(np.diff(directions, axis=0), axis=1) > 1e-6
+    vertices = points[np.r_[True, corners, True]]
+    if len(vertices) <= 3:
+        return tuple(map(tuple, vertices))
+    # Do not shift the first waypoint chosen by the tangent or passage cost.
+    rounded = list(map(tuple, vertices[:2]))
+    t = np.linspace(0., 1., 12)[:, None]
+    for a, b, c in zip(vertices[1:], vertices[2:], vertices[3:]):
+        incoming, outgoing = b - a, c - b
+        before, after = np.linalg.norm(incoming), np.linalg.norm(outgoing)
+        start = b - incoming * min(.45, .20 / before)
+        end = b + outgoing * min(.45, .20 / after)
+        arc = (1. - t) ** 2 * start + 2. * t * (1. - t) * b + t ** 2 * end
+        cells = np.rint((arc + origin) / RESOLUTION).astype(int) + START
+        rows, cols = cells.T
+        inside = (rows >= 0) & (rows < allowed.shape[0]) & (cols >= 0) & (cols < allowed.shape[1])
+        if (inside.all() and allowed[rows, cols].all()
+                and allowed[rows[:-1], cols[1:]].all() and allowed[rows[1:], cols[:-1]].all()):
+            rounded.extend(map(tuple, arc))
+        else:
+            rounded.append(tuple(b))
+    return (*rounded, tuple(vertices[-1]))
+
+
 def clearance_route(grid, geometry, half_width, target, stop, approach_origin, previous=(), *,
                     body_half_width=None):
     """Find a clearance-weighted reference about the body pivot, on either side of the goal line."""
@@ -1649,7 +1721,11 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     topology = tuple((FORWARD[cell], RIGHT[cell]) for cell in path)
     relative = tuple((f - pivot, r) for f, r in topology)
     look = next((i for i, point in enumerate(relative) if math.hypot(*point) >= .40), len(relative) - 1)
-    return Detour(None, ((0., 0.), *relative[look:]), geometry,
+    points = ((0., 0.), *relative[look:])
+    # Use the preexisting keepout plus two cells of room on any rounded
+    # segment. A tight bypass continues to use its support waypoints.
+    points = _round_grid_route(points, allowed & (clearance >= half_width + 2 * RESOLUTION), (pivot, 0.))
+    return Detour(None, points, geometry,
                   reachable_prefix=reachable_prefix, topology=topology)
 
 

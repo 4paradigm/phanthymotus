@@ -24,6 +24,7 @@ from .motion import (FootprintSpec, MotionCheck, MotionTrace, Pose, Twist, _DEFA
 
 MAX_SEARCH_CANDIDATES = 64
 ROUTE_SPEED_SCALES = (1., .75, .5, .25)
+PREFERRED_CLEARANCE_M = .30
 
 
 @dataclass(frozen=True)
@@ -449,7 +450,16 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
 
 def _obstacle_score(check):
     # Only rank sweeps that already passed the hard footprint checks.
-    return 1.5 * max(0., .30 - check.min_clearance_m) / .30
+    return 1.5 * max(0., PREFERRED_CLEARANCE_M - check.min_clearance_m) / PREFERRED_CLEARANCE_M
+
+
+def pursuit_cost(command, previous, nominal_speed, yaw_limit, check):
+    """Rank checked arcs by continuity, progress, and speed near an obstacle."""
+    speed_scale = max(.1, nominal_speed)
+    speed_fraction = min(1., math.hypot(*command[:2]) / speed_scale)
+    change = .6 * math.dist(command[:2], previous[:2]) / speed_scale
+    change += .75 * abs(command[2] - previous[2]) / max(.2, *map(abs, yaw_limit))
+    return change + .75 * (1. - speed_fraction) + _obstacle_score(check) * (1. + speed_fraction)
 
 
 def score_candidate(command, trace, check, reference, previous, *, half_width, limits,
@@ -668,6 +678,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                        if footprint_mode == "camera_approx" else (0., 0.))
         lookahead = max(.45, x_speed * horizon)
         segments = _route_segments(points)
+        best = None
+        best_cost = math.inf
         for scale in ROUTE_SPEED_SCALES[:min(slots, len(ROUTE_SPEED_SCALES) - int(transition_slot))]:
             if budget.expired():
                 break
@@ -704,10 +716,19 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             if progress <= 0.:
                 continue
             components = CandidateScore(0., -progress, _obstacle_score(check), 0., 0., 0.)
-            diag.update(admissible_candidates=1, reference_scores=1, scores_by_reference=[1], reason=None)
-            choice = Choice(command, poses[:prediction.moving_count], components.total, progress,
-                            check.min_clearance_m, prediction, check, components)
-            return interpolate(choice, room - route_error)
+            diag["admissible_candidates"] += 1
+            cost = pursuit_cost(command, previous, max(x_speed, y_speed), yaw_limit, check)
+            if cost < best_cost:
+                best_cost = cost
+                best = Choice(command, poses[:prediction.moving_count], components.total, progress,
+                              check.min_clearance_m, prediction, check, components)
+                best_room = room - route_error
+            if scale == 1. and check.min_clearance_m >= PREFERRED_CLEARANCE_M and command[2] * previous[2] >= 0.:
+                break
+        if best is not None:
+            diag.update(reference_scores=diag["admissible_candidates"],
+                        scores_by_reference=[diag["admissible_candidates"]], reason=None)
+            return interpolate(best, best_room)
         diag["reason"] = "search_deadline" if budget.expired() else "no_admissible_candidates"
         return None
     outcomes = budget.for_context(context)

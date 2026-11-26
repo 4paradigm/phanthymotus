@@ -90,6 +90,14 @@ def test_retained_short_route_creeps_through_a_bend():
     assert 0. < choice.command[0] < .25 and choice.command[2] < 0.
 
 
+def test_retained_route_prefers_a_slower_arc_with_more_braking_clearance():
+    choice = _run(((0., 0.), (1.6, .25)), grid=_grid(obstacles=[(.4, .4)]),
+                  follow_published=True, target=None, measured=(.35, 0., -.1), previous=(.35, 0., -.1))
+    assert choice is not None and choice.check.accepted
+    assert 0. < choice.command[0] < .5 and choice.command[2] < 0.
+    assert choice.clearance > .05
+
+
 @pytest.mark.parametrize("side", [-1., 1.])
 @pytest.mark.parametrize("arc_clear", [False, True])
 def test_a_bent_route_sweeps_the_declared_turn_floor_before_sending(side, arc_clear):
@@ -1016,6 +1024,17 @@ def test_isolated_blocker_detour_enters_on_expanded_circle_tangent():
     angle = math.asin(radius / 1.95)
     forward, right = route.points[1]
     assert abs(math.atan2(right, forward)) == pytest.approx(angle, abs=.09)
+
+def test_grid_route_rounds_a_corner_only_with_clearance():
+    points = ((0., 0.), (.4, 0.), (.7, .3), (1.2, .3))
+    allowed = np.ones(local_path.SHAPE, dtype=bool)
+    rounded = local_path._round_grid_route(points, allowed, (0., 0.))
+    assert rounded[:2] == points[:2] and rounded[-1] == points[-1]
+    assert len(rounded) > len(points)
+    steps = np.diff(rounded[1:], axis=0)
+    headings = np.arctan2(steps[:, 1], steps[:, 0])
+    assert np.max(abs(np.diff(np.unwrap(headings)))) < math.pi / 4 - 1e-3
+    assert local_path._round_grid_route(points, ~allowed, (0., 0.)) == points
 
 
 @pytest.mark.parametrize("jambs_only", [False, True])

@@ -1844,6 +1844,22 @@ def test_normal_direct_tracking_is_not_no_reference(monkeypatch, body):
     assert card._state.dwa_totals.get("published_decisions", 0) == 0
 
 
+def test_direct_forward_renewal_checks_the_latest_obstacle_sweep(monkeypatch):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=False)
+    snapshot = [card._observation_snapshot(with_capture_timing=True)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._tick()
+    first, = packets
+    work = card._scheduled_command
+    assert first["values"][0] > 0. and work.forward_check.direct_association is not None
+    advance_snapshot(snapshot, clock, 1120, obstacle=True, vx=.30)
+    diagnostics = {}
+    checked = card._recheck_forward(work.forward_check, first["values"], 800, clock[0],
+                                    snapshot=snapshot[0], diagnostics=diagnostics)
+    assert checked is not None and not checked[2]
+    assert diagnostics["reason"] == "footprint_collision"
+
+
 def test_planning_expiry_keeps_measured_dwa_progress(monkeypatch):
     card, _, clock, snapshot, first = selected_card(monkeypatch)
     card._publish_command(first)
@@ -2644,7 +2660,8 @@ def test_route_timer_brakes_for_new_depth_inside_its_stopping_sweep(monkeypatch,
 
     monkeypatch.setattr(motion, "evaluate_motion", count_evaluations)
     card._dispatch_command()
-    assert len(traces) == 1 and traces[0].stopped
+    assert 1 <= len(traces) <= (len(dwa.ROUTE_SPEED_SCALES) if fresh_feedback and clear else 1)
+    assert all(trace.stopped for trace in traces)
     if clear:
         assert len(packets) == (2 if fresh_feedback else 1)
         assert packets[-1]["values"][0] > 0

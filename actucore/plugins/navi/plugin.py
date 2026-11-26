@@ -2878,6 +2878,35 @@ class NaviPlugin:
             ahead = policy_mod.projected_forward_clearance(occupied, geometry, config)
             clear = not (ahead is not None and ahead + policy_mod.FORWARD_CLEARANCE_MARGIN_M < check.distance_m
                          and ahead <= policy_mod.forward_stop_line(config, speed))
+        elif check.direct_association is not None:
+            previous = self._wire_twist or check.previous_twist
+            command = (values[0] if check.direct_vx is None else check.direct_vx, values[1], values[5])
+            rates = measured, previous, command
+            scan = self._state.active_scan
+            reference = policy_mod.dwa_pose_reference(scan, odom)
+            source_pose = policy_mod.dwa_grid_pose(scan, geometry, depth_ms, odom,
+                                                    capture=depth.get("obstacle_capture_pose"))
+            current_pose = policy_mod.dwa_grid_pose(scan, geometry, now_ms, odom)
+            try:
+                registration = policy_mod.dwa_registration(source_pose, current_pose, depth_ms, now_ms,
+                                                           geometry, rates, reference=reference)
+            except policy_mod.DwaFrameMismatch:
+                return None
+            mode = "camera_approx" if geometry.front == 0. else "body"
+            footprint = motion.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
+                                            config.clearance_margin_m, mode)
+            admission = min(self._ttl_ms, deadline - now_ms) / 1000
+            trace = motion.predict_motion(measured, previous, command,
+                                          hold_s=admission + (config.watchdog_ms + 50) / 1000,
+                                          latency_s=admission, geometry=geometry, mode=mode,
+                                          acceleration=config.motion_acceleration, braking=config.motion_braking)
+            result = motion.evaluate_motion(
+                trace, footprint=footprint, occupied=(registration.squares(occupied),), remembered=(),
+                supported_region=local_path.SUPPORTED_REGION, original_goal=None, stop_distance_m=0.,
+                cull_obstacles=True)
+            clear = result.accepted
+            if diagnostics is not None and not clear:
+                diagnostics["reason"] = result.reason
         newer = replace(check, geometry=geometry, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
                         feedback_source=feedback_source, feedback_ms=odom_ms, occupied=occupied)
         return obs_ms, deadline, clear, newer
@@ -4467,6 +4496,9 @@ class NaviPlugin:
         route_error = transform.error(math.hypot(*origin.acceptance.route_points[-1]))
         yaw_limit = (-policy_mod._scan_yaw_rate(cfg, 1.), policy_mod._scan_yaw_rate(cfg, -1.))
         checked = values = previous_values = None
+        previous = self._wire_twist or original.previous
+        best = None
+        best_cost = math.inf
         for scale in dwa.ROUTE_SPEED_SCALES:
             tracked = dwa.track_route(
                 points, nominal * scale, original.prediction_horizon_s, yaw_limit,
@@ -4490,11 +4522,23 @@ class NaviPlugin:
                 cover_slower_feedback=(cover_slower_feedback or target_refresh or self._goal_beyond_local_grid(origin)),
                 target_refresh=target_refresh)
             values = diagnostics.pop("visual_command", candidate)
-            if (checked is None or checked[2] or not wz or diagnostics.get("reason") not in
+            if checked is not None and checked[2]:
+                result = checked[3].motion_guard.check
+                cost = dwa.pursuit_cost(tuple(values[i] for i in (0, 1, 5)), previous, nominal, yaw_limit, result)
+                if cost < best_cost:
+                    best_cost = cost
+                    best = checked, values, diagnostics.copy()
+                if scale == 1. and result.min_clearance_m >= dwa.PREFERRED_CLEARANCE_M and values[5] * previous[2] >= 0.:
+                    break
+            elif (checked is None or not wz or diagnostics.get("reason") not in
                     ("insufficient_room", "outside_grid", "footprint_collision", "occluded_prefix", "target_standoff")):
                 break
             if int(time.time() * 1000) >= packet_deadline_ms:
                 break
+        if best is not None:
+            checked, values, selected_diagnostics = best
+            diagnostics.clear()
+            diagnostics.update(selected_diagnostics)
         if values is None:
             diagnostics.setdefault("reason", "route_end")
         return checked, values
