@@ -1609,7 +1609,8 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     allowed = clearance > half_width - RESOLUTION
     allowed[start] = True
     desired = geometry.front + geometry.rear
-    cost = 3. * _clearance_shortfall(np.maximum(0., clearance - half_width), desired)
+    gap = np.maximum(0., clearance - half_width)
+    cost = 3. * _clearance_shortfall(gap, desired)
     # Rejoin the original approach line when the obstruction ends. Otherwise
     # any point on the standoff circle, even far to the side, is equally good.
     dx, dy = target[0] - (approach_origin[0] + pivot), target[1] - approach_origin[1]
@@ -1618,6 +1619,9 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     cost += .5 * lateral / max(.15, half_width)
     cost, tangent_goal = _detour_shape_cost(cost, occupied, blockers, geometry, half_width,
                                            body_half_width or half_width, start, target)
+    if tangent_goal is not None:
+        # Keep charging for nearby cells along a compact obstacle's tangents.
+        cost += 2. * _clearance_shortfall(gap, .25)
     if previous:
         distance = np.full_like(clearance, np.inf)
         for f, r in previous:

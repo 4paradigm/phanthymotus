@@ -492,14 +492,14 @@ def score_candidate(command, trace, check, reference, previous, *, half_width, l
     obstacle = 0. if check is None else _obstacle_score(check)
     x_limit, y_limit, yaw_limit = limits
     smooth = .6 * (abs(command[0] - previous[0]) / max(.1, x_limit[1])
-                   + abs(command[1] - previous[1]) / max(.1, max(abs(y_limit[0]), y_limit[1]))
-                   + abs(command[2] - previous[2]) / max(.2, max(abs(yaw_limit[0]), yaw_limit[1])))
+                   + abs(command[1] - previous[1]) / max(.1, max(abs(y_limit[0]), y_limit[1])))
+    smooth += .75 * abs(command[2] - previous[2]) / max(.2, max(abs(yaw_limit[0]), yaw_limit[1]))
     heading = .45 * heading_error / max(.15, half_width) if guidance else .5 * heading_error / math.pi
     goal = 0.
     if target is not None:
         initial_range = math.dist(start_body[:2], target)
         end_range = math.dist(end_body[:2], target)
-        goal = .25 * (end_range - initial_range) / max(1., initial_range)
+        goal = .10 * (end_range - initial_range) / max(1., initial_range)
     return CandidateScore(path, along_route, obstacle, smooth, heading, goal), progress, None
 
 

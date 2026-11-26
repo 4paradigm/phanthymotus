@@ -653,6 +653,30 @@ def test_soft_clearance_preserves_a_feasible_narrow_opening():
     assert choice.command[0] > 0. and choice.components.obstacle > 0.
 
 
+def test_a_star_applies_short_range_clearance_after_detour_shape(monkeypatch):
+    f, r = local_path.FORWARD, local_path.RIGHT
+    occupied = (abs(f - 1.5) <= .11) & (abs(r) <= .11)
+    shape_cost = local_path._detour_shape_cost
+    shortest_path = local_path.shortest_path
+    scores = {}
+
+    def capture_shape(*args, **kwargs):
+        cost, goal = shape_cost(*args, **kwargs)
+        scores["shape"] = cost.copy()
+        return cost, goal
+
+    def capture_route(*args, **kwargs):
+        scores["route"] = kwargs["cell_cost"].copy()
+        return shortest_path(*args, **kwargs)
+
+    monkeypatch.setattr(local_path, "_detour_shape_cost", capture_shape)
+    monkeypatch.setattr(local_path, "shortest_path", capture_route)
+    assert local_path.clearance_route((~occupied, occupied), _geometry(), .27, (3., 0.), .60, (0., 0.))
+    extra = scores["route"] - scores["shape"]
+    assert extra[np.isclose(f, 1.5) & np.isclose(r, .45)].item() > 0.
+    assert extra[np.isclose(f, 1.5) & np.isclose(r, .70)].item() == 0.
+
+
 def test_unused_prediction_can_be_checked_by_a_later_reference_after_budget_exhaustion():
     budget = dwa.CandidateBudget(8)
     options = dict(candidate_budget=budget, max_candidates=8, yaw_limits=(0., 0.))
@@ -786,6 +810,26 @@ def test_guidance_penalizes_driving_parallel_to_an_offset_lane():
         return score.heading
 
     assert heading(.10) > heading(0.)
+
+
+def test_local_score_prioritizes_route_progress_and_turn_continuity():
+    command = (.30, 0., .10)
+    trace = dwa._predict(command, command, horizon=1., dt=.05,
+                         acceleration=(1., 1., 1.), braking=(1., 1., 1.), stop=True)
+    route = ((0., 0.), (1., 0.))
+
+    def score(previous, target):
+        cost, progress, reason = dwa.score_candidate(
+            command, trace, None, route, previous, half_width=.26,
+            limits=((0., .5), (0., 0.), (-.5, .5)), progress_scale=.5, target=target)
+        assert reason is None and progress > .25
+        return cost
+
+    turn_change = score((.30, 0., 0.), (1., 0.))
+    speed_change = score((.20, 0., .10), (1., 0.))
+    away = score((.30, 0., 0.), (-1., 0.))
+    assert turn_change.smooth > 1.2 * speed_change.smooth
+    assert 0. < away.total - turn_change.total < .07
 
 
 def test_slow_entry_arc_can_gain_heading_before_half_a_cell_of_progress():
