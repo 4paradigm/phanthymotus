@@ -116,7 +116,7 @@ class MotionContext:
         g = self.geometry
         mount = _array_key(g.base_from_optical) if g.base_from_optical is not None else None
         geometry = (g.horizontal, g.vertical, g.front, g.rear, g.height, g.free_space_validated,
-                    g.min_obstacle_height, mount)
+                    mount)
         return (tuple(self.measured), tuple(self.previous), self.horizon, self.latency, geometry,
                 self.footprint, _obstacle_key(self.occupied), _obstacle_key(self.remembered),
                 tuple(map(tuple, self.supported_region)) if self.supported_region is not None else None,

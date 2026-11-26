@@ -2545,9 +2545,7 @@ class NaviPlugin:
                     or capture_pose.frame != check.mount_frame or pose.frame != check.mount_frame):
                 return reject("geometry_mismatch")
             calibrated = depth.get("mount_accuracy_validated") is True
-            geometry = replace(geometry, base_from_optical=mount, free_space_validated=calibrated,
-                               min_obstacle_height=(local_path.MIN_OBSTACLE_HEIGHT_M if calibrated else
-                                                    self._config.local_geometry.min_obstacle_height))
+            geometry = replace(geometry, base_from_optical=mount, free_space_validated=calibrated)
         front_required = bool(not guard.corner_only and track is not None and track.front_required)
         live_point = None
         target_pending = False
@@ -3560,7 +3558,7 @@ class NaviPlugin:
         geometry = config.scan_geometry or config.local_geometry
         footprint = (None if geometry is None else
                      (geometry.front, geometry.rear, geometry.height,
-                      geometry.horizontal, geometry.vertical, geometry.min_obstacle_height,
+                      geometry.horizontal, geometry.vertical,
                       geometry.free_space_validated, tuple(geometry.base_from_optical.flat)))
         fields = ("local_controller", "local_planning", "vx_max", "vy_max", "wz_max", "use_lateral",
                   "floor_vx", "floor_vy", "floor_wz", "floor_vx_moving", "floor_vy_moving",

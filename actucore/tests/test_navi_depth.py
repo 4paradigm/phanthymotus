@@ -301,7 +301,7 @@ def test_ground_is_excluded_from_obstacle_distance_but_retains_coverage():
 
 
 @pytest.mark.parametrize("surface", ["slope", "step", "occluded_step", "tall_step", "gap", "leg"])
-def test_projection_only_extends_ground_across_a_continuous_shallow_surface(surface):
+def test_projection_applies_obstacle_height_to_far_surfaces(surface):
     from plugins.navi import local_path
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -316,7 +316,7 @@ def test_projection_only_extends_ground_across_a_continuous_shallow_surface(surf
         if surface == "gap":
             surface_depth[(floor >= 1.8) & (floor <= 2.25)] = np.nan
     elif surface in ("step", "occluded_step", "tall_step"):
-        height = {"step": .08, "occluded_step": .06, "tall_step": .18}[surface]
+        height = {"step": .18, "occluded_step": .24, "tall_step": .24}[surface]
         top = (1.25 - height) / np.maximum(ray, .001)
         riser = np.nan if surface == "occluded_step" else 3.05
         surface_depth = np.where(top >= 3.05, top, np.where(floor >= 3.05, riser, floor))
@@ -333,7 +333,7 @@ def test_projection_only_extends_ground_across_a_continuous_shallow_surface(surf
     grid = local_path.project_observation(dict(map=frame, ground=ground), geometry)
     roi = (local_path.FORWARD >= 3.15) & (local_path.FORWARD <= 3.45) & (
         local_path.RIGHT >= .80) & (local_path.RIGHT <= 1.6)
-    assert bool(grid[1][roi].any()) == (surface != "slope")
+    assert bool(grid[1][roi].any()) == (surface in ("occluded_step", "tall_step", "leg"))
 
 
 def test_ground_filter_preserves_raised_obstacles_and_rejects_a_wall():
@@ -734,7 +734,8 @@ def test_repeated_depth_revisions_preserve_pixel_order_and_mutable_edits():
 
 
 @pytest.mark.parametrize("wide", [False, True])
-def test_metric_clearance_uses_the_same_low_patch_as_the_planning_grid(wide):
+@pytest.mark.parametrize("height", [.19, .21])
+def test_metric_clearance_uses_the_same_height_threshold_as_the_planning_grid(wide, height):
     from plugins.navi import local_path, policy
     from plugins.navi.camera import HorizontalIntrinsics
 
@@ -743,7 +744,8 @@ def test_metric_clearance_uses_the_same_low_patch_as_the_planning_grid(wide):
     geometry = local_path.camera_square(camera, vertical, .275)
     frame = _floor_scene()
     columns = slice(180, 480) if wide else slice(318, 350)
-    frame[388:402, columns] = 1.02
+    rows = slice(388, 402)
+    frame[rows, columns] *= (.42 - height) / .42
     ground = D.ground_mask(frame, camera, vertical)
     assert ground is not None
     config = policy.Config(local_geometry=geometry, depth_intrinsics=camera)
@@ -751,10 +753,13 @@ def test_metric_clearance_uses_the_same_low_patch_as_the_planning_grid(wide):
     raw, coverage = _corridor(frame, ground=ground, intrinsics=camera,
                               half_width_m=policy._keepout_m(config),
                               reference_m=config.obstacle_stop_m)
-    assert raw == pytest.approx(1.02)
+    assert raw < 1.
     clearance, measured = policy._clearance(depth, config)
-    if wide:
-        assert clearance == raw
+    grid = local_path.project_observation(depth, geometry)
+    assert bool(grid[1].any()) is (height >= .20)
+    if height >= .20:
+        obstacle = frame[rows, columns]
+        assert obstacle.min() <= clearance <= obstacle.max()
     else:
         assert clearance > 1.5
     assert measured == coverage

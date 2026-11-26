@@ -16,11 +16,7 @@ UNKNOWN, FREE, OCCUPIED = 0, 1, 2
 CARDINAL_STEPS = ((0, 1), (1, 0), (0, -1), (-1, 0))
 STEPS = CARDINAL_STEPS + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 RESOLUTION = .05
-MIN_OBSTACLE_HEIGHT_M = .02
-LOW_OBSTACLE_HEIGHT_M = .10
-LOW_COMPONENT_AREA_M2 = .05
-LOW_COMPONENT_SPAN_M = .50
-APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M = .05
+MIN_OBSTACLE_HEIGHT_M = .20
 # Preserve the forward range while covering the body behind a front camera.
 START = (20, 28)
 SHAPE = (87, 57)
@@ -282,40 +278,6 @@ def _neighbor_count(mask):
                for r in range(3) for c in range(3) if (r, c) != (1, 1))
 
 
-def _isolated_low_cells(occupied, highest, lowest, resolution):
-    """Find small, wholly visible patches without a physical connection to a taller return."""
-    tall = occupied & (highest >= LOW_OBSTACLE_HEIGHT_M)
-    low = occupied & ~tall
-    # Entire contiguous runs already meeting the span limit need no component walk.
-    columns = np.arange(low.shape[1])
-    left = np.maximum.accumulate(np.where(low, -1, columns), axis=1)
-    right = np.minimum.accumulate(np.where(low, low.shape[1], columns)[:, ::-1], axis=1)[:, ::-1]
-    long_runs = low & ((right - left - 1) * resolution >= LOW_COMPONENT_SPAN_M)
-    pending = set(map(tuple, np.argwhere(low & ~long_runs).tolist()))
-    removed = np.zeros_like(occupied)
-    rows, cols = occupied.shape
-    while pending:
-        patch = [pending.pop()]
-        supported = False
-        for r, c in patch:
-            if r == 0 or c == 0 or r == rows - 1 or c == cols - 1:
-                supported = True  # The rest of this patch may lie outside the grid.
-            for nr in range(max(0, r-1), min(rows, r+2)):
-                for nc in range(max(0, c-1), min(cols, c+2)):
-                    if (nr, nc) in pending:
-                        pending.remove((nr, nc))
-                        patch.append((nr, nc))
-                    elif long_runs[nr, nc] or (tall[nr, nc] and lowest[nr, nc] <= highest[r, c] + resolution):
-                        supported = True
-        if supported or len(patch) * resolution**2 >= LOW_COMPONENT_AREA_M2:
-            continue
-        rr, cc = zip(*patch)
-        span = (math.hypot(max(rr)-min(rr), max(cc)-min(cc)) + 1) * resolution
-        if span < LOW_COMPONENT_SPAN_M:
-            removed[rr, cc] = True
-    return removed
-
-
 def _floorless_hits(frame):
     """Keep vertically supported range returns when a floor plane is unavailable."""
     step = max(1, frame.shape[0] // 50)
@@ -331,20 +293,11 @@ def _floorless_hits(frame):
     return hits
 
 
-def _floor_patch_evidence(frame, heights, pixels, intrinsics, optical_normal):
-    """Look for floor on both sides of a low return and a vertical face below it."""
+def _vertical_face_evidence(frame, heights, pixels, intrinsics, optical_normal):
+    """Keep a sparse return when depth also shows a vertical face beneath it."""
     fx, cx, fy, cy = intrinsics
     row, col = np.divmod(pixels, frame.shape[1])
     depth = frame[row, col]
-    floor_above = np.zeros(len(row), dtype=bool)
-    floor_below = floor_above.copy()
-    for distance in (.06, .08, .10):
-        step = np.ceil(distance * fy / depth).astype(int)
-        top = row - step
-        bottom = row + step
-        floor_above |= (top >= 0) & (abs(heights[np.maximum(top, 0), col]) <= .025)
-        floor_below |= (bottom < frame.shape[0]) & (
-            abs(heights[np.minimum(bottom, frame.shape[0] - 1), col]) <= .025)
     x, y = (col - cx) * depth / fx, (row - cy) * depth / fy
     down = optical_normal / np.linalg.norm(optical_normal)
     face = np.ones(len(row), dtype=bool)
@@ -356,43 +309,7 @@ def _floor_patch_evidence(frame, heights, pixels, intrinsics, optical_normal):
         face &= (r >= 0) & (r < frame.shape[0]) & (c >= 0) & (c < frame.shape[1])
         r, c = np.clip(r, 0, frame.shape[0] - 1), np.clip(c, 0, frame.shape[1] - 1)
         face &= (abs(frame[r, c] - expected) <= .008) & (heights[r, c] >= .003)
-    return floor_above & floor_below, face
-
-
-def _continuous_far_floor(frame, ground, heights, hits):
-    """Extend a measured floor up columns with a shallow, continuous profile."""
-    # Keep the original classification in the near field, where a depth
-    # discontinuity smeared by the camera matters most to immediate braking.
-    max_height_error = .20
-    candidates = hits & (frame >= 3.) & (heights <= max_height_error)
-    if not candidates.any():
-        return None
-
-    # Across a short run the range must recede and the height change must
-    # match a low slope. Check adjacent returns too, so a fit cannot bridge
-    # missing depth or the riser between a floor and a raised platform.
-    span = max(2, frame.shape[0] // 30)
-    run = frame[:-span] - frame[span:]
-    rise = heights[:-span] - heights[span:]
-    shallow = (run > .025) & (abs(rise) <= .27 * run + .035)
-    # A majority of overlapping profiles must support the same local slope.
-    # This tolerates row-to-row depth noise without trusting a single pair.
-    support = np.pad(shallow.cumsum(axis=0, dtype=np.int32), ((1, 0), (0, 0)))
-    rows = np.arange(frame.shape[0] - 1)
-    start = np.minimum(np.maximum(0, rows - span // 2), len(shallow))
-    end = np.minimum(rows + 1, len(shallow))
-    supported = (end > start)[:, None] & (
-        support[end] - support[start] >= .65 * (end - start)[:, None])
-    run = frame[:-1] - frame[1:]
-    rise = heights[:-1] - heights[1:]
-    continuous = (run >= -.05) & (run <= .07) & (
-        abs(rise) <= .20 * np.maximum(run, 0.) + .035)
-    climb = continuous & supported & (heights[:-1] <= max_height_error)
-    floor = ground & (abs(heights) <= .014)
-    for row in range(len(climb) - 1, -1, -1):
-        floor[row] |= floor[row + 1] & climb[row]
-    corrected = candidates & floor
-    return corrected if corrected.any() else None
+    return face
 
 
 class DepthGrid(tuple):
@@ -449,16 +366,17 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
             if .02 < top <= 2.5:
                 x, y = u * frame, v[:, None] * frame
                 above_floor = (y + optical_normal[0]*x + optical_normal[2]*frame - c) / normal[2]
+    ignored_low_pixels = None
     if above_floor is None:
         hits = valid & _floorless_hits(frame)
-        ignored_floor = None
     else:
         hits = valid & ~ground & (above_floor >= MIN_OBSTACLE_HEIGHT_M)
         if geometry.height is not None:
             hits &= above_floor <= geometry.height + .05
-        ignored_floor = _continuous_far_floor(frame, ground, above_floor, hits)
-        if ignored_floor is not None:
-            hits &= ~ignored_floor
+        if check_free_space:
+            low = valid & ~ground & (above_floor >= 0.) & (above_floor < MIN_OBSTACLE_HEIGHT_M)
+            if low.any():
+                ignored_low_pixels = low
     if max_hit_depth is not None and above_floor is None:
         valid &= frame <= max_hit_depth
         hits &= valid
@@ -475,14 +393,14 @@ def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_dept
     x, y = u[col] * z, v[row] * z
     floor_context = None
     floor_samples = ground[samples] if above_floor is not None and check_free_space else None
-    if above_floor is not None and geometry.min_obstacle_height == APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M:
+    if above_floor is not None:
         floor_context = (frame, above_floor, samples, (fx, cx, fy, cy), optical_normal)
     return _project_observed(geometry, right, forward, resolution, x, y, z,
                              hits[samples], check_free_space=check_free_space,
                              heights=above_floor[samples] if above_floor is not None else None,
                              floor_context=floor_context, floor_samples=floor_samples,
                              pixel_samples=samples if check_free_space and above_floor is not None else None,
-                             ignored_low_pixels=ignored_floor if check_free_space else None,
+                             ignored_low_pixels=ignored_low_pixels,
                              max_hit_depth=max_hit_depth if above_floor is not None else None)
 
 
@@ -511,31 +429,11 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     raised = possible_hits
     if heights is not None:
         heights = heights[in_grid]
-        raised = possible_hits & (heights >= geometry.min_obstacle_height)
+        raised = possible_hits & (heights >= MIN_OBSTACLE_HEIGHT_M)
     cell_ids = cells[0] * right.shape[1] + cells[1]
     counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
     occupied = counts >= 3
-    removed = None
-    raw_removed = None
-    if heights is not None and possible_hits.any():
-        top = np.zeros(right.shape)
-        bottom = np.full(right.shape, np.inf)
-        np.maximum.at(top.ravel(), cell_ids[raised], heights[raised])
-        np.minimum.at(bottom.ravel(), cell_ids[raised], heights[raised])
-        removed = _isolated_low_cells(occupied, top, bottom, resolution)
-        raw_removed = removed
-        if pixel_samples is not None:
-            # The pixel corridor can also see returns below the raster vote
-            # threshold. Classify these without joining separate occupied patches.
-            weak = possible_hits & ~raised
-            np.maximum.at(top.ravel(), cell_ids[weak], heights[weak])
-            np.minimum.at(bottom.ravel(), cell_ids[weak], heights[weak])
-            present = top > 0.
-            if (present & ~occupied).any():
-                raw_removed = removed | _isolated_low_cells(present, top, bottom, resolution)
     if within_depth is not None:
-        # The range cap belongs to this query. A large platform straddling it
-        # must be classified using its complete visible footprint first.
         keep = within_depth[in_grid]
         in_grid[in_grid] = keep
         cells = cells[0][keep], cells[1][keep]
@@ -544,12 +442,6 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
             heights = heights[keep]
         counts = np.bincount(cell_ids[raised], minlength=right.size).reshape(right.shape)
         occupied = counts >= 3
-    if pixel_samples is not None and raw_removed is not None and raw_removed.any():
-        votes = possible_hits & (heights < LOW_OBSTACLE_HEIGHT_M) & raw_removed[cells]
-        if votes.any():
-            if ignored_low_pixels is None:
-                ignored_low_pixels = np.zeros(pixel_samples.shape, dtype=bool)
-            ignored_low_pixels.flat[np.flatnonzero(pixel_samples)[in_grid][votes]] = True
     neighbors = _neighbor_count(occupied)
     ends = occupied & (neighbors == 1)
     small = occupied & ((neighbors == 0) | (ends & (_neighbor_count(ends) == 1)))
@@ -567,24 +459,14 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
             np.maximum.at(highest, sparse_cells, heights[sparse_hits])
             np.minimum.at(lowest, sparse_cells, heights[sparse_hits])
             weak = small & weak & (highest - lowest < .05)
-            occupied &= ~(small & (highest < .05))
-            if floor_context is None:
-                occupied &= ~weak
-            else:
-                # Only suppress an extra near-floor patch with positive floor evidence.
-                # A thin upright face can also rescue a return from the weak-hit rule.
-                low = small & far & (highest <= APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M + .01)
-                candidates = (low | weak)[cells] & raised
-                if candidates.any():
-                    frame, above_floor, samples, intrinsics, optical_normal = floor_context
-                    pixels = np.flatnonzero(samples)[in_grid][candidates]
-                    floor, face = _floor_patch_evidence(frame, above_floor, pixels, intrinsics, optical_normal)
-                    ids = cell_ids[candidates]
-                    floor_votes = np.bincount(ids[floor], minlength=right.size).reshape(right.shape)
-                    face_votes = np.bincount(ids[face], minlength=right.size).reshape(right.shape)
-                    occupied &= ~((weak | (low & (floor_votes >= .8 * counts))) & (face_votes < 2))
-    if removed is not None:
-        occupied &= ~removed
+            candidates = weak[cells] & raised
+            if floor_context is not None and candidates.any():
+                frame, above_floor, samples, intrinsics, optical_normal = floor_context
+                pixels = np.flatnonzero(samples)[in_grid][candidates]
+                face = _vertical_face_evidence(frame, above_floor, pixels, intrinsics, optical_normal)
+                face_votes = np.bincount(cell_ids[candidates][face], minlength=right.size).reshape(right.shape)
+                weak &= face_votes < 2
+            occupied &= ~weak
     # Only metric returns establish visibility. Unseen gaps, blind regions,
     # and cells behind the last measured surface retain the unknown state.
     free = np.zeros(right.shape, dtype=bool)
@@ -616,7 +498,6 @@ class Geometry:
     rear: float
     height: float | None
     free_space_validated: bool = True
-    min_obstacle_height: float = MIN_OBSTACLE_HEIGHT_M
 
     @property
     def half_length(self):
@@ -632,11 +513,8 @@ def camera_square(horizontal, vertical, half_width, *, half_length=None, at_fron
                      [0., -1., 0., 0.], [0., 0., 0., 1.]])
     extent = (half_length if type(half_length) in (int, float)
               and math.isfinite(half_length) and half_length > 0 else half_width)
-    # The uncalibrated camera approximation can put a few centimetres of
-    # floor residual into obstacle cells. Keep those cells unknown.
     front, rear = (0., 2 * extent) if at_front else (extent, extent)
-    return Geometry(horizontal, vertical, axes, front, rear, None,
-                    min_obstacle_height=APPROXIMATE_CAMERA_MIN_OBSTACLE_HEIGHT_M)
+    return Geometry(horizontal, vertical, axes, front, rear, None)
 
 
 def body_square(geometry, vendor):
@@ -897,7 +775,7 @@ class DepthProjection:
 
     def grid_for(self, geometry, *, require_valid_depth, check_free_space):
         geometry_key = (geometry.horizontal, geometry.vertical, geometry.front, geometry.height,
-                        geometry.min_obstacle_height, geometry.base_from_optical.tobytes())
+                        geometry.base_from_optical.tobytes())
         key = (geometry_key, check_free_space)
         with self._lock:
             # The free-space query only changes free cells. Its occupied mask

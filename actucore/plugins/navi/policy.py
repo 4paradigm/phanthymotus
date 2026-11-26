@@ -1411,9 +1411,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
             calibrated = depth.get("mount_accuracy_validated") is True
             half_length = config.local_geometry.half_length
             geometry = replace(config.local_geometry, base_from_optical=depth["body_from_optical"],
-                               front=half_length, rear=half_length, free_space_validated=calibrated,
-                               min_obstacle_height=(local_path.MIN_OBSTACLE_HEIGHT_M if calibrated
-                                                    else config.local_geometry.min_obstacle_height))
+                               front=half_length, rear=half_length, free_space_validated=calibrated)
             config = replace(config, scan_geometry=geometry, local_geometry=geometry)
         else:
             depth = dict(depth, body_mount_required=False)
