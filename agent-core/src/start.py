@@ -94,6 +94,7 @@ async def _auto_ping_all_mcps():
 def _register_core_mcp(silent=False):
     """Register agent-core itself as an MCP with decision_core tool."""
     import api.mcp_manage as mcp_mgr
+    from fanshi_card import TOOL as FANSHI_TOOL
 
     CORE_MCP_ID = 'agentcore'
     existing = mcp_mgr._get_mcp_list()
@@ -407,6 +408,7 @@ def _register_core_mcp(silent=False):
         ],
     })
 
+    next(m for m in existing if m['id'] == 'channel')['tools'].append(FANSHI_TOOL)
     mcp_mgr._save_mcp_list(existing)
     if not silent:
         print(f'[startup] registered core MCP: {CORE_MCP_ID}')

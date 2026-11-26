@@ -1236,6 +1236,13 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
 
     # ── Handle internal channel MCP ──
     if mcp_id == 'channel':
+        if req.tool == 'fanshi_message_send':
+            from fanshi_card import handle
+            result = await handle(req.arguments)
+            # Keep partial/unknown diagnostics (parts + action_id) visible in the canvas.
+            # Transport succeeded even when the platform rejected a message.
+            return {'code': 200, 'data': result}
+
         from channel.manager import channel_request_topic, manager as channel_mgr
 
         def _card_channel(tool: str, instance_id: str) -> str:
