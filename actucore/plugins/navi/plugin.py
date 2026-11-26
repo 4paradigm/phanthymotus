@@ -2979,8 +2979,7 @@ class NaviPlugin:
                 if accepted.route_points and accepted.motion_guard.pose is not None:
                     self._state.published_dwa_route = accepted
             committed = self._state.committed_route
-            if (self._state.published_dwa_route is None and committed is not None
-                    and self._state.dwa_trace.get("wait_for_committed_route")):
+            if self._state.published_dwa_route is None and committed is not None:
                 self._state.published_dwa_route = committed
             if self._config.local_controller == "dwa" and self._wire_twist is not None:
                 # A preview or an expired candidate did not change the chassis
