@@ -1984,13 +1984,42 @@ def test_the_card_adopts_the_geometry_of_whichever_topic_carries_the_depth():
     assert any("0.888" in note for note in card._camera_notes)
 
 
-def test_old_config_margin_cannot_override_adopted_chassis_width():
+@pytest.mark.parametrize("settings, margin", [
+    pytest.param({}, None, id="absent"),
+    pytest.param({"clearance_margin_m": 0}, 0., id="zero"),
+    pytest.param({"clearance_margin_m": .15}, .15, id="positive"),
+    pytest.param({"clearance_margin_m": None}, None, id="null"),
+    pytest.param({"clearance_margin_m": -.1}, None, id="negative"),
+    pytest.param({"clearance_margin_m": float("nan")}, None, id="nan"),
+    pytest.param({"clearance_margin_m": float("inf")}, None, id="infinite"),
+    pytest.param({"clearance_margin_m": True}, None, id="boolean"),
+    pytest.param({"clearance_margin_m": "0.15"}, None, id="string"),
+    pytest.param({"clearance_margin_m": 10**400}, None, id="overflow"),
+])
+def test_saved_clearance_margin_is_applied_on_start_and_restart(monkeypatch, settings, margin):
     from plugins.navi import policy
 
-    card = _card(half_width_m=.35, clearance_margin_m=.05)
-    assert policy._keepout_m(card._config) == pytest.approx(.385)
-    policy.adopt_limits(card._config, {"footprint": {"half_width": .20}})
-    assert policy._keepout_m(card._config) == pytest.approx(.22)
+    card = _card(view_hz=0., **settings)
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(card, "_node", _FakeNode()))
+    expected = .385 if margin is None else .35 + margin
+    assert policy._keepout_m(card._config) == pytest.approx(expected)
+    for width, default_keepout in ((.20, .22), (.39, .429)):
+        try:
+            started = card.dispatch("navi", {
+                "action": "start",
+                "control_interface": _descriptor(footprint={"half_width": width}),
+                "input_topics": [_OBJECTS_TOPIC, _DEPTH_TOPIC],
+            })
+            assert started["state"] == "running"
+            assert card._config.half_width_m == width
+            expected = default_keepout if margin is None else width + margin
+            assert policy._keepout_m(card._config) == pytest.approx(expected)
+            updated = card.dispatch("navi", {"action": "config", "stop_distance_m": .8,
+                                             "clearance_margin_m": .5})
+            assert updated["config"] == {"stop_distance_m": .8}
+            assert policy._keepout_m(card._config) == pytest.approx(expected)
+        finally:
+            card._stop()
 
 
 def test_a_calibrated_corridor_excludes_the_left_doorframe():

@@ -346,6 +346,22 @@ def test_arrival_tolerance_accepts_only_distances_within_the_parking_ring(distan
         assert "1.20 m ± 0.10 m tolerance" in decision.reason
 
 
+def test_blocked_parking_does_not_resume_translation_for_ring_jitter():
+    config = _cfg(stop_distance_m=.60, stop_tolerance_m=.05)
+    person = _obj(x=.5, bbox=(.6, .3, .9, .7))
+    depth = _depth(map_=_solid_depth(.64))
+    state = seed(_state(), _detections(person), depth, config)
+    state.parking_hold_generation = state.tracker.track.generation
+
+    slight_change = _step(detections=_detections(person), depth=_depth(map_=_solid_depth(.66)),
+                          state=state, config=config)
+    assert slight_change.status == P.ALIGNING and slight_change.values[:2] == [0., 0.]
+    assert not state.arrived
+
+    _step(detections=_detections(person), depth=_depth(map_=_solid_depth(.78)), state=state, config=config)
+    assert state.parking_hold_generation is None
+
+
 def test_default_tolerance_is_five_centimetres():
     config = _cfg(stop_distance_m=1.2)
     decision = _step(detections=_detections(_obj()),

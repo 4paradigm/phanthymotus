@@ -39,6 +39,7 @@ import json
 import logging
 import math
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -424,6 +425,19 @@ _IGNORED_LEGACY_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw",
                                     "stop_tolerance_m"))
 
 
+def _policy_config(settings: dict) -> policy_mod.Config:
+    # Restore the fixed margin from existing deployment YAML when it is valid.
+    margin = settings.get("clearance_margin_m")
+    if type(margin) not in (int, float) or not 0 <= margin <= sys.float_info.max:
+        margin = None
+    return policy_mod.Config(_clearance_margin_override_m=margin, **{
+        k: v for k, v in settings.items()
+        if (k in policy_mod.Config.__dataclass_fields__
+            and k not in ("stop_tolerance_m", "motion_acceleration", "motion_braking",
+                          "_clearance_margin_override_m"))
+    })
+
+
 def _sensor_qos(depth=2):
     """BEST_EFFORT, to match what every producer this card reads actually uses.
 
@@ -514,11 +528,7 @@ class NaviPlugin:
         self._wire_moving = False
         self._wire_twist = None
 
-        self._config = policy_mod.Config(**{
-            k: v for k, v in self._cfg.items()
-            if (k in policy_mod.Config.__dataclass_fields__
-                and k not in ("stop_tolerance_m", "motion_acceleration", "motion_braking"))
-        })
+        self._config = _policy_config(self._cfg)
         self._state = policy_mod.State()
 
         # Observations. A separate lock from `_lock`: these are written by ROS
@@ -826,11 +836,7 @@ class NaviPlugin:
         # Rebuild the effective policy configuration for every start.
         # adopt_limits mutates its input; reusing the previous Config would
         # preserve the former chassis's yaw and velocity restrictions.
-        self._config = policy_mod.Config(**{
-            k: v for k, v in self._cfg.items()
-            if (k in policy_mod.Config.__dataclass_fields__
-                and k not in ("stop_tolerance_m", "motion_acceleration", "motion_braking"))
-        })
+        self._config = _policy_config(self._cfg)
         self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
         self._response_notes = policy_mod.adopt_response(self._config, descriptor)
 
@@ -2189,12 +2195,14 @@ class NaviPlugin:
         angle_controlled = decision.dwa_acceptance is not None and decision.dwa_acceptance.angle_controlled
         guard = decision.dwa_acceptance.motion_guard if decision.dwa_acceptance else None
         probe = guard is not None and guard.probe_region
+        retained_detour = (decision.dwa_acceptance is not None and decision.dwa_acceptance.locks_detour
+                           and decision.dwa_acceptance.followed_route)
         corner_only = (guard is not None and guard.corner_only
                        or state.camera_arc_selected and state.dwa_trace.get("corner_only"))
         if (not config.local_planning or depth is None or depth.get("map") is None
                 or depth.get("capture_invalid") or not decision.values or not any(decision.values)
                 or (decision.values[0] <= 0 and decision.dwa_acceptance is None)
-                or (decision.distance_m is None and not (probe or angle_controlled or corner_only))
+                or (decision.distance_m is None and not (probe or angle_controlled or corner_only or retained_detour))
                 or (not objects_ms and renewable) or (scan.active and not angle_controlled)
                 or (scan.result_frame and not (scan.receipt_only and state.checked_prefix))
                 or (not angle_controlled and decision.status != policy_mod.APPROACHING
@@ -2426,6 +2434,92 @@ class NaviPlugin:
                                  target=check.target, config=config, original_receipt=original_receipt,
                                  allow_missing_surface=follow_route)
 
+    def _new_person_fronts(self, check, objects, depth, objects_ms, now_ms, geometry):
+        """Measure new person boxes for spacing, without changing target association or its clock."""
+        config = self._config
+        if (check.target != "person" or not check.target_receipt_ms < objects_ms <= now_ms
+                or now_ms - objects_ms >= config.max_obs_age_ms):
+            return ()
+        source = observation_source(objects)
+        track = self._state.tracker.track
+        floor = track.latest_source if track is not None else None
+        if ((check.target_source is not None and (source is None or source <= check.target_source))
+                or (floor is not None and (source is None or source < floor))):
+            return ()
+        fronts = []
+        for person in target_objects(objects, "person", config):
+            box = person.get("bbox_norm")
+            front = (depth_mod.front_surface(depth["map"], box, geometry.horizontal, depth.get("ground"))
+                     if box else None)
+            if front is not None:
+                # An unassociated box can contain a nearer foreground patch.
+                # Require support from the box's representative depth before
+                # using this ray as evidence of a closer person.
+                representative = depth_mod.sample_box(depth["map"], box)
+                if representative > front[0]:
+                    front = (representative, front[1] * representative / front[0])
+            fronts.append(front)
+        return tuple(fronts)
+
+    def _person_front_too_close(self, prediction, fronts, geometry, view, stop_distance):
+        for front in fronts:
+            if front is None:
+                continue
+            point = local_path.target_in_grid(geometry, front[0], -front[1])
+            if dwa.minimum_target_distance(prediction, view.points(point)) < (
+                    stop_distance + view.error(math.hypot(*point)) - 1e-10):
+                return True
+        return False
+
+    def _outgoing_person_standoff(self, check, values, now_ms, deadline_ms, snapshot):
+        """Check newly seen people against the packet's remaining motion and braking."""
+        objects, depth, odom, objects_ms = snapshot
+        depth_ms = depth_mod.observation_ms(depth)
+        config = self._config
+        if (check is None or not any(values[:2]) or depth_ms is None or depth.get("capture_invalid")
+                or depth.get("map") is None or not 0 <= now_ms - depth_ms < config.depth_age_limit_ms):
+            return False
+        geometry = check.geometry
+        if check.mount_frame is not None and depth.get("body_from_optical") is not None:
+            geometry = replace(geometry, base_from_optical=depth["body_from_optical"])
+        fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
+        if not any(front is not None for front in fronts):
+            return False
+        command = tuple(values[i] for i in (0, 1, 5))
+        previous = self._wire_twist or check.previous_twist
+        measured = odom_mod.planar_feedback(odom) or previous
+        rates = measured, previous, command
+        depth_ms = min(depth_ms, depth.get("capture_ms") or depth_ms)
+        scan = self._state.active_scan
+        odom = odom or {}
+        source = policy_mod.dwa_grid_pose(scan, geometry, depth_ms, odom, capture=depth.get("obstacle_capture_pose"))
+        current = policy_mod.dwa_grid_pose(scan, geometry, now_ms, odom)
+        try:
+            view = policy_mod.dwa_registration(source, current, depth_ms, now_ms, geometry, rates,
+                                               reference=policy_mod.dwa_pose_reference(scan, odom))
+        except policy_mod.DwaFrameMismatch:
+            view = policy_mod.dwa_registration(None, None, depth_ms, now_ms, geometry, rates)
+        admission = max(0., (deadline_ms - now_ms) / 1000)
+        hold = admission + (config.watchdog_ms + 50) / 1000
+        stop_distance = config.stop_distance_m
+        track = self._state.tracker.track
+        association = check.direct_association
+        if (association is not None and track is not None and track.observed
+                and association[0].generation == track.generation and track.front_reference is not None
+                and len(fronts) == 1 and fronts[0] is not None
+                and math.dist(fronts[0], track.front_reference) <= policy_mod.FORWARD_CLEARANCE_MARGIN_M):
+            # A consistent update of the tracked front leaves the range
+            # controller in charge. Brake if even an immediate stop would
+            # enter the inner ring edge. Other fronts check the whole packet.
+            command = (0., 0., 0.)
+            admission = hold = 0.
+            stop_distance = config.arrival_min_distance_m
+        mode = "camera_approx" if geometry.front == 0. else "body"
+        prediction = motion.predict_motion(measured, previous, command, hold_s=hold,
+                                           latency_s=admission, geometry=geometry, mode=mode,
+                                           acceleration=config.motion_acceleration, braking=config.motion_braking)
+        return self._person_front_too_close(prediction, fronts, geometry, view, stop_distance)
+
     def _recheck_dwa_motion(self, check, values, max_age, now_ms, snapshot, *, renew, diagnostics,
                             handoff_deadline_ms=None, scan=None, route_room=None,
                             packet_deadline_ms=None, check_outgoing=False, cover_slower_feedback=False,
@@ -2624,10 +2718,11 @@ class NaviPlugin:
 
         twists = (measured, previous, command, *(row[2] for row in odom.get("velocity_history", ())
                                                 if row[2] is not None))
+        anchor_changed = target_revision[0] != check.target_revision[0]
         try:
             scene = self._registered_dwa_scene(
                 check, depth, odom, now_ms, depth_ms, geometry, twists, scan=scan, sources=sources,
-                anchor_changed=target_revision[0] != check.target_revision[0])
+                anchor_changed=anchor_changed)
         except policy_mod.DwaFrameMismatch:
             return reject("geometry_mismatch")
         if scene is None:
@@ -2698,15 +2793,23 @@ class NaviPlugin:
             prediction, terminal_boundary=boundary, footprint=guard.footprint,
             occupied=occupied, remembered=remembered,
             supported_region=local_path.SUPPORTED_REGION, original_goal=None, stop_distance_m=0.)
-        if checking_route:
+        # A newly measured front can veto a translating packet even when
+        # this check only confirms the original admission window.
+        new_front = live_point is not None or (
+            guard.association is None and target_revision[1] != check.target_revision[1])
+        translating = any(command[:2]) or any(measured[:2]) or any(previous[:2])
+        if checking_route or (new_front and translating):
             result = dwa.check_measured_standoff(prediction, result, front_constraint, config.stop_distance_m)
-        if result.accepted and memory_first_send:
-            # Reappearing detections still need a front measurement for association.
-            for person in target_objects(objects, "person", config):
-                box = person.get("bbox_norm")
-                if box is None or depth_mod.front_surface(depth["map"], box, geometry.horizontal,
-                                                         depth.get("ground")) is None:
-                    return reject("target_missing")
+        if translating and anchor_changed and goal is not None:
+            old_anchor, new_anchor = check.target_revision[0], target_revision[0]
+            if old_anchor is not None and new_anchor is not None and old_anchor[:2] != new_anchor[:2]:
+                result = dwa.check_measured_standoff(prediction, result, (goal, goal_error), config.stop_distance_m)
+        if result.accepted and translating:
+            fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
+            if self._person_front_too_close(prediction, fronts, geometry, view, config.stop_distance_m):
+                result = replace(result, accepted=False, reason="target_standoff")
+            elif memory_first_send and (not fronts or any(front is None for front in fronts)):
+                return reject("target_missing")
         if not result.accepted:
             diagnostics["reason"] = result.reason
             return obs_ms, deadline, False, check
@@ -2851,7 +2954,9 @@ class NaviPlugin:
         stamps = (distance_ms, depth_ms) if command_only else (distance_ms, depth_ms, odom_ms)
         obs_ms = min(stamps)
         deadline = min(target_deadline, depth_ms + config.depth_age_limit_ms, obs_ms + max_age)
-        if not command_only:
+        if command_only and handoff_deadline_ms is not None:
+            deadline = min(deadline, handoff_deadline_ms)
+        elif not command_only:
             deadline = min(deadline, odom_ms + min(self._odom_max_age_ms, config.max_feedback_gap_ms))
         deadline = int(deadline)
         if not max(stamps) <= now_ms < deadline:
@@ -2870,10 +2975,17 @@ class NaviPlugin:
             if self._wire_twist is not None:
                 speeds += (self._wire_twist,)
             speed = max(math.hypot(vx, vy) for vx, vy, _ in speeds)
+            range_ms = min(distance_ms, check.target_source_ms or check.target_capture_ms or distance_ms)
+            travel = speed * ((deadline - range_ms + config.watchdog_ms + 50) / 1000)
+            travel += speed ** 2 / (2 * config.motion_braking[0])
+            if travel > check.distance_m - config.stop_distance_m:
+                if diagnostics is not None:
+                    diagnostics["reason"] = "target_standoff"
+                return None
             ahead = policy_mod.projected_forward_clearance(occupied, geometry, config)
             clear = not (ahead is not None and ahead + policy_mod.FORWARD_CLEARANCE_MARGIN_M < check.distance_m
                          and ahead <= policy_mod.forward_stop_line(config, speed))
-        elif check.direct_association is not None:
+        elif check.direct_association is not None or not same_depth:
             previous = self._wire_twist or check.previous_twist
             command = (values[0] if check.direct_vx is None else check.direct_vx, values[1], values[5])
             rates = measured, previous, command
@@ -3965,6 +4077,7 @@ class NaviPlugin:
                 geometry = replace(geometry, base_from_optical=mount)
             elif not np.array_equal(mount, geometry.base_from_optical):
                 return None
+        match = None
         if not direct and not target_pending:
             match = self._dwa_target_match(check, objects, depth, odom, objects_ms, geometry,
                                            check.front_required, follow_route=True)
@@ -4015,6 +4128,9 @@ class NaviPlugin:
                                                latency_s=0., geometry=geometry, mode=mode,
                                                acceleration=config.motion_acceleration, braking=config.motion_braking,
                                                initial_bounds=bounds)
+            fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
+            if self._person_front_too_close(prediction, fronts, geometry, registration, config.stop_distance_m):
+                return None
             if not motion.evaluate_motion(
                     prediction, footprint=footprint, occupied=occupied, remembered=(),
                     supported_region=local_path.SUPPORTED_REGION, original_goal=None,
@@ -4060,7 +4176,11 @@ class NaviPlugin:
             prediction, footprint=guard.footprint, occupied=occupied, remembered=(),
             supported_region=local_path.SUPPORTED_REGION, original_goal=None,
             stop_distance_m=0., terminal_boundary=motion.TravelBudget(room))
-        if not result.accepted:
+        fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
+        if match is not None and match.standoff_point is not None:
+            fronts += (match.standoff_point,)
+        if not result.accepted or self._person_front_too_close(
+                prediction, fronts, geometry, registration, config.stop_distance_m):
             return None
         if visibility_required:
             shadow = local_path.occluded_cells(*grid, geometry)
@@ -4490,6 +4610,17 @@ class NaviPlugin:
         nominal = math.hypot(*origin.acceptance.command[:2])
         route_error = transform.error(math.hypot(*origin.acceptance.route_points[-1]))
         yaw_limit = (-policy_mod._scan_yaw_rate(cfg, 1.), policy_mod._scan_yaw_rate(cfg, -1.))
+        track = self._state.tracker.track
+        view_bearing = None
+        blocker_exit = origin.acceptance.blocker_exit
+        if (cfg.use_lateral and origin.acceptance.locks_detour and not origin.acceptance.corridor_corner
+                and origin.acceptance.passage_exit is None and track is not None
+                and track.generation == original.generation and track.observed and track.navigation_range_known):
+            yaw_limit = dwa.view_yaw_limits(yaw_limit, track.bearing_rad, cfg.half_fov_rad,
+                                            original.prediction_horizon_s)
+            if (blocker_exit is not None and abs(track.bearing_rad) > cfg.half_fov_rad / 2
+                    and not local_path.passage_ahead(transform.points(blocker_exit))):
+                view_bearing = track.bearing_rad
         checked = values = previous_values = None
         previous = self._wire_twist or original.previous
         best = None
@@ -4498,7 +4629,7 @@ class NaviPlugin:
             tracked = dwa.track_route(
                 points, nominal * scale, original.prediction_horizon_s, yaw_limit,
                 body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral,
-                yaw_floor=cfg.floor_wz_moving)
+                yaw_floor=cfg.floor_wz_moving, view_bearing=view_bearing)
             if tracked is None:
                 break
             (vx, vy, wz), room = tracked
@@ -4874,6 +5005,14 @@ class NaviPlugin:
         with self._output_lock:
             active = self._scheduled_command
             now_ms = int(time.time() * 1000)
+            if (active is not None and active.sent and self._wire_moving and active.forward_check is not None
+                    and self._outgoing_person_standoff(
+                        active.forward_check, active.message["values"], now_ms,
+                        min(active.expires_ms, active.message["stamp_ms"] + active.message["ttl_ms"]),
+                        self._observation_snapshot(with_capture_timing=True))):
+                self._cancel_scheduled_motion(stop=(now_ms, "局部规划：目标间距不足，停车", True),
+                                              dwa_reason="target_standoff")
+                return
             executing = self._arc_in_progress(active, now_ms)
             if (active is not None and active.camera_arc_end_ms is not None and active.sent
                     and active.successor is None and active.forward_check is not None
@@ -5100,7 +5239,8 @@ class NaviPlugin:
         snapshot = self._observation_snapshot(with_capture_timing=True)
         diagnostics = {}
         checked = self._recheck_forward(check, work.message["values"], max_age, now_ms,
-                                        snapshot=snapshot, diagnostics=diagnostics, command_only=True)
+                                        snapshot=snapshot, diagnostics=diagnostics, command_only=True,
+                                        handoff_deadline_ms=work.expires_ms)
         now_ms = int(time.time() * 1000)
         reason = diagnostics.get("reason")
         if checked is not None and not checked[2]:
@@ -5228,6 +5368,23 @@ class NaviPlugin:
         if (prediction is not None and origin is None
                 and (message["values"] != prediction.work.message["values"] or not self._prediction_inputs_current(prediction))):
             return self._wire_moving
+        if origin is None and prediction is None and any(message["values"][:2]):
+            work = self._scheduled_command
+            staged = self._staged_forward_check
+            check = None
+            if self._command_timer is not None and work is not None:
+                check = work.forward_check
+            elif staged is not None and staged[0] == message["seq"]:
+                check = staged[1]
+            if check is not None:
+                now_ms = int(time.time() * 1000)
+                if self._outgoing_person_standoff(check, message["values"], now_ms,
+                                                  message["stamp_ms"] + message["ttl_ms"],
+                                                  self._observation_snapshot(with_capture_timing=True)):
+                    self._scheduled_command = None
+                    stop_reason = "target_standoff"
+                    message = dict(message, values=[0.] * ACTION_DIM, stamp_ms=now_ms,
+                                   obs_stamp_ms=now_ms, ttl_ms=self._ttl_ms)
         if origin is not None and any(message["values"]):
             now_ms = int(time.time() * 1000)
             rejection = self._dwa_publish_rejection(message, origin, now_ms, sent=prediction is not None)

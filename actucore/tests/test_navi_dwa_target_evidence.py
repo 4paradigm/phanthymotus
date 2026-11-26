@@ -482,6 +482,10 @@ def test_sent_memory_command_rechecks_physics_during_target_reappearance(monkeyp
         assert [packet["values"] for packet in packets] == [message["values"]]
         assert card._scheduled_command is None
         assert card._dwa_publication["reason"] == "publish_expired"
+    elif event in ("near", "near_new_depth"):
+        assert [packet["values"] for packet in packets] == [message["values"], [0.] * 6]
+        assert card._scheduled_command is None
+        assert card._dwa_publication["reason"] == "target_standoff"
     else:
         assert len(packets) == 1 and card._scheduled_command.expires_ms == deadline
 
@@ -503,7 +507,9 @@ def test_memory_first_send_checks_reappearing_people(monkeypatch, change):
             depth["map"][:150] = card._config.stop_distance_m
         snapshot[0] = (objects, depth, odom, 1010)
     else:
-        card._state.tracker.track.front_fix = np.array([card._config.stop_distance_m + .01, 0.])
+        track = card._state.tracker.track
+        track.front_fix = np.array([card._config.stop_distance_m + .01, 0.])
+        track.measured_range_m = None  # Coasting transports the prior fix without issuing a new measurement.
     card._publish_command(message)
     if change in ("new_detection", "dim_detection"):
         assert packets[-1]["values"] == message["values"]
@@ -564,9 +570,15 @@ def test_publication_follows_associated_target_generation(monkeypatch, life):
         assert card._dwa_publication["reason"] == "superseded"
 
 
-@pytest.mark.parametrize("method", ["sample", "turn"])
-@pytest.mark.parametrize("stop", [4.6, 5.05], ids=["clear", "standoff"])
-def test_measured_target_limits_motion_independently_of_fixed_anchor(monkeypatch, method, stop):
+@pytest.mark.parametrize("method,stop,at_rest,expected", [
+    pytest.param("sample", 4.6, False, True, id="clear-sample"),
+    pytest.param("turn", 4.6, False, True, id="clear-turn"),
+    pytest.param("sample", 5.1, False, False, id="standoff-sample"),
+    pytest.param("turn", 5.1, True, False, id="standoff-turn"),
+    pytest.param("turn", 5.02, False, False, id="parking-ring-still-braking"),
+    pytest.param("turn", 5.02, True, True, id="parking-ring-at-rest"),
+])
+def test_measured_target_limits_motion_independently_of_fixed_anchor(monkeypatch, method, stop, at_rest, expected):
     from plugins.navi import policy
     card, _, _, snapshot, _ = selected_card(monkeypatch, body=True, live_target=True)
     _, depth, _, _ = snapshot[0]
@@ -576,13 +588,15 @@ def test_measured_target_limits_motion_independently_of_fixed_anchor(monkeypatch
     assert state.tracker.track.measured_range_m == 5.
     config.stop_distance_m = stop
     geometry = config.scan_geometry
+    if at_rest:
+        state.commanded = state.active_scan.motion = (0., 0., 0.)
     if method == "turn":
         accepted = policy._check_dwa_turn(depth, config, state, geometry, (anchor.x, 0.), "parking", (0., 0., .25))
     else:
         state.dwa_budget = None
         outcome = policy._dwa_detour(depth, config, state, state.view_detour, anchor.x, 0.)
         accepted = outcome is not None
-    assert accepted == (stop < 5.)
+    assert accepted == expected
     assert anchor.x == 5.6
 
 
@@ -730,7 +744,8 @@ def test_unstamped_update_cannot_erase_a_generations_source_order(monkeypatch):
 
 
 @pytest.mark.parametrize("duplicate", [False, True], ids=["fresh", "duplicate"])
-def test_memory_range_is_registered_from_its_depth_capture_pose(monkeypatch, duplicate):
+@pytest.mark.parametrize("travel", [0., .15], ids=["stationary", "advancing"])
+def test_memory_range_is_registered_from_its_depth_capture_pose(monkeypatch, duplicate, travel):
     from plugins.navi import policy
     from plugins.navi.odom import PlanarPose
 
@@ -738,6 +753,7 @@ def test_memory_range_is_registered_from_its_depth_capture_pose(monkeypatch, dup
     state, config = card._state, card._config
     state.goal_anchor.x = 8.
     config.stop_distance_m = 4.65
+    config.vx_max = .15
     payload, depth, odom, receipt = snapshot[0]
     start = PlanarPose(1000, ("odom",), 0., 0., 0.)
     snapshot[0] = dict(payload, timestamp=.9), depth, dict(odom, obstacle_pose=start), receipt
@@ -746,7 +762,7 @@ def test_memory_range_is_registered_from_its_depth_capture_pose(monkeypatch, dup
     advance_snapshot(snapshot, clock, 1100)
     _, depth, odom, _ = snapshot[0]
     capture = PlanarPose(1010, start.frame, .01, 0., 0.)
-    current = PlanarPose(1100, start.frame, .16, 0., 0.)
+    current = PlanarPose(1100, start.frame, capture.x + travel, 0., 0.)
     depth = dict(depth, capture_ms=1010, obstacle_capture_pose=capture)
     depth["map"][:150] = 4.98
     odom = dict(odom, obstacle_pose=current)
@@ -757,7 +773,7 @@ def test_memory_range_is_registered_from_its_depth_capture_pose(monkeypatch, dup
     if duplicate:
         advance_snapshot(snapshot, clock, 1110)
         _, latest_depth, latest_odom, _ = snapshot[0]
-        current = PlanarPose(1110, start.frame, .18, 0., 0.)
+        current = PlanarPose(1110, start.frame, capture.x + 1.13 * travel, 0., 0.)
         latest_depth = dict(latest_depth, obstacle_capture_pose=current)
         latest_odom = dict(latest_odom, obstacle_pose=current)
         snapshot[0] = fresh, latest_depth, latest_odom, 1110
@@ -765,8 +781,11 @@ def test_memory_range_is_registered_from_its_depth_capture_pose(monkeypatch, dup
                     state=state, config=config, dt=.01)
         assert state.tracker.track.measured_range_m is None
     card._publish_command(message)
-    assert packets[-1]["values"] == [0.] * 6
-    assert card._info()["dwa"]["publication"]["reason"] == "target_standoff"
+    if travel:
+        assert packets[-1]["values"] == [0.] * 6
+        assert card._info()["dwa"]["publication"]["reason"] == "target_standoff"
+    else:
+        assert packets[-1]["values"] == message["values"]
 
 
 def test_duplicate_does_not_extend_captured_point_lifetime(monkeypatch):

@@ -14,6 +14,7 @@ import pytest
 from plugins.navi import active_scan, dwa, local_path, plugin, policy
 from plugins.navi.active_scan import NearProjection
 from plugins.navi.camera import HorizontalIntrinsics
+from plugins.navi.track import Track
 
 
 def observation_case(*, controller="dwa", body=True, attempted=True):
@@ -301,6 +302,22 @@ def test_unavailable_selector_context_has_a_specific_reason_without_a_call(monke
     assert state.dwa_trace["fallback_reason"] == reason
 
 
+@pytest.mark.parametrize("committed,unfinished", [(False, False), (True, False), (True, True)])
+def test_missing_range_may_continue_a_route_that_reaches_the_exit(monkeypatch, committed, unfinished):
+    config, state, depth, reference = prepared_reference_case()
+    if unfinished:
+        end = reference.points[-1][0] + .30
+        reference = replace(reference, blocker_exit=((end, -.5), (end, .5)))
+    calls = observe_selector(monkeypatch)
+    outcome = policy._dwa_detour(depth, config, state, reference, None, None, follow_published=committed)
+    if committed and not unfinished:
+        assert len(calls) == 1 and calls[0][0]["target"] is None
+        assert outcome is not None and outcome.command[0] > 0.
+    else:
+        assert not calls and outcome is None
+        assert state.dwa_trace["fallback_reason"] == "no_reference"
+
+
 @pytest.mark.parametrize("reason", ["footprint_collision", "remembered_obstacle", "occluded_prefix",
                                     "target_standoff"])
 def test_candidate_rejections_preserve_the_actual_constraint(monkeypatch, reason):
@@ -319,7 +336,10 @@ def test_candidate_rejections_preserve_the_actual_constraint(monkeypatch, reason
     elif reason == "occluded_prefix":
         extra["shadow"] = np.ones(local_path.SHAPE, dtype=bool)
     elif reason == "target_standoff":
-        distance = config.stop_distance_m / 2
+        measured = config.stop_distance_m / 2
+        state.tracker.track = Track(np.array([measured, 0., 0., 0.]), np.eye(4), range_known=True)
+        state.tracker.track.record_range(measured, (measured, 0.), depth)
+        state.goal_anchor.generation = state.tracker.track.generation
     calls = observe_selector(monkeypatch)
     assert policy._dwa_detour(depth, config, state, reference, distance, 0., **extra) is None
     assert len(calls) == 1
@@ -954,3 +974,46 @@ def test_default_latest_depth_only_executes_a_visible_detour(monkeypatch):
     assert all(not inputs["remembered"] for inputs, _ in calls)
     assert state.view_detour is not None
     assert packets[-1]["values"][0] > 0.
+
+
+@pytest.mark.parametrize("restriction", [None, "obstacle", "exit", "footprint"])
+def test_exhausted_detour_tail_hands_off_only_to_a_clear_target_corridor(restriction):
+    config, state, depth, odom = advance_case(body=True)
+    scan, geometry = state.active_scan, config.scan_geometry
+    scan.retire_motion()
+    scan.use_obstacle_history = config.use_obstacle_history = False
+    odom["vx"] = .30
+    state.commanded = (.30, 0., 0.)
+    state.dwa_odom = odom
+    state.dwa_admission_ms = 0 if restriction == "footprint" else 250
+    state.tracker.track = Track(np.array([3., 0., 0., 0.]), np.eye(4), range_known=True)
+    assert scan.update(depth, odom, geometry, receipt_only=True) is None
+
+    # Establish a checked guard, then put the last twenty centimetres of the
+    # published route in that frame. A curved tail can sweep outside the corridor.
+    reference = local_path.Detour(None, ((0., 0.), (1., 0.)), geometry)
+    selected = policy._dwa_detour(depth, config, state, reference, 3., 0.)
+    assert selected is not None and selected.guard.check.accepted
+    end = (.16, .14) if restriction == "footprint" else (.20, 0.)
+    exit_line = ((.05, -.20), (.05, .20)) if restriction == "exit" else None
+    route = policy.DwaAcceptance(1, selected.command, motion_guard=selected.guard,
+                                 route_points=((0., 0.), end), passage_exit=exit_line, locks_detour=True)
+    state.committed_route = state.published_dwa_route = route
+    if restriction in ("obstacle", "footprint"):
+        forward, right = (.65, 0.) if restriction == "obstacle" else (.20, .30)
+        stamp, pose, free, _, *evidence = scan.views[-1]
+        hits = np.isclose(local_path.FORWARD, forward) & np.isclose(local_path.RIGHT, right)
+        scan.views[-1] = (stamp, pose, free & ~hits, hits, *evidence)
+    state.dwa_budget = None
+    state.dwa_trace.clear()
+
+    assert policy._follow_published_route(depth, config, state, geometry, 3., 0.,
+                                          foreground=restriction == "obstacle") is None
+
+    expected = {"insufficient_room"}
+    if restriction == "footprint":
+        expected.add("footprint_collision")
+    assert set(state.dwa_trace["rejected"]) == expected
+    assert policy._target_corridor_clear(depth, config, scan, 3., 0.) == (restriction != "obstacle")
+    retained = route if restriction is not None else None
+    assert state.committed_route is state.published_dwa_route is retained

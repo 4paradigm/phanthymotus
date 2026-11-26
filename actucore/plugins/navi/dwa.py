@@ -111,6 +111,7 @@ class MotionContext:
     terminal_boundary: object = None
     frame: tuple = ()
     measured_target: tuple | None = None
+    measured_standoff_m: float | None = None
 
     def key(self):
         g = self.geometry
@@ -123,7 +124,7 @@ class MotionContext:
                 tuple(self.target) if self.target is not None else None, self.stop_distance,
                 tuple(self.acceleration), tuple(self.braking),
                 tuple(self.rotation_center) if self.rotation_center is not None else None,
-                self.terminal_boundary, self.frame, self.measured_target)
+                self.terminal_boundary, self.frame, self.measured_target, self.measured_standoff_m)
 
     @property
     def response_key(self):
@@ -159,7 +160,8 @@ class MotionContext:
             supported_region=self.supported_region, original_goal=self.target,
             stop_distance_m=self.stop_distance, terminal_boundary=self.terminal_boundary,
             prepared_layers=self.prepared_layers)
-        return check_measured_standoff(prediction, checked, self.measured_target, self.stop_distance)
+        spacing = self.stop_distance if self.measured_standoff_m is None else self.measured_standoff_m
+        return check_measured_standoff(prediction, checked, self.measured_target, spacing)
 
     def check(self, command):
         prediction = self.predict(command)
@@ -419,7 +421,19 @@ def stays_on_route(points, positions, half_width):
         _project_to_route(position, points, segments)[1] <= max(.30, half_width) for position in positions)
 
 
-def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None, yaw_floor=0.):
+def view_yaw_limits(limits, bearing, half_fov, horizon):
+    """Reserve room in the image for a target on the outside of a lateral detour."""
+    if abs(bearing) <= .65 * half_fov:
+        return limits
+    outward = max(0., (.85 * half_fov - abs(bearing)) / horizon)
+    # Positive yaw turns left, moving a positive (rightward) image bearing
+    # farther right. Leave steering back toward the target available.
+    lower, upper = limits
+    return (lower, min(upper, outward)) if bearing > 0. else (max(lower, -outward), upper)
+
+
+def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None, yaw_floor=0.,
+                view_bearing=None):
     """Track the finite visible polyline in the current forward/right grid."""
     segments = _route_segments(points)
     remaining = remaining_route_length(points, segments=segments)
@@ -445,6 +459,12 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
         minimum = math.copysign(yaw_floor, wz)
         turn = abs(r) >= local_path.RESOLUTION / 2 or abs(wz) >= yaw_floor / 2
         wz = minimum if turn and yaw_limit[0] <= minimum <= yaw_limit[1] else 0.
+    if lateral and view_bearing is not None and wz * view_bearing >= 0.:
+        # Sideways translation follows the route while the chassis keeps the
+        # camera on the target. The caller still sweeps this exact twist.
+        correction = -math.copysign(max(yaw_floor, abs(view_bearing) / (2. * horizon)), view_bearing)
+        if yaw_limit[0] <= correction <= yaw_limit[1]:
+            wz = correction
     return (vx, vy, wz), remaining
 
 
@@ -525,6 +545,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            footprint: FootprintSpec | None = None, latency_s=0., remembered=None,
            supported_region=None, terminal_boundary=None, occupied=None, alternate_routes=(),
            candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None,
+           measured_standoff_m=None, view_bearing=None,
            guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0., retry_from_rest=False) -> Choice | None:
     """Select a legal target velocity whose complete predicted stop is admissible.
 
@@ -615,7 +636,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     obstacles = local_path.occupied_squares(grid[1]) if occupied is None else occupied
     context = MotionContext(measured, previous, horizon, latency_s, geometry, footprint, obstacles, remembered,
                             supported_region, target, stop_distance, acceleration, braking, rotation_center,
-                            terminal_boundary, motion_frame, measured_target)
+                            terminal_boundary, motion_frame, measured_target, measured_standoff_m)
 
     def interpolate(choice, room=math.inf):
         if not (transition_slot or entry_slot) or choice is None or not any(choice.command[:2]) or budget.expired():
@@ -685,7 +706,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 break
             tracked = track_route(points, x_speed * scale, horizon, yaw_limit,
                                   body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
-                                  yaw_floor=floors[3])
+                                  yaw_floor=floors[3], view_bearing=view_bearing)
             if tracked is None:
                 break
             command, room = tracked

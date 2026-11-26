@@ -48,6 +48,22 @@ def test_lateral_route_chooses_lateral_velocity_and_keeps_original_target():
     assert choice.progress > 0.
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+@pytest.mark.parametrize("follow_published", [False, True])
+def test_lateral_detour_keeps_steering_authority_toward_the_target(side, follow_published):
+    target_bearing = side * .60
+    yaw_limits = dwa.view_yaw_limits((-.7, .7), target_bearing, .80, 1.)
+    choice = _run(((0., 0.), (1.3, -side * .32)), lateral=True, follow_published=follow_published,
+                  target=(3., 3. * math.tan(target_bearing)), yaw_limits=yaw_limits,
+                  floors=(.08, .08, .4, .20), view_bearing=target_bearing)
+    assert choice is not None and choice.check.accepted
+    assert choice.command[0] > 0. and side * choice.command[1] > 0.
+    assert side * choice.command[2] <= 0.
+    if follow_published:
+        assert choice.command[2] == pytest.approx(-target_bearing / 2.)
+    assert yaw_limits[0 if side > 0. else 1] == -.7 * side
+
+
 def test_braking_sweep_rejects_an_obstacle_near_the_chassis():
     obstacles = [(round(x,2), round(y,2))
                  for x in np.arange(.4,.9,.05) for y in np.arange(-.45,.46,.05)]
@@ -678,9 +694,9 @@ def test_a_star_applies_short_range_clearance_after_detour_shape(monkeypatch):
     scores = {}
 
     def capture_shape(*args, **kwargs):
-        cost, goal = shape_cost(*args, **kwargs)
+        cost, goal, blocker_exit = shape_cost(*args, **kwargs)
         scores["shape"] = cost.copy()
-        return cost, goal
+        return cost, goal, blocker_exit
 
     def capture_route(*args, **kwargs):
         scores["route"] = kwargs["cell_cost"].copy()
@@ -1072,6 +1088,8 @@ def test_box_detour_holds_passing_lane_until_the_rear_clears():
                                        (0., 0.), body_half_width=.25)
     assert route is not None
     clear_at = float(f[occupied].max()) + local_path.RESOLUTION / 2 + geometry.rear
+    start, end = route.blocker_exit
+    assert start[0] == pytest.approx(end[0]) and start[0] >= clear_at
     side = [abs(right) for forward, right in route.topology if 1.60 <= forward < clear_at]
     assert len(side) > 2
     assert all(after >= before - 1e-9 for before, after in zip(side, side[1:]))

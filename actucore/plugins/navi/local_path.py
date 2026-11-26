@@ -554,13 +554,14 @@ class Detour:
     topology: tuple[tuple[float, float], ...] = ()  # original ordered nodes, in the observed grid
     passage_exit: tuple[tuple[float, float], tuple[float, float]] | None = None
     corridor_corner: bool = False
+    blocker_exit: tuple[tuple[float, float], tuple[float, float]] | None = None  # rear-clear line in route coordinates
 
 
-def passage_ahead(exit_line):
+def passage_ahead(exit_line, origin=(0., 0.)):
     if exit_line is None:
         return False
     (forward, right), (end_forward, end_right) = exit_line
-    return (end_right - right) * forward - (end_forward - forward) * right > 0.
+    return (end_right - right) * (forward - origin[0]) - (end_forward - forward) * (right - origin[1]) > 0.
 
 
 def has_corridor_corner(points, span):
@@ -1421,14 +1422,14 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     midline_error = abs(cols - (left + right) / 2) * RESOLUTION
     cost = np.where(opening, 8. * np.square(midline_error / half_width), cost)
     if not len(blockers[0]):
-        return cost, None
+        return cost, None, None
     pivot = (geometry.front - geometry.rear) / 2
     nearest = np.hypot(FORWARD[blockers] - pivot, RIGHT[blockers]).argmin()
     row, col = (int(axis[nearest]) for axis in blockers)
     # A measured opening beside the blocker is more informative than a circle
     # around a jamb or wall. Its traversability is still decided by the caller.
     if (opening[row, :] & (abs(cols - col) * RESOLUTION <= 3 * half_width)).any():
-        return cost, None
+        return cost, None, None
     remaining = set(zip(*np.nonzero(occupied)))
     remaining.remove((row, col))
     component = [(row, col)]
@@ -1440,11 +1441,11 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
                 component.append(neighbor)
     low, high = np.min(component, axis=0), np.max(component, axis=0)
     if (low == 0).any() or (high == np.array(occupied.shape) - 1).any():
-        return cost, None
+        return cost, None, None
     span = (high - low + 1) * RESOLUTION
     body_width = 2 * body_half_width
     if max(span) > 3 * body_width:
-        return cost, None
+        return cost, None, None
     center = ((low + high) / 2 - START) * RESOLUTION
     forward, lateral = center[0] - pivot, center[1]
     distance = math.hypot(forward, lateral)
@@ -1454,12 +1455,12 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
         # A tangent within one grid cell of the start can force a sharp turn.
         radius -= 1.5 * body_half_width
     if distance <= radius:
-        return cost, None
+        return cost, None, None
     bearing = math.atan2(lateral, forward)
     offset = math.asin(radius / distance)
     tangents = [angle for angle in (bearing - offset, bearing + offset) if abs(angle) <= math.pi / 2]
     if not tangents:
-        return cost, None
+        return cost, None, None
     f = FORWARD - FORWARD[start]
     r = RIGHT - RIGHT[start]
     travel = np.hypot(f, r)
@@ -1472,7 +1473,7 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     to_target = np.asarray(target) - center
     target_range = math.hypot(*to_target)
     if target_range <= radius:
-        return cost, None
+        return cost, None, None
     # Use the obstacle-to-target axis so rotating the camera does not move
     # the point at which the chassis has passed the measured obstacle.
     direction = to_target / target_range
@@ -1491,7 +1492,9 @@ def _detour_shape_cost(cost, occupied, blockers, geometry, half_width, body_half
     cost = np.where((along >= 0.) & (along <= target_range) & ~opening,
                     8. * np.square(exit_error / half_width), cost)
     exit_region = (along >= rear_clear) & (along <= target_range) & ~opening
-    return cost, exit_region & (exit_error <= RESOLUTION)
+    exit_point = center + rear_clear * direction - (pivot, 0.)
+    exit_line = tuple(exit_point - normal), tuple(exit_point + normal)
+    return cost, exit_region & (exit_error <= RESOLUTION), exit_line
 
 
 def _round_grid_route(points, allowed, origin):
@@ -1572,8 +1575,8 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     length = max(RESOLUTION, math.hypot(dx, dy))
     lateral = abs((FORWARD-target[0])*dy - (RIGHT-target[1])*dx) / length
     cost += .5 * lateral / max(.15, half_width)
-    cost, tangent_goal = _detour_shape_cost(cost, occupied, blockers, geometry, half_width,
-                                           body_half_width or half_width, start, target)
+    cost, tangent_goal, blocker_exit = _detour_shape_cost(cost, occupied, blockers, geometry, half_width,
+                                                         body_half_width or half_width, start, target)
     if tangent_goal is not None:
         # Keep charging for nearby cells along a compact obstacle's tangents.
         cost += 2. * _clearance_shortfall(gap, .30)
@@ -1608,8 +1611,8 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     # Use the preexisting keepout plus two cells of room on any rounded
     # segment. A tight bypass continues to use its support waypoints.
     points = _round_grid_route(points, allowed & (clearance >= half_width + 2 * RESOLUTION), (pivot, 0.))
-    return Detour(None, points, geometry,
-                  reachable_prefix=reachable_prefix, topology=topology)
+    return Detour(None, points, geometry, reachable_prefix=reachable_prefix, topology=topology,
+                  blocker_exit=blocker_exit)
 
 
 def opening_route(frame, occupied, geometry, half_width, plane, target, allow_detour=False, travel_limits=None,

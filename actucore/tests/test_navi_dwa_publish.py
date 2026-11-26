@@ -346,6 +346,26 @@ def test_stopped_detour_rechecks_the_same_route_before_new_motion(monkeypatch, l
     assert packets[-1]["values"][0] > 0.
 
 
+def test_retained_route_with_no_target_range_reaches_the_wire(monkeypatch):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    committed = card._state.committed_route
+    assert committed is not None
+
+    card._state.goal_anchor = None
+    card._state.tracker.track = None
+    advance_snapshot(snapshot, clock, 1100)
+    _, depth, odom, _ = snapshot[0]
+    snapshot[0] = {"timestamp": 1.1, "objects": []}, depth, odom, 1100
+    message = card.next_command()
+
+    assert card._last_decision.distance_m is None
+    assert card._state.dwa_trace.get("retained_route")
+    assert card._stage_command(message, card._output_epoch)
+    assert len(packets) == 2 and packets[-1]["values"][0] > 0.
+
+
 @pytest.mark.parametrize("next_depth", ["expired", "clear", "obstacle"])
 def test_expired_depth_leaves_the_sent_packet_until_its_original_deadline(monkeypatch, next_depth):
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
@@ -487,6 +507,30 @@ def test_predicted_route_can_send_after_the_original_deadline(monkeypatch, new_d
         assert work.forward_check is measured_check
     else:
         assert not any(packets[-1]["values"])
+
+
+@pytest.mark.parametrize("feedback", ["measured", "missing"])
+def test_route_timer_brakes_for_an_unassociated_near_person(monkeypatch, feedback):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    old, = packets
+    work = card._scheduled_command
+    assert work.dwa_origin is not None and old["values"][0] > 0.
+    stamp = work.expires_ms - 40
+    advance_snapshot(snapshot, clock, stamp, vx=old["values"][0])
+    objects, depth, odom, _ = snapshot[0]
+    depth["map"][35:100, 300:340] = card._config.stop_distance_m
+    person = {"name": "person", "confidence": .95, "position": [0., -.7],
+              "bbox_norm": [.46, .07, .54, .21]}
+    if feedback == "missing":
+        odom = dict(odom, vx=None, vy=None, wz=None)
+    snapshot[0] = dict(objects, timestamp=stamp / 1000, objects=[*objects["objects"], person]), depth, odom, stamp
+
+    card._dispatch_command()
+
+    assert [packet["values"] for packet in packets] == [old["values"], [0.] * 6]
+    assert card._dwa_publication["reason"] == "target_standoff"
 
 
 @pytest.mark.parametrize("target_missing", [False, True])
@@ -1808,15 +1852,13 @@ def test_scan_returns_control_on_fresh_feasible_motion(monkeypatch, mode, event)
 
 @pytest.mark.parametrize("scheduled", [False, True])
 def test_first_blocked_frame_retries_failed_zero_before_new_motion(monkeypatch, scheduled):
-    import numpy as np
     card, packets, clock, snapshot = observation_card(monkeypatch, body=True)
+    card._config.use_obstacle_history = False
     card._command_timer = object() if scheduled else None
     card._tick()
     assert packets[-1]["values"][0] > 0.
-    scan = card._state.active_scan
-    scan.near_projection = NearProjection(squares=local_path.ObstacleSquares(np.array([[.05, .18]]), .02),
-                                          stamp_ms=1000)
-    advance_snapshot(snapshot, clock, 1050)
+    clear = snapshot[0][1]["map"].copy()
+    advance_snapshot(snapshot, clock, 1050, obstacle=True)
     publish = card._publisher.publish
     attempts = []
     attempted_seq = [packets[-1]["seq"]]
@@ -1831,8 +1873,8 @@ def test_first_blocked_frame_retries_failed_zero_before_new_motion(monkeypatch, 
     card._publisher.publish = fail_first_stop
     card._tick()
     assert attempts == [[0.] * 6]
-    scan.near_projection = NearProjection()
     advance_snapshot(snapshot, clock, 1100)
+    snapshot[0][1]["map"][:] = clear
     card._tick()
     assert attempts == [[0.] * 6, [0.] * 6]
     assert not card._wire_moving
@@ -1901,6 +1943,43 @@ def test_direct_forward_renewal_checks_the_latest_obstacle_sweep(monkeypatch):
                                     snapshot=snapshot[0], diagnostics=diagnostics)
     assert checked is not None and not checked[2]
     assert diagnostics["reason"] == "footprint_collision"
+
+
+@pytest.mark.parametrize("stage", ["direct", "scheduled", "timer"])
+@pytest.mark.parametrize("near_person", [True, False], ids=["near-person", "small-foreground-patch"])
+def test_direct_translation_checks_new_unassociated_person_depth(monkeypatch, stage, near_person):
+    card, packets, clock = direct_tracking_card(monkeypatch, body=True)
+    snapshot = [card._observation_snapshot(with_capture_timing=True)]
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
+    card._command_timer = object() if stage != "direct" else None
+    message = card.next_command()
+    assert message["values"][0] > 0. and card._last_decision.dwa_acceptance is None
+    if stage == "timer":
+        assert card._stage_command(message, card._output_epoch)
+        assert packets[-1]["values"] == message["values"]
+    stamp = message["stamp_ms"] + message["ttl_ms"] - 50 if stage == "timer" else 1010
+    advance_snapshot(snapshot, clock, stamp)
+    _, depth, odom, _ = snapshot[0]
+    if near_person:
+        depth["map"][35:100, 300:340] = card._config.stop_distance_m
+    else:
+        depth["map"][35:51, 315:325] = card._config.stop_distance_m
+    person = {"name": "person", "confidence": .95, "position": [0., -.7],
+              "bbox_norm": [.46, .07, .54, .21]}
+    snapshot[0] = {"timestamp": stamp / 1000, "objects": [person]}, depth, odom, stamp
+
+    if stage == "direct":
+        card._publish_command(message)
+    elif stage == "scheduled":
+        card._stage_command(message, card._output_epoch)
+    else:
+        card._dispatch_command()
+
+    if near_person:
+        assert packets[-1]["values"] == [0.] * 6
+        assert card._dwa_publication["reason"] == "target_standoff"
+    else:
+        assert packets[-1]["values"] == message["values"]
 
 
 def test_planning_expiry_keeps_measured_dwa_progress(monkeypatch):
@@ -3596,7 +3675,7 @@ def test_first_send_retry_uses_original_association_to_refresh_the_target_clock(
 
 
 @pytest.mark.parametrize("hazard", ["standoff", "sweep", "inside_sweep", "inside_standoff"])
-def test_direct_renewal_does_not_apply_swept_or_predicted_standoff_veto(monkeypatch, hazard):
+def test_direct_renewal_vetoes_a_new_obstacle_in_the_actual_sweep(monkeypatch, hazard):
     card, packets, clock = direct_tracking_card(monkeypatch, body=True)
     snapshot = [card._observation_snapshot(with_capture_timing=True)]
     monkeypatch.setattr(card, "_observation_snapshot", lambda **_: snapshot[0])
@@ -3623,8 +3702,13 @@ def test_direct_renewal_does_not_apply_swept_or_predicted_standoff_veto(monkeypa
 
     card._dispatch_command()
 
-    assert len(packets) == 2 and packets[-1]["values"] == first["values"]
-    assert card._scheduled_command is work and work.expires_ms > deadline
+    assert len(packets) == 2
+    if hazard == "inside_sweep":
+        assert packets[-1]["values"] == [0.] * 6
+        assert card._dwa_publication["reason"] == "footprint_collision"
+    else:
+        assert packets[-1]["values"] == first["values"]
+        assert card._scheduled_command is work and work.expires_ms > deadline
 
 
 @pytest.mark.parametrize("target_front,expected_speed", [(1.2, .105), (5., .3)])
