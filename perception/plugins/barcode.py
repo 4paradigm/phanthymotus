@@ -49,7 +49,7 @@ from sensor_msgs.msg import CompressedImage
 
 from utils.log_sampling import escape_log_text
 from utils.qos import CAMERA_QOS
-from utils.ros_lifecycle import dispose_node
+from utils.ros_lifecycle import NodeLifecycle
 
 from plugins.barcode_runtime import (
     SCAN_MODE_ALL,
@@ -348,8 +348,10 @@ class BarcodeScanPlugin:
     def __init__(self, plugin_cfg: dict, executor):
         self._plugin_cfg = dict(plugin_cfg)
         self._executor = executor
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._nodes: dict[str, _BarcodeNode] = {}
+        self._lifecycle = NodeLifecycle(executor, self._nodes, self._state_lock, label=self.PREFIX)
+        self._draining_nodes = self._lifecycle.draining
         self._instance_configs: dict[str, dict] = {}
         log.info("[barcode] plugin init: formats=%s",
                  self._plugin_cfg.get("formats") or "(all)")
@@ -359,7 +361,19 @@ class BarcodeScanPlugin:
 
     # ── MCP dispatch ─────────────────────────────────────────────────────
 
-    def dispatch(self, name: str, args: dict) -> dict | None:
+    def dispatch(self, name, args):
+        action = args.get("action", name)
+        if action == "config":
+            with self._lifecycle.configuration():
+                result = self._dispatch(name, args)
+        else:
+            result = self._dispatch(name, args)
+        if action in ("start", "stop", "info", "config") and isinstance(result, dict):
+            return self._lifecycle.annotate(result, args.get("instance_id", ""),
+                                            scoped_info=action == "info")
+        return result
+
+    def _dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name == "barcode" else name
         instance_id = args.get("instance_id", "")
 
@@ -470,88 +484,21 @@ class BarcodeScanPlugin:
             ),
         )
 
-    def _dispose(self, node_key: str, node: _BarcodeNode) -> None:
-        try:
-            # retire, not plain stop: marks the node dead under its own lock
-            # so an in-flight start that lost the race reports idle instead of
-            # subscribing on a destroyed handle.
-            node.retire()
-        finally:
-            dispose_node(self._executor, node, label=f"barcode/{node_key}")
-        log.info("[barcode] node disposed: %s", node_key)
+    def _dispose(self, node_key, node) -> dict:
+        return self._lifecycle.retire(node_key, node, node.retire)
 
     def _do_start(self, instance_id: str, args: dict) -> dict:
         input_topic = args.get("input_topic") or ""
-        node_key = instance_id or input_topic or _DEFAULT_INSTANCE
-
-        retired = None
-        with self._state_lock:
-            existing = self._nodes.get(node_key)
-            if existing is not None and existing._input_topic != input_topic:
-                # Topics are fixed at node construction; rebind the key.
-                retired = self._nodes.pop(node_key)
-        if retired is not None:
-            self._dispose(node_key, retired)
-
-        with self._state_lock:
-            existing = self._nodes.get(node_key)
-        if existing is not None:
-            return existing.start()        # idempotent re-start
-
-        node = self._create_node(node_key, input_topic)
-        # README lifecycle rule: register under the lock *before* starting, so
-        # a concurrent stop can always find the node. A started-but-
-        # unregistered node would keep a live subscription nothing can reach.
-        with self._state_lock:
-            current = self._nodes.get(node_key)
-            registered = False
-            if current is None:
-                try:
-                    self._executor.add_node(node)
-                except Exception as error:  # noqa: BLE001
-                    log.error("[barcode] failed to register instance %r: %s",
-                              node_key, escape_log_text(error))
-                else:
-                    self._nodes[node_key] = node
-                    registered = True
-        if not registered:
-            try:
-                node.destroy_node()   # never started, never registered
-            except Exception:  # noqa: BLE001
-                pass
-            if current is not None:
-                return current.start()
-            return {"state": "idle", "input": input_topic}
-        try:
-            result = node.start()
-        except Exception:
-            with self._state_lock:
-                if self._nodes.get(node_key) is node:
-                    del self._nodes[node_key]
-            self._dispose(node_key, node)
-            raise
-        with self._state_lock:
-            still_ours = self._nodes.get(node_key) is node
-        if not still_ours:
-            # A concurrent stop retired the node while start() ran; its
-            # dispose handled teardown — make sure this start left nothing on.
-            node.stop()
-            return {"state": "idle", "input": input_topic}
-        return result
+        key = instance_id or input_topic or _DEFAULT_INSTANCE
+        request, blocked = self._lifecycle.begin(key, input_topic)
+        if blocked:
+            return blocked
+        return self._lifecycle.start(
+            key, request, lambda: self._create_node(key, input_topic),
+            self._lifecycle.retire_node)
 
     def _do_stop(self, instance_id: str) -> dict:
-        to_dispose: list[tuple[str, _BarcodeNode]] = []
-        with self._state_lock:
-            if instance_id:
-                node = self._nodes.pop(instance_id, None)
-                if node is not None:
-                    to_dispose.append((instance_id, node))
-            else:
-                to_dispose.extend(self._nodes.items())
-                self._nodes = {}
-        for node_key, node in to_dispose:
-            self._dispose(node_key, node)
-        return {"state": "idle"}
+        return self._lifecycle.stop(instance_id or None)
 
     def _do_config(self, instance_id: str, args: dict) -> dict:
         cfg = {
@@ -741,3 +688,6 @@ class BarcodeScanPlugin:
             **extra,
         }
 
+    def shutdown(self) -> dict:
+        """Cancel pending creation and retain failed cleanup for explicit retry."""
+        return self._lifecycle.shutdown()

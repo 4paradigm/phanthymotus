@@ -67,6 +67,9 @@ class _FakeNode:
     def get_name(self):
         return self._name
 
+    def resolve_topic_name(self, topic):
+        return topic if topic.startswith("/") else f"/{topic}"
+
     def create_publisher(self, msg_type, topic, qos):
         publisher = _FakePublisher(topic)
         self.publishers.append(publisher)
@@ -115,13 +118,10 @@ class _FakeString:
 
 
 class _FakeHeader:
-    """`stamp` is the only field anything here sets, but the attribute has to
-    exist: a publisher that stamps its outgoing frames (pose's overlay) would
-    otherwise fail inside its own try/except and publish nothing, which looks
-    like a disabled feature rather than a missing stub."""
+    """A ROS header starts with a zero Time and an empty frame ID."""
 
     def __init__(self):
-        self.stamp = 0
+        self.stamp = types.SimpleNamespace(sec=0, nanosec=0)
         self.frame_id = ""
 
 
