@@ -289,10 +289,13 @@ def _register_core_mcp(silent=False):
                 'name': 'channel_request',
                 'type': 'sensor',
                 'description': (
-                    'Inbound gateway for messaging platforms (Feishu / Telegram / Slack): delivers '
+                    'Inbound gateway for messaging platforms (Feishu / Telegram / Slack / WeCom): delivers '
                     'messages users send from a chat app — including image and file attachments — '
                     'into the decision core. You never call this tool. The events it produces carry '
-                    'channel="channel:<platform>"; reply to those with channel_reply.'
+                    'channel="channel:<platform>"; reply to those with channel_reply. '
+                    'For a user request about an image, use Read on its path in the event files list '
+                    'before describing it. A path alone is not image content; if Read fails or vision '
+                    'input is disabled, explain that you cannot see the image.'
                 ),
                 'inputSchema': {'type': 'object', 'properties': {}},
                 'configSchema': {
@@ -312,11 +315,17 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
+                'display_description': (
+                    'Outbound gateway for messaging channels: sends text or supported files from '
+                    'decision_core to the source conversation or a configured trusted bot. '
+                    'For a reply, use the triggering message_id as source_message_id.'
+                ),
                 'description': (
-                    'Send a reply on a messaging platform (Feishu / Telegram / Slack). '
+                    'Send a reply on a messaging platform (Feishu / Telegram / Slack / WeCom). '
                     'This is the ONLY way those users receive anything from you — text left in '
                     '`content` reaches nobody. When the triggering event\'s channel attribute starts '
-                    'with "channel:" (for example channel="channel:feishu"), any reply must go through '
+                    'with "channel:" (for example channel="channel:feishu" or '
+                    'channel="channel:wecom"), any reply must go through '
                     'this tool, and only to that channel. Whether the event warrants a response at all '
                     'is a separate judgement — see the response rules; when it does not, just finish. '
                     'For Feishu bot collaboration, only set mention_open_id when another bot must '

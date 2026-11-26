@@ -529,6 +529,9 @@ class ChannelManager:
             await self._push_error(msg)
         _update_status(channel_id, 'error')
 
+        if adapter is not None and not getattr(adapter, 'should_auto_reconnect', lambda: True)():
+            return
+
         if channel_id in self._starting or (adapter and getattr(adapter, 'reconnecting', False)):
             return
         # Keep retrying after a long outage. The delay is capped, not the number
@@ -600,7 +603,8 @@ class ChannelManager:
 
         cls = _ADAPTER_CLASSES.get(platform)
         if cls is None:
-            msg = f'[channel] No adapter for platform: {platform}. Supported: telegram, slack, feishu'
+            msg = (f'[channel] No adapter for platform: {platform}. '
+                   f'Supported: {", ".join(sorted(_ADAPTER_CLASSES)) or "none"}')
             print(msg)
             await self._push_error(msg)
             return
@@ -743,7 +747,8 @@ class ChannelManager:
                     if adapter:
                         await adapter.send_message(OutboundMessage(
                             chat_id=msg.chat_id,
-                            text='Pending approval. An admin has been notified.'
+                            text='Pending approval. An admin has been notified.',
+                            reply_to_message_id=msg.message_id,
                         ))
                     return
 

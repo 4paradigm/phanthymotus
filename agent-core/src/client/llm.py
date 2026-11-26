@@ -14,6 +14,38 @@ import config
 LOG_PATH = pathlib.Path('./resource/log')
 
 
+def _prepare_messages(messages: list[dict]) -> list[dict]:
+    """Move tool images to a user message after the complete tool-result batch."""
+    prepared = []
+    pending_images = []
+    for message in messages:
+        if message.get('role') != 'tool' and pending_images:
+            prepared.append({'role': 'user', 'content': pending_images})
+            pending_images = []
+        content = message.get('content')
+        if isinstance(content, list):
+            # Also accept images saved or produced before image_url used an object.
+            content = [
+                {**part, 'image_url': {'url': part['image_url']}}
+                if part.get('type') == 'image_url' and isinstance(part.get('image_url'), str)
+                else part for part in content
+            ]
+            images = [part for part in content if part.get('type') == 'image_url']
+            if message.get('role') == 'tool' and images:
+                pending_images.append({
+                    'type': 'text',
+                    'text': f'[Image output from tool call {message.get("tool_call_id", "")}]',
+                })
+                pending_images.extend(images)
+                content = [part for part in content if part.get('type') != 'image_url']
+                content = content or '[Image output attached below.]'
+            message = {**message, 'content': content}
+        prepared.append(message)
+    if pending_images:
+        prepared.append({'role': 'user', 'content': pending_images})
+    return prepared
+
+
 # ── 流式参数 ──────────────────────────────────────────────────────────────────
 #
 # 为什么必须流式：`stream=False` 时，在整个响应体到齐之前没有任何信号，于是
@@ -624,6 +656,8 @@ class Client():
         reconsider_event: 'asyncio.Event | None' = None,
         model_override: 'str | None' = None,
     ) -> dict:
+
+        message_list = _prepare_messages(message_list)
 
         def _extra(client, think_mode: bool) -> dict:
             # think_mode 只决定发哪一组：关掉，还是开着但压到最低档。两组共用

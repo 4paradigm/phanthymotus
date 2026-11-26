@@ -153,6 +153,10 @@ class ChannelAdapter(ABC):
         """返回 (是否连通, 失败原因)。默认只看 _running，子类应重写为真实探测。"""
         return (self._running, '' if self._running else 'adapter not running')
 
+    def should_auto_reconnect(self) -> bool:
+        """需要人工处理的连接状态可由适配器禁止自动重连。"""
+        return True
+
     def status(self) -> str:
         """返回当前状态：connected / degraded / disconnected。
 
