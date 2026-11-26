@@ -38,7 +38,7 @@ _FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
 _CHAT_HISTORY_LIMIT = 12
 _CHAT_HISTORY_TEXT_MAX = 500
 
-# Set by the LLM dispatcher for WeCom viewer turns. Context-local rather than an
+# Set by the LLM dispatcher for scoped viewer turns. Context-local rather than an
 # argument supplied by the model, so concurrent turns/calls cannot widen it.
 viewer_reply_scope: ContextVar[tuple[frozenset[str], frozenset[str]] | None] = ContextVar(
     'viewer_reply_scope', default=None)
@@ -223,6 +223,12 @@ def uses_trusted_bots(platform: str) -> bool:
     if cls is not None:
         return bool(getattr(cls, 'USES_TRUSTED_BOTS', False))
     return platform in _TRUSTED_BOTS_FALLBACK
+
+
+def scopes_conversations(platform: str) -> bool:
+    """Whether this adapter requires conversation-scoped turns and viewer history."""
+    return (isinstance(platform, str)
+            and bool(getattr(_ADAPTER_CLASSES.get(platform), 'SCOPED_CONVERSATIONS', False)))
 
 
 # ── Manager ──────────────────────────────────────────────────────────────────
@@ -769,6 +775,13 @@ class ChannelManager:
         if msg.prepare is not None:
             await msg.prepare()
 
+        if scopes_conversations(msg.platform):
+            from channel import context
+            if not context.is_authorized({'_channel_scope': (
+                    msg.platform, msg.channel_id, msg.chat_id, msg.user_id,
+                    user['role'], private_chat)}):
+                return
+
         # 4. Store last conversation context for reply routing (persisted)
         self._set_last_context(
             msg.channel_id, msg.chat_id, msg.user_id,
@@ -777,7 +790,7 @@ class ChannelManager:
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
         )
-        if msg.platform != 'wecom':
+        if not scopes_conversations(msg.platform):
             self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
                                        user_label=msg.display_name or msg.user_id)
         # 5. Publish to topic for dashboard and canvas data flow
@@ -980,7 +993,7 @@ class ChannelManager:
             result = f'Reply sent to {channel_id} ({"; ".join(parts) or "empty"})'
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
-            if not mention_open_id and adapter.platform != 'wecom':
+            if not mention_open_id and not scopes_conversations(adapter.platform):
                 self._record_chat_exchange(channel_id, chat_id, 'assistant', text)
             return result
         except PartialSendError as e:

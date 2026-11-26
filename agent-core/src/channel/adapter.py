@@ -126,6 +126,10 @@ class ChannelAdapter(ABC):
     # 所以 lan channel 不该出现 trusted_bots 字段。
     USES_TRUSTED_BOTS: bool = False
 
+    # Split human turns by conversation, sender and authority. Restricted turns
+    # retain their own history; operators may still use the shared main history.
+    SCOPED_CONVERSATIONS: bool = False
+
     def __init__(self, channel_id: str, platform: str, config: dict,
                  on_message: OnMessageCallback):
         self.channel_id = channel_id

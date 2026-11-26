@@ -1,4 +1,4 @@
-"""Server-owned origin of asynchronous work started by a WeCom turn."""
+"""Server-owned authority and origin of conversation-scoped Channel work."""
 
 import json
 from contextvars import ContextVar
@@ -18,13 +18,14 @@ def context_key(origin: dict) -> str:
 
 
 def history_context(origin: dict | None) -> str | None:
-    """Only restricted WeCom turns select a separate conversation history."""
+    """Restricted turns on scoped adapters select a separate conversation history."""
     if origin is None:
         return None
     key = context_key(origin)
     if key:
         scope = origin['_channel_scope']
-        if scope[0] != 'wecom' or (scope[4] in ('operator', 'owner') and not scope[5]):
+        from channel.manager import scopes_conversations
+        if not scopes_conversations(scope[0]) or (scope[4] in ('operator', 'owner') and not scope[5]):
             return None
     return key  # An unknown Channel identity must not fall back to shared memory.
 
@@ -34,7 +35,8 @@ def capture(origin: dict | None = None) -> dict | None:
     origin = current.get() if origin is None else origin
     if not isinstance(origin, dict) or not context_key(origin):
         return None
-    if origin['_channel_scope'][0] != 'wecom':
+    from channel.manager import scopes_conversations
+    if not scopes_conversations(origin['_channel_scope'][0]):
         return None
     session_id = origin.get('_channel_session_id')
     message_ids = origin.get('_channel_message_ids')
@@ -50,21 +52,31 @@ def capture(origin: dict | None = None) -> dict | None:
     }
 
 
-def is_active(origin: dict) -> bool:
-    """A deleted conversation or revoked authorization cannot be resumed."""
-    origin = capture(origin)
-    if origin is None:
+def is_authorized(origin: dict) -> bool:
+    """Recheck the authority captured before media preparation or queueing."""
+    if not context_key(origin):
         return False
-    import config
     from channel import acl
     from channel.manager import get_channel_config
 
     platform, channel_id, _, user_id, role, chat_only = origin['_channel_scope']
-    user = acl.get_user(platform, user_id)
     channel = get_channel_config(channel_id)
-    if (not user or user['role'] != role or not channel or not channel.get('enabled')
+    if (not channel or not channel.get('enabled')
             or channel.get('platform') != platform or bool(channel.get('chat_only')) != chat_only):
         return False
+    # chat_only deliberately bypasses the people ACL and grants only text replies.
+    if chat_only:
+        return role == 'viewer'
+    user = acl.get_user(platform, user_id)
+    return bool(user and user['role'] == role)
+
+
+def is_active(origin: dict) -> bool:
+    """A deleted conversation or revoked authorization cannot be resumed."""
+    origin = capture(origin)
+    if origin is None or not is_authorized(origin):
+        return False
+    import config
     with config._get_conn() as conn:
         if history_context(origin) is None:
             return conn.execute(

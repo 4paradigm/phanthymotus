@@ -184,6 +184,7 @@ class WecomAdapter(ChannelAdapter):
     SUPPORTED_FILE_KINDS = (KIND_IMAGE,)
     SUPPORTS_BOT_TO_BOT = False
     USES_TRUSTED_BOTS = False
+    SCOPED_CONVERSATIONS = True
 
     def __init__(self, channel_id: str, platform: str, config: dict,
                  on_message: OnMessageCallback):

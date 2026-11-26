@@ -174,39 +174,6 @@ def delete_session(session_id: str):
     delete_sessions([session_id])
 
 
-def _delete_channel_recaps(conn, session_ids: list[str], placeholders: str):
-    """Remove the legacy recap for each deleted human Channel identity."""
-    contexts = conn.execute(
-        f'SELECT context_key FROM chat_sessions WHERE id IN ({placeholders}) AND kind = ?',
-        [*session_ids, KIND_CHANNEL],
-    ).fetchall()
-    if not contexts:
-        return
-    row = conn.execute("SELECT value FROM config WHERE key = 'channel_chat_history'").fetchone()
-    if not row:
-        return
-    history = json.loads(row[0])
-    if not isinstance(history, dict):
-        return
-    for (context_key,) in contexts:
-        try:
-            scope = json.loads(context_key)
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(scope, list) or len(scope) != 6:
-            continue
-        _, channel_id, chat_id, user_id, user_role, _ = scope
-        channel = history.get(channel_id, {})
-        if not isinstance(channel, dict) or not isinstance(channel.get(chat_id), list):
-            continue
-        channel[chat_id] = [entry for entry in channel[chat_id]
-                            if not (isinstance(entry, dict) and entry.get('user_id') == user_id
-                                    and entry.get('user_role') == user_role
-                                    and entry.get('sender_type') == 'user')]
-    conn.execute("UPDATE config SET value = ? WHERE key = 'channel_chat_history'",
-                 (json.dumps(history, ensure_ascii=False),))
-
-
 def delete_sessions(session_ids: list[str]):
     """Delete multiple sessions."""
     if not session_ids:
@@ -214,7 +181,6 @@ def delete_sessions(session_ids: list[str]):
     placeholders = ','.join('?' * len(session_ids))
     with _get_conn() as conn:
         conn.execute('BEGIN IMMEDIATE')
-        _delete_channel_recaps(conn, session_ids, placeholders)
         conn.execute(f'DELETE FROM chat_messages WHERE session_id IN ({placeholders})', session_ids)
         conn.execute(f'DELETE FROM chat_sessions WHERE id IN ({placeholders})', session_ids)
         conn.commit()
@@ -248,7 +214,7 @@ def clear_all():
     with _get_conn() as conn:
         conn.execute('DELETE FROM chat_messages')
         conn.execute('DELETE FROM chat_sessions')
-        conn.execute("DELETE FROM config WHERE key IN ('channel_chat_history', 'channel_history_migrations')")
+        conn.execute("DELETE FROM config WHERE key = 'channel_chat_history'")
         try:
             conn.execute('DELETE FROM chat_messages_fts')
         except Exception:
@@ -286,20 +252,18 @@ def rebuild_fts():
         conn.commit()
 
 
-def search(query: str, limit: int = 10, *, context_key: str | None = None,
-           include_channels: bool = True) -> list[dict]:
-    """全文搜索历史对话。"""
+def search(query: str, limit: int = 10, *, context_key: str | None = None) -> list[dict]:
+    """Search shared history, or one restricted conversation when explicitly scoped."""
     if context_key == '':
         return []  # An unidentified Channel input has no authorized history.
     with _get_conn() as conn:
         _ensure_fts(conn)
         try:
-            where = ''
             params = [query]
             if context_key is not None:
                 where = ' AND cs.kind = ? AND cs.context_key = ?'
                 params.extend([KIND_CHANNEL, context_key])
-            elif not include_channels:
+            else:
                 where = ' AND cs.kind != ?'
                 params.append(KIND_CHANNEL)
             params.append(limit)
