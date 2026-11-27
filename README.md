@@ -532,19 +532,14 @@ Add sensors and actuators you need onto the canvas, connect them to the core Age
 
 ![Canvas](docs/images/home.png)
 
-One browser session edits a canvas at a time. If someone is already editing,
-another session can request a takeover from the canvas toolbar. The editor can hand
-over the latest saved layout, save the current layout and hand it over in one step,
-or decline. After 15 seconds without a response, the requester receives edit access
-and loads the requested layout.
+One browser session edits the shared canvas at a time. An editor can hand over the
+last saved version, save current changes and hand over, or decline. With no reply,
+the requester receives the last saved version after 15 seconds.
 
-Open **My drafts** to view the cards and connections automatically saved in this
-browser for each editing session. Open or create a draft to arrange cards and
-connections locally while another person edits the shared canvas. Applying a draft
-requests edit access if the shared canvas is occupied. If you already have edit
-access, restore a draft directly. Your earlier drafts stay available after
-another session changes the shared canvas. Restoring a draft requires
-intelligent control to be stopped.
+**My draft** opens the same canvas editor with your browser's saved draft.
+Card positions, links and non-sensitive settings autosave locally. **Apply draft**
+writes them to the shared canvas when it is available and intelligent control is
+stopped.
 
 ### Real-Time Monitoring
 

@@ -4,7 +4,8 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, ensureEdit, cardsForTool } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, cardsForTool,
+  isEditingDraft, readDraftConfig, saveDraftConfig } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
 import { openDeployPanel } from './deploy-panel.js';
@@ -68,7 +69,7 @@ export function initSidebar() {
   _initCollapse();
 
   // Load saved tool configs
-  _loadToolConfigs();
+  refreshToolConfigs();
 }
 
 /**
@@ -104,7 +105,7 @@ function _initCollapse() {
   });
 }
 
-async function _loadToolConfigs() {
+export async function refreshToolConfigs() {
   try {
     const resp = await fetch('/api/canvas/tool-configs');
     const data = await resp.json();
@@ -1018,11 +1019,25 @@ function _applyOptionsReply(bodyEl, reply) {
   }
 }
 
+function draftConfigSchema(schema) {
+  const properties = {};
+  for (const [key, field] of Object.entries(schema?.properties || {})) {
+    if (field['x-sensitive'] ?? (field.format === 'password')) continue;
+    const { ['x-options-action']: action, ...safe } = field;
+    if (safe.format === 'llm-source') Object.assign(safe, { format: undefined, enum: ['cloud', 'local'] });
+    if (['audio-input-device', 'video-input-device', 'channel-select'].includes(safe.format)) delete safe.format;
+    properties[key] = safe;
+  }
+  return { ...schema, properties };
+}
+
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
+  const draft = isEditingDraft();
+  if (draft) configSchema = draftConfigSchema(configSchema);
   // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
   // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
   const liveEditable = mcpId === 'agentcore' && toolName === 'decision_core';
-  if (isProjectRunning() && !liveEditable) {
+  if (!draft && isProjectRunning() && !liveEditable) {
     alert('Stop agent before modifying');
     return;
   }
@@ -1031,13 +1046,13 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
 
-  titleEl.textContent = `Configure ${toolName}`;
+  titleEl.textContent = draft ? `草稿设置 · ${toolName}` : `Configure ${toolName}`;
   bodyEl.innerHTML = '';
 
   const props = configSchema.properties || {};
   const required = configSchema.required || [];
   const configKey = `${mcpId}:${toolName}`;
-  const savedValues = _toolConfigs[configKey] || {};
+  const savedValues = { ..._toolConfigs[configKey], ...(draft ? readDraftConfig(mcpId, toolName) : {}) };
 
   // If all fields are instance-scope, show them here too (as shared defaults)
   const hasSharedFields = Object.values(props).some(d => d.scope !== 'instance');
@@ -1219,11 +1234,12 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   // Collect and store the form; null when it could not be. Shared by Save and
   // by an x-options-action button, which has to store what was typed before
   // the tool can act on it.
+  const initial = draft ? new Map([...bodyEl.querySelectorAll('[data-key]')].map(input => [input.dataset.key, input.value])) : null;
   const persist = async () => {
-    if (!(await ensureEdit())) return null;
+    if (draft !== isEditingDraft() || (!draft && !(await ensureEdit()))) return null;
     const values = {};
     for (const input of bodyEl.querySelectorAll('[data-key]')) {
-      if (!input.value.trim()) continue;
+      if (!input.value.trim() || initial?.get(input.dataset.key) === input.value) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
       if (fieldWrapper && fieldWrapper.style.display === 'none'
@@ -1235,6 +1251,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
         return null;
       }
     }
+
+    if (draft) return saveDraftConfig(mcpId, toolName, [['', values]]) ? values : null;
 
     // Save to per-tool API
     try {
@@ -1266,6 +1284,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
   const save = async () => {
     const values = await persist();
     if (!values) return;
+    if (draft) { close(); return; }
 
     // Update sidebar card status indicator
     const card = _scroll.querySelector(`.sidebar-tool-card[data-mcp-id="${mcpId}"][data-tool-name="${toolName}"]`);
@@ -1349,7 +1368,9 @@ function _hideDetail() {
  * Only shows fields with scope === "instance".
  */
 export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema, description) {
-  if (isProjectRunning()) {
+  const draft = isEditingDraft();
+  if (draft) configSchema = draftConfigSchema(configSchema);
+  if (!draft && isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
   }
@@ -1358,7 +1379,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const bodyEl  = document.getElementById('tool-config-body');
   const saveBtn = document.getElementById('tool-config-save');
 
-  titleEl.textContent = `Instance Config: ${toolName}`;
+  titleEl.textContent = draft ? `草稿设置 · ${toolName}` : `Instance Config: ${toolName}`;
   bodyEl.innerHTML = '';
 
   // The fields below state what can be *changed*; nothing else in this dialog
@@ -1377,7 +1398,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const props = (configSchema && configSchema.properties) || {};
   const required = (configSchema && configSchema.required) || [];
   const configKey = `${mcpId}:${toolName}:${instanceId}`;
-  const savedValues = _toolConfigs[configKey] || {};
+  const savedValues = { ..._toolConfigs[configKey], ...(draft ? readDraftConfig(mcpId, toolName, instanceId) : {}) };
 
   // **The card's dialog can set everything, so there is never a second place
   // you have to go.** Tool-level fields render here too, as real inputs, in a
@@ -1408,7 +1429,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     bodyEl.appendChild(box);
     sharedHost = box;
   }
-  const sharedSaved = _toolConfigs[`${mcpId}:${toolName}`] || {};
+  const sharedSaved = { ..._toolConfigs[`${mcpId}:${toolName}`], ...(draft ? readDraftConfig(mcpId, toolName) : {}) };
 
   // Expert settings go in a fold. A card whose every tuning knob is laid out
   // flat is a card nobody can configure: the pose card reached 26 fields, each
@@ -1563,11 +1584,12 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   }
 
   const close = () => { overlay.classList.add('hidden'); };
+  const initial = draft ? new Map([...bodyEl.querySelectorAll('[data-key]')].map(input => [input.dataset.key, input.value])) : null;
   const save = async () => {
-    if (!(await ensureEdit())) return;
+    if (draft !== isEditingDraft() || (!draft && !(await ensureEdit()))) return;
     const values = {};
     for (const input of bodyEl.querySelectorAll('[data-key]')) {
-      if (!input.value.trim()) continue;
+      if (!input.value.trim() || initial?.get(input.dataset.key) === input.value) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
       if (fieldWrapper && fieldWrapper.style.display === 'none'
@@ -1587,6 +1609,11 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     const instanceValues = {}, sharedValues = {};
     for (const [key, value] of Object.entries(values)) {
       ((props[key] && props[key].scope !== 'instance') ? sharedValues : instanceValues)[key] = value;
+    }
+
+    if (draft) {
+      if (saveDraftConfig(mcpId, toolName, [[instanceId, instanceValues], ['', sharedValues]])) close();
+      return;
     }
 
     const base = `/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`;

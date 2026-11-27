@@ -12,11 +12,10 @@
  */
 
 import { showToast } from './toast.js';
-import { canvasDrafts, openCanvasDrafts } from './canvas-drafts.js';
-import { openCanvasDraftEditor } from './canvas-draft-editor.js';
+import { canvasDrafts } from './canvas-drafts.js';
 
 import { showTopicDetail } from './detail-panel.js';
-import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
+import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired, refreshToolConfigs } from './sidebar.js';
 import { startMicStream, stopMicStream, isMicActive, isMicSuspended } from './mic-stream.js';
 import { startCameraStream, stopCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { fetchInstanceConfig, micOptions, cameraOptions, describeMediaError } from './browser-source.js';
@@ -70,8 +69,9 @@ let _takeoverBusy = false;
 const EDITOR_SAVE_TIMEOUT_MS = 4000;
 let _takeoverChecked = false;
 let _draftStore = null;
+let _draftEditing = null;
+let _switchingCanvas = false;
 let _draftWriteFailed = false;
-let _draftCopySequence = 0;
 const _queuedDrafts = new Map();
 let _handledTakeover = null;
 const _pastEditorInstances = new Set();
@@ -84,6 +84,7 @@ let _layoutGen = 0;  // bumped on every _reloadLayout; see _clearCanvas
  * another session (in which case a toast + locked UI state is shown).
  */
 async function _ensureEdit({ forClear = false } = {}) {
+  if (_draftEditing) return !_takeoverBusy;
   if (_clearing && !forClear) {
     _showToast('正在清空画布，请稍候');
     return false;
@@ -174,7 +175,7 @@ function _projectEditLockReason() {
 }
 
 function _editLockReason() {
-  return _clearing ? '正在清空画布，请稍候' : _projectEditLockReason();
+  return _clearing ? '正在清空画布，请稍候' : _draftEditing ? '' : _projectEditLockReason();
 }
 
 /**
@@ -310,7 +311,7 @@ function _startCardCamera(card, { warm = false } = {}) {
 }
 
 async function _rearmBrowserSources() {
-  if (!_projectRunning) return;
+  if (_draftEditing || !_projectRunning) return;
 
   const cameraCard = _cards.find(c => c.toolName === 'remote_camera');
   if (cameraCard && !isCameraActive()) {
@@ -363,10 +364,26 @@ function _applyProjectState(running) {
   // rather than opening a second stream, so the start-project path and the
   // cross-tab project_state event cannot double-start. (Checking "is it
   // active" was not enough: a stream only becomes active once it is fully up.)
-  if (_projectRunning) _rearmBrowserSources();
+  if (_projectRunning && !_draftEditing) _rearmBrowserSources();
 }
 export function redrawCanvas() { _scheduleRedraw(); }
-export function ensureEdit() { return _ensureEdit(); }
+export function ensureEdit() { return _draftEditing ? Promise.resolve(false) : _ensureEdit(); }
+export function isEditingDraft() { return !!_draftEditing; }
+export function readDraftConfig(mcpId, toolName, instanceId = '') {
+  return _draftEditing?.find(entry => entry.mcp_id === mcpId && entry.tool_name === toolName
+    && entry.instance_id === instanceId)?.values || {};
+}
+export function saveDraftConfig(mcpId, toolName, writes) {
+  if (!_draftEditing) return false;
+  for (const [instance_id, values] of writes) {
+    if (!Object.keys(values).length) continue;
+    const merged = { ...readDraftConfig(mcpId, toolName, instance_id), ...values };
+    _draftEditing = _draftEditing.filter(entry =>
+      entry.mcp_id !== mcpId || entry.tool_name !== toolName || entry.instance_id !== instance_id);
+    _draftEditing.push({ mcp_id: mcpId, tool_name: toolName, instance_id, values: merged });
+  }
+  return _saveWorkingDraft();
+}
 export function isEditor() { return _isEditor; }
 
 /**
@@ -384,7 +401,7 @@ export function reloadFromServer() { return _reloadLayout(); }
 export async function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
   if (_refuseEdit()) return false;
   if (!(await _ensureEdit())) return false;
-  if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
+  if (!_draftEditing && hasConfig && !isToolConfigured(mcpId, toolName)) return false;
   if (!multiInstance) {
     const existing = _cards.find(c => c.mcpId === mcpId && c.toolName === toolName);
     if (existing) return false;
@@ -423,6 +440,7 @@ const VIEWPORT_KEY = 'canvas-viewport-v1';
 let _viewportTimer = null;
 /** Remember this browser's zoom/pan. Debounced — a pinch fires continuously. */
 function _saveViewport() {
+  if (_draftEditing) return;
   clearTimeout(_viewportTimer);
   _viewportTimer = setTimeout(() => {
     try {
@@ -601,6 +619,7 @@ export async function initCanvas(initialMcps) {
 }
 
 export function updateCanvasMcps(mcps) {
+  if (_draftEditing) { _allMcps = mcps; return; }
   _allMcps = mcps || [];
   // This runs on a 10s poll and can replace card elements wholesale. Doing that
   // mid-drag detaches the element that holds the pointer capture: the drag
@@ -838,6 +857,7 @@ function _setupControlButtons() {
   document.getElementById('canvas-clear')?.addEventListener('click', _clearCanvas);
 
   document.getElementById('canvas-project-toggle')?.addEventListener('click', () => {
+    if (_draftEditing) return;
     if (_clearing) { _showToast('正在清空画布，请稍候'); return; }
     if (_projectRunning) { _stopProject(); return; }
     // _projectRunning only flips true once the start fetch resolves, so a
@@ -886,7 +906,7 @@ function _setupDropZone() {
     } catch { return; }
 
     // Prevent unconfigured tools from being added
-    if (data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {
+    if (!_draftEditing && data.hasConfig && !isToolConfigured(data.mcpId, data.toolName)) {
       _showDropReject(e, '请先配置后再使用');
       return;
     }
@@ -967,6 +987,24 @@ function _addCard(data, save = true) {
 
   const el = _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: data.topicIn, topicOut: data.topicOut, topicOutFrom });
   _viewport.appendChild(el);
+  if (_draftEditing && !el.querySelector('.canvas-card-instance-cfg-btn')) {
+    const mcp = _allMcps.find(item => item.id === mcpId);
+    const tool = (mcp?.tools || []).find(item => item?.name === toolName);
+    const header = el.querySelector('.canvas-card-header');
+    if (header && tool?.configSchema) {
+      const settings = document.createElement('button');
+      settings.type = 'button';
+      settings.className = 'tool-card-info-btn canvas-card-instance-cfg-btn';
+      settings.textContent = '⚙';
+      settings.title = '配置草稿卡片';
+      settings.setAttribute('aria-label', '配置草稿卡片');
+      settings.onclick = event => {
+        event.stopPropagation();
+        openInstanceConfigModal(mcpId, toolName, id, tool.configSchema, tool.description);
+      };
+      header.append(settings);
+    }
+  }
 
   // Restore or initialize persisted topic data
   let topicInData  = data.topicIn  || [];
@@ -1038,6 +1076,12 @@ async function _removeCard(id) {
 async function _clearCanvas() {
   if (!_cards.length || _refuseEdit()) return;
   if (!confirm('确定清空画布上的所有卡片和连线吗？已安装的技能不会被删除。')) return;
+  if (_draftEditing) {
+    _renderCanvasLayout({});
+    _draftEditing = [];
+    _saveWorkingDraft();
+    return;
+  }
 
   // Flush a pending autosave instead of cancelling it: every abort below
   // returns without saving, so a cancelled save was the user's last edit lost.
@@ -1360,6 +1404,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             form.append('path', uploadDir);
           }
           try {
+            if (_draftEditing) return;
             const res = await fetch(endpoint, { method: 'POST', body: form });
             const data = await res.json();
             if (data.code === 200) {
@@ -1584,6 +1629,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           form.append('file', fileInput.files[0]);
           form.append('path', uploadDir);
           try {
+            if (_draftEditing) return;
             const res = await fetch('/api/file/upload', { method: 'POST', body: form });
             const data = await res.json();
             if (data.code === 200) {
@@ -1802,7 +1848,7 @@ function _setupPortDrag() {
         _saveLayout({ draft: true });
 
         const toCardData = _cards.find(c => c.id === toCard.dataset.cardId);
-        if (toCardData && _projectRunning) {
+        if (!_draftEditing && toCardData && _projectRunning) {
           // Restart on the card's *whole* input set, not just the link that was
           // just drawn. Perception rebuilds a node whose input_topic differs
           // from the one it holds (plugins/tts.py), so naming only the new topic
@@ -2540,6 +2586,7 @@ function _initAutoStartToggle() {
 }
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
+  if (_draftEditing) return;
   try {
     const res = await fetch(`/api/mcp/${encodeURIComponent(mcpId)}/call`, {
       method: 'POST',
@@ -2710,6 +2757,7 @@ async function _refreshConfiguredTopics({ mcp_id, tool }) {
 }
 
 async function _fetchTopicsFromDriver(card, inputTopics, { force = false } = {}) {
+  if (_draftEditing) return;
   const topics = Array.isArray(inputTopics) ? inputTopics
                 : (inputTopics ? [inputTopics] : []);
   const want = inputKey(topics);
@@ -2726,7 +2774,7 @@ async function _fetchTopicsFromDriver(card, inputTopics, { force = false } = {})
                                           ...inputArgs(topics) } }),
     });
     const data = await resp.json();
-    if (card._topicFetchToken !== token) return; // superseded by a newer config/query
+    if (_draftEditing || !_cards.includes(card) || card._topicFetchToken !== token) return; // superseded by a newer config/query
     const parsed = _parseMcpCallResult(data);
     if (!parsed) { card._topicFetchFor = null; return; }
     const topicOut = parsed?.topic_out;
@@ -2796,6 +2844,7 @@ async function _fetchTopicsFromDriver(card, inputTopics, { force = false } = {})
  *    log filled with `ASGI callable returned without completing handshake`.
  */
 async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
+  if (_draftEditing) return;
   // Ask the driver directly first, the same way the info modal does. Every
   // other source here (out-port dataset, the closure captured at render time,
   // the static MCP definition) is _revalidateDerivedTopics' cache, and it has
@@ -2877,6 +2926,7 @@ function _inputTopicsFor(card) {
  * an outgoing connection, which a stale leaf card like TTS satisfies neither of.
  */
 function _revalidateDerivedTopics() {
+  if (_draftEditing) return;
   for (const card of _cards) {
     const want = _inputTopicsFor(card);
     const wantKey = inputKey(want);
@@ -2930,6 +2980,7 @@ function _collectInTopics(cardId, el) {
 }
 
 async function _fetchInfoAndShow(mcp, toolObj, opts) {
+  if (_draftEditing) return;
   const toolName = typeof toolObj === 'string' ? toolObj : toolObj.name;
   try {
     const res = await fetch(`/api/mcp/${encodeURIComponent(mcp.id)}/call`, {
@@ -2953,6 +3004,7 @@ async function _fetchInfoAndShow(mcp, toolObj, opts) {
 // ── Execute ───────────────────────────────────────────────────────────────────
 
 async function _executeCard(el, mcpId, toolName, instanceId) {
+  if (_draftEditing) return;
   const btn = el.querySelector('.canvas-exec-btn');
   btn.disabled = true;
   btn.textContent = '执行中…';
@@ -3208,12 +3260,14 @@ let _saveTimer = null;
 let _saveDeferred = false;  // a save was skipped during a clear; replay it after
 const _pendingLayoutSaves = new Set();
 function _debouncedSave({ draft = false } = {}) {
+  if (_draftEditing) { _saveWorkingDraft(); return; }
   if (draft && _isEditor) _saveCanvasDraft();
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => { _saveTimer = null; _saveLayout(); }, 400);
 }
 
 function _saveLayout({ draft = false, ...options } = {}) {
+  if (_draftEditing) return Promise.resolve(_saveWorkingDraft());
   // System-triggered saves must not auto-claim.
   if (!_isEditor) return Promise.resolve(false);
   // Nor race the clear's empty write — but remember them, or an aborted clear
@@ -3284,7 +3338,7 @@ function _syncEmptyState() {
   const clearBtn = document.getElementById('canvas-clear');
   if (clearBtn) {
     clearBtn.disabled = _cards.length === 0 || _clearing || _editsLocked()
-      || _takeoverBusy || (!_isEditor && !!_currentEditor);
+      || _takeoverBusy || (!_draftEditing && !_isEditor && !!_currentEditor);
   }
 }
 
@@ -3308,21 +3362,32 @@ function _createEditorBar() {
 function _updateEditorUI() {
   let bar = document.getElementById('canvas-editor-bar');
   if (!bar) bar = _createEditorBar();
-  bar.classList.toggle('canvas-editor-bar--locked', !_isEditor && !!_currentEditor);
+  bar.classList.toggle('canvas-editor-bar--locked', !_draftEditing && !_isEditor && !!_currentEditor);
 
-  const variant = _editorSyncing ? 'syncing' : _isEditor ? 'editor' : _currentEditor ? 'reader' : 'free';
-  const template = JSON.stringify([variant, _takeover?.id, _takeoverBusy, _editorInstance]);
+  const variant = _draftEditing ? 'draft' : _editorSyncing ? 'syncing' : _isEditor ? 'editor' : _currentEditor ? 'reader' : 'free';
+  const applyBlocked = _draftEditing && (_projectEditLockReason() || (_currentEditor && !_isEditor ? '共享画布空闲后可应用' : '') || (_takeover ? '请先处理接管申请' : ''));
+  const template = JSON.stringify([variant, _takeover?.id, _takeoverBusy, _editorInstance, applyBlocked]);
   if (bar.dataset.state !== template) {
     bar.dataset.state = template;
     const countdown = '<span class="editor-countdown" aria-hidden="true"></span>';
-    if (_editorSyncing) {
+    if (_draftEditing) {
+      bar.innerHTML = `<button class="editor-btn" id="canvas-back-shared">共享画布</button>
+        <span class="editor-label editor-label--active" aria-current="true">我的草稿</span>
+        <button class="editor-btn editor-btn--claim" id="canvas-apply-draft">应用草稿</button>
+        ${applyBlocked ? `<span class="editor-label">${applyBlocked}</span>` : ''}`;
+      bar.querySelector('#canvas-back-shared').onclick = async () => {
+        if (!(await _leaveDraftCanvas())) _showToast('暂时无法返回共享画布，请检查网络');
+      };
+      bar.querySelector('#canvas-apply-draft').onclick = _applyWorkingDraft;
+    } else if (_editorSyncing) {
       bar.innerHTML = _SVG_PEN + '<span class="editor-label" role="status">正在加载已保存的画布…</span>';
     } else if (_isEditor && _takeover) {
       const personal = _takeover.layout_source === 'personal';
-      const request = personal ? '对方申请接管，将使用自己的草稿' : '对方申请接管，想继续当前画布';
-      const save = personal ? '保存我的草稿并交接' : '保存并交接';
+      const request = personal ? '对方申请使用自己的草稿' : '对方申请接手共享画布';
+      const direct = personal ? '交接编辑权' : '用已保存版本交接';
+      const save = personal ? '保留我的修改并交接' : '保存当前修改并交接';
       bar.innerHTML = `${_SVG_PEN}<span class="editor-label" role="status">${request} ${countdown}</span>
-        <button class="editor-btn editor-btn--claim" id="canvas-handoff-takeover">直接交接</button>
+        <button class="editor-btn editor-btn--claim" id="canvas-handoff-takeover">${direct}</button>
         <button class="editor-btn" id="canvas-approve-takeover">${save}</button>
         <button class="editor-btn" id="canvas-deny-takeover">拒绝</button>`;
       bar.querySelector('#canvas-handoff-takeover').onclick = () => _respondTakeover('handoff');
@@ -3349,12 +3414,16 @@ function _updateEditorUI() {
       bar.innerHTML = _SVG_PEN + '<button class="editor-btn editor-btn--claim" id="canvas-claim-btn">编辑</button>';
       bar.querySelector('#canvas-claim-btn').onclick = _ensureEdit;
     }
-    bar.insertAdjacentHTML('beforeend', '<button class="editor-btn" id="canvas-drafts-btn">我的草稿</button>');
-    bar.querySelector('#canvas-drafts-btn').onclick = _showCanvasDrafts;
+    if (!_draftEditing) {
+      bar.insertAdjacentHTML('beforeend', '<button class="editor-btn" id="canvas-drafts-btn">我的草稿</button>');
+      bar.querySelector('#canvas-drafts-btn').onclick = _showCanvasDrafts;
+    }
     for (const button of bar.querySelectorAll('button')) button.disabled = _takeoverBusy;
+    const apply = bar.querySelector('#canvas-apply-draft');
+    if (apply && applyBlocked) apply.disabled = true;
   }
   _updateTakeoverCountdown();
-  _setCanvasReadonly(!_isEditor || _takeoverBusy);
+  _setCanvasReadonly((!_draftEditing && !_isEditor) || _takeoverBusy);
   _syncEmptyState();
 }
 
@@ -3404,104 +3473,123 @@ async function _loadDraftStore() {
   }
 }
 
-function _newDraftId() {
-  return `${_sessionId}:copy:${Date.now()}:${_draftCopySequence++}`;
-}
-
-function _saveCanvasDraft(layout = _layoutSnapshot(), { initial = false, copy = false } = {}) {
-  const id = copy ? _newDraftId() : _activeDraftId();
+function _saveCanvasDraft(layout = _layoutSnapshot(), { initial = false } = {}) {
+  const id = _activeDraftId();
   try {
     if (_draftStore) {
       _draftStore.save(id, layout, initial);
       _draftWriteFailed = false;
     } else {
-      if (copy) {
-        _showToast('草稿存储暂不可用，请稍后重试');
-        return false;
-      }
       if (!initial || !_queuedDrafts.has(id)) _queuedDrafts.set(id, { layout: structuredClone(layout), initial });
     }
     return true;
   } catch (error) {
     console.warn('Could not save canvas draft', error);
-    if (!_draftWriteFailed || copy) _showToast('草稿未保存，请检查浏览器存储空间');
+    if (!_draftWriteFailed) _showToast('草稿未保存，请检查浏览器存储空间');
     _draftWriteFailed = true;
     return false;
   }
 }
 
-async function _showCanvasDrafts() {
-  if (!_draftStore) await _loadDraftStore();
+function _saveWorkingDraft() {
   try {
+    _draftStore.save('working', { ..._layoutSnapshot(), draft_configs: _draftEditing });
+    return true;
+  } catch (error) {
+    console.warn('Could not save working draft', error);
+    _showToast('草稿未保存，请检查浏览器存储空间');
+    return false;
+  }
+}
+
+async function _showCanvasDrafts() {
+  if (_switchingCanvas || _takeoverBusy || _draftEditing) return;
+  _switchingCanvas = true;
+  try {
+    if (!_draftStore) await _loadDraftStore();
     if (!_draftStore) {
       _showToast('草稿存储暂不可用，请稍后重试');
       return;
     }
-    if (document.querySelector('.canvas-drafts-dialog, .canvas-drafts-editor')) return;
-    openCanvasDrafts({
-      drafts: _draftStore.list(),
-      activeId: _isEditor ? _activeDraftId() : null,
-      applyLabel: _isEditor ? '恢复到画布' : _currentEditor ? '申请接管并使用' : '编辑并使用',
-      blockedReason: _takeover ? '请先处理当前接管申请。' : _projectEditLockReason(),
-      canCopy: _isEditor,
-      onApply: _useCanvasDraft,
-      onEdit: _editLocalDraft,
-      onCopy: () => {
-        if (_isEditor && _saveCanvasDraft(_layoutSnapshot(), { copy: true })) _showToast('已另存草稿');
-      },
-    });
+    const drafts = _draftStore.list();
+    const draft = structuredClone(drafts.find(item => item.id === 'working')?.layout || drafts[0]?.layout || _layoutSnapshot());
+    if (_saveTimer) {
+      clearTimeout(_saveTimer);
+      _saveTimer = null;
+      void _saveLayout();
+    }
+    _draftEditing = draft.draft_configs || [];
+    _canvasEl.classList.add('canvas-mode-draft');
+    _renderCanvasLayout(draft);
+    _setCanvasTransform(draft.transform);
+    _revealHandoffCards();
+    _updateEditorUI();
+    _saveWorkingDraft();
   } catch (error) {
-    console.warn('Could not open canvas drafts', error);
+    console.warn('Could not open working draft', error);
     _showToast('无法读取草稿，请检查浏览器存储');
+  } finally {
+    _switchingCanvas = false;
   }
 }
 
-function _editLocalDraft(layout) {
-  const id = _newDraftId();
-  openCanvasDraftEditor({
-    layout,
-    mcps: _allMcps,
-    onSave: draft => {
-      try {
-        _draftStore.save(id, draft);
-        return true;
-      } catch (error) {
-        console.warn('Could not save local canvas draft', error);
-        return false;
-      }
-    },
-    onClose: _showCanvasDrafts,
-    onApply: _useCanvasDraft,
-  });
+async function _leaveDraftCanvas() {
+  if (_switchingCanvas || !_draftEditing || !_saveWorkingDraft()) return false;
+  _switchingCanvas = true;
+  try {
+    const response = await fetch('/api/canvas/layout');
+    if (!response.ok) return false;
+    const data = await response.json();
+    if (_staleEditorState(data)) return false;
+    _draftEditing = null;
+    _canvasEl.classList.remove('canvas-mode-draft');
+    _renderCanvasLayout(data.data || {});
+    _setCanvasTransform(_loadViewport() || data.data?.transform);
+    _applyEditorState(data, { layoutLoaded: true });
+    void refreshToolConfigs();
+    if (_projectRunning) _rearmBrowserSources();
+    return true;
+  } catch (error) {
+    console.warn('Could not return to the shared canvas', error);
+    return false;
+  } finally {
+    _switchingCanvas = false;
+  }
 }
 
-async function _useCanvasDraft(layout) {
-  if (_takeoverBusy || _takeover || _refuseEdit()) return;
-  if (!_isEditor) return _requestTakeover(layout);
-  if (!_saveCanvasDraft()) return;
-
+async function _applyWorkingDraft() {
+  if (!_draftEditing || _switchingCanvas || _takeoverBusy || _takeover || _projectEditLockReason()) return;
+  if ((_currentEditor && !_isEditor) || !_saveWorkingDraft()) return;
   _takeoverBusy = true;
   _updateEditorUI();
   try {
-    if (!(await _editorPost('restore-draft', { ...layout, ..._editorLease() }))) {
-      _showToast('无法恢复草稿，请确认你仍在编辑且智能控制已停止');
-    }
+    const applied = await _editorPost('restore-draft', {
+      ..._layoutSnapshot(), ..._editorLease(), draft_configs: _draftEditing,
+    });
+    if (!applied) _showToast('未能应用草稿，请检查卡片设置和共享画布状态');
+    else if (await _leaveDraftCanvas()) _showToast('草稿已应用到共享画布');
+    else _showToast('草稿已应用，返回共享画布时请重试');
   } catch {
-    _showToast('恢复结果未确认，请检查网络');
+    _showToast('未确认应用结果，请检查网络');
   } finally {
     _takeoverBusy = false;
     _updateEditorUI();
   }
 }
 
-async function _requestTakeover(layout = null) {
-  if (_takeoverBusy || (layout && _refuseEdit())) return;
+function _setCanvasTransform(view = {}) {
+  _zoom = Number.isFinite(view.zoom) ? Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, view.zoom)) : 1;
+  _tx = view.tx ?? 0;
+  _ty = view.ty ?? 0;
+  _applyTransform();
+}
+
+async function _requestTakeover() {
+  if (_takeoverBusy) return;
   _takeoverBusy = true;
   _updateEditorUI();
   try {
-    if (!(await _editorPost('request-takeover', layout ? { layout } : undefined))) {
-      _showToast(layout ? '无法使用我的卡片，请确认智能控制已停止' : '暂时无法申请接管，请刷新状态后重试');
-    }
+    if (!(await _editorPost('request-takeover'))) _showToast('暂时无法申请接管，请刷新状态后重试');
   } catch {
     _showToast('申请发送失败，请检查网络');
   } finally {
@@ -3616,7 +3704,7 @@ function _applyEditorState(data, { layoutLoaded = false, announce = true } = {})
   _currentEditor = editor;
   _editorSyncing = editor === _sessionId && !layoutLoaded && (_editorSyncing || renewedLease || (acquired && takeover));
   _isEditor = editor === _sessionId && !_editorSyncing;
-  if (_isEditor && !wasEditor) _saveCanvasDraft(_layoutSnapshot(), { initial: true });
+  if (!_draftEditing && _isEditor && !wasEditor) _saveCanvasDraft(_layoutSnapshot(), { initial: true });
   _updateEditorUI();
 
   if (wasEditor && !_isEditor) {
@@ -3638,7 +3726,7 @@ function _applyEditorState(data, { layoutLoaded = false, announce = true } = {})
       _showToast('智能控制正在运行或切换，停止后可以重新申请使用草稿');
     }
   }
-  if (_editorSyncing && !_handoffLoad) {
+  if (!_draftEditing && _editorSyncing && !_handoffLoad) {
     clearTimeout(_reloadTimer);
     const generation = _editorGeneration;
     _handoffLoad = _reloadLayout().then(() => {
@@ -3695,8 +3783,8 @@ const _KEEP_ALIVE_MS = 15000;
 let _lastPingAt = 0;
 let _pingTimer = null;
 
-function _pingEdit(event) {
-  if (!_isEditor || event?.target?.closest?.('.canvas-drafts-dialog, .canvas-drafts-editor')) return;
+function _pingEdit() {
+  if (_draftEditing || !_isEditor) return;
   const wait = _KEEP_ALIVE_MS - (Date.now() - _lastPingAt);
   if (wait <= 0) { _sendPing(); return; }
   if (!_pingTimer) {
@@ -3705,7 +3793,7 @@ function _pingEdit(event) {
 }
 
 async function _sendPing() {
-  if (!_isEditor) return;
+  if (_draftEditing || !_isEditor) return;
   _lastPingAt = Date.now();
   try {
     await _editorPost('keep-edit', _editorLease());
@@ -3716,29 +3804,32 @@ async function _sendPing() {
   document.addEventListener(ev, _pingEdit, { capture: true, passive: true }));
 
 async function _reloadLayout() {
+  if (_draftEditing) return false;
   try {
     const layoutRes = await fetch('/api/canvas/layout');
     const layoutJson = await layoutRes.json();
-    if (!layoutRes.ok || _staleEditorState(layoutJson)) return false;
-    _layoutGen++;
-    // Clear current cards
-    for (const c of _cards) c.el.remove();
-    _cards = [];
-    _connections = [];
-    _execConnections = [];
-    // Reload
-    const saved = layoutJson.data?.cards || [];
-    for (const c of saved) _addCard(c, false);
-    const cardIds = new Set(_cards.map(c => c.id));
-    _connections = (layoutJson.data?.connections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
-    _execConnections = (layoutJson.data?.execConnections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
-    _resolveAllTopics();
-    _scheduleRedraw();
-    _syncEmptyState();
+    if (!layoutRes.ok || _draftEditing || _staleEditorState(layoutJson)) return false;
+    _renderCanvasLayout(layoutJson.data || {});
     if (_editorSyncing && layoutJson.editor === _sessionId) _revealHandoffCards();
     _applyEditorState(layoutJson, { layoutLoaded: true });
     return true;
   } catch { return false; }
+}
+
+function _renderCanvasLayout(layout) {
+  _layoutGen++;
+  for (const card of _cards) card.el.remove();
+  _cards = [];
+  _connections = [];
+  _execConnections = [];
+  for (const card of layout.cards || []) _addCard(card, false);
+  const ids = new Set(_cards.map(card => card.id));
+  const valid = link => ids.has(link.fromCardId) && ids.has(link.toCardId);
+  _connections = (layout.connections || []).filter(valid);
+  _execConnections = (layout.execConnections || []).filter(valid);
+  _resolveAllTopics();
+  _scheduleRedraw();
+  _syncEmptyState();
 }
 
 function _revealHandoffCards() {
