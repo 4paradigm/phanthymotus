@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 
 import pytest
 
@@ -39,6 +40,51 @@ def _descriptor(mode="twist", dof=6, **over):
 
 def _card(**cfg):
     return NaviPlugin(cfg, executor=None)
+
+
+def test_runtime_driver_declaration_updates_yaw_without_restarting(monkeypatch):
+    card = _card()
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(
+        card, "_node", _FakeNode({"/camera/depth": ["sensor_msgs/msg/CompressedImage"]})))
+
+    def descriptor(limit, delta):
+        return _descriptor(limits={
+            "lower": [-.60, -.40, 0., 0., 0., -limit],
+            "upper": [.60, .40, 0., 0., 0., limit],
+            "max_delta_per_step": [.03, .03, 1e-6, 1e-6, 1e-6, delta],
+        })
+
+    try:
+        assert card.dispatch("navi", {"action": "start", "control_interface": descriptor(1., .1),
+                                      "input_topics": ["/camera/objects", "/camera/depth"]})["state"] == "running"
+        original_state = card._state
+        assert card._config.motion_acceleration == pytest.approx((.30, .30, 1.))
+        assert card._config.motion_braking == pytest.approx((.30, .30, 1.))
+        card._command_message([0.] * 6, 1., 1000)
+        fast_ramp = descriptor(1., 3.)
+        assert card.dispatch("navi", {"action": "config",
+                                      "control_interface": fast_ramp})["control_interface_updated"]
+        info = card.dispatch("navi", {"action": "info"})
+        assert info["config"]["wz_max"] == pytest.approx(1.)
+        assert info["downstream_limits"]["max_delta_per_step"][5] == 3.
+        assert card._config.motion_acceleration == pytest.approx((.30, .30, 30.))
+        assert card._config.motion_braking == pytest.approx((.30, .30, 30.))
+        assert card._command_message([0.] * 6, 1., 1000)["control_interface"] == fast_ramp
+        updated = descriptor(.52, 3.)
+        assert card.dispatch("navi", {"action": "config", "control_interface": updated})["status"] == "configured"
+        info = card.dispatch("navi", {"action": "info"})
+        assert info["config"]["wz_max"] == pytest.approx(.52)
+        assert info["config"]["search_rate"] == pytest.approx(.52)
+        assert card._state is original_state
+        assert card._command_message([0.] * 6, 1., 1000)["control_interface"] == updated
+
+        bad = card.dispatch("navi", {"action": "config", "control_interface": descriptor(.7, float("inf"))})
+        assert bad["state"] == "error"
+        assert card.dispatch("navi", {"action": "info"})["config"]["wz_max"] == pytest.approx(.52)
+        assert card.dispatch("navi", {"action": "config", "control_interface": descriptor(1., 3.)})["status"] == "configured"
+        assert card.dispatch("navi", {"action": "info"})["config"]["wz_max"] == pytest.approx(1.)
+    finally:
+        card._stop()
 
 
 # ── refusing to start ────────────────────────────────────────────────────────
@@ -136,6 +182,651 @@ def test_the_interrupt_hooks_stop_navigation():
     assert hooks["on_interrupt_motion"]["action"] == "stop_navigation"
 
 
+@pytest.mark.parametrize("action", ["pause", "stop_navigation", "stop", "navigate_to"])
+def test_lifecycle_stops_previous_motion_with_long_watchdog(monkeypatch, action):
+    card = _card()
+    card._running = True
+    card._publisher = object()
+    card._config.watchdog_ms = 600
+    card._state.commanded = (.10, 0., 0.)
+    published = []
+    monkeypatch.setattr(card, "_publish_command", published.append, raising=False)
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+    card.dispatch("navi", {"action": action, "target": "person"})
+    assert len(published) == 1
+    assert published[0]["values"] == [0.0] * 6
+    assert published[0]["obs_stamp_ms"] == published[0]["stamp_ms"] == 123_000
+    assert not any(card._state.commanded)
+
+
+@pytest.mark.parametrize("stop", [
+    "first_short", "expiry", "gap", "duplicate", "angle", "translation", "obstacle",
+    "rolling_obstacle", "depth", "pause",
+])
+def test_velocity_timer_can_finish_a_checked_turn_while_planner_is_busy(monkeypatch, stop):
+    import numpy as np
+    from plugins.navi.active_scan import CheckedTurnSweep, SHAPE, START
+    from plugins.navi.local_path import Geometry
+
+    card = _card()
+    card._running = True
+    card._publisher = object()
+    card._command_timer = object()
+    card._config.watchdog_ms = 600
+    card._ttl_ms = 400
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    published = []
+    stopped = threading.Event()
+
+    def publish(packet):
+        published.append(packet)
+        if not any(packet["values"]):
+            stopped.set()
+
+    monkeypatch.setattr(card, "_publish_command", publish)
+    card._depth_ms, card._depth_map = 1000, np.ones((4, 4))
+    scan = card._state.active_scan
+    card._config.max_feedback_gap_ms = scan.max_feedback_gap_ms = 250
+    scan.receipt_only = scan.buffered_odom = scan.issued_yaw = True
+    scan.phase, scan.advance_m, scan.directions = "turn", 1., (-1.,)
+    scan.turn_angle, scan.turn_yaw = .25, .6
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.odom_source = 1000
+    occupied = np.zeros(SHAPE, dtype=bool)
+    if stop == "obstacle":
+        occupied[START[0] + 12, START[1]] = True
+    elif stop == "rolling_obstacle":
+        occupied[START[0] + 14, START[1]] = True
+    geometry = Geometry(None, None, np.eye(4), .23, .23, None)
+    vx = .15 if stop == "rolling_obstacle" else 0.
+    twist = (vx, 0., .6)
+    scan.turn_sweep = CheckedTurnSweep(geometry, .33, 1.15, occupied, scan.pose,
+                                       (twist,) if vx else None, scan.pose)
+    card._state.commanded = twist
+    card._velocity_history.append((1000, 1000, (vx, 0., 0.)))
+    if stop == "first_short":
+        card._descriptor = {"rate": {"max_obs_age_ms": 155}}
+    entered = threading.Event()
+    release = threading.Event()
+
+    def plan():
+        if now > 1000:
+            entered.set()
+            assert release.wait(2)
+        return card._command_message([vx, 0., 0., 0., 0., .6], now / 1000, 950)
+
+    monkeypatch.setattr(card, "next_command", plan)
+    card._tick()
+    if vx:
+        assert card._scheduled_command.turn is not None and not published
+    if stop == "first_short":
+        now = 1025  # The cadence delay leaves the same 80 ms as the field packet.
+        card._dispatch_command()
+        assert not published
+        assert card._scheduled_command is None
+        assert "控制周期" in card._output_stop[1]
+        monkeypatch.setattr(card, "next_command", lambda: None)
+        card._tick()
+        assert scan.turn_until_ms == 0 and scan.turn_stop_ms is None
+        return
+    card._dispatch_command()
+    assert published[-1]["values"][0] == vx and published[-1]["values"][5] == .6
+    now = 1100
+    card._velocity_history.append((now, now, (vx, 0., .4)))
+    planner = threading.Thread(target=card._tick)
+    planner.start()
+    pauser = None
+    try:
+        assert entered.wait(1)
+        card._dispatch_command()
+        assert [m["values"][5] for m in published] == [.6, .6]
+        assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == 1400
+        assert all(m["obs_stamp_ms"] == 950 for m in published)
+        assert published[1]["seq"] > published[0]["seq"]
+        if stop == "pause":
+            pauser = threading.Thread(target=card._halt, args=(True,))
+            pauser.start()
+            assert stopped.wait(1)
+        else:
+            if stop == "expiry":
+                now = 1350
+                card._velocity_history.append((now, now, (0., 0., .4)))
+                card._dispatch_command()
+                assert published[-1]["values"][5] == .6
+                assert published[-1]["ttl_ms"] == 50
+            now = {"expiry": 1400, "gap": 1360, "duplicate": 1360,
+                   "angle": 1320, "translation": 1200, "obstacle": 1200,
+                   "rolling_obstacle": 1200, "depth": 1200}[stop]
+            if stop == "angle":
+                card._velocity_history.append((now, now, (0., 0., 1.)))
+            elif stop in ("translation", "obstacle", "rolling_obstacle"):
+                card._velocity_history.append((now, now, (.30, 0., .4)))
+            elif stop == "duplicate":
+                card._velocity_history.append((now, 1100, (0., 0., .4)))
+            elif stop == "depth":
+                card._depth_map = np.full((4, 4), np.nan)
+            card._dispatch_command()
+        if stop == "translation":
+            assert published[-1]["values"][5] == .6
+            assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == 1400
+            now = 1400
+            card._dispatch_command()
+        expected = 4 if stop in ("translation", "expiry") else 3
+        assert len(published) == expected and published[-1]["values"] == [0.] * 6
+        if stop in ("obstacle", "rolling_obstacle"):
+            assert "扫掠区有障碍" in card._output_stop[1]
+    finally:
+        release.set()
+        planner.join(2)
+        if pauser is not None:
+            pauser.join(2)
+    card._dispatch_command()
+    assert len(published) == expected
+
+
+@pytest.mark.parametrize("explicit_stop", [False, True])
+def test_velocity_timer_does_not_repeat_a_translation_or_extend_its_observations(monkeypatch, explicit_stop):
+    card = _card()
+    card._running = True
+    card._publisher = object()
+    card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 400}}
+    card._ttl_ms = 400
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    published = []
+    monkeypatch.setattr(card, "_publish_command", published.append)
+    motion = card._command_message([.15] + [0.] * 5, 1., 850)
+    card._stage_command(motion, card._output_epoch)
+    assert len(published) == 1
+    now = 1050
+    card._dispatch_command()
+    assert published[0]["values"][0] == .15
+    assert published[0]["obs_stamp_ms"] == 850
+    assert published[0]["stamp_ms"] + published[0]["ttl_ms"] == 1250
+    now = 1150
+    card._dispatch_command()
+    assert len(published) == 1
+    if explicit_stop:
+        card._stage_command(card._command_message([0.] * 6, now / 1000, now), card._output_epoch)
+        assert len(published) == 2 and published[-1]["values"] == [0.] * 6
+    now = 1250
+    card._dispatch_command()
+    assert len(published) == (2 if explicit_stop else 1)
+    assert published[0]["stamp_ms"] + published[0]["ttl_ms"] == 1250
+
+
+@pytest.mark.parametrize("case", [
+    "clear", "unknown", "obstacle", "duplicate", "old_target", "old_odom", "invalid_depth",
+    "expires_again",
+])
+@pytest.mark.parametrize("arc", [False, True])
+def test_late_local_translation_rechecks_new_depth_without_restamping_target(monkeypatch, case, arc):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(local_planning=True, max_depth_age_ms=800, watchdog_ms=600, max_feedback_gap_ms=250)
+    card._config.local_geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    card._descriptor = {"rate": {"max_obs_age_ms": 800}}
+    card._ttl_ms = 400
+    card._state.avoidance_yaw_override = True
+    card._state.view_detour = local_path.Detour((.25, -.05), (), card._config.local_geometry)
+    card._state.checked_prefix = arc
+    card._state.active_scan.receipt_only = card._state.active_scan.buffered_odom = True
+    now = 100_000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    ground = np.ones((4, 4), dtype=bool)
+    old = dict(map=ground, ground=ground, frame_id=99_100, source_frame_id=100)
+    new = dict(old, frame_id=99_920, source_frame_id=100 if case == "duplicate" else 101)
+    odom = dict(vx=0., vy=0., wz=0., received_ms=99_980)
+    if case == "old_odom":
+        odom["stamp_ms"] = 99_740
+    target_ms = 99_450 if case == "old_target" else 99_850
+    snapshots = iter([({"objects": []}, old, odom, target_ms), ({"objects": []}, new, odom, 99_990)])
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **kwargs: next(snapshots))
+    values = [.25, 0., 0., 0., 0., .20] if arc else [.25, -.05, 0., 0., 0., 0.]
+    candidate = policy.Decision(values, policy.AVOIDING, "局部规划：沿避障路线行进", distance_m=2.)
+    monkeypatch.setattr(policy, "step", lambda **kwargs: candidate)
+
+    def observe(*args, require_valid_depth, check_free_space):
+        nonlocal now
+        assert require_valid_depth and not check_free_space
+        if case == "invalid_depth":
+            return None
+        occupied = np.zeros(local_path.SHAPE, dtype=bool)
+        if case == "obstacle":
+            occupied[local_path.START[0] + 7, local_path.START[1]] = True
+        if case == "expires_again":
+            now += 300
+        return occupied.copy() if case == "unknown" else ~occupied, occupied
+
+    monkeypatch.setattr(local_path, "observe", observe)
+    command = card.next_command()
+    if case in ("clear", "unknown"):
+        assert command["values"] == candidate.values
+        assert command["obs_stamp_ms"] == target_ms
+        assert command["stamp_ms"] + command["ttl_ms"] == 100_230
+    else:
+        assert command["values"] == [0.] * 6
+        if case == "obstacle":
+            assert "新深度复检发现扫掠区有障碍" in card._last_decision.reason
+
+
+@pytest.mark.parametrize("status", ["searching", "failed"])
+def test_silent_policy_stops_previous_motion_on_failure_with_long_watchdog(monkeypatch, status):
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._config.watchdog_ms = 600
+    card._state.commanded = (.10, 0., 0.)
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+
+    def step(**kwargs):
+        kwargs["state"].commanded = (0., 0., 0.)
+        return policy.Decision(None, status)
+
+    monkeypatch.setattr(policy, "step", step)
+    stop = card.next_command()
+    if status == policy.FAILED:
+        assert stop["values"] == [0.0] * 6
+        assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
+    else:
+        assert stop is None
+    assert card.next_command() is None
+
+
+def test_bumi_search_checks_depth_and_stops_immediately_when_it_expires(monkeypatch):
+    import numpy as np
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import camera_square
+
+    card = _card(lost_frames=1)
+    cfg = card._config
+    cfg.local_planning, cfg.half_width_m, cfg.watchdog_ms = True, .21, 300
+    cfg.depth_intrinsics = HorizontalIntrinsics(640, 600, 320)
+    card._depth_vertical = (480, 600, 240)
+    cfg.local_geometry = camera_square(cfg.depth_intrinsics, card._depth_vertical, .21)
+    card._state.target = "person"
+    now = [100_000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+
+    tangent = (np.arange(480) - 240) / 600
+    floor = np.minimum(.4 / np.maximum(tangent, .01), 5.)
+
+    def tick(stamp, obstacle=None):
+        if obstacle is not None:
+            now[0] = stamp - 50
+            frame = np.broadcast_to(floor[:, None], (480, 640)).copy()
+            frame[205:351, 255:386] = obstacle
+            card._set_depth_map(frame)
+        now[0] = stamp
+        card._objects = {"objects": []}
+        card._objects_ms = stamp
+        card._odom = {"vx": 0., "vy": 0., "wz": 0.}
+        card._odom_ms = stamp
+        return card.next_command()
+
+    assert tick(100_000, .25)["values"] == [0.] * 6
+    search = tick(100_100, .60)
+    assert search["values"] == [0., 0., 0., 0., 0., -.60]
+    assert search["obs_stamp_ms"] == 100_050
+    stop = tick(100_800)
+    assert stop["values"] == [0.] * 6
+    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_800
+    assert tick(100_900) is None
+
+
+@pytest.mark.parametrize("interrupt", [None, "depth", "detections"])
+def test_legacy_card_scans_the_clearer_side_then_replans_with_the_current_view(monkeypatch, interrupt):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from plugins.navi import active_scan, local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card(wz_max=.25)
+    cfg = card._config
+    # Exercise the retained staged scan with its synthetic clearance grid.
+    cfg.local_controller = "legacy"
+    cfg.local_planning = True
+    cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                                  (480, 420, 243), .23)
+    cfg.scan_geometry = cfg.local_geometry
+    cfg.half_width_m = .23
+    cfg.watchdog_ms = 300 if interrupt else 600
+    card._odom_stamp_verified = True
+    now = [100_000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    card._state.target = "person"
+    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True,
+                             measured_range_m=None)
+    monkeypatch.setattr(card._state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(policy, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        2.6 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else
+        2.6 if card._state.active_scan.pose[2] < -.30 else .90, 1.0))
+    free = np.ones(local_path.SHAPE, dtype=bool)
+    obstacle = np.isclose(local_path.FORWARD, .90) & np.isclose(local_path.RIGHT, .25)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (
+        (~free, obstacle) if now[0] == 100_000 else (free, ~free)))
+    def tick(stamp, yaw_odometry=0, fresh=True):
+        now[0] = stamp
+        card._objects = {"objects": []}
+        card._objects_ms = stamp
+        card._odom = {"vx": 0., "vy": 0., "wz": yaw_odometry}
+        card._odom_ms = stamp
+        if fresh:
+            card._depth_map = np.ones((2, 2), dtype=float)
+            card._depth_ground = np.ones((2, 2), dtype=bool)
+            card._depth_ms = stamp
+        return card.next_command()
+
+    assert tick(100_000)["values"] == [0.] * 6
+    assert card._state.active_scan.directions == (-1., 1.)
+    assert tick(100_050)["values"] == [0.] * 6
+    left = tick(100_150)
+    assert left["values"] == [0., 0., 0., 0., 0., .25]
+    if interrupt:
+        now[0] = 100_250
+        if interrupt == "detections":
+            card._objects_ms = 99_000
+            continued = card.next_command()
+            assert continued["values"] == left["values"]
+            assert continued["obs_stamp_ms"] == 100_150
+            assert card._state.active_scan.active
+            return
+        card._depth_ms = 99_000
+        stop = card.next_command()
+        assert stop["values"] == [0.] * 6
+        assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_250
+        assert card._state.active_scan.phase == "brake_for_replan"
+        assert tick(100_350)["values"] == [0.] * 6
+        return
+    for stamp in range(100_250, 101_550, 100):
+        command = tick(stamp, .25)
+    assert command["values"] == [0.] * 6
+    assert tick(101_550, fresh=False)["values"] == [0.] * 6
+    command = tick(101_700, fresh=False)
+    assert command["values"][0] > 0.
+    assert command["values"][1:] == [0.] * 5
+    assert command["obs_stamp_ms"] == 101_450
+    card._odom_stamp_verified = False
+    fresh = tick(101_800)
+    assert fresh["values"][0] > 0.
+    assert fresh["obs_stamp_ms"] == 101_800
+
+
+def test_card_keeps_consecutive_motion_when_one_speed_axis_is_missing(monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import camera_square
+
+    card = _card(local_planning=True)
+    intrinsics = HorizontalIntrinsics(80, 60., 40.)
+    card._config.local_geometry = camera_square(intrinsics, (60, 60., 30.), .24)
+    card._config.depth_intrinsics = intrinsics
+    card._config.watchdog_ms = 600
+    card._state.target = "person"
+    frame = np.full((60, 80), 3.)
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+
+    def tick(i, segment="current", *, missing_vy=None):
+        nonlocal now
+        now = 1000 + 100 * i
+        if missing_vy is None:
+            missing_vy = i >= 4 and i % 2 == 0
+        payload = {"schema": "motus.odom/1", "frame": "body", "stamp_ms": now,
+                   "twist": [.15, None if missing_vy else 0., 0., 0., 0., 0.],
+                   "pose": {"frame_id": "odom", "child_frame_id": "base_link",
+                            "position": [.012 * i, 0., 0.], "quaternion": [0., 0., 0., 1.]},
+                   "vendor": {"segment_id": segment}}
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+        card._depth_map, card._depth_ms = frame, now
+        card._objects_ms = now
+        card._objects = {"timestamp": i + 1, "objects": [
+            {"name": "person", "position": [0., 0.], "confidence": .99,
+             "bbox_norm": (.20, .10, .80, .90)}]}
+        return card.next_command()
+
+    for i in range(4):
+        command = tick(i)
+    assert command["values"][0] > 0.
+    scan = card._state.active_scan
+    for i in range(4, 12):
+        assert tick(i)["values"][0] > 0.
+        assert card._state.active_scan is scan
+        assert card.observation(with_capture_timing=True)[2]["motion_pose"].stamp_ms == now
+        assert card._velocity_history[-1][2] == (.15, 0., 0.)
+    assert len(scan.poses) > 2 and scan.buffered_odom
+
+    assert tick(12, segment="new_pose", missing_vy=False)["values"][0] > 0.
+    assert card._state.active_scan is scan
+    assert tick(13, segment="reset", missing_vy=True)["values"] == [0.] * 6
+    assert card._velocity_history[-1][2] is None
+
+
+def test_card_uses_receipt_time_without_reusing_the_source_clock(monkeypatch):
+    import numpy as np
+
+    card = _card()
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+    frame = np.ones((2, 2), dtype=float)
+    for capture in (None, 123_001, 122_000, 122_950):
+        card._set_depth_map(frame, capture_ms=capture)
+        depth = card.observation(with_capture_timing=True)[1]
+        assert depth["frame_id"] == 123_000
+        assert "capture_ms" not in depth
+        assert not depth.get("capture_invalid")
+
+
+
+@pytest.mark.parametrize("sweep_observed, pose_only", [(True, False), (False, False), (False, True)])
+def test_legacy_card_can_scan_with_existing_depth_and_odom_without_capture_metadata(
+        monkeypatch, sweep_observed, pose_only):
+    import math
+    import numpy as np
+    from types import SimpleNamespace
+    from plugins.navi import active_scan, local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card(wz_max=.4)
+    cfg = card._config
+    # This fixture asserts the historical scan phases and fixed leg commands.
+    cfg.local_controller = "legacy"
+    cfg.local_planning = True
+    cfg.odom_expected = True
+    cfg.half_width_m = .23
+    cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                                  (480, 420, 243), .23)
+    assert cfg.scan_geometry is None
+    now = [100_000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    card._state.target = "person"
+    target = SimpleNamespace(bearing_rad=0., range_m=2., range_known=True, observed=True,
+                             measured_range_m=None)
+    monkeypatch.setattr(card._state.tracker, "step", lambda **kwargs: target)
+    monkeypatch.setattr(policy, "_clearance", lambda depth, config, lateral_offset_m=0: (
+        2.4 if lateral_offset_m < 0 else 1.7 if lateral_offset_m > 0 else
+        2.4 if heading > .30 else .90, 1.0))
+    visible = np.ones(local_path.SHAPE, dtype=bool) if sweep_observed else local_path.FORWARD > 0
+    obstacle = np.isclose(local_path.FORWARD, .90) & np.isclose(local_path.RIGHT, .25)
+    monkeypatch.setattr(active_scan, "observe", lambda *args: (
+        (np.zeros_like(visible), obstacle) if now[0] == 100_000
+        else (visible, np.zeros_like(visible))))
+    heading = 0.
+
+    def tick(stamp, yaw=0., fresh=True):
+        nonlocal heading
+        heading += yaw * (stamp - now[0]) / 1000
+        now[0] = stamp
+        card._objects = {"objects": []}
+        card._objects_ms = stamp
+        if pose_only:
+            card._on_string("odom", SimpleNamespace(data=json.dumps({
+                "schema": "motus.odom/1", "stamp_ms": stamp - 60, "frame": "body",
+                "twist": [None] * 6,
+                "pose": {"frame_id": "odom", "child_frame_id": "base_link",
+                         "position": [0., 0., 0.],
+                         "quaternion": [0., 0., math.sin(heading / 2), math.cos(heading / 2)]},
+            })))
+        else:
+            card._odom = {"vx": 0., "vy": 0., "wz": yaw}
+            card._odom_ms = stamp
+        if fresh:
+            card._depth_map = np.ones((4, 4), dtype=float)
+            card._depth_ground = np.ones((4, 4), dtype=bool)
+            card._depth_ms = stamp
+            card._depth_source_ms = stamp
+        return card.next_command()
+
+    if pose_only:
+        assert tick(99_900)["values"] == [0.] * 6
+    assert tick(100_000)["values"] == [0.] * 6
+    assert tick(100_050)["values"] == [0.] * 6
+    command = tick(100_150)
+    if pose_only:
+        assert command["values"] == [0.] * 6
+        assert tick(100_250)["values"] == [0.] * 6
+        command = tick(100_350)
+    assert command["values"][:5] == [0.] * 5
+    assert command["values"][5] == .4
+    yaw = command["values"][5]
+    stamp = now[0]
+    for _ in range(25):
+        stamp += 100
+        yaw = tick(stamp, yaw)["values"][5]
+        if card._state.active_scan.ready:
+            break
+    else:
+        pytest.fail("scan never reached the angular target")
+    assert math.degrees(heading) == pytest.approx(20., abs=2.)
+    assert card._state.active_scan.advance_origin is None
+    command = tick(stamp + 100, fresh=False)
+    assert command["values"][0] > 0
+    assert command["values"][1:] == [0.] * 5
+
+
+def test_card_retains_the_outbound_twist_for_unmeasured_ego_prediction(monkeypatch):
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._descriptor = {"limits": {"min_magnitude": [.2, 0., 0., 0., 0., 0.]}}
+    monkeypatch.setattr(policy, "step", lambda **kwargs:
+                        policy.Decision([.11, 0., 0., 0., 0., 0.], policy.APPROACHING))
+    message = card.next_command()
+    assert message["values"][0] == .2
+    assert card._state.commanded == (.2, 0., 0.)
+
+
+def test_resume_does_not_include_the_paused_duration_in_the_first_tick(monkeypatch):
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._running = True
+    now, ticks = [1.], []
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now[0])
+
+    def step(**inputs):
+        ticks.append(inputs["dt"])
+        return policy.Decision(None, policy.BLIND)
+
+    monkeypatch.setattr(policy, "step", step)
+    card.next_command()
+    assert card._halt(True)["state"] == "paused"
+    now[0] = 21.1
+    assert card._halt(False)["state"] == "running"
+    card.next_command()
+    assert ticks == pytest.approx([.1, .1])
+
+
+def test_partial_result_reaches_acp_and_is_consumed_once(monkeypatch):
+    import threading
+
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._state.target = "person"
+    card._state.partial_result = dict(outcome="partial", target_reached=False,
+                                      reachability_scope="observed_local", remaining_distance_m=1.4,
+                                      best_verified_distance_m=1.4)
+    card._acp_action_id = "navi_original"
+    card._last_decision = policy.Decision(None, policy.FAILED, "locally blocked", distance_m=1.4)
+    delivered, calls = threading.Event(), []
+
+    def post(*args):
+        calls.append(args)
+        delivered.set()
+
+    monkeypatch.setattr(card, "_post_acp", post)
+    card._maybe_complete()
+    assert delivered.wait(1.)
+    card._maybe_complete()
+    assert len(calls) == 1 and not card._acp_action_id
+    action, status, result = calls[0]
+    assert (action, status, result["target"]) == ("navi_original", "failed", "person")
+    assert all(result[key] == value for key, value in card._state.partial_result.items())
+
+
+def test_local_avoidance_accepts_only_recent_continuous_pose_without_twist(monkeypatch):
+    import numpy as np
+    from types import SimpleNamespace
+    from plugins.navi import local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card()
+    cfg = card._config
+    cfg.local_planning = cfg.use_lateral = True
+    cfg.local_geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337),
+                                                  (480, 420, 243), .23)
+    now = [100_200]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    occupied = np.isclose(local_path.FORWARD, .9) & np.isclose(local_path.RIGHT, 0.)
+    monkeypatch.setattr(local_path, "observe", lambda *args: (~occupied, occupied))
+    depth = {"frame_id": now[0], "map": occupied, "ground": ~occupied}
+
+    def feed(stamp, segment="a"):
+        card._on_string("odom", SimpleNamespace(data=json.dumps({
+            "schema": "motus.odom/1", "stamp_ms": stamp, "frame": "body",
+            "twist": [None] * 6,
+            "pose": {"frame_id": "vo", "child_frame_id": "camera_mapped_to_body",
+                     "position": [0., 0., 0.], "quaternion": [0., 0., 0., 1.]},
+            "vendor": {"status": "tracking", "pose_reference": "body_axes", "segment_id": segment},
+        })))
+
+    def plan():
+        _, _, odom = card.observation(with_capture_timing=True)
+        return policy._local_translation(depth, cfg, card._state, odom, .9, 1.)
+
+    feed(100_000)
+    assert plan() is None
+    feed(100_100)
+    assert plan()[1] < 0.
+    now[0] = 100_601
+    feed(100_100)
+    assert plan() is None
+    feed(100_501)
+    assert plan() is None
+    feed(100_600, "b")
+    assert plan() is None
+    now[0] = 100_800
+    feed(100_700, "b")
+    assert plan()[1] < 0.
+
+
+def test_local_prefix_cannot_be_enlarged_by_the_moving_deadband(monkeypatch):
+    policy = navi_plugin.policy_mod
+    card = _card()
+    card._config.local_planning = True
+    card._state.avoidance_yaw_override = True
+    card._descriptor = {"limits": {"min_magnitude_moving": [.12, 0., 0., 0., 0., 0.]}}
+    monkeypatch.setattr(policy, "step", lambda **kwargs:
+                        policy.Decision([.075, 0., 0., 0., 0., 0.], policy.AVOIDING))
+    assert card.next_command()["values"] == [0.] * 6
+
+
 def test_it_claims_the_base_resource():
     assert _tool()["inputSchema"]["x-resource"] == ["base"]
 
@@ -231,13 +922,15 @@ class _FakeNode:
         self.graph = graph or {}
         self.subscriptions = []
         self.subscription_details = []
+        self.subscription_groups = {}
         self.timers = []
         self.destroyed = False
 
     def get_topic_names_and_types(self):
         return list(self.graph.items())
 
-    def create_subscription(self, msg_type, topic, cb, depth):
+    def create_subscription(self, msg_type, topic, cb, depth, *, callback_group=None):
+        self.subscription_groups[topic] = callback_group
         self.subscriptions.append(topic)
         self.subscription_details.append((msg_type, topic, cb, depth))
 
@@ -252,6 +945,130 @@ class _FakeNode:
     def destroy_node(self):
         self.destroyed = True
         self.timers.clear()
+
+
+def test_depth_processing_leaves_odometry_and_object_callbacks_runnable():
+    topics = ["/cam/objects", "/cam/depth", "/state/odom"]
+    node = _FakeNode({"/cam/depth": ["sensor_msgs/msg/CompressedImage"]})
+    _, problem = _card()._bind_inputs(node, topics)
+    assert not problem
+    groups = node.subscription_groups
+    assert groups["/cam/depth"] is not groups["/state/odom"]
+    assert groups["/cam/depth"] is not groups["/cam/objects"]
+
+
+@pytest.mark.parametrize("body_geometry, max_hz, odom_topic", [
+    (False, 20, "/odom"), (True, 20, "/odom"), (True, 5, "/odom"), (True, 20, ""),
+])
+def test_local_geometry_starts_separate_planning_and_velocity_timers(monkeypatch, body_geometry, max_hz, odom_topic):
+    from types import SimpleNamespace
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    class Node(_FakeNode):
+        def create_timer(self, period, callback, *, callback_group):
+            self.timers.append((period, callback, callback_group))
+            return self.timers[-1]
+
+        def create_publisher(self, *args):
+            return object()
+
+    node = Node()
+    monkeypatch.setitem(sys.modules, "rclpy.node", SimpleNamespace(Node=lambda name: node))
+    monkeypatch.setitem(sys.modules, "rclpy.callback_groups",
+                        SimpleNamespace(MutuallyExclusiveCallbackGroup=object))
+    executor = SimpleNamespace(add_node=lambda node: None, remove_node=lambda node: None)
+    card = NaviPlugin({"view_hz": 0., "rate_hz": min(10, max_hz)}, executor=executor)
+    monkeypatch.setattr(card, "_bind_inputs", lambda *args: ({"depth_map": "/depth", "odom": odom_topic}, ""))
+
+    def camera(*args):
+        card._config.depth_intrinsics = HorizontalIntrinsics(640, 315, 337)
+        card._depth_vertical = (480, 420, 243)
+        return ""
+
+    monkeypatch.setattr(card, "_adopt_camera", camera)
+    descriptor = _descriptor(footprint={"half_width": .20})
+    descriptor["rate"].update(max_hz=max_hz, expected_hz=min(10, max_hz))
+    args = {"control_interface": descriptor}
+    if body_geometry:
+        args["camera_info"] = {"/depth": {"vendor": {"body_from_optical": [
+            [0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]]}}}
+    try:
+        assert card._start(args)["state"] == "running"
+        assert (card._config.scan_geometry is not None) == body_geometry
+        assert [timer[0] for timer in node.timers] == [1 / min(10, max_hz)] * 2
+        assert [timer[1] for timer in node.timers] == [card._tick, card._dispatch_command]
+        assert node.timers[0][2] is not node.timers[1][2]
+    finally:
+        card._stop()
+    assert node.destroyed and card._command_timer is None
+
+
+@pytest.mark.parametrize("event", ["clear", "obstacle", "standoff", "unchecked", "late"])
+def test_no_odom_timer_only_repeats_checked_forward_motion_within_original_deadline(monkeypatch, event):
+    from types import SimpleNamespace
+
+    import numpy as np
+    from plugins.navi import local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card()
+    card._running = True
+    card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 500}}
+    card._ttl_ms = 400
+    card._config.local_planning = True
+    card._config.stop_distance_m = 1.1
+    card._config.local_geometry = local_path.camera_square(
+        HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    card._state.motion_source = "command"
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    wire = []
+    card._publisher = SimpleNamespace(publish=lambda payload: wire.append(json.loads(payload.data)))
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(local_path, "project_observation", lambda *args, **kwargs: (~occupied, occupied))
+    card._depth_map = np.ones((4, 4))
+    card._depth_ms = card._depth_source_ms = card._objects_ms = 1000
+    card._objects = {"objects": [{"name": "person"}]}
+    values = [.20, 0., 0., 0., 0., 0.]
+    decision = policy.Decision(values, policy.APPROACHING, distance_m=1.15 if event == "standoff" else 2.)
+    request = card._command_message(values, 1., 1000)
+    if event != "unchecked":
+        check = card._forward_check(decision, (0., 0., 0.), card.observation(with_capture_timing=True)[1], None, 1000)
+        card._staged_forward_check = (request["seq"], check)
+    assert card._stage_command(request, card._output_epoch)
+    assert len(wire) == 1 and wire[0]["values"] == values
+
+    now = card._depth_ms = 1100
+    card._dispatch_command()
+    assert len(wire) == 1
+    now = card._depth_ms = card._depth_source_ms = 1200
+    if event == "obstacle":
+        occupied[local_path.START[0] + 3, local_path.START[1]] = True
+    elif event == "late":
+        original_publish = card._publish_command
+
+        def late_publish(*args, **kwargs):
+            nonlocal now
+            now = 1400
+            return original_publish(*args, **kwargs)
+
+        monkeypatch.setattr(card, "_publish_command", late_publish)
+    card._dispatch_command()
+    expected = 1 if event in ("unchecked", "late") else 2
+    assert len(wire) == expected
+    if event == "clear":
+        assert wire[1]["values"] == values
+        assert wire[1]["stamp_ms"] + wire[1]["ttl_ms"] == 1400
+        assert wire[1]["obs_stamp_ms"] == 1000
+    elif event in ("obstacle", "standoff"):
+        assert wire[1]["values"] == [0.] * 6
+    now = max(now, 1300)
+    card._dispatch_command()
+    now = card._depth_ms = card._depth_source_ms = 1410
+    card._dispatch_command()
+    assert len(wire) == expected
 
 
 def _bind(topics, graph=None):
@@ -324,6 +1141,36 @@ def test_an_image_topic_with_no_known_suffix_is_the_camera_not_the_depth_map():
     assert problem == ""
     assert bound["image"] == "/ubuntu/camera/main"
     assert bound["depth_map"] == "/cam/visual_depth"
+
+
+def test_declared_jpeg_input_binds_before_ros_discovery():
+    card, node = _card(), _FakeNode()
+    view_source = "/factory/rgb"
+    bound, problem = card._bind_inputs(
+        node, [view_source, "/cam/objects", "/cam/depth"],
+        input_bindings={"bindings": [{"topic": view_source, "format": "image/jpeg"}]},
+    )
+    assert problem == "" and bound["image"] == view_source
+    assert not bound["unknown"]
+    [(message_type, _, callback, _)] = [
+        subscription for subscription in node.subscription_details if subscription[1] == view_source
+    ]
+    assert message_type.__name__ == "CompressedImage" and callback == card._on_image
+
+
+@pytest.mark.parametrize("companion", ["objects", "visual_depth", "visual_depth_summary"])
+@pytest.mark.parametrize("message_types", [[], ["std_msgs/msg/String"]], ids=["undiscovered", "string"])
+def test_camera_companion_infers_jpeg_only_until_the_ros_graph_has_a_type(companion, message_types):
+    view_source = "/factory/rgb"
+    topics = [view_source, view_source + "/" + companion]
+    if companion != "objects":
+        topics.append("/cam/objects")
+    if companion == "objects":
+        topics.append("/cam/depth")
+    bound, problem = _bind(topics, graph={view_source: message_types})
+    assert problem == ""
+    assert bound["image"] == ("" if message_types else view_source)
+    assert bool(bound["unknown"]) == bool(message_types)
 
 
 def test_the_camera_is_optional():
@@ -444,6 +1291,48 @@ def test_each_navigate_to_gets_a_fresh_action_id():
     assert first["action_id"] != second["action_id"]
 
 
+@pytest.mark.parametrize("action", ["navigate_to", "stop_navigation", "stop"])
+def test_ending_active_navigation_reports_its_action_once(monkeypatch, action):
+    import queue
+
+    card = _card()
+    card._running = True
+    delivered = queue.Queue()
+    monkeypatch.setattr(card, "_post_acp", lambda *args: delivered.put(args))
+    first = card.dispatch("navi", {"action": "navigate_to", "target": "chair"})
+    replacement = card.dispatch("navi", {"action": action, "target": "person"})
+
+    action_id, status, result = delivered.get(timeout=.5)
+    assert (action_id, status, result["target"], result["status"]) == (
+        first["action_id"], "failed", "chair", "cancelled")
+
+    if action == "navigate_to":
+        card._last_decision = navi_plugin.policy_mod.Decision(
+            None, navi_plugin.policy_mod.ARRIVED, "target reached")
+        card._maybe_complete()
+        action_id, status, result = delivered.get(timeout=.5)
+        assert (action_id, status, result["target"]) == (replacement["action_id"], "completed", "person")
+    card._maybe_complete()
+    assert delivered.empty()
+
+
+def test_overlapping_navigate_calls_return_their_own_action_ids(monkeypatch):
+    card = _card()
+    card._running = True
+    second = {}
+    monkeypatch.setattr(card, "_post_acp", lambda *args: None)
+
+    def start_second(message, *args):
+        if message == "navi navigate_to: target=%r" and args == ("chair",):
+            second.update(card.dispatch("navi", {"action": "navigate_to", "target": "person"}))
+
+    monkeypatch.setattr(navi_plugin.log, "info", start_second)
+    first = card.dispatch("navi", {"action": "navigate_to", "target": "chair"})
+
+    assert first["action_id"] != second["action_id"]
+    assert card._acp_action_id == second["action_id"]
+
+
 def test_the_visible_list_stays_small_under_full_colour():
     """`publish_color: full` carries twelve numbers per object, and this reply
     goes into LLM context whole, every time it is called. On r1_sz it reached
@@ -482,6 +1371,25 @@ def test_it_starts_without_a_downstream_card():
                                                   "/cam/visual_depth"]})
     assert out["state"] == "running"
     assert any("不会驱动任何硬件" in note for note in out["degraded"])
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_navi_owns_feedback_and_obstacle_history_defaults(monkeypatch, configured):
+    settings = {"max_feedback_gap_ms": 350, "use_obstacle_history": True} if configured else {}
+    card = _card(**settings)
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(card, "_node", _FakeNode()))
+    descriptor = _descriptor()
+    descriptor["rate"]["max_feedback_gap_ms"] = 250
+    descriptor["navigation"] = {"use_obstacle_history": not configured}
+    try:
+        started = card.dispatch("navi", {"action": "start", "control_interface": descriptor,
+                                          "input_topics": ["/cam/objects", "/cam/visual_depth"]})
+        assert started["state"] == "running"
+        effective = card._info()["config"]
+        assert effective["max_feedback_gap_ms"] == (350 if configured else 300)
+        assert effective["use_obstacle_history"] is configured
+    finally:
+        card._stop()
 
 
 def test_an_unbound_card_says_so_in_info():
@@ -688,7 +1596,8 @@ def test_a_lost_target_tells_the_caller_to_look_before_retrying():
 
 def test_the_dialog_exposes_only_generic_card_configuration():
     keys = set(_tool()["configSchema"]["properties"])
-    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m"}
+    assert keys == {"rate_hz", "stop_distance_m", "obstacle_stop_m",
+                    "dwa_horizon_s", "dwa_samples"}
 
 
 def test_only_default_stop_distance_is_available_to_the_config_action():
@@ -893,7 +1802,7 @@ def test_visual_observation_freshness_boundary(monkeypatch, age_ms, role):
     if role == "depth" and age_ms > 1000:
         assert depth is None
     else:
-        assert depth == {"map": None, "bands": {"center": 2.0}}
+        assert depth == {"map": None, "bands": {"center": 2.0}, "frame_id": card._depth_ms}
 
 
 @pytest.mark.parametrize("age_ms", [900, 1000, 1001])
@@ -914,6 +1823,143 @@ def test_visual_age_controls_publication_without_rewriting_stamp(monkeypatch, ag
         assert message["stamp_ms"] == now_ms
         assert message["obs_stamp_ms"] == now_ms - age_ms
         assert message["ttl_ms"] == card._ttl_ms == 300
+
+
+def test_slow_planning_stamps_the_command_at_emission_and_keeps_used_observation(monkeypatch):
+    card = _card()
+    now_ms = [123_456]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms[0] / 1000)
+    assert _first_command(card) is not None
+    card._objects_ms = 123_400
+    card._depth_ms = 123_420
+    card._ttl_ms = 200
+    step = navi_plugin.policy_mod.step
+
+    def slow_step(**kwargs):
+        decision = step(**kwargs)
+        now_ms[0] += 250
+        card._objects_ms = now_ms[0]
+        return decision
+
+    monkeypatch.setattr(navi_plugin.policy_mod, "step", slow_step)
+    command = card.next_command()
+
+    assert command["stamp_ms"] == 123_706
+    assert command["obs_stamp_ms"] == 123_400
+    assert command["ttl_ms"] == 200
+
+
+@pytest.mark.parametrize("planning_ms", [200, 201])
+def test_a_motion_decision_that_expires_during_planning_publishes_a_stop(monkeypatch, planning_ms):
+    card = _card()
+    now_ms = [123_456]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms[0] / 1000)
+    assert _first_command(card) is not None
+    card._config.local_planning = True
+    card._descriptor = _descriptor(rate={"max_obs_age_ms": 500})
+    card._objects_ms = now_ms[0] - 56
+    card._depth_ms = now_ms[0] - 300
+    step = navi_plugin.policy_mod.step
+
+    def slow_step(**kwargs):
+        decision = step(**kwargs)
+        now_ms[0] += planning_ms
+        return decision
+
+    monkeypatch.setattr(navi_plugin.policy_mod, "step", slow_step)
+    message = card.next_command()
+    assert message["values"] == [0.] * 6
+    assert message["obs_stamp_ms"] == message["stamp_ms"] == 123_456 + planning_ms
+    assert card._state.commanded == (0., 0., 0.)
+    assert card._last_decision.status == navi_plugin.policy_mod.BLIND
+
+
+@pytest.mark.parametrize("age_ms,expired", [(599, False), (600, True), (690, True)])
+def test_planning_rejects_depth_already_expired_by_the_downstream_limit(monkeypatch, age_ms, expired):
+    card = _card(local_planning=True, max_depth_age_ms=800)
+    card._descriptor = _descriptor(rate={"max_obs_age_ms": 600})
+    now_ms = 123_456
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now_ms / 1000)
+    card._depth_ms = now_ms - age_ms
+
+    def step(**kwargs):
+        assert kwargs["depth"].get("capture_invalid", False) is expired
+        return navi_plugin.policy_mod.Decision([0.] * 6, navi_plugin.policy_mod.BLIND, "test")
+
+    monkeypatch.setattr(navi_plugin.policy_mod, "step", step)
+    card.next_command()
+
+
+@pytest.mark.parametrize("has_hardware_clock", [False, True])
+@pytest.mark.parametrize("header_age", [None, 750, 1109, 1700])
+def test_depth_plans_from_receipt_with_either_clock(monkeypatch, header_age, has_hardware_clock):
+    import numpy as np
+
+    card = _card(local_planning=True, max_depth_age_ms=1200)
+    card._descriptor = _descriptor(rate={"max_obs_age_ms": 1000})
+    card._depth_vendor = {"hardware_capture_timestamp_available": has_hardware_clock}
+    now = [2000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    source = None if header_age is None else now[0] - header_age
+    card._set_depth_map(np.ones((8, 8)), capture_ms=source, received_ms=1730)
+    inputs = []
+
+    def step(**kwargs):
+        inputs.append((kwargs["depth"], kwargs["dwa_time_left"]))
+        if kwargs["depth"] is not None:
+            return navi_plugin.policy_mod.Decision([.1, 0., 0., 0., 0., 0.], navi_plugin.policy_mod.APPROACHING)
+        return navi_plugin.policy_mod.Decision(None, navi_plugin.policy_mod.SEARCHING)
+
+    monkeypatch.setattr(navi_plugin.policy_mod, "step", step)
+    message = card.next_command()
+    depth, budget = inputs[-1]
+    assert depth["frame_id"] == 1730 and depth["receipt_timed"]
+    assert not depth.get("capture_invalid") and budget() > 0.
+    assert "capture_ms" not in depth
+    assert message["values"][0] > 0. and message["obs_stamp_ms"] == 1730
+    assert not card.observation(with_capture_timing=True)[1].get("capture_invalid")
+    now[0] = 3200
+    card.next_command()
+    assert inputs[-1][0] is None
+
+
+@pytest.mark.parametrize("has_hardware_clock", [False, True])
+def test_repeated_driver_depth_header_does_not_restart_the_receipt_clock(monkeypatch, has_hardware_clock):
+    import numpy as np
+
+    card = _card(local_planning=True, max_depth_age_ms=1200)
+    card._depth_vendor = {"hardware_capture_timestamp_available": has_hardware_clock}
+    now = [2000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0] / 1000)
+    frame = np.ones((8, 8))
+    card._set_depth_map(frame, capture_ms=1300, source_stamp_ns=1_300_000_000)
+    now[0] = 3300
+    card._set_depth_map(frame, capture_ms=1300, source_stamp_ns=1_300_000_000)
+    assert card.observation(with_capture_timing=True)[1] is None
+    card._set_depth_map(frame, capture_ms=2500, source_stamp_ns=2_500_000_000)
+    assert card.observation(with_capture_timing=True)[1]["frame_id"] == 3300
+
+
+def test_first_avoidance_turn_that_expires_during_planning_reenters_a_stop_hold(monkeypatch):
+    policy = navi_plugin.policy_mod
+    card = _card(local_planning=True)
+    card._descriptor = _descriptor(rate={"max_obs_age_ms": 600})
+    scan = card._state.active_scan
+    scan.phase, scan.receipt_only, scan.attempted = "turn", True, True
+    card._state.motion_source = "measured"
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 100.000)
+    monkeypatch.setattr(card, "_observation_snapshot",
+                        lambda **kw: ({}, {"frame_id": 99400}, {"received_ms": 99900}, 99900))
+
+    def turn(**kwargs):
+        scan.current_frame = 99400
+        scan.issued_yaw = True
+        return policy.Decision([0., 0., 0., 0., 0., .3], policy.AVOIDING, "向左观察")
+
+    monkeypatch.setattr(policy, "step", turn)
+    assert card.next_command()["values"] == [0.] * 6
+    assert not scan.issued_yaw
+    assert scan.phase == "brake_for_replan" and scan.attempted
 
 
 def test_invalid_odom_contract_keeps_legacy_receipt_time(monkeypatch):
@@ -978,6 +2024,95 @@ def test_the_card_adopts_the_geometry_of_whichever_topic_carries_the_depth():
     assert card._adopt_camera({_DEPTH_TOPIC: _decl(_DEPTH_TOPIC)}, _binding()) == ""
     assert card._config.half_fov_rad == 0.888
     assert any("0.888" in note for note in card._camera_notes)
+
+
+@pytest.mark.parametrize("settings, margin", [
+    pytest.param({}, None, id="absent"),
+    pytest.param({"clearance_margin_m": 0}, 0., id="zero"),
+    pytest.param({"clearance_margin_m": .15}, .15, id="positive"),
+    pytest.param({"clearance_margin_m": None}, None, id="null"),
+    pytest.param({"clearance_margin_m": -.1}, None, id="negative"),
+    pytest.param({"clearance_margin_m": float("nan")}, None, id="nan"),
+    pytest.param({"clearance_margin_m": float("inf")}, None, id="infinite"),
+    pytest.param({"clearance_margin_m": True}, None, id="boolean"),
+    pytest.param({"clearance_margin_m": "0.15"}, None, id="string"),
+    pytest.param({"clearance_margin_m": 10**400}, None, id="overflow"),
+])
+def test_saved_clearance_margin_is_applied_on_start_and_restart(monkeypatch, settings, margin):
+    from plugins.navi import policy
+
+    card = _card(view_hz=0., **settings)
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(card, "_node", _FakeNode()))
+    expected = .385 if margin is None else .35 + margin
+    assert policy._keepout_m(card._config) == pytest.approx(expected)
+    for width, default_keepout in ((.20, .22), (.39, .429)):
+        try:
+            started = card.dispatch("navi", {
+                "action": "start",
+                "control_interface": _descriptor(footprint={"half_width": width}),
+                "input_topics": [_OBJECTS_TOPIC, _DEPTH_TOPIC],
+            })
+            assert started["state"] == "running"
+            assert card._config.half_width_m == width
+            expected = default_keepout if margin is None else width + margin
+            assert policy._keepout_m(card._config) == pytest.approx(expected)
+            updated = card.dispatch("navi", {"action": "config", "stop_distance_m": .8,
+                                             "clearance_margin_m": .5})
+            assert updated["config"] == {"stop_distance_m": .8}
+            assert policy._keepout_m(card._config) == pytest.approx(expected)
+        finally:
+            card._stop()
+
+
+def test_a_calibrated_corridor_excludes_the_left_doorframe():
+    import numpy as np
+    from plugins.navi import policy, view
+
+    card = _card(half_width_m=.30, obstacle_stop_m=.60)
+    depth = np.full((480, 640), 1.12, dtype=np.float32)
+    depth[168:408, 104:120] = 0.56
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
+                        K=[315, 0, 336.65, 0, 420, 243, 0, 0, 1])
+    assert card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding()) == ""
+
+    assert policy._clearance({"map": depth}, card._config)[0] == 1.12
+    assert policy._clearance({"map": depth}, card._config, lateral_offset_m=-0.33)[0] == 0.56
+    assert view.corridor_edges(1.0, card._config, 640) == (233, 441)
+    assert view.corridor_edges(1.0, card._config, 320) == (116, 220)
+    assert policy._clearance({"map": depth[:, ::2]}, card._config)[0] == 1.12
+    left_coverage = policy._clearance({"map": depth}, card._config, lateral_offset_m=-0.33)[1]
+    right_coverage = policy._clearance({"map": depth}, card._config, lateral_offset_m=0.33)[1]
+    assert left_coverage == pytest.approx(0.973, abs=0.005)
+    assert right_coverage == pytest.approx(0.874, abs=0.005)
+
+    depth[168:408, 495:530] = 0.56
+    assert policy._clearance({"map": depth}, card._config)[0] == 0.56
+
+
+@pytest.mark.parametrize("intrinsics", [
+    None,
+    [315, 0, 640, 0, 420, 243, 0, 0, 1],
+    [315, 15, 336.65, 0, 420, 243, 0, 0, 1],
+    [float("inf"), 0, 336.65, 0, 420, 243, 0, 0, 1],
+    [10**400, 0, 336.65, 0, 420, 243, 0, 0, 1],
+])
+def test_unusable_intrinsics_fall_back_to_the_centered_corridor(intrinsics):
+    import numpy as np
+    from plugins.navi import policy, view
+
+    card = _card(half_width_m=.30)
+    depth = np.full((480, 640), 1.12, dtype=np.float32)
+    depth[168:408, 132:145] = 0.56
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole", half_fov_rad=0.7934)
+    assert card._adopt_camera({_DEPTH_TOPIC: {
+        **declaration, "K": [315, 0, 336.65, 0, 420, 243, 0, 0, 1],
+    }}, _binding()) == ""
+    assert card._adopt_camera({_DEPTH_TOPIC: {**declaration, "K": intrinsics}}, _binding()) == ""
+    assert any("画面中心" in note for note in card._camera_notes)
+
+    assert policy._clearance({"map": depth}, card._config)[0] == 0.56
+    left, right = view.corridor_edges(1.0, card._config, 640)
+    assert left + right == 640
 
 
 def test_a_declaration_for_some_other_topic_is_not_used_for_the_depth():
@@ -1115,6 +2250,52 @@ def test_the_tick_hands_the_frame_off_instead_of_rendering_it():
     # tick to get it.
     assert set(snapshot) >= {"depth_m", "objects", "jpeg", "decision", "track",
                              "bearing", "target", "clearance", "coverage"}
+
+
+def test_restarting_without_rgb_clears_the_previous_camera_snapshot(monkeypatch):
+    from types import SimpleNamespace
+
+    card = _card()
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(card, "_node", _FakeNode()))
+    topics = ["/camera/objects", "/camera/visual_depth_summary"]
+    first_inputs = {"input_topics": ["/camera", *topics], "input_bindings": {"/camera": "image/jpeg"}}
+    assert card._start(first_inputs)["state"] == "running"
+    assert card._binding["image"] == "/camera"
+    card._on_image(SimpleNamespace(data=b"old jpeg"))
+    assert card._stop()["state"] == "stopped"
+
+    try:
+        assert card._start({"input_topics": topics})["state"] == "running"
+        assert not card._binding["image"]
+        assert card._image_jpeg is None and card._info()["image_age_ms"] is None
+    finally:
+        card._stop()
+
+
+def test_view_omits_expired_rgb_and_uses_the_next_fresh_jpeg(monkeypatch):
+    import queue
+    from types import SimpleNamespace
+
+    card = _card(max_obs_age_ms=300)
+    card._view_queue = queue.Queue(maxsize=1)
+    card._depth_map = depth = object()
+    clock = [1000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: clock[0] / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: clock[0] / 1000)
+
+    card._on_image(SimpleNamespace(data=b"first jpeg"))
+    card._publish_view()
+    assert card._view_queue.get_nowait()["jpeg"] == b"first jpeg"
+
+    clock[0] = 1350
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["jpeg"] is None and snapshot["depth_m"] is depth
+
+    clock[0] = 1600
+    card._on_image(SimpleNamespace(data=b"fresh jpeg"))
+    card._publish_view()
+    assert card._view_queue.get_nowait()["jpeg"] == b"fresh jpeg"
 
 
 def test_a_backed_up_queue_keeps_the_newest_frame():
@@ -1345,3 +2526,728 @@ def test_head_depth_topic_binds_as_metric_depth():
     assert bound["depth_map"] == "/nvidia_desktop/camera/head/depth"
 
 
+def test_metric_depth_subscription_keeps_only_the_latest_queued_frame():
+    node = _FakeNode()
+    depth = "/nvidia_desktop/camera/head/visual_depth"
+    objects = "/nvidia_desktop/camera/head/objects"
+    _, problem = _card()._bind_inputs(node, [objects, depth])
+    assert not problem
+    profiles = {topic: qos for _, topic, _, qos in node.subscription_details}
+    assert profiles[depth].depth == 1
+    assert profiles[objects].depth == 2
+
+
+
+
+def test_summary_does_not_refresh_a_bound_depth_map():
+    card = _card()
+    node = _FakeNode()
+    bound, problem = card._bind_inputs(
+        node, ["/cam/objects", "/cam/visual_depth", "/cam/visual_depth_summary"])
+    assert problem == ""
+    assert bound["depth_map"] == "/cam/visual_depth"
+    assert not bound["depth_summary"]
+    assert "/cam/visual_depth_summary" not in node.subscriptions
+
+
+def test_full_depth_frames_filter_floor_only_for_avoidance():
+    import numpy as np
+    from plugins.navi import depth, policy
+
+    card = _card(half_width_m=0.23)
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
+                        K=[315, 0, 336.65, 0, 420, 243, 0, 0, 1])
+    assert card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding()) == ""
+    rows = (np.arange(480) - 243) / 420 - 0.02
+    floor = np.minimum(0.42 / np.maximum(rows, 0.001), 4.0).astype(np.float32)
+    frame = np.broadcast_to(floor[:, None], (480, 640)).copy()
+
+    card._set_depth_map(frame)
+    observation = card.observation()[1]
+    assert observation["map"] is frame
+    assert depth.sample_box(observation["map"], (0.4, 0.8, 0.6, 0.85)) < 1.5
+    assert policy._clearance(observation, card._config)[0] > 1.5
+
+    card._set_depth_map(np.full_like(frame, 0.55))
+    observation = card.observation()[1]
+    assert "ground" not in observation
+    assert policy._clearance(observation, card._config)[0] == 0.55
+
+
+def test_projected_depth_grid_is_shared_by_scanning_planning_and_execution(monkeypatch):
+    from dataclasses import replace
+
+    import numpy as np
+    from plugins.navi import active_scan, local_path
+
+    card = _card()
+    declaration = _decl(_DEPTH_TOPIC, distortion_model="pinhole",
+                        K=[315, 0, 336.65, 0, 420, 243, 0, 0, 1])
+    assert card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding()) == ""
+    geometry = local_path.camera_square(card._config.depth_intrinsics, card._depth_vertical,
+                                        .25, at_front=True)
+    frame = np.full((24, 32), 2.0, dtype=np.float32)
+    project = local_path.observe
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args[0])
+        return project(*args, **kwargs)
+
+    monkeypatch.setattr(local_path, "observe", counted)
+    monkeypatch.setattr(active_scan, "observe", counted)
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+    card._set_depth_map(frame, received_ms=122_900)
+    first = card.observation()[1]
+    scan = active_scan.ActiveScan()
+    scan.observe_single(first, geometry, 500, 123_000)
+    free, occupied = scan.observed_grid()
+    second = card.observation()[1]
+    cache = local_path.PlanCache()
+    assert cache.grid_for(second, geometry)[0] is free
+    assert local_path.project_observation(second, replace(geometry, base_from_optical=
+                                          geometry.base_from_optical.copy()),
+                                          require_valid_depth=True, check_free_space=False)[1] is occupied
+    assert len(calls) == 1
+
+    shifted = geometry.base_from_optical.copy()
+    shifted[0, 3] = .10
+    local_path.project_observation(second, replace(geometry, base_from_optical=shifted))
+    assert len(calls) == 2
+    card._set_depth_map(np.full_like(frame, .60), received_ms=122_950)
+    newer = card.observation()[1]
+    _, new_occupied = local_path.project_observation(newer, geometry, require_valid_depth=True,
+                                                    check_free_space=False)
+    assert not np.array_equal(new_occupied, occupied)
+    assert len(calls) == 3
+
+    card._set_depth_map(np.full_like(frame, np.nan), received_ms=122_980)
+    invalid = card.observation()[1]
+    assert not cache.grid_for(invalid, geometry)[1].any()
+    assert local_path.project_observation(invalid, geometry, require_valid_depth=True,
+                                          check_free_space=False) is None
+
+
+@pytest.mark.parametrize("depth_age_ms,depth_limit_ms,with_odom,ttl_cap,expected_ttl,bumi_mount",
+                         [(50, None, True, 600, 400, False), (700, 800, True, 250, 250, False),
+                          (50, None, False, 600, 400, False), (50, None, True, 600, 400, True)])
+def test_legacy_local_planner_connects_to_the_navi_command_stream(monkeypatch, depth_age_ms, depth_limit_ms,
+                                                                 with_odom, ttl_cap, expected_ttl, bumi_mount):
+    import numpy as np
+    from plugins.navi import active_scan, local_path, policy
+
+    card = _card(confirm_hits=1, max_depth_age_ms=depth_limit_ms)
+    node = _FakeNode({_DEPTH_TOPIC: ["sensor_msgs/msg/CompressedImage"]})
+    card._executor = object()
+    card._open_publisher = lambda: setattr(card, "_node", node)
+    odom_topic = "/demo/state/odom"
+    input_topics = [_OBJECTS_TOPIC, _DEPTH_TOPIC]
+    if with_odom:
+        input_topics.append(odom_topic)
+    declaration = _decl(_DEPTH_TOPIC, id="demo/camera_front", distortion_model="pinhole",
+                        K=[315, 0, 336, 0, 420, 243, 0, 0, 1])
+    if bumi_mount:
+        declaration["vendor"] = dict(
+            frame_id="ubuntu_rgb_optical", clock_id="realsense_capture/epoch/global_time",
+            timestamp_semantics="source_capture_mapped", clock_mapping_verified=False,
+            body_mount=dict(schema="motus.camera_mount/1", topic="/ubuntu/camera/rgbd/body_mount",
+                            mode="dynamic", length_unit="m", parent_frame="base_link",
+                            child_frame="ubuntu_rgb_optical", transform_direction="body_from_camera",
+                            epoch="epoch", version="capture_tf_v1", status="unavailable"))
+    reply = card.dispatch("navi", {
+        "action": "start", "input_topics": input_topics,
+        "control_interface": _descriptor(footprint={"half_width": 0.23, "half_length": 0.25},
+                                         rate={"max_hz": 20, "watchdog_ms": 600,
+                                                   "max_command_ttl_ms": ttl_cap,
+                                                   "max_obs_age_ms": depth_limit_ms or 500}),
+        "camera_info": {_DEPTH_TOPIC: declaration},
+    })
+    assert reply["state"] == "running"
+    assert reply["ttl_ms"] == expected_ttl
+    assert card._config.local_planning
+    # The mocked translation below intentionally supplies a fixed legacy leg;
+    # default DWA startup and native command publication have their own test.
+    card._config.local_controller = "legacy"
+    assert card._config.half_width_m == .23
+    assert card._config.local_geometry.front == 0.
+    assert card._config.local_geometry.rear == .50
+
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 123.0)
+    card._state = policy.State(target="person")
+    card._objects = {"timestamp": 123.0, "objects": [
+        {"name": "person", "position": [0, 0], "confidence": .9}]}
+    card._objects_ms = 123_000
+    card._depth_map = np.full((480, 640), 2.5, dtype=np.float32)
+    card._depth_ground = np.zeros_like(card._depth_map, dtype=bool)
+    depth_stamp = 123_000 - depth_age_ms
+    card._depth_ms = depth_stamp
+    if with_odom:
+        card._odom = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+        card._odom_ms = 123_000
+    monkeypatch.setattr(
+        policy, "_clearance",
+        lambda depth, config, lateral_offset_m=0: (
+            .79 if lateral_offset_m > 0 else .80 if lateral_offset_m < 0 else .78, 1.0))
+    attempted = []
+
+    def plan(frame, ground, geometry, half_width, ahead, side, max_age_ms, watchdog_ms=300, **kwargs):
+        attempted.append((side, half_width, max_age_ms, watchdog_ms))
+        return local_path.Detour((.04, 0.), ((0., 0.), (.2, .3)), geometry) if side > 0 else None
+
+    monkeypatch.setattr(local_path, "_checked_translation", plan)
+    occupied = (abs(local_path.RIGHT) < .05) & np.isclose(local_path.FORWARD, .80)
+    monkeypatch.setattr(local_path, "observe", lambda *args: (~occupied, occupied))
+    monkeypatch.setattr(active_scan, "observe", local_path.observe)
+    for index in range(6):
+        card._objects = dict(card._objects, timestamp=122.9 + .02 * index)
+        command = card.next_command()
+        if command is not None and command["values"][:2] == [.04, 0.]:
+            break
+    assert command["values"] == [.04, 0., 0.0, 0.0, 0.0, 0.0], card._last_decision.reason
+    if bumi_mount:
+        assert "body_mount" not in reply["inputs"]
+        assert "body_mount_required" not in card.observation(with_capture_timing=True)[1]
+    assert command["ttl_ms"] == expected_ttl
+    expected_limit = depth_limit_ms or 500
+    assert attempted[:2] == [(-1.0, .253, expected_limit, 600), (1.0, .253, expected_limit, 600)]
+    assert all(attempt[1:] == (.253, expected_limit, 600) for attempt in attempted)
+    assert command["obs_stamp_ms"] == depth_stamp
+    assert card._state.view_detour.points == ((0., 0.), (.2, .3))
+    card._depth_ms = 0
+    stop = card.next_command()
+    assert stop["values"] == [0.0] * 6
+    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 123_000
+    assert card._state.view_detour is None
+    assert card.next_command() is None
+    if with_odom:
+        card._depth_ms = depth_stamp
+        card._odom_ms = 0
+        resumed = card.next_command()
+        assert resumed["values"] == [.04, 0., 0.0, 0.0, 0.0, 0.0]
+        assert resumed["obs_stamp_ms"] == depth_stamp
+
+
+def test_dynamic_body_mount_is_bound_to_the_depth_camera_and_exact_capture(monkeypatch):
+    from types import SimpleNamespace
+    import numpy as np
+
+    now = [123.1]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now[0])
+    card, node = _card(), _FakeNode()
+    mount = dict(schema="motus.camera_mount/1", topic="/rgbd/mount", mode="dynamic",
+                 version="v1", epoch="s1", parent_frame="base_link", child_frame="optical",
+                 transform_direction="body_from_camera", length_unit="m", accuracy_validated=False)
+    vendor = dict(body_mount=mount, clock_id="head", frame_id="optical",
+                  timestamp_semantics="source_capture_mapped",
+                  clock_reference=dict(clock_id="host_realtime", timestamp_basis="host_realtime",
+                                       domain_id="boot1"))
+    declarations = {_DEPTH_TOPIC: _decl(_DEPTH_TOPIC, format="image/depth-zlib", vendor=vendor)}
+    binding, error = card._bind_inputs(node, [_DEPTH_TOPIC, _OBJECTS_TOPIC], declarations)
+    assert not error
+    assert card._adopt_camera(declarations, binding) == ""
+    card._binding = binding
+    callbacks = [cb for _, topic, cb, *_ in node.subscription_details if topic == mount["topic"]]
+    assert len(callbacks) == 1
+    stamp = 123_000_000_123
+    matrix = [[0., 0., 1., .07], [-1., 0., 0., 0.], [0., -1., 0., 1.44], [0., 0., 0., 1.]]
+    sample = dict(mount, status="available", stamp_ns=stamp, clock_id="head",
+                  stamp_source="measurement", matrix=matrix, accuracy_validated=True)
+    def deliver(**changes):
+        callbacks[0](SimpleNamespace(data=json.dumps(dict(sample, **changes))))
+    def observation():
+        return card._observation_snapshot(with_capture_timing=True)[1]
+    message = SimpleNamespace(data=b"valid", header=SimpleNamespace(
+        stamp=SimpleNamespace(sec=123, nanosec=123), frame_id="optical"))
+    monkeypatch.setattr(navi_plugin.depth_mod, "decode", lambda _: np.ones((12, 16)))
+    card._on_depth_map(message)
+    assert observation()["body_mount_required"]
+    assert observation()["source_stamp_ns"] == stamp
+    assert "body_from_optical" not in observation()
+    for change in (dict(stamp_ns=stamp+1), dict(clock_id="other"), dict(version="v2"),
+                   dict(epoch="s2"), dict(child_frame="another_camera"), dict(parent_frame="map"),
+                   dict(transform_direction="camera_from_body"), dict(stamp_source="received"),
+                   dict(status="unavailable"), dict(matrix=np.zeros((4, 4)).tolist())):
+        deliver(**change)
+        assert "body_from_optical" not in observation(), change
+    deliver()
+    np.testing.assert_array_equal(observation()["body_from_optical"], matrix)
+    assert observation()["mount_accuracy_validated"] is False
+    deliver(status="unavailable")
+    assert "body_from_optical" not in observation()
+    deliver()
+    message.header.frame_id = "other_camera"
+    card._on_depth_map(message)
+    np.testing.assert_array_equal(observation()["body_from_optical"], matrix)
+    now[0] += 2.
+    message.header.frame_id = "optical"
+    card._on_depth_map(message)
+    deliver()
+    assert observation() is None
+
+
+def test_obstacle_pose_pairs_on_both_sides_of_depth_receipt(monkeypatch):
+    from types import SimpleNamespace
+    import numpy as np
+
+    card = _card()
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: 10.2)
+    declaration = _decl(_DEPTH_TOPIC, vendor={})
+    card._adopt_camera({_DEPTH_TOPIC: declaration}, _binding())
+    card._set_depth_map(np.ones((8, 8)), source_stamp_ns=10_030_000_000, capture_ms=10_030, received_ms=10_060)
+    def pose(stamp, x, segment="run", child="base_link"):
+        slam = dict(status="tracking", segment_id=segment)
+        data = dict(schema="motus.odom/1", frame="body", stamp_ms=10_197,
+                    twist=[1., 0., None, None, None, 0.],
+                    pose=dict(stamp_ms=stamp, frame_id="odom", child_frame_id=child,
+                              position=[x, 0., 0.], quaternion=[0., 0., 0., 1.]),
+                    vendor=dict(motus_slam=slam))
+        card._on_string("odom", SimpleNamespace(data=json.dumps(data)))
+    def snapshot():
+        return card._observation_snapshot(with_capture_timing=True)[1:3]
+    pose(10000, 0.)
+    assert "obstacle_capture_pose" not in snapshot()[0]
+    pose(10120, .12)
+    depth, odom = snapshot()
+    assert depth["obstacle_capture_pose"].x == pytest.approx(.06)
+    assert depth["obstacle_capture_pose"].stamp_ms == 10060
+    assert odom["obstacle_pose"].stamp_ms == 10120
+    pose(10040, -1.)
+    assert snapshot()[1]["obstacle_pose"].stamp_ms == 10120
+    assert snapshot()[0]["obstacle_capture_pose"].x == pytest.approx(.06)
+    pose(10140, .14, segment="new")
+    assert "obstacle_capture_pose" not in snapshot()[0]
+    pose(10201, .15, segment="future")
+    assert "obstacle_capture_pose" not in snapshot()[0]
+    declaration["vendor"]["body_mount"] = dict(parent_frame="base_link")
+    pose(10160, .16, child="base_footprint")
+    assert "obstacle_pose" not in snapshot()[1]
+
+
+
+@pytest.mark.parametrize("event", ["plan_slow", "new_obstacle", "feedback_gap", "expiry"])
+def test_checked_local_leg_uses_independent_command_timer(monkeypatch, event):
+    import threading
+    import numpy as np
+    from plugins.navi import local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card()
+    card._running = True
+    card._publisher = card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 500}}
+    card._ttl_ms = 400
+    geometry = local_path.camera_square(HorizontalIntrinsics(640, 315, 337), (480, 420, 243), .20)
+    card._config.local_geometry = geometry
+    scan = card._state.active_scan
+    scan.receipt_only = scan.buffered_odom = True
+    scan.poses.append((1000, scan.pose, 0.))
+    scan.odom_source = 1000
+    card._state.motion_source = "measured"
+    card._state.executing_leg = policy.PathLeg(geometry, (0., .6), scan.pose)
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    published = []
+    monkeypatch.setattr(card, "_publish_command", published.append)
+    frame = np.ones((4, 4))
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    monkeypatch.setattr(local_path, "observe", lambda *args, **kwargs: (~occupied, occupied))
+    card._depth_map = card._depth_ground = frame
+    card._depth_ms = card._odom_ms = 1000
+    card._velocity_history.append((1000, 1000, (0., 0., 0.)))
+    old_epoch = card._output_epoch
+    request = card._command_message([0., -.10, 0., 0., 0., 0.], 1., 900)
+    assert card._stage_command(request, old_epoch)
+    assert published[-1]["values"][1] == -.10
+
+    if event == "feedback_gap":
+        now = 1310
+        card._velocity_history.append((now, now, (0., -.10, 0.)))
+    elif event == "expiry":
+        now = 1400
+        for stamp in (1100, 1200, 1300, 1400):
+            card._velocity_history.append((stamp, stamp, (0., -.10, 0.)))
+    else:
+        now = 1100
+        card._velocity_history.append((now, now, (0., -.10, 0.)))
+        if event == "new_obstacle":
+            card._depth_ms = 1100
+            occupied[local_path.START[0], local_path.START[1] + 6] = True
+    card._odom_ms = now
+    if event == "plan_slow":
+        entered, finish = threading.Event(), threading.Event()
+
+        def slow_plan():
+            entered.set()
+            assert finish.wait(2.)
+            return None
+
+        monkeypatch.setattr(card, "next_command", slow_plan)
+        planner = threading.Thread(target=card._tick)
+        planner.start()
+        try:
+            assert entered.wait(2.)
+            card._dispatch_command()
+            assert planner.is_alive()
+            assert len(published) == 2
+        finally:
+            finish.set()
+            planner.join(2.)
+        assert not planner.is_alive()
+    else:
+        card._dispatch_command()
+        assert len(published) == 2
+    if event == "plan_slow":
+        assert published[1]["values"] == published[0]["values"]
+        assert published[1]["obs_stamp_ms"] == 900
+        assert published[1]["stamp_ms"] + published[1]["ttl_ms"] == 1400
+    else:
+        assert published[1]["values"] == [0.] * 6
+        assert not card._stage_command(request, old_epoch)
+
+
+@pytest.mark.parametrize(("branch", "expected"), [
+    ("route", ((0., 0.), (.8, .3), (1.5, .3))),
+    ("prefix", ((0., 0.), (.1, .03))),
+])
+def test_view_uses_the_valid_dwa_route_without_a_legacy_plan_cache(branch, expected):
+    import queue
+
+    import numpy as np
+    from plugins.navi import dwa, local_path, policy
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    card = _card(local_controller="dwa", local_planning=True)
+    card._view_queue = queue.Queue(maxsize=1)
+    state = card._state
+    geometry = local_path.camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    reference = local_path.Detour(None, ((0., 0.), (.8, .3), (1.5, .3)), geometry)
+    choice = dwa.Choice((.20, 0., -.1), ((0., 0., 0.), (.1, .03, .05)), 0., .1, .5)
+    state.dwa_proposal = policy.DwaProposal(choice, reference, branch, guard=None)
+    state.dwa_selected = True
+    state.view_detour = local_path.Detour(None, ((0., 0.), (.1, .03)), geometry, reference.points)
+    card._depth_map = np.full((8, 8), 2., dtype=np.float32)
+    state.dwa_projection = local_path.DepthProjection(card._depth_map, None)
+    assert state.local_plan.key is None
+
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["detour"] is not None
+    assert snapshot["detour"].points == expected
+    assert snapshot["project_detour"]
+
+    card._depth_map = card._depth_map.copy()
+    card._view_next_at = 0.
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["detour"].points == expected
+    assert not snapshot["project_detour"]
+
+    state.dwa_selected = False
+    card._view_next_at = 0.
+    card._publish_view()
+    assert card._view_queue.get_nowait()["detour"] is None
+
+
+def test_selected_turn_route_survives_new_depth_without_a_plan_cache():
+    import queue
+
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    card = _card()
+    card._view_queue = queue.Queue(maxsize=1)
+    scan = card._state.active_scan
+    geometry = card._config.local_geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    scan.phase, scan.route_segment, scan.advance_m = "brake", True, 1.
+    scan.directions, scan.turn_angle = (1.,), .30
+    candidate = Detour(None, ((0., 0.), (.955, .296), (1.5, .30)), geometry)
+    card._state.view_detour = candidate
+    card._publish_view()
+    assert card._view_queue.get_nowait()["detour"] == candidate
+
+    card._state.view_detour = None
+    card._depth_ms = 2
+    card._view_next_at = 0.
+    scan.phase, scan.origin_set, scan.pose = "turn", True, (0., 0., .10)
+    card._publish_view()
+    snapshot = card._view_queue.get_nowait()
+    assert snapshot["detour"].points[1] == pytest.approx((.98007, .19867), abs=1e-5)
+    assert snapshot["executing"] is None
+
+    scan.phase = "idle"
+    card._view_next_at = 0.
+    card._publish_view()
+    assert card._view_queue.get_nowait()["detour"] is None
+
+
+@pytest.mark.parametrize("next_frame", [
+    "clear", "duplicate", "blocked", "feedback_gap", "duplicate_feedback", "old_target", "check_crosses_expiry", "refresh_also_expires",
+])
+@pytest.mark.parametrize("checked_prefix", [False, True])
+def test_forward_timer_refreshes_a_short_window_only_after_a_new_clear_observation(
+        monkeypatch, next_frame, checked_prefix):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(local_planning=True, max_depth_age_ms=800, max_feedback_gap_ms=350)
+    card._running = True
+    card._publisher = card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 800}}
+    card._config.local_geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    state = card._state
+    state.checked_prefix = checked_prefix
+    state.avoidance_yaw_override = checked_prefix
+    if checked_prefix:
+        state.view_detour = local_path.Detour(None, ((0., 0.), (.15, 0.)), card._config.local_geometry)
+    state.active_scan.receipt_only = state.active_scan.buffered_odom = True
+    card._ttl_ms = 400
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    frame = np.ones((4, 4))
+    old = dict(map=frame, frame_id=950, capture_ms=350, source_frame_id=350)
+    new = dict(map=frame, frame_id=1090, capture_ms=900, source_frame_id=900)
+    if next_frame == "duplicate":
+        new["source_frame_id"] = old["source_frame_id"]
+    sample_ms = 740 if next_frame == "duplicate_feedback" else 995
+    odom = dict(vx=.1, vy=0., wz=0., received_ms=sample_ms, source_sample_id=sample_ms)
+    objects_ms = 600 if next_frame == "old_target" else 970
+
+    def observe(*_, **__):
+        nonlocal now
+        if next_frame == "check_crosses_expiry":
+            now += 55
+        if next_frame == "refresh_also_expires":
+            now += 350
+        grid = np.zeros(local_path.SHAPE, dtype=bool)
+        if next_frame == "blocked":
+            grid[local_path.START[0] + 5, local_path.START[1]] = True
+        return ~grid, grid
+
+    def snapshot(**kwargs):
+        if now == 1000:
+            return {"objects": []}, old, odom, objects_ms
+        latest_source = sample_ms if next_frame == "duplicate_feedback" else 1095
+        latest_odom = dict(odom, received_ms=1095, source_sample_id=latest_source)
+        return {"objects": []}, new, latest_odom if next_frame != "feedback_gap" else None, 1095
+
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(local_path, "observe", observe)
+    monkeypatch.setattr(policy, "step", lambda **kwargs: policy.Decision(
+        [.15, 0., 0., 0., 0., .10], policy.AVOIDING if checked_prefix else policy.APPROACHING,
+        "checked motion", distance_m=3.))
+    published = []
+    monkeypatch.setattr(card, "_publish_command", lambda message, **_: published.append(message))
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    initial_ttl = 90 if checked_prefix and next_frame == "duplicate_feedback" else 150
+    assert published[-1]["ttl_ms"] == initial_ttl
+    now = 1100
+    card._dispatch_command()
+    if next_frame in ("clear", "check_crosses_expiry"):
+        assert len(published) == 2 and published[-1]["values"][0] == .15
+        assert published[-1]["obs_stamp_ms"] == 900
+        assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] <= 1445
+    elif next_frame == "blocked":
+        assert len(published) == 2 and published[-1]["values"] == [0.] * 6
+    else:
+        now = max(now, 1150)
+        card._dispatch_command()
+        assert len(published) == 1
+        assert published[0]["stamp_ms"] + published[0]["ttl_ms"] == 1000 + initial_ttl
+
+
+@pytest.mark.parametrize("new_feedback", [False, True])
+def test_forward_timer_can_recheck_same_unexpired_depth_with_new_feedback(monkeypatch, new_feedback):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(local_planning=True, max_depth_age_ms=1200, max_feedback_gap_ms=350)
+    card._running = True
+    card._publisher = card._command_timer = object()
+    card._descriptor = {"rate": {"max_obs_age_ms": 1200}}
+    card._config.local_geometry = local_path.Geometry(None, None, np.eye(4), .23, .23, None)
+    card._ttl_ms = 250
+    now = 1000
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: now / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: now / 1000)
+    depth = dict(map=np.ones((4, 4)), frame_id=950, capture_ms=700, source_frame_id=700)
+
+    def snapshot(**kwargs):
+        source = now - 5 if new_feedback else 995
+        return {"objects": []}, depth, dict(vx=.1, vy=0., wz=0., received_ms=now - 5,
+                                            source_sample_id=source), 970
+
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    scan = card._state.active_scan
+    scan.receipt_only, scan.current_frame, scan.source_frame = True, 950, 700
+    scan.views.append((950, scan.pose, ~occupied, occupied))
+    projections = []
+    def project(*args, **kwargs):
+        projections.append(True)
+        return ~occupied, occupied
+    monkeypatch.setattr(local_path, "observe", project)
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(policy, "step", lambda **kwargs: policy.Decision(
+        [.15, 0., 0., 0., 0., 0.], policy.APPROACHING, "target at 3 m", distance_m=3.))
+    published = []
+    monkeypatch.setattr(card, "_publish_command", lambda message, **_: published.append(message))
+
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    assert published[-1]["ttl_ms"] == 250
+    now = 1100  # Early enough to recheck before the old command expires.
+    card._dispatch_command()
+    assert len(published) == (2 if new_feedback else 1)
+    assert not projections
+    if new_feedback:
+        assert published[-1]["obs_stamp_ms"] == 700
+        assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == 1350
+    now = 1350 if new_feedback else 1250
+    card._dispatch_command()
+    assert len(published) == (2 if new_feedback else 1)
+    assert published[-1]["stamp_ms"] + published[-1]["ttl_ms"] == now
+
+
+@pytest.mark.parametrize("scan_result", [0, 950])
+@pytest.mark.parametrize("new_feedback", [False, True])
+def test_delayed_prefix_uses_new_feedback_before_publishing_short_window(
+        monkeypatch, scan_result, new_feedback):
+    import numpy as np
+    from plugins.navi import local_path, policy
+
+    card = _card(local_planning=True, max_depth_age_ms=1200, max_feedback_gap_ms=350)
+    geometry = local_path.Geometry(None, None, np.eye(4), .275, .275, None)
+    card._config.local_geometry = geometry
+    card._descriptor = {"rate": {"max_obs_age_ms": 1200}}
+    card._ttl_ms = 400
+    state = card._state
+    scan = state.active_scan
+    scan.receipt_only = True
+    scan.result_frame = scan_result
+    scan.current_frame, scan.source_frame = 950, 700
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    scan.views.append((950, scan.pose, ~occupied, occupied))
+    depth = dict(map=np.ones((4, 4)), frame_id=950, capture_ms=700, source_frame_id=700)
+    snapshots = iter(
+        ({"objects": []}, depth, dict(vx=.15, vy=0., wz=0., received_ms=t, source_sample_id=t), 960)
+        for t in (850, 1150 if new_feedback else 850)
+    )
+    clock = 1000
+
+    def plan(**_):
+        nonlocal clock
+        clock = 1205  # Planning consumed the original feedback window.
+        state.checked_prefix = state.avoidance_yaw_override = True
+        state.view_detour = local_path.Detour(None, ((0., 0.), (.15, 0.)), geometry)
+        return policy.Decision([.15, 0., 0., 0., 0., 0.], policy.AVOIDING, "checked", distance_m=3.)
+
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: clock / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: clock / 1000)
+    monkeypatch.setattr(card, "_observation_snapshot", lambda **_: next(snapshots))
+    monkeypatch.setattr(policy, "step", plan)
+
+    command = card.next_command()
+    if new_feedback:
+        assert command["values"][0] == .15
+        assert command["obs_stamp_ms"] == 700
+        assert command["ttl_ms"] == 255  # The original target observation still expires at 1460.
+    else:
+        assert command["values"] == [0.] * 6
+        assert "运动反馈已到期" in card._last_decision.reason
+
+@pytest.mark.parametrize("saved_controller", [None, "legacy", "dwa"])
+def test_all_cards_use_dwa_without_a_controller_selector(saved_controller):
+    saved = {"dwa_samples": 48}
+    if saved_controller is not None:
+        saved["local_controller"] = saved_controller
+    original = dict(saved)
+    selected = NaviPlugin(saved, executor=None)
+    schema = selected.get_tools()[0]["configSchema"]["properties"]
+    assert "local_controller" not in schema
+    assert schema["dwa_horizon_s"]["scope"] == "instance"
+    assert schema["dwa_samples"]["scope"] == "instance"
+    assert selected._config.local_controller == "dwa"
+    assert selected._config.dwa_samples == 48
+    assert saved == original
+
+
+@pytest.mark.parametrize("saved_controller", [None, "legacy", "dwa"])
+def test_dwa_instance_values_survive_card_restart(monkeypatch, saved_controller):
+    saved = {"dwa_horizon_s": 1.2, "dwa_samples": 64}
+    if saved_controller is not None:
+        saved["local_controller"] = saved_controller
+    saved = json.loads(json.dumps(saved))
+    effective_values = {**saved, "local_controller": "dwa"}
+    card = _card(**saved)
+    monkeypatch.setattr(card, "_open_publisher", lambda: setattr(
+        card, "_node", _FakeNode({"/camera/depth": ["sensor_msgs/msg/CompressedImage"]})))
+    try:
+        for _ in range(2):
+            assert card.dispatch("navi", {"action": "start", "control_interface": _descriptor(),
+                                          "input_topics": ["/camera/objects", "/camera/depth"]})[
+                "state"] == "running"
+            effective = card._info()["config"]
+            assert {key: effective[key] for key in effective_values} == effective_values
+            ignored = card._config_action({"local_controller": "legacy", "dwa_horizon_s": 2.,
+                                           "dwa_samples": 32})
+            assert set(ignored["ignored_parameters"]) == set(effective_values)
+            assert card._config.local_controller == "dwa"
+            card._stop()
+    finally:
+        card._stop()
+
+
+
+def test_decision_log_preserves_bends_and_reversals_within_log_budget():
+    route = [(x / 20, 0.) for x in range(80)]
+    route += [(3.95, y / 20) for y in range(12)] + [(3.95, .5)]
+    trace = {"decision_id": 350, "reference": route, "topology_reference": route}
+    record = json.loads(navi_plugin._decision_log(trace))
+    assert record["reference"] == [[0., 0.], [3.95, 0.], [3.95, .55], [3.95, .5]]
+    assert trace["reference"] is route and len(route) == 93
+    trace["attempts"] = [{"reason": "no_reference"}] * 250
+    message = navi_plugin._decision_log(trace)
+    assert len(message.encode()) <= 3800
+    assert json.loads(message)["attempts_count"] == 250
+
+
+def test_person_overlay_keeps_matched_box_without_range_and_marks_short_detector_loss(monkeypatch):
+    import queue
+    import numpy as np
+    from plugins.navi.track import COASTING, CONFIRMED, Track
+
+    card = _card()
+    card._view_queue = queue.Queue(maxsize=1)
+    state = card._state
+    state.target = "person"
+    box = (.3, .2, .6, .8)
+    state.tracker.track = track = Track(mean=np.array([2., 0., 0., 0.]), cov=np.eye(4), hue="", name="person",
+                                       state=CONFIRMED, source=1., front_required=True, front_box=box)
+    clock = [1000]
+    monkeypatch.setattr(navi_plugin.time, "time", lambda: clock[0] / 1000)
+    monkeypatch.setattr(navi_plugin.time, "monotonic", lambda: clock[0] / 1000)
+    card._objects = {"timestamp": 1., "objects": [{"name": "person", "bbox_norm": box}]}
+    card._objects_ms = 1000
+
+    def snapshot():
+        card._view_next_at = 0.
+        card._publish_view()
+        return card._view_queue.get_nowait()
+
+    fresh = snapshot()
+    assert card._box_for(fresh) == (box, None)
+    assert not fresh["box_last_seen"]
+
+    clock[0] = 1250
+    track.state, track.since_obs_s = COASTING, .25
+    card._objects = {"timestamp": 1.25, "objects": []}
+    card._objects_ms = 1250
+    coasting = snapshot()
+    assert card._box_for(coasting) == (box, None)
+    assert coasting["box_last_seen"]
+
+    clock[0] = 2400
+    track.since_obs_s = 1.4
+    expired = snapshot()
+    assert card._box_for(expired) == (None, None)
+    assert not expired["box_last_seen"]

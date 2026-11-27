@@ -1,0 +1,1770 @@
+import json
+import math
+from dataclasses import replace
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from plugins.navi import active_scan as scan
+from plugins.navi.camera import HorizontalIntrinsics
+from plugins.navi.depth import ground_mask
+from plugins.navi.local_path import DepthProjection, Geometry, body_square, camera_square
+from plugins.navi.odom import PlanarPose
+
+
+def _depth(stamp, occupied=None):
+    free = np.ones(scan.SHAPE, dtype=bool)
+    if occupied is None:
+        occupied = np.zeros_like(free)
+    return {"map": free, "ground": free, "capture_ms": stamp, "frame_id": stamp}
+
+
+def _odom(stamp, wz=0):
+    return {"vx": 0.0, "vy": 0.0, "wz": wz, "stamp_ms": stamp}
+
+
+def _setup(monkeypatch):
+    blocked = np.zeros(scan.SHAPE, dtype=bool)
+    visible = np.ones_like(blocked)
+    monkeypatch.setattr(scan, "observe",
+                        lambda *args: (visible.copy(), blocked.copy()))
+    lookout = scan.ActiveScan(max_feedback_gap_ms=250)
+    geometry = Geometry(None, None, np.eye(4), .23, .23, None)
+    return lookout, geometry, visible, blocked
+
+
+def _tick(lookout, geometry, stamp, wz=0, capture=True):
+    depth = _depth(stamp if capture is True else capture)
+    lookout.update(depth, _odom(stamp, wz), geometry)
+    return lookout.command(geometry, .33, .25, 600)
+
+
+def _legacy_buffered_turn_card(config):
+    """Test the segmented fallback's hand-built burst state and deadlines.
+
+    These fixtures call ActiveScan.begin directly without a tracked DWA goal
+    or accepted motion proposal. Public card startup uses DWA; only the legacy
+    contract tests below select this internal fallback explicitly.
+    """
+    from plugins.navi import plugin
+
+    card = plugin.NaviPlugin(config, executor=None)
+    card._config.local_controller = "legacy"
+    return card
+
+
+@pytest.mark.parametrize("command_only", [False, True])
+def test_receipt_only_projects_only_the_latest_requested_frame(monkeypatch, command_only):
+    geometry = camera_square(HorizontalIntrinsics(64, 50, 32), (48, 50, 24), .23)
+    tangent = (np.arange(48) - 24) / 50
+    image = np.broadcast_to(np.minimum(.42 / np.maximum(tangent, .001), 4.)[:, None],
+                            (48, 64)).copy()
+    ground = image < 4.
+    newer = image.copy()
+    newer[:25, 20:45] = 1.
+    expected = scan.observe(newer, geometry, scan.RIGHT, scan.FORWARD, scan.RESOLUTION, ground)
+    observe = scan.observe
+    projected = []
+
+    def project(frame, *args):
+        projected.append(frame)
+        return observe(frame, *args)
+
+    monkeypatch.setattr(scan, "observe", project)
+    look = scan.ActiveScan()
+    for stamp, frame in ((1000, image), (1100, newer)):
+        depth = {"map": frame, "ground": ground, "frame_id": stamp}
+        if command_only:
+            assert look.observe_single(depth, geometry, 500, stamp) is None
+        else:
+            odom = {**_odom(stamp), "received_ms": stamp}
+            assert look.update(depth, odom, geometry, receipt_only=True) is None
+    assert look.current_frame == 1100
+    assert not projected
+    for actual, wanted in zip(look.grid(), expected):
+        np.testing.assert_array_equal(actual, wanted)
+    look.grid()
+    assert len(projected) == 1 and projected[0] is newer
+
+
+def test_active_scan_turns_right_and_can_return_using_the_current_view(monkeypatch):
+    lookout, geometry, _, blocked = _setup(monkeypatch)
+    _tick(lookout, geometry, 1000)
+    assert lookout.begin((1., -1.))
+    assert _tick(lookout, geometry, 1050).yaw == 0
+    assert _tick(lookout, geometry, 1150).yaw < 0
+    for stamp in range(1250, 2550, 100):
+        result = _tick(lookout, geometry, stamp, -.25)
+    assert result.yaw == 0
+    assert math.degrees(lookout.pose[2]) == pytest.approx(20., abs=2.)
+    assert _tick(lookout, geometry, 2500, capture=2450).yaw == 0
+    assert not lookout.ready
+    assert lookout.phase == "return" and lookout.side_frame == 2450
+    blocked[30, 38] = True
+    assert _tick(lookout, geometry, 2600).yaw > 0
+    blocked[30, 38] = False
+    for stamp in range(2700, 4000, 100):
+        result = _tick(lookout, geometry, stamp, .25)
+    assert result.yaw == 0
+    _tick(lookout, geometry, 4000)
+    assert lookout.ready
+    _, occupied = lookout.grid()
+    assert not occupied.any()  # Later views confirmed the earlier obstacle cell was free.
+    assert lookout.try_other_side()
+    assert _tick(lookout, geometry, 4100).yaw == 0
+    assert _tick(lookout, geometry, 4200).yaw > 0
+
+
+def test_active_scan_holds_an_occupied_sweep(monkeypatch):
+    lookout, geometry, _, blocked = _setup(monkeypatch)
+    blocked[14, 28] = True
+    _tick(lookout, geometry, 1000)
+    assert lookout.begin((1., -1.))
+    for stamp in (1050, 1200, 1250, 1350):
+        assert _tick(lookout, geometry, stamp).yaw == 0
+    assert not lookout.active
+    assert not lookout.begin((1., -1.))
+
+
+@pytest.mark.parametrize("feedback", ["pose", "receipt_twist", "aligned_twist"])
+@pytest.mark.parametrize("start_delay_ms", [0, 250])
+def test_scan_converges_with_delayed_feedback_and_chassis(monkeypatch, start_delay_ms, feedback):
+    lookout, geometry, _, _ = _setup(monkeypatch)
+    history = {stamp: 0. for stamp in range(99_600, 100_000, 100)}
+    yaw, rate, turn_start = 0., 0., None
+    measured_twist = feedback != "pose"
+    angle = math.atan2(.45, 1.85) if measured_twist else scan.ANGLE
+    for stamp in range(100_000, 115_000, 100):
+        if turn_start is not None:
+            moving_ms = min(100, max(0, stamp - turn_start - start_delay_ms))
+            yaw += rate * moving_ms / 1000
+        history[stamp] = yaw
+        measured = stamp - 300
+        rate_at_measurement = (history[measured] - history[measured - 100]) / .1
+        odom = {"received_ms": stamp, "source_sample_id": measured, "stamp_ms": measured}
+        if measured_twist:
+            odom.update(vx=0., vy=0., wz=rate_at_measurement)
+        else:
+            pose = PlanarPose(measured, ("odom", "body"), 0., 0., history[measured])
+            odom.update(motion_pose=pose, pose_feedback=(0., 0., rate_at_measurement),
+                        pose_feedback_since_ms=measured - 100)
+        depth = dict(_depth(stamp), control_ms=stamp, capture_ms=measured)
+        lookout.update(depth, odom, geometry, receipt_only=feedback != "aligned_twist")
+        if stamp == 100_000:
+            assert lookout.begin((-1., 1.), advance_m=1.9 if measured_twist else None, turn_angle=angle)
+        rate = lookout.command(geometry, .31, 1. if measured_twist else .83, 300,
+                               min_yaw_rate=0. if measured_twist else .33, now_ms=stamp).yaw
+        turn_start = (turn_start if turn_start is not None else stamp) if rate else None
+        assert abs(yaw) <= angle + scan.ANGLE_TOLERANCE
+        if lookout.ready:
+            break
+
+    assert lookout.ready
+    assert yaw == pytest.approx(angle, abs=scan.ANGLE_TOLERANCE)
+
+
+@pytest.mark.parametrize("stalled", [False, True])
+def test_slow_measured_turn_excludes_stop_waits_from_stall_window(monkeypatch, stalled):
+    look, geometry, _, _ = _setup(monkeypatch)
+    rate = 0.
+    start = None
+    angle = math.radians(6)
+    for stamp in range(1000, 11000, 100):
+        # At low speed this chassis needs 200 ms to start each burst.
+        measured = rate if start is not None and stamp - start > 200 and not stalled else 0.
+        look.update(_depth(stamp), {**_odom(stamp, measured), "received_ms": stamp},
+                    geometry, receipt_only=True)
+        if stamp == 1000:
+            assert look.begin((-1.,), advance_m=1., turn_angle=angle)
+        result = look.command(geometry, .375, .1, 500, 800, now_ms=stamp)
+        rate = result.yaw
+        start = (start if start is not None else stamp) if rate else None
+        if look.ready or "转向无实测进展" in result.reason:
+            break
+    if stalled:
+        assert "转向无实测进展" in result.reason
+    else:
+        assert look.ready
+        assert -look.pose[2] == pytest.approx(angle, abs=scan.ANGLE_TOLERANCE)
+
+
+def test_measured_turn_deadline_stops_and_waits_for_new_feedback(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(now, received, source, wz=0.):
+        look.update(dict(_depth(now), control_ms=now),
+                    {"vx": 0., "vy": 0., "wz": wz, "received_ms": received,
+                     "source_sample_id": source}, geometry, receipt_only=True)
+        return look.command(geometry, .375, 1., 500, 800).yaw
+
+    tick(1000, 1000, 10)
+    assert look.begin((-1.,), advance_m=1.9, turn_angle=math.radians(14))
+    assert tick(1100, 1100, 11) == 0.
+    assert tick(1200, 1200, 12) > 0.
+    assert tick(1400, 1400, 13) > 0.
+    assert tick(1500, 1500, 14) > 0.
+    assert tick(1600, 1580, 14) == 0.  # deadline on the control clock, repeated input
+    assert tick(1650, 1640, 14) == 0.
+    assert tick(1700, 1680, 15) == 0.
+    assert tick(1800, 1800, 16, wz=.12) == 0.  # in-flight rotation after braking
+    assert tick(1900, 1900, 17, wz=-.08) == 0.
+    assert tick(2050, 2050, 18) == 0.
+    assert tick(2150, 2140, 18) == 0.  # a repeated sample cannot release the stop
+    assert tick(2200, 2200, 19, wz=-.08) == 0.
+    assert tick(2300, 2300, 20) > 0.
+
+
+@pytest.mark.parametrize("case", [
+    "continuous", "gap", "batched_gap", "duplicate", "translation", "obstacle", "expired",
+])
+def test_receipt_scan_checks_buffered_odom_independently_of_the_control_tick(monkeypatch, case):
+    from plugins.navi import plugin
+
+    look, geometry, _, occupied = _setup(monkeypatch)
+    card = plugin.NaviPlugin({"local_planning": True}, executor=None)
+    now = 1000
+    monkeypatch.setattr(plugin.time, "time", lambda: now / 1000)
+
+    def sample(stamp, vx=0., wz=0., source=None):
+        nonlocal now
+        now = stamp
+        payload = dict(schema="motus.odom/1", frame="body", stamp_ms=stamp if source is None else source,
+                       twist=[vx, 0., None, None, None, wz])
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+
+    def update():
+        odom = card._observation_snapshot(with_capture_timing=True)[2]
+        return look.update(dict(_depth(now), control_ms=now), odom, geometry, receipt_only=True)
+
+    def command():
+        return look.command(geometry, .33, 1., 600)
+
+    sample(1000)
+    assert update() is None
+    assert look.begin((-1.,), advance_m=1.5, route_segment=True)
+    sample(1100)
+    assert update() is None and command().yaw == 0.
+    sample(1200)
+    assert update() is None and command().yaw > 0.
+
+    # Drive the callbacks between two control ticks, including a transient
+    # excursion that has already ended by the time the planner takes a snapshot.
+    if case == "gap":
+        sample(1490, wz=.10)
+    elif case == "batched_gap":
+        sample(1300, wz=.10, source=1500)
+    else:
+        sample(1300, vx=.25 if case in ("translation", "obstacle") else 0., wz=.10)
+        sample(1420, wz=.10, source=1300 if case == "duplicate" else None)
+    sample(1620 if case == "expired" else 1500, wz=.10, source=1300 if case == "duplicate" else None)
+    hold = update()
+    if case == "continuous":
+        assert hold is None
+        assert look.pose[2] == pytest.approx(-.030)
+        assert command().yaw > 0.
+    elif case in ("translation", "obstacle"):
+        assert hold is None and command().yaw > 0.
+        if case == "obstacle":
+            occupied[scan.START[0] + 14, scan.START[1]] = True
+        for stamp in (1550, 1650, 1750):
+            sample(stamp, vx=.30, wz=.10)
+        assert update() is None
+        result = command()
+        if case == "obstacle":
+            assert result.yaw == 0. and "扫掠区有障碍" in result.reason
+        else:
+            assert result.yaw > 0. and look.pose[0] > .05
+    elif case == "expired":
+        assert hold is None
+        assert command().yaw == 0.
+        assert look.turn_stop_ms == 1620 and look.turn_until_ms == 0
+    elif case == "duplicate":
+        assert hold is None and look.poses[-1][0] == 1300
+        sample(1600, wz=.10, source=1300)
+        assert update().yaw == 0.
+        assert look.phase == "brake_for_replan"
+    else:
+        assert look.phase == "brake_for_replan" and hold.yaw == 0.
+        assert "间隔过长" in hold.reason
+
+
+@pytest.mark.parametrize(("rate_hz", "expiry"), [
+    (10., "tick"), (10., "publication"), (10., "observation"), (2., "tick"),
+])
+def test_legacy_card_renews_a_short_turn_with_continuous_velocity_feedback(monkeypatch, rate_hz, expiry):
+    from plugins.navi import plugin
+
+    look, geometry, _, _ = _setup(monkeypatch)
+    card = _legacy_buffered_turn_card({"local_planning": True, "wz_max": 1.})
+    card._config.local_geometry = geometry
+    card._descriptor = {"rate": {"max_obs_age_ms": 600}}
+    card._rate_hz = rate_hz
+    card._ttl_ms = 400
+    card._state.target = "person"
+    card._state.active_scan = look
+    now = 100_000
+    publish_delay = 0
+    depth_at = now
+    history = []
+
+    def snapshot(**kwargs):
+        odom = dict(_odom(now), received_ms=now, source_sample_id=now, velocity_history=tuple(history))
+        return {"objects": []}, dict(_depth(depth_at), control_ms=now), odom, now
+
+    def tick(stamp, *, lag=0, depth_stamp=None):
+        nonlocal now, publish_delay, depth_at
+        for sample in range(now + 100, stamp, 100):
+            history.append((sample, sample, (0., 0., 0.)))
+        now = stamp
+        publish_delay = lag
+        depth_at = stamp if depth_stamp is None else depth_stamp
+        history.append((now, now, (0., 0., 0.)))
+        return card.next_command()
+
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: now / 1000)
+    monkeypatch.setattr(plugin.time, "time", lambda: (now + publish_delay) / 1000)
+    _, depth, odom, _ = snapshot()
+    look.update(depth, odom, geometry, receipt_only=True)
+    assert look.begin((-1.,), advance_m=1.9, route_segment=True)
+    assert tick(100_100)["values"] == [0.] * 6
+
+    first = tick(100_550)  # 450 ms since the last tick, even with fresh odometry.
+    if rate_hz == 2.:
+        assert first["values"] == [0.] * 6
+        return
+
+    assert first["values"][5] > 0. and first["ttl_ms"] == 400
+    assert look.turn_until_ms == 100_950
+    # A slow planner can still renew the command using buffered fresh feedback.
+    next_message = tick(100_800)
+    assert next_message["values"][5] > 0. and next_message["ttl_ms"] == 400
+    if expiry == "observation":
+        # A still-valid frame can expire before the normal command lease.
+        next_message = tick(101_050, depth_stamp=100_600)
+        assert next_message["values"][5] > 0. and next_message["ttl_ms"] == 150
+        stop = tick(101_250)
+    else:
+        next_message = tick(101_050)
+        assert next_message["values"][5] > 0. and next_message["ttl_ms"] == 400
+        stop = tick(101_300, lag=200) if expiry == "publication" else tick(101_500)
+    assert stop["values"] == [0.] * 6
+    assert look.turn_stop_ms == stop["stamp_ms"] and look.turn_until_ms == 0
+
+
+def test_buffered_turn_reaches_evaluation_with_slew_limited_feedback(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, wz=0., vx=0., depth_stamp=None):
+        odom = dict(_odom(stamp, wz), vx=vx, received_ms=stamp, source_sample_id=stamp,
+                    velocity_history=((stamp, stamp, (vx, 0., wz)),))
+        hold = look.update(dict(_depth(depth_stamp or stamp), control_ms=stamp),
+                           odom, geometry, receipt_only=True, max_depth_age_ms=800)
+        return hold or look.command(geometry, .33, 1., 600, 800)
+
+    tick(1000)
+    assert look.begin((-1.,), advance_m=1.5, route_segment=True)
+    assert tick(1050).yaw == 0.
+    assert tick(1150).yaw > 0.
+    for i in range(1, 8):
+        assert tick(1150 + 100 * i, wz=i / 10, vx=.09 if i == 2 else 0.).yaw > 0.
+    assert tick(1950, wz=.69).yaw == 0.
+    for stamp in range(2050, 2651, 100):
+        assert tick(stamp, depth_stamp=1950).yaw == 0.
+    assert look.ready and look.side_frame == 1950
+
+
+@pytest.mark.parametrize("recovery", ["clear", "obstacle", "feedback_gap"])
+def test_legacy_buffered_route_survives_a_depth_lapse_and_checks_the_new_view(monkeypatch, recovery):
+    from plugins.navi import policy
+
+    look, geometry, _, blocked = _setup(monkeypatch)
+
+    def tick(stamp, *, wz=0., source=None):
+        depth = None if source is None else dict(_depth(stamp), control_ms=stamp, source_frame_id=source)
+        odom = dict(_odom(stamp, wz), received_ms=stamp, source_sample_id=stamp,
+                    velocity_history=((stamp, stamp, (0., 0., wz)),))
+        update = look.update(depth, odom, geometry, receipt_only=True, max_depth_age_ms=600)
+        return update or look.command(geometry, .33, 1., 500, 600, now_ms=stamp)
+
+    tick(1000, source=900)
+    assert look.begin((-1.,), advance_m=1.0, turn_angle=.20, route_segment=True)
+    assert tick(1100, source=1000).yaw == 0.
+    assert tick(1200, source=1100).yaw > 0.
+    assert tick(1300, wz=.5).yaw == 0.
+    assert look.current_frame == 0 and look.advance_m == 1.0
+    assert look.phase == "turn" and look.turn_stop_ms == 1300
+
+    if recovery == "feedback_gap":
+        assert tick(1600, source=1500).yaw == 0.
+        assert look.phase == "brake_for_replan"
+        return
+
+    for stamp in (1400, 1500):
+        assert tick(stamp, source=1100).yaw == 0.
+        assert look.current_frame == 0  # Redelivery cannot unlock the paused turn.
+        assert look.turn_stop_ms == 1300
+    if recovery == "obstacle":
+        blocked[scan.START[0] + 3, scan.START[1]] = True
+    for stamp in (1600, 1700, 1800):
+        assert tick(stamp, source=stamp - 50).yaw == 0.
+    next_turn = tick(1900, source=1850)
+    if recovery == "obstacle":
+        assert next_turn.yaw == 0. and "扫掠区有障碍" in next_turn.reason
+        return
+
+    assert next_turn.yaw > 0.
+    assert look.advance_m == 1.0 and look.route_segment
+    assert tick(2000, wz=.65, source=1950).yaw > 0.
+    assert tick(2100, wz=.9, source=2050).yaw == 0.
+    for stamp in range(2200, 2800, 100):
+        assert tick(stamp, source=stamp - 50).yaw == 0.
+    assert look.ready
+    config = policy.Config(local_controller="legacy", local_planning=True, local_geometry=geometry)
+    state = policy.State(target="person", motion_source="measured", active_scan=look,
+                         goal_anchor=policy.DetourGoal(2., 0.))
+    odom = dict(_odom(2700), received_ms=2700, source_sample_id=2700,
+                velocity_history=((2700, 2700, (0., 0., 0.)),))
+    depth = dict(_depth(2700), map=np.full(scan.SHAPE, 4.), control_ms=2700, source_frame_id=2650)
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config, state=state, dt=.1)
+    assert decision.values[0] > 0. and not any(decision.values[1:])
+    assert decision.reason == "主动观察：转稳后直行"
+
+
+@pytest.mark.parametrize("blocked_sweep", [False, True])
+def test_checked_turn_can_start_without_a_preceding_stop(monkeypatch, blocked_sweep):
+    look, geometry, _, blocked = _setup(monkeypatch)
+    depth = dict(_depth(1000), control_ms=1000, source_frame_id=900)
+    odom = dict(_odom(1000), vx=.15, received_ms=1000, source_sample_id=1000,
+                velocity_history=((1000, 1000, (.15, 0., 0.)),))
+    look.update(depth, odom, geometry, receipt_only=True)
+    assert look.begin((-1.,), advance_m=1.0, turn_angle=.20, route_segment=True)
+    if blocked_sweep:
+        blocked[scan.START[0] + 6, scan.START[1]] = True
+
+    command = look.command(geometry, .33, 1., 500, 600, now_ms=1000,
+                           control_period_s=.1, previous_linear=.2, forward_limit=.15)
+
+    if blocked_sweep:
+        assert not command.yaw and look.phase == "brake"
+    else:
+        assert command.vx == .15 and command.yaw > 0. and look.phase == "turn"
+        assert look.turn_sweep.twists[0][0] == .20
+
+
+@pytest.mark.parametrize("obstacle", [(.0, .60), (.55, .0)])
+def test_route_turn_checks_the_direction_of_measured_forward_motion(monkeypatch, obstacle):
+    look, geometry, _, hits = _setup(monkeypatch)
+    at_forward, at_right = obstacle
+    hits[:] = np.isclose(scan.FORWARD, at_forward) & np.isclose(scan.RIGHT, at_right)
+    depth = dict(_depth(1000), control_ms=1000, source_frame_id=900)
+    odom = dict(_odom(1000), vx=.15, received_ms=1000, source_sample_id=1000,
+                velocity_history=((1000, 1000, (.15, 0., 0.)),))
+    look.update(depth, odom, geometry, receipt_only=True)
+    assert look.begin((-1.,), advance_m=.55, turn_angle=.20, route_segment=True)
+
+    command = look.command(geometry, .33, 1., 500, 600, now_ms=1000,
+                           control_period_s=.1, previous_linear=.20, forward_limit=.15)
+
+    if at_right:
+        assert command.vx == .15 and command.yaw > 0.
+    else:
+        assert command.yaw == 0.
+
+
+def test_tianyi_buffered_turn_tolerates_a_short_feedback_gap():
+    from plugins.navi import policy
+
+    config = policy.Config(max_feedback_gap_ms=350)
+    look = scan.ActiveScan(max_feedback_gap_ms=config.max_feedback_gap_ms,
+                           receipt_only=True, buffered_odom=True, phase="turn", issued_yaw=True)
+    look.poses.append((1000, look.pose, 0.))
+    look.odom_source = 1000
+    history = [(1000, 1000, (0., 0., 0.))]
+    assert look.sync_buffered_motion(history, 1300) is None
+    history.append((1330, 1330, (0., 0., .2)))
+    assert look.sync_buffered_motion(history, 1330) is None
+    assert look.poses[-1][0] == 1330
+    assert look.sync_buffered_motion(history, 1681)[1]
+
+
+def test_buffered_odom_keeps_its_frame_when_two_new_samples_share_a_receipt_ms():
+    look = scan.ActiveScan(receipt_only=True, buffered_odom=True, keep_physical_views=True)
+    look.poses.append((1000, look.pose, 0.))
+    look.odom_source = 990
+    frame = look.motion_frame
+    history = [(1100, 1084, (.2, 0., 0.)), (1100, 1090, (.3, 0., 0.))]
+
+    assert look.sync_buffered_motion(history, 1100) is None
+    assert look.motion_frame is frame
+    assert look.pose == pytest.approx((.02, 0., 0.))
+    assert look.motion == (.3, 0., 0.) and look.odom_source == 1090
+    assert [stamp for stamp, _, _ in look.poses] == [1000, 1100]
+
+
+@pytest.mark.parametrize("planning_ms,expected_ttl", [(282, 242), (399, 125), (400, 0)])
+def test_legacy_slow_first_buffered_turn_uses_unspent_observation_budget(monkeypatch, planning_ms, expected_ttl):
+    from plugins.navi import plugin
+
+    look, geometry, _, _ = _setup(monkeypatch)
+    card = _legacy_buffered_turn_card({"local_planning": True, "wz_max": 1., "max_depth_age_ms": 800})
+    card._config.local_geometry = geometry
+    card._descriptor = {"rate": {"max_obs_age_ms": 800}}
+    card._ttl_ms = 400
+    card._state.target, card._state.active_scan = "person", look
+    stamp = 100_000
+    simulated_lag = 0
+    depth_stamp = 99_924
+    history = []
+
+    def snapshot(**kwargs):
+        odom = dict(_odom(stamp), received_ms=stamp, source_sample_id=stamp, velocity_history=tuple(history))
+        return {"objects": []}, dict(_depth(depth_stamp), control_ms=stamp), odom, stamp
+
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(plugin.time, "time", lambda: (stamp + simulated_lag) / 1000)
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: stamp / 1000)
+    _, depth, odom, _ = snapshot()
+    look.update(depth, odom, geometry, receipt_only=True, max_depth_age_ms=800)
+    assert look.begin((-1.,), advance_m=1.9, route_segment=True)
+    stamp += 100
+    history.append((stamp, stamp, (0., 0., 0.)))
+    assert not any(card.next_command()["values"])
+    stamp += 100
+    history.append((stamp, stamp, (0., 0., 0.)))
+    simulated_lag = planning_ms
+    message = card.next_command()
+    if expected_ttl:
+        assert message["values"][5] > 0.
+        assert message["obs_stamp_ms"] == depth_stamp
+        assert message["ttl_ms"] == expected_ttl
+        assert message["stamp_ms"] + message["ttl_ms"] == depth_stamp + 800
+    else:
+        assert not any(message["values"])
+        assert not look.issued_yaw
+
+
+@pytest.mark.parametrize("expiry", ["first_yaw", "renewal", "snapshot"])
+def test_legacy_card_finishing_a_turn_command_after_its_deadline_sends_stop(monkeypatch, expiry):
+    from plugins.navi import plugin
+
+    look, geometry, _, _ = _setup(monkeypatch)
+    card = _legacy_buffered_turn_card({"local_planning": True, "wz_max": 1.})
+    card._config.local_geometry = geometry
+    card._config.watchdog_ms = 500
+    card._descriptor = {"rate": {"max_obs_age_ms": 600}}
+    card._ttl_ms = 400
+    card._state.target = "person"
+    card._state.active_scan = look
+    now = 100_000
+    lag = 0
+
+    def snapshot(**kwargs):
+        return ({"objects": []}, dict(_depth(now), control_ms=now),
+                dict(_odom(now), received_ms=now, source_sample_id=now), now)
+
+    monkeypatch.setattr(card, "_observation_snapshot", snapshot)
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: now / 1000)
+    monkeypatch.setattr(plugin.time, "time", lambda: (now + lag) / 1000)
+    _, depth, odom, _ = snapshot()
+    look.update(depth, odom, geometry, receipt_only=True)
+    assert look.begin((-1.,), advance_m=1.9, turn_angle=math.radians(14), route_segment=True)
+    now += 100
+    assert card.next_command()["values"] == [0.] * 6
+    now += 100
+    if expiry == "first_yaw":
+        lag = 450
+    else:
+        assert card.next_command()["values"][5] > 0.
+        now += 200
+        lag = 50
+        renewal = card.next_command()
+        assert renewal["values"][5] > 0.
+        assert renewal["stamp_ms"] + renewal["ttl_ms"] <= look.turn_until_ms
+        now = 100_600 if expiry == "snapshot" else 100_500
+        lag = 100_650 - now
+    stop = card.next_command()
+    assert stop["values"] == [0.] * 6
+    assert stop["obs_stamp_ms"] == stop["stamp_ms"] == 100_650
+    assert look.turn_stop_ms == stop["stamp_ms"] and look.turn_until_ms == 0
+    assert look.issued_yaw == (expiry != "first_yaw")
+    assert not any(card._state.commanded)
+    # A later clock with the same velocity sample cannot reopen the burst.
+    assert look.command(geometry, .375, 1., 500, 800, now_ms=101_200).yaw == 0.
+    assert look.turn_stop_ms == stop["stamp_ms"]
+
+
+def test_active_scan_waits_for_new_odom_then_can_replan(monkeypatch):
+    lookout, geometry, _, _ = _setup(monkeypatch)
+    _tick(lookout, geometry, 1000)
+    assert lookout.begin((1., -1.))
+    _tick(lookout, geometry, 1050)
+    assert _tick(lookout, geometry, 1200).yaw < 0
+    assert lookout.update(_depth(1250), None, geometry).yaw == 0.
+    assert lookout.phase == "brake_for_replan"
+    assert not lookout.begin((1., -1.))
+    assert _tick(lookout, geometry, 1350).replanned_turn
+    assert lookout.begin((1., -1.))
+
+
+@pytest.mark.parametrize("lose_depth, yaw_limit", [(False, .83), (False, .60), (True, .83)])
+def test_command_only_scan_evaluates_when_the_timed_turn_finishes(monkeypatch, lose_depth, yaw_limit):
+    look, geometry, _, _ = _setup(monkeypatch)
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((1., -1.))
+    rates = []
+    first_turn = None
+    for stamp in range(1100, 7400, 100):
+        depth = None if lose_depth and first_turn is not None else _depth(stamp)
+        look.observe_single(depth, geometry, 800, stamp)
+        command = look.command(geometry, .31, yaw_limit, 300, 800, min_yaw_rate=.33)
+        if command.yaw and first_turn is None:
+            first_turn = stamp
+        rates.append(command.yaw)
+        if lose_depth and first_turn is not None and depth is None:
+            assert command.yaw == 0 and not look.active
+            return
+        if look.ready:
+            break
+    assert first_turn is not None
+    nonzero = [rate for rate in rates if rate]
+    assert all(-yaw_limit <= rate <= -.33 for rate in nonzero)
+    assert math.degrees(-sum(nonzero) * .1) == pytest.approx(20., abs=2.)
+    assert look.ready and stamp == first_turn + 100 * len(nonzero)
+    assert len(look.views) == 1 and not look.poses
+
+
+def test_running_command_only_turn_slows_when_the_downstream_cap_is_lowered(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((1.,))
+    for stamp in range(1100, 1700, 100):
+        look.observe_single(_depth(stamp), geometry, 800, stamp)
+        command = look.command(geometry, .31, .8, 300)
+        if command.yaw:
+            break
+    assert abs(command.yaw) > .35
+
+    look.observe_single(_depth(stamp + 100), geometry, 800, stamp + 100)
+    command = look.command(geometry, .31, .8, 300, yaw_limits=(.35, .8))
+    assert -.35 <= command.yaw < 0.
+    assert look.active
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_command_only_scan_checks_obstacles_with_unseen_rear(monkeypatch, blocked):
+    look, geometry, free, occupied = _setup(monkeypatch)
+    free[:] = scan.FORWARD > 0.
+    row, col = scan.START
+    occupied[row + 4, col + 6] = blocked
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((1.,))
+    for stamp in range(1100, 1700, 100):
+        look.observe_single(_depth(stamp), geometry, 800, stamp)
+        result = look.command(geometry, .31, .83, 300, 800, min_yaw_rate=.33)
+        if result.yaw:
+            assert not blocked and result.yaw < 0.
+            break
+    assert look.issued_yaw is (not blocked)
+    assert look.active is (not blocked)
+
+
+@pytest.mark.parametrize("first", [-1., 1.])
+def test_command_only_scan_turns_to_the_far_side_of_its_original_heading(monkeypatch, first):
+    look, geometry, _, _ = _setup(monkeypatch)
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((first, -first))
+    yaw = heading = 0.
+    switched = False
+    for stamp in range(1100, 17000, 100):
+        look.observe_single(_depth(stamp), geometry, 800, stamp)
+        heading += yaw * .1
+        yaw = look.command(geometry, .31, .83, 300, 800, min_yaw_rate=.33,
+                           previous_yaw=yaw).yaw
+        if look.ready and not switched:
+            assert math.degrees(heading) == pytest.approx(-first * 20., abs=2.)
+            assert look.try_other_side()
+            switched = True
+        elif look.ready:
+            assert math.degrees(heading) == pytest.approx(first * 20., abs=2.)
+            return
+    pytest.fail("The other heading was never observed")
+
+
+def test_command_only_scan_reuses_the_current_view_after_turning(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+    look.observe_single(_depth(1000), geometry, 800, 1000)
+    assert look.begin((1.,))
+    look.phase = "turn"
+    look.timed_heading = look.turn_angle
+    look.observe_single(_depth(1000), geometry, 800, 1100)
+    assert look.command(geometry, .31, .83, 300).yaw == 0.
+    assert look.ready and look.side_frame == 1000
+
+
+def test_scan_slows_for_unexpected_yaw_rate(monkeypatch):
+    lookout, geometry, _, _ = _setup(monkeypatch)
+    _tick(lookout, geometry, 1000)
+    assert lookout.begin((-1., 1.))
+    _tick(lookout, geometry, 1050)
+    assert _tick(lookout, geometry, 1200).yaw > 0
+    assert 0. < _tick(lookout, geometry, 1250, wz=.55).yaw < .25
+    assert lookout.phase == "turn"
+
+
+def test_scan_time_limit_applies_even_with_fresh_frames_and_no_angular_progress(monkeypatch):
+    lookout, geometry, _, _ = _setup(monkeypatch)
+    _tick(lookout, geometry, 1000)
+    assert lookout.begin((-1., 1.))
+    _tick(lookout, geometry, 1050)
+    for stamp in range(1200, 9200, 200):
+        assert _tick(lookout, geometry, stamp).yaw > 0
+    assert _tick(lookout, geometry, 9200).yaw == 0
+    assert lookout.phase == "brake_for_replan"
+
+
+@pytest.mark.parametrize("at_stop", [1250, 1050, None, 0])
+def test_drift_before_first_yaw_can_replan_with_the_current_depth(monkeypatch, at_stop):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, source, vx=0.):
+        look.update(dict(_depth(stamp), source_frame_id=source),
+                    {**_odom(stamp), "received_ms": stamp, "vx": vx},
+                    geometry, receipt_only=True)
+        return look.command(geometry, .375, 1., 500)
+
+    tick(1000, 1000)
+    assert look.begin((1., -1.))
+    assert tick(1050, 1050).yaw == 0.
+    assert tick(1150, 1050, vx=.12).yaw == 0.
+    assert "重新规划" in tick(1250, at_stop).reason
+    assert not look.issued_yaw
+    assert look.begin((-1., 1.))
+
+
+def test_receipt_only_scan_keeps_turning_when_translation_has_no_collision(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, vx=0., vy=0., yaw=0.):
+        look.update(_depth(stamp), {"vx": vx, "vy": vy, "wz": yaw, "received_ms": stamp},
+                    geometry, receipt_only=True, max_depth_age_ms=800)
+        return look.command(geometry, .33, 1., 600, 800)
+
+    tick(1000)
+    assert look.begin((1., -1.))
+    assert tick(1050).yaw == 0.
+    assert tick(1150).yaw < 0.
+    assert tick(1250, vx=.113, vy=-.014, yaw=-.204).yaw < 0.
+    assert look.active
+    assert tick(1400, vx=-.006, vy=-.035).yaw < 0.
+    assert look.active and look.attempted
+
+
+@pytest.mark.parametrize("interruption", ["depth", "gap"])
+def test_interrupted_turn_can_replan_after_two_interruptions(monkeypatch, interruption):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, source, *, depth=True):
+        observation = dict(_depth(stamp), source_frame_id=source) if depth else None
+        hold = look.update(observation, dict(_odom(stamp), received_ms=stamp),
+                           geometry, receipt_only=True)
+        return hold or look.command(geometry, .33, 1., 600)
+
+    tick(1000, 10)
+    assert look.begin((-1.,), advance_m=1.5, route_segment=True)
+    assert tick(1100, 11).yaw == 0.
+    assert tick(1200, 12).yaw > 0.
+    stopped = 1550 if interruption == "gap" else 1300
+    assert tick(stopped, 13, depth=interruption != "depth").yaw == 0.
+    assert look.phase == "brake_for_replan" and look.attempted
+    assert tick(stopped + 100, 12 if interruption == "gap" else 13).replanned_turn
+    assert not look.active and not look.attempted and look.advance_m is None
+    assert look.begin((-1.,), advance_m=1.5, route_segment=True)
+    assert tick(stopped + 200, 17).yaw == 0.
+    assert tick(stopped + 300, 18).yaw > 0.
+    assert tick(stopped + 400, 19, depth=False).yaw == 0.
+    final = tick(stopped + 500, 20)
+    assert final.yaw == 0.
+    assert final.replanned_turn
+    assert look.begin((-1.,))
+
+
+def test_receipt_scan_allows_two_seconds_for_yaw_progress(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp):
+        look.update(_depth(stamp), {**_odom(stamp), "vy": -.039, "received_ms": stamp},
+                    geometry, receipt_only=True, max_depth_age_ms=800)
+        return look.command(geometry, .30, 1., 600, 800)
+
+    tick(1000)
+    assert look.begin((1., -1.))
+    assert tick(1050).yaw == 0.
+    assert tick(1150).yaw < 0.
+    for stamp in range(1250, 3050, 100):
+        assert tick(stamp).yaw < 0.
+    hold = tick(3050)
+    assert hold.yaw == 0. and "转向无实测进展" in hold.reason
+    # A subsequent missing frame must not make a stalled turn retryable.
+    look.update(None, {**_odom(3100), "received_ms": 3100},
+                geometry, receipt_only=True, max_depth_age_ms=800)
+    tick(3150)
+    assert tick(3300).yaw == 0.
+    assert not look.active and look.attempted and look.exhausted
+
+
+def test_turn_stall_is_detected_after_initial_measured_progress(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, wz=0.):
+        look.update(_depth(stamp), dict(_odom(stamp, wz), received_ms=stamp),
+                    geometry, receipt_only=True, max_depth_age_ms=800)
+        return look.command(geometry, .30, 1., 600, 800)
+
+    tick(1000)
+    assert look.begin((-1.,))
+    assert tick(1050).yaw == 0.
+    assert tick(1150).yaw > 0.
+    for stamp in (1250, 1350, 1450):
+        assert tick(stamp, .67).yaw > 0.
+    assert -look.pose[2] == pytest.approx(.201)
+    for stamp in range(1550, 3450, 100):
+        assert tick(stamp).yaw > 0.
+    hold = tick(3450)
+    assert hold.yaw == 0. and "转向无实测进展" in hold.reason
+
+
+@pytest.mark.parametrize("missing", ["depth", "odom", "poll_gap"])
+def test_receipt_scan_stops_then_replans_after_temporary_input_loss(monkeypatch, missing):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, depth=True, odom=True, wz=0.):
+        return look.update(_depth(stamp) if depth else None,
+                           {**_odom(stamp, wz), "received_ms": stamp} if odom else None,
+                           geometry, receipt_only=True, max_depth_age_ms=800)
+
+    update(1000)
+    assert look.begin((1., -1.))
+    update(1050)
+    assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
+    update(1150)
+    assert look.command(geometry, .33, 1., 600, 800).yaw < 0.
+    loss = 1500 if missing == "poll_gap" else 1250
+    hold = update(loss, depth=missing != "depth", odom=missing != "odom")
+    assert hold.yaw == 0. and look.active
+    for t, yaw in ((loss + 100, -.12), (loss + 200, 0.), (loss + 350, 0.)):
+        update(t, wz=yaw)
+        assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
+    assert not look.attempted and not look.has_result and not look.active
+    assert look.begin((-1., 1.))
+
+
+@pytest.mark.parametrize(("motion", "reason"), [
+    ((-.0028, -.0353, -.2373), "仍在转动，停车后重规划"),
+    ((.0936, -.0349, .0753), "检测到平移，停车后重规划"),
+])
+def test_receipt_scan_distinguishes_rotation_from_translation_while_stopping(monkeypatch, motion, reason):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, motion=(0., 0., 0.)):
+        vx, vy, wz = motion
+        return look.update(_depth(stamp), dict(vx=vx, vy=vy, wz=wz, received_ms=stamp),
+                           geometry, receipt_only=True)
+
+    update(1000)
+    assert look.begin((1.,))
+    assert look.command(geometry, .33, 1., 600).yaw == 0.
+    assert update(1358).yaw == 0.
+
+    assert update(1444, motion) is None
+    hold = look.command(geometry, .33, 1., 600)
+    assert hold.yaw == 0.
+    assert look.phase == "brake_for_replan"
+    assert hold.reason == f"主动观察：{reason}"
+
+
+@pytest.mark.parametrize("released", [True, False])
+def test_receipt_scan_replans_after_travel_and_depth_recovery(
+        monkeypatch, released):
+    """Tianyi 2.0, 2026-11-20 06:06:59: depth paused for 2.3 s while the scan's
+    straight segment had already covered 0.62 m. The replan hold must use
+    the current view once feedback is available."""
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, vx=0., depth=True):
+        return look.update(_depth(stamp) if depth else None,
+                           {"vx": vx, "vy": 0., "wz": 0., "received_ms": stamp},
+                           geometry, receipt_only=True, max_depth_age_ms=800)
+
+    update(1000)
+    assert look.begin((1., -1.), advance_m=1.)
+    update(1050)
+    assert look.command(geometry, .33, 1., 600, 800).yaw == 0.
+    update(1150)
+    assert look.command(geometry, .33, 1., 600, 800).yaw < 0.
+    look.phase, look.issued_yaw = "evaluate", True
+    if released:
+        look.advance_origin = look.pose
+    # 0.6 m of forward travel, as the policy's released straight segment produces.
+    for stamp in range(1250, 5300, 100):
+        assert update(stamp, vx=.15) is None
+    assert math.dist(look.pose[:2], look.origin[:2]) > .18
+    hold = update(5350, depth=False)
+    assert hold.yaw == 0. and "停车后重规划" in hold.reason and look.phase == "brake_for_replan"
+    for stamp in range(5450, 7650, 100):
+        assert update(stamp, depth=False).reason == hold.reason
+    assert update(7700) is None
+    first = look.command(geometry, .33, 1., 600, 800)
+    assert first.yaw == 0.
+    assert "重新规划" in first.reason
+    assert not look.active and not look.issued_yaw and not look.attempted
+
+
+@pytest.mark.parametrize("missing", ["depth", "odom"])
+def test_receipt_scan_retries_if_input_lapses_while_braking_before_first_turn(monkeypatch, missing):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, *, depth=True, odom=True, vx=0.):
+        return look.update(_depth(stamp) if depth else None,
+                           {**_odom(stamp), "received_ms": stamp, "vx": vx} if odom else None,
+                           geometry, receipt_only=True)
+
+    for stamp in range(1000, 1900, 100):
+        update(stamp, vx=.3)
+    assert look.pose[0] > .18
+    assert look.begin((-1., 1.))
+    assert not look.origin_set and not look.issued_yaw
+    update(1900, depth=missing != "depth", odom=missing != "odom")
+    assert look.phase == "brake_for_replan" and look.attempted
+
+    update(2000)
+    assert "已停稳，重新规划" in look.command(geometry, .33, 1., 600).reason
+    assert look.begin((-1., 1.))
+
+
+def test_scan_waits_for_the_odometry_bracket_instead_of_discarding_the_depth(monkeypatch):
+    lookout, geometry, _, _ = _setup(monkeypatch)
+    _tick(lookout, geometry, 1000)
+    assert lookout.begin((-1., 1.))
+    _tick(lookout, geometry, 1050)
+
+    waiting = lookout.update(_depth(1120), _odom(1100), geometry)
+    assert waiting.yaw == 0 and lookout.active
+    assert lookout.update(_depth(1220), _odom(1200), geometry) is None
+    assert lookout.current_frame == 1120
+    assert lookout.command(geometry, .33, .25, 600).yaw > 0
+
+
+def test_receipt_timed_scan_uses_latest_frame_without_waiting_for_odom(monkeypatch):
+    lookout, geometry, _, _ = _setup(monkeypatch)
+    for received, feedback in ((1120, 1100), (1220, 1200)):
+        observation = _depth(received)
+        observation.pop("capture_ms")
+        observation["receipt_timed"] = True
+        odom = {**_odom(feedback), "received_ms": feedback}
+        assert lookout.update(observation, odom, geometry, receipt_only=True) is None
+        assert lookout.current_frame == received
+
+
+def test_calibrated_view_fusion_is_reused_until_pose_changes_or_a_view_expires():
+    look = scan.ActiveScan()
+    hits = np.isclose(scan.FORWARD, 1.) & np.isclose(scan.RIGHT, 0.)
+    look.views.append((1000, look.pose, ~hits, hits))
+    look.poses.append((1100, look.pose, 0.))
+    _, occupied = look.observed_grid()
+    assert occupied.any()
+    assert look.observed_grid()[1] is occupied
+    look.poses.append((1200, look.pose, 0.))
+    assert look.observed_grid()[1] is occupied
+
+    look.pose = (.05, 0., 0.)
+    _, shifted = look.observed_grid()
+    assert not np.array_equal(shifted, occupied)
+    look.poses.append((1001 + scan.MAP_AGE_MS, look.pose, 0.))
+    assert not look.observed_grid()[1].any()
+
+
+def test_recent_grid_fusion_only_replaces_occupied_with_new_observed_free():
+    look = scan.ActiveScan()
+    empty = np.zeros(scan.SHAPE, dtype=bool)
+    cell = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+    look.views.append((1000, look.pose, empty, cell))
+    look.views.append((1100, look.pose, empty, empty))
+    look.poses.append((1100, look.pose, 0.))
+    assert np.array_equal(look.observed_grid()[1], cell)
+
+    look.views.append((1200, look.pose, cell, empty))
+    look.poses.append((1200, look.pose, 0.))
+    free, occupied = look.observed_grid()
+    assert np.array_equal(free, cell)
+    assert not occupied.any()
+
+    look.views.append((1300, look.pose, empty, cell))
+    look.poses.append((1300, look.pose, 0.))
+    free, occupied = look.observed_grid()
+    assert not free.any()
+    assert np.array_equal(occupied, cell)
+
+
+def test_scan_allows_an_unobserved_rear_sweep(monkeypatch):
+    lookout, geometry, visible, _ = _setup(monkeypatch)
+    visible[:] = scan.FORWARD > 0
+    _tick(lookout, geometry, 1000)
+    assert lookout.clear_sweep(geometry, .33, 0.)
+
+
+def test_s10_search_sweep_is_checked_against_hits_not_the_rear_grid_extent():
+    geometry = camera_square(object(), (480, 420, 243), .23)
+    occupied = np.zeros_like(scan.RIGHT, dtype=bool)
+    lookout = scan.ActiveScan()
+    assert lookout.clear_sweep(geometry, .23, 0., occupied=occupied)
+    occupied[scan.START[0] + 6, scan.START[1]] = True
+    assert not lookout.clear_sweep(geometry, .23, 0., occupied=occupied)
+
+
+def test_body_geometry_does_not_assume_the_camera_or_cloud_is_the_yaw_pivot():
+    geometry = camera_square(object(), (480, 420, 243), .23, at_front=True)
+    transform = geometry.base_from_optical.copy()
+    transform[:3, 3] = [.27, .04, .06]
+    inverse = np.linalg.inv(transform).tolist()
+    assert body_square(geometry, {"camera_optical_from_cloud": inverse,
+                                  "cloud_frame_id": "lidar_link"}) is None
+    mounted = body_square(geometry, {"camera_optical_from_cloud": inverse,
+                                     "cloud_frame_id": "base_link"})
+    np.testing.assert_allclose(mounted.base_from_optical, transform)
+    assert (geometry.front, geometry.rear) == (0., .46)
+    assert (mounted.front, mounted.rear) == (.23, .23)
+
+
+def test_front_camera_checks_the_body_behind_the_plan_origin():
+    from plugins.navi import local_path as grid
+
+    geometry = camera_square(object(), (480, 420, 243), .20, half_length=.23, at_front=True)
+    occupied = np.isclose(grid.FORWARD, .95) & np.isclose(grid.RIGHT, 0.)
+    # Stop at 0.80 m for a target 1.40 m ahead. The camera is already the
+    # front edge, so occupancy beyond the stopping point is outside the segment.
+    assert grid.segment_clear(occupied, geometry, .25, 0., 1.40 - .60)
+    occupied |= np.isclose(grid.FORWARD, .80) & np.isclose(grid.RIGHT, 0.)
+    assert not grid.segment_clear(occupied, geometry, .25, 0., 1.40 - .60)
+
+    occupied = np.isclose(grid.FORWARD, -.45) & np.isclose(grid.RIGHT, .25)
+    look = scan.ActiveScan()
+    assert not look.clear_sweep(geometry, .20, 0., occupied=occupied)
+
+
+@pytest.mark.parametrize("half_width", [.23, .35])
+@pytest.mark.parametrize("route_segment", [False, True])
+def test_receipt_only_scan_turns_with_only_front_depth(half_width, route_segment):
+    horizontal = HorizontalIntrinsics(640, 315, 337)
+    vertical = (480, 420, 243)
+    geometry = camera_square(horizontal, vertical, half_width)
+    tangent = (np.arange(480) - 243) / 420
+    floor = np.minimum(.42 / np.maximum(tangent - .02, .001), 4.0)
+    image = np.broadcast_to(floor[:, None], (480, 640)).copy()
+    look = scan.ActiveScan()
+    ground = ground_mask(image, horizontal, vertical)
+    assert ground is not None
+
+    for stamp in (1000, 1050, 1150):
+        look.update({"map": image, "ground": ground, "frame_id": stamp},
+                    {**_odom(stamp), "received_ms": stamp}, geometry, receipt_only=True)
+        if stamp == 1000:
+            assert look.begin((1.,), advance_m=1., route_segment=route_segment)
+        result = look.command(geometry, half_width, .18, 600)
+    assert result.yaw == -.18
+
+
+@pytest.mark.parametrize("initial_hit", [False, True])
+def test_receipt_only_sweep_uses_measured_cells_and_blocks_an_initial_hit(monkeypatch, initial_hit):
+    look, geometry, _, occupied = _setup(monkeypatch)
+    occupied[scan.START[0], scan.START[1] + 5] = initial_hit  # Cell straddles the side of the chassis.
+    for stamp in (1000, 1050, 1150):
+        look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp},
+                    geometry, receipt_only=True)
+        if stamp == 1000:
+            assert look.begin((1.,))
+        result = look.command(geometry, .25, .18, 600)
+    assert (result.yaw < 0) is (not initial_hit)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_scan_checks_the_circular_footprint_at_the_requested_rate(monkeypatch, blocked):
+    look, geometry, _, occupied = _setup(monkeypatch)
+    offset = 8 if blocked else 11
+    occupied[scan.START[0] + 3, scan.START[1] - offset] = True
+    for stamp in (1000, 1050, 1150):
+        look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp},
+                    geometry, receipt_only=True)
+        if stamp == 1000:
+            assert look.begin((1.,))
+        result = look.command(geometry, .33, 1., 600)
+    assert result.yaw == (0. if blocked else -1.)
+
+
+@pytest.mark.parametrize("at_front", [False, True])
+def test_dynamic_sweep_uses_the_body_diagonal_plus_the_width_based_margin(at_front):
+    from plugins.navi import local_path
+
+    front, rear = (0., .55) if at_front else (.275, .275)
+    geometry = Geometry(None, None, np.eye(4), front, rear, None)
+    center = -.275 if at_front else 0.
+    shape = local_path.SHAPE
+    envelope = local_path.motion_sweep_hits(np.ones(shape, dtype=bool), geometry, .275,
+                                           1.75, ((0., 0., 1.),))
+    radius = math.hypot(.275, .275) + .0275
+    half_cell = local_path.RESOLUTION / 2
+    df = np.maximum(0., abs(local_path.FORWARD - center) - half_cell)
+    dr = np.maximum(0., abs(local_path.RIGHT) - half_cell)
+    expected = df**2 + dr**2 <= radius**2
+    assert np.array_equal(envelope, expected)
+    forward = local_path.motion_sweep_hits(np.ones(shape, dtype=bool), geometry, .275,
+                                          1., ((.25, 0., 0.),))
+    assert forward.sum() > envelope.sum()
+    assert np.array_equal(forward & (local_path.FORWARD < center),
+                          envelope & (local_path.FORWARD < center))
+
+
+def test_sweep_stops_for_an_occupied_cell_that_straddles_the_footprint(monkeypatch):
+    look, _, _, occupied = _setup(monkeypatch)
+    geometry = Geometry(None, None, np.eye(4), .22, .23, None)
+    # This cell is centred at forward .20 m, left .30 m. It extends .005 m
+    # past the front edge and the right turn sweeps through the exposed part.
+    occupied[14, 22] = True
+    _tick(look, geometry, 1000)
+    assert look.begin((1.,))
+    _tick(look, geometry, 1050)
+    assert _tick(look, geometry, 1150).yaw == 0
+
+
+def test_receipt_only_scan_rejects_a_republished_depth_frame(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+    view = {**_depth(1000), "source_frame_id": 80_000}
+    look.update(view, {**_odom(1000), "received_ms": 1000}, geometry, receipt_only=True)
+    assert look.begin((1., -1.))
+    for stamp in (1050, 1150, 1250, 1350, 1450):
+        look.update({**view, "frame_id": stamp},
+                    {**_odom(stamp), "received_ms": stamp}, geometry, receipt_only=True)
+        look.command(geometry, .33, .18, 600)
+    assert look.current_frame == 1000
+    look.update({**view, "frame_id": 1550},
+                {**_odom(1550), "received_ms": 1550}, geometry, receipt_only=True)
+    assert look.current_frame == 0
+    assert look.phase == "brake_for_replan"
+
+
+def test_observed_turn_can_use_the_current_depth_after_turning(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def tick(stamp, source):
+        look.update(dict(_depth(stamp), source_frame_id=source),
+                    dict(_odom(stamp), received_ms=stamp), geometry, receipt_only=True)
+        return look.command(geometry, .25, 1., 600)
+
+    tick(1000, 10)
+    assert look.begin((-1.,), advance_m=1.)
+    assert tick(1100, 11).yaw == 0.
+    look.pose = (0., 0., -look.turn_angle)
+    assert tick(1200, 11).yaw == 0.
+    assert look.ready
+    assert look.side_frame == 1100
+
+
+def test_receipt_stamp_cannot_extend_the_life_of_repeated_odometry(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, source):
+        look.update(_depth(stamp), {**_odom(stamp), "received_ms": stamp,
+                                    "source_sample_id": source}, geometry, receipt_only=True)
+
+    update(1000, 1)
+    assert look.begin((1., -1.))
+    update(1050, 2)
+    assert look.command(geometry, .33, .18, 600).yaw == 0
+    update(1150, 3)
+    assert look.command(geometry, .33, .18, 600).yaw < 0
+    update(1250, 3)
+    update(1350, 3)
+    update(1450, 3)
+    assert look.phase == "brake_for_replan"
+
+
+def test_obstacle_evidence_survives_unknown_then_clears_only_on_measured_free_cells():
+    origin = PlanarPose(1000, ('room',), 0., 0., 0.)
+    moved = PlanarPose(1200, ('room',), .50, 0., 0.)
+    memory = scan.ObservedObstacles()
+    occupied = np.zeros(scan.SHAPE, dtype=bool)
+    occupied[scan.START[0] + 30, scan.START[1]] = True
+    memory.remember(origin, occupied)
+    reprojected = memory.project(moved)
+    assert reprojected[scan.START[0] + 20, scan.START[1]]
+    assert memory.project(PlanarPose(1250, ('room',), .50, 0., math.pi / 2))[
+        scan.START[0], scan.START[1] + 20]
+    assert memory.project(PlanarPose(1300, ('new',), 0., 0., 0.)) is None
+    assert memory.project(moved, observed_free=np.zeros_like(occupied)).any()
+    out_of_range = PlanarPose(1400, origin.frame, 10., 0., 0.)
+    assert not memory.project(out_of_range, observed_free=~occupied).any()
+    revisited = PlanarPose(1500, origin.frame, moved.x, moved.y, moved.yaw)
+    assert np.array_equal(memory.project(revisited), reprojected)
+    assert not memory.project(revisited, observed_free=reprojected.copy()).any()
+    assert not memory.cells
+
+
+def test_stopped_turn_that_passed_the_target_checks_the_actual_heading(monkeypatch):
+    look, geometry, _, _ = _setup(monkeypatch)
+
+    def update(stamp, yaw=0.):
+        look.update(_depth(stamp), {**_odom(stamp, yaw), "received_ms": stamp},
+                    geometry, receipt_only=True)
+        return look.command(geometry, .25, 1., 500, now_ms=stamp)
+
+    update(1000)
+    assert look.begin((1.,), advance_m=1.5, turn_angle=math.radians(26.57), route_segment=True)
+    assert update(1050).yaw == 0.
+    assert update(1150).yaw < 0.
+    look.pose = (0., 0., math.radians(32.))
+    assert update(1250, -.3).yaw == 0.
+    for stamp in range(1350, 1950, 100):
+        assert update(stamp).yaw == 0.
+    assert look.ready
+    assert math.degrees(look.pose[2]) > 30.
+
+
+@pytest.mark.parametrize("speed,turns", [(.072, True), (.10, False)])
+def test_scan_stop_tolerance_uses_buffered_odom_without_zeroing_velocity(monkeypatch, speed, turns):
+    look, geometry, _, _ = _setup(monkeypatch)
+    history = []
+
+    def tick(stamp, vx):
+        history.append((stamp, stamp, (vx, 0., 0.)))
+        odom = dict(_odom(stamp), vx=vx, received_ms=stamp, source_sample_id=stamp,
+                    velocity_history=tuple(history))
+        update = look.update(_depth(stamp), odom, geometry, receipt_only=True)
+        return update or look.command(geometry, .25, 1., 600, 800)
+
+    tick(1000, 0.)
+    assert look.begin((1.,), advance_m=1.5)
+    assert tick(1100, speed).yaw == 0.
+    result = tick(1200, speed)
+    assert bool(result.yaw) is turns
+    if turns:
+        assert look.pose[0] == pytest.approx(.2 * speed)
+        assert look.motion[0] == speed
+        assert look._turn_translation(1.45, look.motion) == pytest.approx(speed * 1.45)
+    else:
+        assert "等待底盘停稳" in result.reason
+
+
+def test_completed_view_prevents_repeated_observation_but_allows_route_alignment():
+    look = scan.ActiveScan()
+    look.receipt_only, look.current_frame = True, 1200
+    look.phase, look.directions, look.origin_set = "turn", (1.,), True
+    look.pose = (0., 0., scan.ANGLE)
+    look.poses.append((1200, look.pose, 0.))
+    clear = np.zeros(scan.SHAPE, dtype=bool)
+    look.views.append((1200, look.pose, clear, clear))
+    look.command(None, .3, .6, 300)
+    assert look.ready
+
+    look.finish()
+    look.note_clear_path(1200)
+    look.pose = (0., 0., 0.)
+    assert not look.begin((1.,))
+    assert look.begin((1.,), advance_m=.8, route_segment=True)
+
+
+def test_camera_near_obstacle_follows_relative_pose_through_a_blind_frame():
+    from plugins.navi.odom import PlanarPose
+
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    empty = np.zeros(scan.SHAPE, dtype=bool)
+    obstacle = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+
+    def view(stamp, x, y, yaw, free, hits):
+        pose = PlanarPose(stamp, ("odom", "body"), x, y, yaw)
+        look.current_frame = stamp
+        look.views.clear()
+        look.views.append((stamp, look.pose, free, hits))
+        depth = dict(frame_id=stamp, obstacle_capture_pose=pose)
+        look.update_near_obstacles(depth, geometry, pose, .30, 1.50, approaching=True)
+
+    for stamp in (1000, 1010, 1020):
+        view(stamp, 0., 0., 0., empty, obstacle)
+    view(1100, .30, 0., 0., empty, empty)
+    free, occupied = look.grid()
+    assert occupied[scan.START[0] + 10, scan.START[1]]
+    assert not free.any()
+
+    # Turning in place moves the hit out of the front image, not past the robot.
+    view(1200, .30, 0., math.pi, empty, empty)
+    assert look.near_obstacles.cells
+
+    view(1300, 3.35, -.40, 0., empty, empty)
+    assert not look.grid()[1].any()
+    assert look.near_obstacles.cells
+    view(1400, .30, 0., 0., empty, empty)
+    assert look.grid()[1][scan.START[0] + 10, scan.START[1]]
+
+    newly_clear = np.isclose(scan.FORWARD, .50) & (abs(scan.RIGHT) < .1)
+    view(1500, .30, 0., 0., newly_clear, empty)
+    assert not look.grid()[1].any()
+    assert not look.near_obstacles.cells
+
+
+def test_camera_near_obstacle_bootstraps_from_velocity_only_with_received_depth(monkeypatch):
+    look, geometry, free, hits = _setup(monkeypatch)
+    free[:] = False
+    hits[scan.START[0] + 16, scan.START[1]] = True
+    for stamp in (980, 990, 1000):
+        frame = dict(_depth(stamp), source_frame_id=124_000 + stamp)
+        first_odom = dict(_odom(stamp), received_ms=stamp, vx=.25)
+        look.update(frame, first_odom, geometry, receipt_only=True)
+        look.update_near_obstacles(frame, geometry, None, .30, 1.5, approaching=True)
+    assert look.near_obstacles.cells
+
+    hits = hits.copy()
+    hits[:] = False
+    monkeypatch.setattr(scan, "observe", lambda *args: (free, hits))
+    new_frame = dict(_depth(1200), source_frame_id=125_200)
+    new_odom = dict(_odom(1200), received_ms=1200, vx=.25)
+    look.update(new_frame, new_odom, geometry, receipt_only=True)
+    look.update_near_obstacles(new_frame, geometry, None, .30, 1.5, approaching=True)
+    assert look.grid()[1][scan.START[0] + 15, scan.START[1]]
+
+    # A repeated frame cannot clear the remembered obstacle.
+    clear = np.ones_like(hits)
+    monkeypatch.setattr(scan, "observe", lambda *args: (clear, hits))
+    repeat = dict(new_frame, frame_id=1250)
+    look.update(repeat, dict(_odom(1250), received_ms=1250), geometry, receipt_only=True)
+    look.update_near_obstacles(repeat, geometry, None, .30, 1.5, approaching=True)
+    assert look.near_obstacles.cells
+
+    newer = dict(_depth(1300), source_frame_id=125_300)
+    look.update(newer, dict(_odom(1300), received_ms=1300), geometry, receipt_only=True)
+    look.update_near_obstacles(newer, geometry, None, .30, 1.5, approaching=True)
+    assert not look.near_obstacles.cells
+
+
+def test_measured_free_survives_unknown_and_is_replaced_by_a_new_obstacle():
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    empty = np.zeros(scan.SHAPE, dtype=bool)
+    row, col = scan.START
+    first = empty.copy()
+    first[row + 16, col] = True
+    closer = empty.copy()
+    closer[row + 10, col] = True
+
+    def view(stamp, x, free, occupied):
+        pose = PlanarPose(stamp, ("odom", "body"), x, 0., 0.)
+        look.current_frame = stamp
+        look.views.clear()
+        look.views.append((stamp, look.pose, free, occupied))
+        depth = dict(frame_id=stamp, obstacle_capture_pose=pose)
+        look.update_near_obstacles(depth, geometry, pose, .30, 1.50, approaching=False)
+        return look.grid()
+
+    assert view(1000, 0., first, empty)[0][row + 16, col]
+    free, occupied = view(1100, .30, empty, empty)
+    assert free[row + 10, col]
+    assert not occupied.any()
+    assert not view(1200, 4.50, empty, empty)[0].any()
+    assert view(1300, .30, empty, empty)[0][row + 10, col]
+
+    free, occupied = view(1400, .30, empty, closer)
+    assert occupied[row + 10, col]
+    assert not free[row + 10, col]
+    # One hit and a repeated source are insufficient for memory.
+    view(1400, .30, empty, closer)
+    assert not look.near_obstacles.has_occupied
+    assert view(1500, .30, empty, empty)[0][row + 10, col]
+    for index in range(scan.FREE_TO_OCCUPIED_SAMPLES):
+        view(1600 + 100 * index, .30, empty, closer)
+        assert look.near_obstacles.has_occupied == (index + 1 == scan.FREE_TO_OCCUPIED_SAMPLES)
+    free, occupied = view(3000, .30, empty, empty)
+    assert occupied[row + 10, col]
+    assert not free[row + 10, col]
+
+    free, occupied = view(3100, .30, closer, empty)
+    assert free[row + 10, col]
+    assert not occupied.any()
+
+
+def test_camera_window_invalidates_far_free_without_storing_a_near_obstacle():
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25, at_front=True)
+    close = np.isclose(scan.FORWARD, .85) & np.isclose(scan.RIGHT, 0.)
+    far = np.isclose(scan.FORWARD, 1.60) & np.isclose(scan.RIGHT, 0.)
+    cells = close | far
+    empty = np.zeros_like(cells)
+
+    def view(stamp, free, occupied):
+        pose = PlanarPose(stamp, ("odom", "body"), 0., 0., 0.)
+        look.current_frame = stamp
+        look.views.clear()
+        look.views.append((stamp, look.pose, free, occupied))
+        depth = dict(frame_id=stamp, obstacle_capture_pose=pose)
+        look.update_near_obstacles(depth, geometry, pose, .30, 1.5, approaching=False)
+        return look.grid()
+
+    view(1000, cells, empty)
+    for index in range(scan.FREE_TO_OCCUPIED_SAMPLES):
+        _, occupied = view(1100 + 100 * index, empty, cells)
+        assert (occupied & cells).sum() == 2  # Both hits still matter in the current view.
+    free, occupied = view(2000, empty, empty)
+    assert np.array_equal(occupied, close)
+    assert not (free & cells).any()
+
+    free, occupied = view(2100, cells, empty)
+    assert np.array_equal(free, cells)
+    assert not occupied.any()
+
+
+@pytest.mark.parametrize("receipt_only", [True, False])
+@pytest.mark.parametrize("weak_returns", ["isolated", "vertical", "mixed_with_floor"])
+def test_projected_weak_depth_keeps_obstacle_until_supported_clearance(receipt_only, weak_returns):
+    look = scan.ActiveScan()
+    geometry = camera_square(HorizontalIntrinsics(80, 60, 40), (60, 90, 5), .25)
+    obstacle = np.full((60, 80), np.nan)
+    obstacle[10:50, 38:42] = .90
+    floor_depth = .42 * 90 / np.maximum(np.arange(60) - 5, 1)
+    floor = np.broadcast_to(floor_depth[:, None], obstacle.shape)
+    weak = floor.copy() if weak_returns == "mixed_with_floor" else np.full_like(obstacle, np.nan)
+    rows = {"isolated": slice(21, 26, 2), "vertical": slice(21, 24),
+            "mixed_with_floor": slice(21, 23)}
+    weak[rows[weak_returns], 40] = .90
+    center = (scan.START[0] + 18, scan.START[1])
+
+    def view(stamp, frame):
+        pose = PlanarPose(stamp, ("odom", "body"), 0., 0., 0.)
+        depth = dict(map=frame, frame_id=stamp, capture_ms=stamp,
+                     grid_projection=DepthProjection(frame, None), obstacle_capture_pose=pose)
+        odom = dict(_odom(stamp), received_ms=stamp)
+        accepted = look.update(depth, odom, geometry, receipt_only=receipt_only) is None
+        assert accepted == np.isfinite(frame).any()
+        look.update_near_obstacles(depth, geometry, pose, .30, 1.50, approaching=True)
+        return look.grid()
+
+    for stamp in (1000, 1100, 1200):
+        assert view(stamp, obstacle)[1][center]
+    assert look.near_obstacles.has_occupied
+    free, occupied = view(1300, weak)
+    assert look.views[-1][2][center]  # The planner can still see the measured cell.
+    assert not look.views[-1][3][center]
+    assert bool(look.observed_grid()[1][center]) is not receipt_only
+    assert occupied[center] and not free[center]
+    assert look.near_obstacles.has_occupied
+    assert not look.near_free[center]
+
+    free, occupied = view(1350, np.full_like(obstacle, np.nan))
+    assert occupied[center] and not free[center]
+
+    free, occupied = view(1400, floor)
+    assert free[center] and not occupied[center]
+    assert not look.near_obstacles.has_occupied
+    assert look.near_free[center]
+
+
+def test_one_aligned_free_observation_clears_memory_unless_view_still_hits():
+    origin = PlanarPose(1000, ("odom", "body"), 0., 0., 0.)
+    newer = PlanarPose(1100, origin.frame, .026, 0., 0.)
+    first = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+    free_center = np.isclose(scan.FORWARD, .75) & np.isclose(scan.RIGHT, 0.)
+    memory = scan.ObservedObstacles()
+    memory.remember(origin, first)
+    memory.remember_view(newer, free_center, first)
+    assert memory.has_occupied
+    memory.remember_view(newer, free_center, np.zeros_like(first))
+    assert not memory.has_occupied
+    assert memory.project_free(newer).any()
+
+
+def test_free_memory_cleans_far_cells_and_keeps_the_window_bounded():
+    memory = scan.ObservedObstacles()
+    origin = PlanarPose(1000, ("odom", "body"), 0., 0., 0.)
+    free = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+    memory.remember_view(origin, free, np.zeros_like(free))
+    shape = memory.free_cells.shape
+    assert np.array_equal(memory.project_free(origin), free)
+    far = PlanarPose(1200, origin.frame, 20., 0., 0.)
+    assert not memory.project_free(far).any()
+    assert memory.free_cells.shape == shape
+    assert not memory.project_free(origin).any()
+
+
+def test_new_obstacles_in_remembered_free_cells_are_evicted_with_the_window():
+    memory = scan.ObservedObstacles()
+    origin = PlanarPose(1000, ("odom", "body"), 0., 0., 0.)
+    far = PlanarPose(3000, origin.frame, 20., 0., 0.)
+    cell = np.isclose(scan.FORWARD, .80) & np.isclose(scan.RIGHT, 0.)
+    closer = np.isclose(scan.FORWARD, .75) & np.isclose(scan.RIGHT, 0.)
+    empty = np.zeros_like(cell)
+    memory.remember_view(origin, cell, empty)
+    for index in range(scan.FREE_TO_OCCUPIED_SAMPLES):
+        ahead = PlanarPose(1100 + 100 * index, origin.frame, .05, 0., 0.)
+        memory.remember_view(ahead, empty, closer)
+    assert np.array_equal(memory.project(ahead), closer)
+    assert not memory.cells
+    memory.project_free(far)
+    assert memory.project(ahead) is None
+
+
+def test_near_projection_origin_follows_the_retained_occupied_layer():
+    from plugins.navi.policy import dwa_memory_revision
+
+    look = scan.ActiveScan()
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25, at_front=True)
+    pose = PlanarPose(990, ("odom",), 0., 0., 0.)
+    look.near_obstacles.frame = pose.frame
+    look.near_obstacles.cells.add((10, 4))
+    look.update_near_obstacles(None, geometry, pose, .25, 2., approaching=False)
+    origin = replace(pose, x=.25)
+    assert look.near_projection_pose == origin
+    assert look.near_squares is not None and look.near_hits.any()
+
+    projection = look.near_projection
+    assert not projection.hits.flags.writeable and not projection.squares.centers.flags.writeable
+    moved = replace(look, near_projection=replace(projection, origin=replace(origin, y=.5)))
+    assert dwa_memory_revision(moved) != dwa_memory_revision(look)
+    squares, hits = look.near_squares, look.near_hits
+    look.invalidate()
+    look.update_near_obstacles(None, geometry, None, .25, 2., approaching=False)
+    assert look.near_projection_pose == origin
+    assert look.near_squares is squares and look.near_hits is hits
+
+    look.near_obstacles.cells.clear()
+    look.update_near_obstacles(None, geometry, pose, .25, 2., approaching=False)
+    assert look.near_projection_pose is None
+    assert look.near_squares is None and look.near_hits is None
+
+
+def test_camera_near_obstacle_can_use_continuous_relative_odometry_during_pose_gap():
+    from plugins.navi.odom import PlanarPose
+
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    empty = np.zeros(scan.SHAPE, dtype=bool)
+    obstacle = np.isclose(scan.FORWARD, .75) & np.isclose(scan.RIGHT, 0.)
+    initial = PlanarPose(1000, ("local", "body"), 10., 2., math.pi / 2)
+    for stamp in (1000, 1010, 1020):
+        capture = PlanarPose(stamp, initial.frame, initial.x, initial.y, initial.yaw)
+        look.current_frame = stamp
+        look.poses.append((stamp, look.pose, 0.))
+        look.views.append((stamp, look.pose, empty, obstacle))
+        look.update_near_obstacles(dict(frame_id=stamp, obstacle_capture_pose=capture),
+                                   geometry, capture, .3, 1.5, approaching=True)
+
+    look.pose = (.30, 0., 0.)
+    look.poses.append((1100, look.pose, 0.))
+    look.update_near_obstacles(None, geometry, None, .3, 1.5, approaching=False)
+    assert look.near_hits[scan.START[0] + 9, scan.START[1]]
+    assert look.near_revision == 1100
+
+
+def test_measured_overspeed_keeps_turn_and_reduces_next_burst():
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25)
+    clear = np.zeros(scan.SHAPE, dtype=bool)
+    look = scan.ActiveScan(receipt_only=True, current_frame=1200, phase="turn",
+                           origin_set=True, issued_yaw=True, directions=(1.,),
+                           turn_angle=math.radians(70), motion=(0., 0., -1.34), still_since=1000)
+    look.poses.append((1200, look.pose, -1.34))
+    look.views.append((1200, look.pose, clear, clear))
+    result = look.command(geometry, .30, 1., 500, 800)
+    assert -.99 < result.yaw < 0.
+    assert look.phase == "turn"
+
+
+def test_buffered_turn_cancels_only_the_burst_when_feedback_is_overspeed():
+    look = scan.ActiveScan(phase="turn", receipt_only=True, buffered_odom=True, directions=(1.,),
+                           turn_yaw=-.7, turn_angle=.7, advance_m=.8)
+    look.poses.append((1000, look.pose, -1.34))
+    history = ((1000, 1000, (0., 0., -1.34)),)
+    assert look.check_turn_feedback(history, 1000, 1.) == (scan.TURN_SPEED_REDUCTION, False)
+    assert look.active and look.advance_m == .8
+
+
+def test_observed_heading_survives_scan_reset_in_the_same_odometry_frame():
+    from plugins.navi.odom import PlanarPose
+
+    look = scan.ActiveScan()
+    seen = PlanarPose(1000, ("odom", "base"), 1., 2., -.35)
+    look.record_observation(seen)
+    look.invalidate()
+    look.observation_pose = PlanarPose(1100, seen.frame, 1., 2., 0.)
+    assert look._already_observed(look.pose, .35)
+    look.observation_pose = PlanarPose(1200, seen.frame, 1.25, 2., 0.)
+    assert not look._already_observed(look.pose, .35)
+    look.observation_pose = PlanarPose(1300, ("new-odom", "base"), 1., 2., 0.)
+    assert not look._already_observed(look.pose, .35)
+
+
+def test_front_camera_near_memory_rotates_about_the_base_centre():
+    from plugins.navi.odom import PlanarPose
+
+    look = scan.ActiveScan(receipt_only=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .25, at_front=True)
+    free = np.zeros(scan.SHAPE, dtype=bool)
+    obstacle = np.isclose(scan.FORWARD, .50) & np.isclose(scan.RIGHT, 0.)
+    capture = PlanarPose(1000, ("odom", "base"), 0., 0., 0.)
+    for stamp in (1000, 1010, 1020):
+        capture = PlanarPose(stamp, capture.frame, 0., 0., 0.)
+        look.current_frame = stamp
+        look.views.append((stamp, look.pose, free, obstacle))
+        look.update_near_obstacles(dict(frame_id=stamp, obstacle_capture_pose=capture),
+                                   geometry, capture, .30, 1.50, approaching=True)
+
+    turned = PlanarPose(1100, capture.frame, 0., 0., math.pi / 2)
+    look.update_near_obstacles(None, geometry, turned, .30, 1.50, approaching=False)
+    assert look.near_hits[scan.START[0] - 5, scan.START[1] + 15]
+    assert not look.near_hits[scan.START[0], scan.START[1] + 10]
+
+
+@pytest.mark.parametrize("speed,collision", [(.075, False), (.15, True)])
+def test_forward_sweep_uses_original_rotated_obstacle_after_it_leaves_view(speed, collision):
+    from plugins.navi import local_path
+
+    pose = PlanarPose(1795284451891, ("odom",), 9.38, -.71, -.28)
+    memory = scan.ObservedObstacles(frame=pose.frame, cells={(185, -23)})
+    raster, squares = memory.project(pose, include_squares=True)
+    assert raster.sum() == 4
+    geometry = Geometry(None, None, np.eye(4), 0., .55, None)
+    velocities = ((-.000305, 0., 0.), (.0375, 0., -.06249), (speed, 0., -.06249))
+    args = (geometry, .275, 1.75, velocities)
+    assert local_path.motion_sweep_hits(raster, *args, padding=.109 * speed).any()
+    assert bool(local_path.motion_sweep_hits(squares, *args, padding=.109 * speed).any()) is collision
+    assert memory.cells == {(185, -23)}
+
+
+def test_exact_square_sweep_keeps_a_cell_enclosed_by_the_center_envelope():
+    from plugins.navi import local_path
+
+    occupancy = local_path.ObstacleSquares(np.array([[.10, .10]]), math.pi / 4)
+    geometry = Geometry(None, None, np.eye(4), 0., 0., None)
+    assert local_path.motion_sweep_hits(occupancy, geometry, 0., 1., ((.30, 0., 0.), (0., -.30, 0.))).any()
+
+
+@pytest.mark.parametrize("right,blocked", [(.31, False), (.20, True)])
+def test_observation_checks_the_requested_finite_turn(monkeypatch, right, blocked):
+    from plugins.navi import local_path, policy
+    from test_navi_dwa_integration import advance_case
+    from plugins.navi.active_scan import NearProjection
+    config, state, depth, odom = advance_case(body=True)
+    config.wz_max = .08
+    config.floor_wz = .04
+    scan = state.active_scan
+    scan.phase, scan.route_segment, scan.advance_m = "turn", False, None
+    scan.origin = scan.pose
+    scan.near_projection = NearProjection(squares=local_path.ObstacleSquares(np.array([[0., right]]), .01),
+                                          stamp_ms=1000)
+    # The same view already started the scan. Only its angular command is due.
+    depth.update(frame_id=1000, control_ms=1000, source_frame_id=1000)
+    odom.update(received_ms=1000, source_sample_id=1000)
+    decision = policy.step(detections=None, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, dwa_admission_ms=100)
+    assert (decision.values[5] == 0.) == blocked
+    if not blocked:
+        assert decision.dwa_acceptance.motion_guard.check.accepted
+        assert decision.values[:2] == [0., 0.]
+
+
+def test_physical_memory_requires_three_views_and_complete_free_support():
+    memory = scan.ObservedObstacles()
+    empty = np.zeros(scan.SHAPE, bool)
+    measured = np.isclose(scan.FORWARD, .50) & np.isclose(scan.RIGHT, 0.)
+    base = PlanarPose(0, ("odom",), 0., 0., 0.)
+    for i, y in enumerate((.024, .026, .024)):
+        pose = replace(base, stamp_ms=1000 + 100*i, y=y)
+        memory.remember_view(pose, empty, measured, remember_occupied=measured, physical_support=True)
+        assert bool(memory.has_occupied) is (i == 2)
+    # The current centre snaps to exactly one original .05m world voxel.
+    assert memory.cells == {(10, 0)}
+    pose = replace(base, stamp_ms=1300, y=.026)
+    memory.remember_view(pose, measured, empty, clear=measured, physical_support=True)
+    assert memory.has_occupied
+    clear = measured | (np.isclose(scan.FORWARD, .50) & np.isclose(scan.RIGHT, .05))
+    memory.remember_view(pose, clear, empty, clear=clear, physical_support=True)
+    assert not memory.has_occupied
+
+
+def test_floorless_view_keeps_only_vertically_supported_hits_in_near_memory():
+    horizontal = HorizontalIntrinsics(640, 420., 320.)
+    geometry = camera_square(horizontal, (480, 420., 240.), .25, at_front=True)
+    image = np.zeros((480, 640))
+    image[445:475, 280:320] = .8
+    image[240:420, 340:380] = .8
+    active = scan.ActiveScan(receipt_only=True, keep_physical_views=True)
+
+    for stamp in (1000, 1100, 1200):
+        depth = dict(map=image, frame_id=stamp, source_frame_id=stamp, capture_ms=stamp)
+        odom = dict(_odom(stamp), received_ms=stamp, source_sample_id=stamp)
+        assert active.update(depth, odom, geometry, receipt_only=True) is None
+        active.update_near_obstacles(depth, geometry, None, .3, 1.5, approaching=True)
+
+    _, observed = active.observed_grid()
+    assert (observed & (scan.RIGHT < 0.)).any()
+    assert (observed & (scan.RIGHT > 0.)).any()
+    assert not (active.near_hits & (scan.RIGHT < 0.)).any()
+    assert (active.near_hits & (scan.RIGHT > 0.)).any()
+
+
+@pytest.mark.parametrize("capture_time", [True, False])
+def test_retained_receipt_view_requires_a_registered_exposure(capture_time):
+    look = scan.ActiveScan(receipt_only=True, keep_physical_views=True)
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .20, at_front=True)
+    for stamp in (1000, 1100):
+        depth = dict(map=np.full((8, 8), .60), frame_id=stamp, source_frame_id=stamp, control_ms=stamp)
+        if capture_time:
+            depth["capture_ms"] = stamp
+        odom = dict(vx=0., vy=0., wz=0., received_ms=stamp, source_sample_id=stamp)
+        assert look.update(depth, odom, geometry, receipt_only=True) is None
+        look.observed_grid()
+    assert len(look.views) == 1  # newest view alone supplies receipt-time routing
+    if capture_time:
+        assert len(look.registered_history) == 1
+        stamp, origin = look.registered_history[0][5]
+        assert stamp == origin.stamp_ms == 1000
+        assert origin.frame == ("navi_relative", look.motion_frame)
+        assert (origin.x, origin.y) == pytest.approx((.20, 0.))
+    else:
+        assert not look.registered_history
+
+
+@pytest.mark.parametrize("floor, expected", [(.1, -.125), (.2, 0.)])
+def test_observation_tries_a_checked_smaller_yaw_before_giving_up(monkeypatch, floor, expected):
+    look, geometry, _, _ = _setup(monkeypatch)
+    _tick(look, geometry, 1000)
+    assert look.begin((1.,))
+    _tick(look, geometry, 1050)
+    look.update(_depth(1150), _odom(1150), geometry)
+    tried = []
+
+    def check(command):
+        tried.append(command)
+        return command == (0., 0., -.125)
+
+    result = look.command(geometry, .33, .25, 600, min_yaw_rate=floor, check_motion=check)
+    assert result.yaw == expected
+    assert tried[0] == (0., 0., -.25)
+    assert all(abs(command[2]) >= floor for command in tried)
+
+
+def test_memory_recheck_uses_distinct_exposures_and_keeps_unseen_side():
+    active = scan.ActiveScan()
+    memory = active.near_obstacles
+    pose = PlanarPose(1000, ("odom",), 0., 0., 0.)
+    occupied = np.isclose(scan.FORWARD, .4) & np.isclose(scan.RIGHT, .3)
+    empty = np.zeros_like(occupied)
+    for source in (1, 1, 1, 2, 3, 3):
+        memory.remember_view(pose, empty, occupied, remember_occupied=occupied,
+                             physical_support=True, source_id=source)
+        assert memory.has_occupied == (source == 3)
+    active.near_projection = scan.NearProjection(origin=pose)
+    active.source_frame = 3
+    assert active.memory_recheck() is None
+    active.source_frame = 4
+    view = active.memory_recheck()
+    assert view["source_id"] == 3 and view["supporting_views"] == 3
+    assert view["right_m"] == pytest.approx(.3)
+    memory.remember_view(pose, occupied, empty, clear=occupied, physical_support=True, source_id=4)
+    assert not memory.has_occupied and active.memory_recheck() is None

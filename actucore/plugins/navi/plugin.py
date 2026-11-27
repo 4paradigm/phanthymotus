@@ -2,7 +2,7 @@
 
 Three wires in (what is there, how far away it is, and optionally how fast we
 are actually going) and one command stream out. The card's own job is small:
-negotiate once at start, then run `policy.step` on a timer and publish what it
+negotiate at start, then run `policy.step` on a timer and publish what it
 returns. All of the behaviour is in `policy.py`, all of the geometry in
 `depth.py`, and both are ROS-free so they can be tested without a robot.
 
@@ -32,20 +32,33 @@ an answer, so this one does, and pushes the ACP callback when it gets there.
 
 from __future__ import annotations
 
+from collections import deque
+from contextlib import nullcontext
+from copy import copy, deepcopy
 import json
 import logging
 import math
 import queue
+import sys
 import threading
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from statistics import median
+
+import numpy as np
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
+from . import dwa
+from . import camera as camera_mod
 from . import depth as depth_mod
+from . import motion
+from . import local_path
 from . import odom as odom_mod
 from . import policy as policy_mod
+from .track import COASTING, CONFIRMED, match_observation, observation_source, target_objects
+from .active_scan import ActiveScan, DEPTH_RECHECK_HOLD, TURN_SPEED_REDUCTION
 
 log = logging.getLogger(__name__)
 
@@ -58,11 +71,341 @@ TOPIC_FORMAT = "control/velocity"
 
 # How often the descriptor is echoed back into the stream. See next_command.
 _DESCRIPTOR_EVERY = 50
+_DWA_LOG_EVERY = 100
+
+
+def _decision_log(trace):
+    # logsafe caps lines at about 4 KiB. Report route corners instead of every
+    # collinear grid sample; the card state retains the original references.
+    record = trace.copy()
+    for key in ("reference", "topology_reference"):
+        if not record.get(key):
+            continue
+        corners = []
+        for f, r in record[key]:
+            point = (round(1000 * f), round(1000 * r))
+            if corners and corners[-1] == point:
+                continue
+            if len(corners) >= 2:
+                a, b = corners[-2:]
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                nx, ny = point[0] - b[0], point[1] - b[1]
+                if dx * ny == dy * nx and dx * nx + dy * ny > 0:
+                    corners.pop()
+            corners.append(point)
+        record[key] = [(x / 1000, y / 1000) for x, y in corners]
+    message = json.dumps(record, ensure_ascii=False)
+    if len(message.encode()) > 3800:
+        # Keep a parseable decision and its aggregate rejection counts even
+        # for long winding paths and repeated searches.
+        for key in ("topology_reference", "reference", "attempts"):
+            if key in record:
+                record[key + "_count"] = len(trace[key] or ())
+                del record[key]
+        message = json.dumps(record, ensure_ascii=False)
+    return message
+
+
+def _motion_inputs(objects, depth, odom):
+    depth, odom = depth or {}, odom or {}
+    return ((local_path.array_revision(depth.get("map")), local_path.array_revision(depth.get("ground")),
+             local_path.array_revision(depth.get("body_from_optical")), depth.get("obstacle_capture_pose"),
+             depth.get("source_frame_id", depth.get("frame_id")), depth.get("mount_accuracy_validated"),
+             depth.get("capture_ms"), depth.get("capture_invalid"), depth.get("body_mount_required"),
+             depth.get("front_flank_ms"), depth.get("blind_passing_flank_ms"), depth.get("obstacle_driver_ms"),
+             depth.get("obstacle_driver_pose")),
+            (odom_mod.planar_feedback(odom), odom.get("source_sample_id", odom.get("received_ms")),
+             odom.get("stamp_ms"), odom.get("motion_pose"), odom.get("obstacle_pose"),
+             tuple(odom.get("velocity_history", ()))),
+            ((objects.get("timestamp"), tuple(
+                (obj.get("name"), policy_mod.hue_of(obj), obj.get("confidence"), tuple(obj.get("position") or ()),
+                 tuple(obj.get("bbox_norm") or ())) for obj in objects.get("objects") or ()))
+             if isinstance(objects, dict) else None))
+
+
+def _only_expired_views(before, after, now_ms):
+    """Dropping expired oldest obstacle layers cannot invalidate the earlier sweep."""
+    if before == after:
+        return True
+    if not before or not after or before[:-1] != after[:-1]:
+        return False
+    previous, current = before[-1], after[-1]
+    removed = len(previous) - len(current)
+    if not current or removed <= 0 or previous[removed:] != current:
+        return False
+    return all(now_ms - (view[4][0][0] if view[4] else view[0]) > policy_mod.MAP_AGE_MS
+               for view in previous[:removed])
+
+
+def _feedback_pose_jump(before, after, gap_ms, config):
+    """A new stamp within a continuous interval cannot rebase the world by metres."""
+    if not before or before[1] == after[1]:
+        return False
+    old, new = before[1], after[1]
+    if old[1] is None or new[1] is None or not 0 <= new[1] - old[1] <= gap_ms:
+        return False
+    if not old[5] or not new[5] or old[5][-1] not in new[5] or new[5][-1][1] != new[1]:
+        return False
+    overlap = new[5].index(old[5][-1]) + 1
+    if (new[5][:overlap] != old[5][-overlap:] or overlap == len(new[5]) or old[5][-1][1] != old[1]
+            or any(row[2] is None for row in new[5][overlap:])):
+        return False
+    rates = [row[2] for row in new[5] if row[2] is not None]
+    speed = max([math.hypot(config.vx_max, config.vy_max)] + [math.hypot(*v[:2]) for v in rates])
+    yaw_rate = max([config.wz_max] + [abs(v[2]) for v in rates])
+    for previous, current in zip(old[3:5], new[3:5]):
+        if (previous is None or current is None or previous.frame != current.frame
+                or not 0 <= current.stamp_ms - previous.stamp_ms <= gap_ms):
+            continue
+        # The full tolerated sampling interval accommodates asynchronous speed
+        # and pose reports. A grid cell absorbs translational quantisation.
+        if (math.hypot(current.x - previous.x, current.y - previous.y) > speed * gap_ms / 1000 + local_path.RESOLUTION
+                or abs(math.remainder(current.yaw - previous.yaw, math.tau)) > yaw_rate * gap_ms / 1000 + 1e-9):
+            return True
+    return False
+
+
+def _continuous_feedback_update(before, after, max_gap_ms, *, stationary, unchanged=False, speed_only=False):
+    """Verify overlapping, ordered feedback in one pose frame and an unchanged scene."""
+    if before[0] != after[0] or before[2] != after[2]:
+        return False
+    old_twist, old_id, old_stamp, old_pose, old_obstacle, old_history = before[1]
+    twist, sample_id, stamp, pose, obstacle, history = after[1]
+    stopped = (0., 0., 0.)
+    if (old_twist is None or twist is None or (stationary and not old_twist == twist == stopped)
+            or (unchanged and old_twist != twist)
+            or old_id is None or sample_id is None
+            or not 0 <= sample_id - old_id <= max_gap_ms or not old_history or not history
+            or (not speed_only and (pose is None or old_pose is None))
+            or (stamp is None) != (old_stamp is None)
+            or (stamp is not None and not 0 <= stamp - old_stamp <= max_gap_ms)):
+        return False
+    rates = [row[2] for row in history if row[2] is not None]
+    if not rates:
+        return False
+    # Pose and speed are sampled separately. Even the entire allowed input
+    # gap at the largest measured rate must reach the new pose in this frame.
+    reach = max_gap_ms / 1000 * max(math.hypot(*v[:2]) for v in rates)
+    turn = max_gap_ms / 1000 * max(abs(v[2]) for v in rates)
+    for previous, current in ((old_pose, pose), (old_obstacle, obstacle)):
+        if previous is None and current is None:
+            continue
+        if (previous is None or current is None or not 0 <= current.stamp_ms - previous.stamp_ms <= max_gap_ms
+                or previous.frame != current.frame
+                or ((stationary or unchanged or previous.stamp_ms == current.stamp_ms)
+                    and replace(previous, stamp_ms=current.stamp_ms) != current)
+                or math.hypot(current.x - previous.x, current.y - previous.y) > reach
+                or abs(math.remainder(current.yaw - previous.yaw, math.tau)) > turn):
+            return False
+    if old_history[-1] not in history:
+        return False
+    overlap = history.index(old_history[-1]) + 1
+    if ((sample_id == old_id and (stamp != old_stamp or overlap == len(history)))
+            or history[:overlap] != old_history[-overlap:] or old_history[-1][1:] != (old_id, old_twist)
+            or history[-1][1:] != (sample_id, twist)):
+        return False
+    receipt, source, _ = old_history[-1]
+    for next_receipt, next_source, next_twist in history[overlap:]:
+        if (next_source is None or not 0 <= next_source - source <= max_gap_ms
+                or not 0 <= next_receipt - receipt <= max_gap_ms or next_twist is None
+                # Pose can advance while the producer repeats its last speed
+                # sample. The same speed stamp cannot identify different rates.
+                or (sample_id == old_id and next_twist != old_twist)
+                or (stationary and next_twist != stopped) or (unchanged and next_twist != old_twist)):
+            return False
+        receipt, source = next_receipt, next_source
+    return True
+
+
+def _feedback_within_sweep(proof, revision, values, max_gap_ms):
+    """Did only odometry advance, with every newer rate inside this sweep's speeds?
+
+    A sweep is admitted until its deadline, which already allows its feedback
+    sample to age. Its modeled response stays between the measured, wire and
+    commanded rates on each axis. A continuous newer report inside that span
+    does not contradict it. One outside the span has to be swept.
+    """
+    before = proof.input_revision
+    if before is None or not _continuous_feedback_update(before, revision, max_gap_ms, stationary=False):
+        return False
+    guard = proof.motion_guard
+    command = tuple(values[i] for i in (0, 1, 5))
+    spans = tuple((min(axis), max(axis)) for axis in zip(guard.measured, guard.previous, command))
+    history = revision[1][5]
+    newer = history[history.index(before[1][5][-1]) + 1:]
+    return all(low <= rate <= high for _, _, twist in newer for rate, (low, high) in zip(twist, spans))
+
+
+def _slower_forward_within_sweep(proof, revision, max_gap_ms):
+    room = proof.forward_feedback_room_m
+    before = proof.input_revision
+    if room is None or not _continuous_feedback_update(before, revision, max_gap_ms, stationary=False):
+        return False
+    old, new = before[1], revision[1]
+    guard = proof.motion_guard
+    footprint = guard.footprint
+    radius = math.hypot(max(footprint.front, footprint.rear) + footprint.clearance_margin_m,
+                        footprint.half_width + footprint.clearance_margin_m)
+    reach = radius + guard.trace.body_travel_m + guard.trace.delay_travel_error + math.hypot(*guard.trace.camera_offset)
+    for a, b in zip(old[3:5], new[3:5]):
+        if a is None and b is None:
+            continue
+        turn = abs(math.remainder(a.yaw - b.yaw, math.tau))
+        if math.hypot(a.x - b.x, a.y - b.y) + reach * turn > room:
+            return False
+    history = new[5]
+    first = history.index(old[5][-1]) + 1
+    return all(0 <= vx <= old[0][0] and vy == wz == 0. for _, _, (vx, vy, wz) in history[first:])
+
+
+def _speed_only_feedback_within_sweep(proof, revision, values, max_gap_ms, now_ms):
+    before, guard = proof.input_revision, proof.motion_guard
+    room = proof.forward_feedback_room_m
+    if (room is None or before is None or guard.pose is None or guard.pose.frame[0] != "navi_relative"
+            or before[1][3:5] != (None, None) or revision[1][3:5] != (None, None)
+            or not _continuous_feedback_update(before, revision, max_gap_ms, stationary=False,
+                                               unchanged=True, speed_only=True)):
+        return False
+    elapsed = (now_ms - guard.checked_ms) / 1000
+    rates = guard.measured, guard.previous, tuple(values[i] for i in (0, 1, 5))
+    footprint = guard.footprint
+    radius = math.hypot(max(footprint.front, footprint.rear) + footprint.clearance_margin_m,
+                        footprint.half_width + footprint.clearance_margin_m)
+    reach = radius + guard.trace.body_travel_m + guard.trace.delay_travel_error + math.hypot(*guard.trace.camera_offset)
+    # Bound how far any point on the swept footprint can shift between
+    # checking and writing, including rotation about the body pivot.
+    shift = max(math.hypot(*v[:2]) for v in rates) + reach * max(abs(v[2]) for v in rates)
+    return 0 <= elapsed and elapsed * shift <= room
+
+
+@dataclass(frozen=True)
+class _ForwardCheck:
+    geometry: local_path.Geometry
+    frame_id: int
+    source_id: int | None
+    target_ms: int
+    distance_m: float | None
+    previous_twist: tuple
+    mount_frame: tuple | None
+    feedback_source: int | None
+    feedback_ms: int | None
+    remembered: object
+    remembered_ms: int
+    occupied: object = None
+    remembered_squares: local_path.ObstacleSquares | None = None
+    guard_horizon_s: float = 0.
+    renewable: bool = True
+    checked_ms: int | None = None
+    motion_guard: policy_mod.DwaMotionGuard | None = None
+    target: str = ""
+    target_source: object = None
+    front_required: bool = False
+    target_receipt_ms: int = 0
+    input_revision: tuple | None = None
+    memory_revision: tuple | None = None
+    target_revision: tuple | None = None
+    depth_ms: int = 0
+    planning_guard: policy_mod.DwaMotionGuard | None = None
+    target_capture_ms: int | None = None
+    target_detection: tuple | None = None
+    direct_association: tuple | None = None
+    direct_vx: float | None = None
+    forward_feedback_room_m: float | None = None
+    bearing_only: bool = False
+    camera_passage: policy_mod.CameraPassage | None = None
+    target_source_ms: int | None = None
+    straight_handoff: policy_mod.DwaAcceptance | None = None
+    straight_forward: bool = False
+
+    def matches_target_receipt(self, receipt_ms):
+        return (self.planning_guard.association is None or self.target_source is not None
+                or receipt_ms == self.target_receipt_ms)
+
+
+@dataclass(frozen=True)
+class _DecisionIdentity:
+    decision_id: int
+    epoch: int
+    state_id: int
+    target: str
+    action_id: str
+    veto_reason: str | None = None
+    expired_route: bool = False
+    discarded_proposal: bool = False
+
+
+@dataclass(frozen=True)
+class _DwaOrigin:
+    acceptance: policy_mod.DwaAcceptance
+    epoch: int
+    state_id: int
+    target: str
+    action_id: str
+    constraints: tuple
+    generation: int | None
+    forward_check: _ForwardCheck | None = None
+    handoff: bool = False
+    tracking_command: tuple | None = None
+
+    @property
+    def diagnostic(self):
+        return _DecisionIdentity(self.acceptance.decision_id, self.epoch, self.state_id, self.target, self.action_id)
+
+    @property
+    def identity(self):
+        return self.epoch, self.state_id, self.acceptance.decision_id
+
+
+@dataclass
+class _ScheduledCommand:
+    message: dict
+    expires_ms: int
+    expires_at: float
+    turn: ActiveScan | None
+    sent: bool = False
+    leg: policy_mod.PathLeg | None = None
+    feedback: ActiveScan | None = None
+    depth_grid: tuple | None = None  # source identity, observation time, projected cells, occlusion
+    checked_pose: tuple | None = None
+    previous_motion: tuple = (0., 0.)
+    forward_check: _ForwardCheck | None = None
+    command_only: bool = False
+    camera_arc_end_ms: int | None = None
+    successor: _ScheduledCommand | None = None
+    camera_successor_frame: int = 0
+    dwa_origin: _DwaOrigin | None = None
+    diagnostic: _DecisionIdentity | None = None
+    stop_reason: str | None = None
+    expiry_stop_reason: str | None = None
+    repeat_until: tuple[int, float] | None = None
+    previous_route: _ScheduledCommand | None = None
+    checking: bool = False
+    checking_new_target: bool = False
+    retry_after_rejection: bool = False
+    predicted_depth_ms: int | None = None
+
+
+@dataclass(frozen=True)
+class _PredictedRouteCheck:
+    work: _ScheduledCommand
+    revision: tuple
+    objects_ms: int
+    observation_ms: int
+    deadline_ms: int
+    depth_ms: int
+    coast_end_ms: int | None = None
+    motion_bounds: tuple | None = None
 
 # A direct hardware depth topic is allowed to come up after Navi.  Do not wait
 # in ``start`` (that would turn an upstream loading delay into a canvas-wide
 # timeout), but do not leave an untyped input retrying forever either.
 _DEPTH_TYPE_WAIT_S = 5.0
+_UNSENT_TURN = "主动观察：首条转向指令剩余窗口短于控制周期"
+_DISCARD_WITHOUT_STOP = frozenset((
+    "publish_expired", "stale_observation", "superseded", "no_feedback",
+    "geometry_mismatch", "target_range_unavailable", "route_end",
+    "publish_error", "planning_error", "postcheck_veto",
+))
 
 # The six twist axes. **The order is fixed by the protocol** — motus.control/1's
 # MODES comment, loco_servo's AXIS_NAMES on the driver side and motus.odom/1's
@@ -89,7 +432,20 @@ _IGNORED_LEGACY_FIELDS = frozenset(("k_yaw", "k_fwd", "adaptive_k_yaw",
                                     "stop_tolerance_m"))
 
 
-def _sensor_qos():
+def _policy_config(settings: dict) -> policy_mod.Config:
+    # Restore the fixed margin from existing deployment YAML when it is valid.
+    margin = settings.get("clearance_margin_m")
+    if type(margin) not in (int, float) or not 0 <= margin <= sys.float_info.max:
+        margin = None
+    return policy_mod.Config(_clearance_margin_override_m=margin, **{
+        k: v for k, v in settings.items()
+        if (k in policy_mod.Config.__dataclass_fields__
+            and k not in ("stop_tolerance_m", "motion_acceleration", "motion_braking", "lateral_step",
+                          "_clearance_margin_override_m"))
+    })
+
+
+def _sensor_qos(depth=2):
     """BEST_EFFORT, to match what every producer this card reads actually uses.
 
     **A reliable subscriber does not match a best-effort publisher.** ROS2 treats
@@ -112,7 +468,7 @@ def _sensor_qos():
 
     return QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                       history=HistoryPolicy.KEEP_LAST,
-                      depth=2,
+                      depth=depth,
                       durability=DurabilityPolicy.VOLATILE)
 
 
@@ -121,6 +477,9 @@ class NaviPlugin:
 
     def __init__(self, plugin_cfg: dict, executor, namespace: str = ""):
         self._cfg = dict(plugin_cfg or {})
+        # DWA is standard for every card. Normalize the retired selector from
+        # startup YAML and saved instances before starts rebuild the Config.
+        self._cfg["local_controller"] = "dwa"
         self._executor = executor
         self._namespace = (namespace or "").strip("/")
         self._topic = self._cfg.get("topic") or DEFAULT_TOPIC
@@ -138,9 +497,11 @@ class NaviPlugin:
         # other plugin here that holds per-instance state.
         self._lock = threading.RLock()
         self._descriptor: dict = {}
+        self._descriptor_changed = False
         self._node = None
         self._publisher = None
         self._timer = None
+        self._command_timer = None
         self._running = False
         self._starting = False
         self._start_cancelled = False
@@ -152,12 +513,29 @@ class NaviPlugin:
         self._last_error = ""
         self._last_decision = None
         self._last_tick = 0.0
+        self._command_window = (0., 0.)
+        # The velocity timer never takes the planner's lock.
+        self._output_lock = threading.RLock()
+        self._scheduled_command = None
+        self._pending_route = None
+        self._staged_forward_check = None
+        self._staged_diagnostic = None
+        self._staged_dwa_command = None
+        self._dwa_last_published = None
+        self._dwa_publication = None
+        self._dwa_decision_log_state = None
+        self._dwa_veto_detail = None
+        self._wire_diagnostic = None
+        self._wire_dwa_origin = None
+        self._output_epoch = 0
+        self._output_blocked = False
+        self._output_stop = None
+        self._wire_seq = 0
+        self._can_replan_search = False
+        self._wire_moving = False
+        self._wire_twist = None
 
-        self._config = policy_mod.Config(**{
-            k: v for k, v in self._cfg.items()
-            if (k in policy_mod.Config.__dataclass_fields__
-                and k != "stop_tolerance_m")
-        })
+        self._config = _policy_config(self._cfg)
         self._state = policy_mod.State()
 
         # Observations. A separate lock from `_lock`: these are written by ROS
@@ -184,13 +562,31 @@ class NaviPlugin:
         # A deque rather than a list: this is written every frame on the hot
         # path and has to be bounded — a card left running for an hour should
         # not be holding thirty thousand frames of detections.
-        from collections import deque
         self._recent = deque(maxlen=int(self._cfg.get("stable_frames", 10)))
         self._depth_map = None
+        self._depth_ground = None
+        self._depth_projection = None
+        self._depth_front_flank_ms = (None, None)
+        self._depth_passing_flanks = ((None, False), (None, False))
+        self._depth_vertical = None
         self._depth_bands = {}
         self._depth_ms = 0
+        self._depth_source_ms = None
+        self._depth_source_ns = None
+        self._depth_vendor = {}
+        self._lateral_depth_reference = None
+        self._lateral_pose_bias = 0.
+        self._mounts = {}
+        self._obstacle_poses = deque(maxlen=32)
         self._odom = None
         self._odom_ms = 0
+        self._odom_received_ms = 0
+        self._odom_source_ms = None
+        self._velocity_history = deque(maxlen=32)
+        self._received_speed_samples = deque(maxlen=2)
+        self._motion_pose = None
+        self._pose_feedback = None
+        self._odom_stamp_verified = False
         self._odom_interface = {}
         self._odom_max_age_ms = int(self._config.max_obs_age_ms)
         self._binding = {}
@@ -215,8 +611,7 @@ class NaviPlugin:
         tuning_properties = {
             "stop_distance_m": {"type": "number", "minimum": 0,
                                 "title": "目标停止距离 stop_distance_m（m）",
-                                "description": "期望停在目标前的距离，按相机到目标"
-                                               "计算；到达距离阈值为此值加停止容差"},
+                                "description": "从任意方向接近时，期望相机与目标保持的距离，并朝向目标"},
         }
         stop_tolerance_spec = {
             "type": "number", "minimum": 0,
@@ -224,8 +619,7 @@ class NaviPlugin:
             "title": "本次停止距离容差 stop_tolerance_m（m）",
             "description": "仅覆盖本次 navigate_to；不写入卡片配置。"
                            "未填时每次恢复 0.05m，用于容纳相机测距误差。"
-                           "距离不大于停止距离加该容差时满足距离条件，"
-                           "仍需有效观测及原有对正条件。",
+                           "实测距离须落在停止距离加减该容差的范围内，并朝向目标。",
         }
         for key, spec in tuning_properties.items():
             spec["default"] = self._cfg.get(
@@ -318,8 +712,18 @@ class NaviPlugin:
                     "rate_hz": {"type": "number", "default": 10,
                                 "description": "指令频率，Hz。会被下游的 max_hz 夹住",
                                 "scope": "instance"},
+                    "dwa_horizon_s": {
+                        "type": "number", "minimum": .2, "maximum": 3.,
+                        "default": self._cfg.get("dwa_horizon_s", 1.2),
+                        "description": "DWA 轨迹预测时长（秒）",
+                        "scope": "instance"},
+                    "dwa_samples": {
+                        "type": "integer", "minimum": 1, "maximum": 256,
+                        "default": self._cfg.get("dwa_samples", 64),
+                        "description": "每次局部规划最多验证的 DWA 速度候选数量",
+                        "scope": "instance"},
                     "obstacle_stop_m": {"type": "number",
-                                        "default": self._cfg.get("obstacle_stop_m", 0.6),
+                                        "default": self._cfg.get("obstacle_stop_m", policy_mod.Config.obstacle_stop_m),
                                         "description": "正前方障碍近于这个距离就完全"
                                                        "不前进（米）。达到或超过到达"
                                                        "距离阈值时，目标可能先被当作"
@@ -443,11 +847,7 @@ class NaviPlugin:
         # Rebuild the effective policy configuration for every start.
         # adopt_limits mutates its input; reusing the previous Config would
         # preserve the former chassis's yaw and velocity restrictions.
-        self._config = policy_mod.Config(**{
-            k: v for k, v in self._cfg.items()
-            if (k in policy_mod.Config.__dataclass_fields__
-                and k != "stop_tolerance_m")
-        })
+        self._config = _policy_config(self._cfg)
         self._limit_notes = policy_mod.adopt_limits(self._config, descriptor)
         self._response_notes = policy_mod.adopt_response(self._config, descriptor)
 
@@ -470,7 +870,37 @@ class NaviPlugin:
             self._paused = False
             self._last_error = ""
             self._state = policy_mod.State()
+            self._last_tick = 0.
+            self._command_window = (0., 0.)
             self._running = True
+
+        with self._obs_lock:
+            self._image_jpeg = None
+            self._image_ms = 0
+            self._depth_map = None
+            self._depth_ground = None
+            self._depth_projection = None
+            self._depth_front_flank_ms = (None, None)
+            self._depth_passing_flanks = ((None, False), (None, False))
+            self._depth_vertical = None
+            self._depth_bands = {}
+            self._depth_ms = 0
+            self._depth_source_ms = None
+            self._depth_source_ns = None
+            self._depth_vendor = {}
+            self._lateral_depth_reference = None
+            self._lateral_pose_bias = 0.
+            self._mounts.clear()
+            self._obstacle_poses.clear()
+            self._odom = None
+            self._odom_ms = 0
+            self._odom_received_ms = 0
+            self._odom_source_ms = None
+            self._velocity_history.clear()
+            self._received_speed_samples.clear()
+            self._motion_pose = None
+            self._pose_feedback = None
+            self._odom_stamp_verified = False
 
         try:
             self._open_publisher()
@@ -500,6 +930,34 @@ class NaviPlugin:
             return self._error(camera_problem)
 
         self._binding = binding
+        from .camera import for_topic
+        from .local_path import body_square, camera_square
+        footprint = descriptor.get("footprint") or {}
+        half_width = footprint.get("half_width")
+        valid_width = (type(half_width) in (int, float)
+                       and math.isfinite(half_width) and half_width > 0)
+        if binding.get("depth_map") and valid_width:
+            self._config.local_geometry = camera_square(
+                self._config.depth_intrinsics, self._depth_vertical, half_width,
+                half_length=footprint.get("half_length"), at_front=True)
+            depth_decl = for_topic(args.get("camera_info"), binding["depth_map"])
+            self._config.scan_geometry = body_square(self._config.local_geometry,
+                                                     depth_decl.get("vendor"))
+            if self._config.scan_geometry is None:
+                self._camera_notes.append("主动观察以相机作为底盘前缘，按最新有效单视角规划")
+            else:
+                half_length = self._config.scan_geometry.half_length
+                self._config.local_geometry = replace(self._config.local_geometry,
+                                                      front=half_length, rear=half_length)
+        self._config.local_planning = bool(
+            binding.get("depth_map") and (binding.get("odom") or self._config.local_geometry is not None))
+        if self._config.local_geometry is not None:
+            # Local path search can miss several command periods. Its swept
+            # motion already budgets the full downstream watchdog interval.
+            self._ttl_ms = negotiate.ttl_ms(rate, descriptor, periods=4.)
+        self._config.odom_expected = bool(binding.get("odom"))
+        if self._config.local_planning and self._config.local_geometry is None:
+            self._camera_notes.append("局部规划需要底盘半宽和完整深度相机内参；避让时保持停车")
         # Callers may supply producer contracts keyed by the actual wired
         # topic.  Selecting only after role binding prevents a second odometry
         # producer on the canvas from donating timing to the wrong stream.
@@ -511,6 +969,19 @@ class NaviPlugin:
         if interface is None:
             interface = args.get("odom_interface")
         self._adopt_odom_interface(interface, bound_topic=binding.get("odom"))
+        if self._timer is not None and self._config.local_planning and self._config.local_geometry is not None:
+            try:
+                from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+
+                with self._output_lock:
+                    self._output_blocked = self._wire_moving = False
+                    self._wire_twist = None
+                    self._wire_seq = 0
+                    self._command_timer = self._node.create_timer(
+                        1.0 / rate, self._dispatch_command, callback_group=MutuallyExclusiveCallbackGroup())
+            except Exception as error:                        # noqa: BLE001
+                self._unwind()
+                return self._error(f"速度发布定时器启动失败：{error}")
         log.info("navi started: topic=%s %.1f Hz ttl=%d ms inputs=%s",
                  self._topic, rate, self._ttl_ms, binding)
         return {"state": "running", "topic": self._topic, "rate_hz": rate,
@@ -598,11 +1069,21 @@ class NaviPlugin:
         depth has always been available and would produce confidently wrong
         distances. Now that both sides declare an `id`, it is a comparison.
         """
-        from .camera import camera_id, for_topic
+        from .camera import camera_id, for_topic, horizontal_intrinsics, vertical_intrinsics
 
         depth_topic = binding.get("depth_map") or binding.get("depth_summary")
         depth_decl = for_topic(declarations, depth_topic) if depth_topic else {}
+        vendor = depth_decl.get("vendor")
+        self._depth_vendor = vendor if binding.get("depth_map") and isinstance(vendor, dict) else {}
         self._camera_notes = policy_mod._adopt_camera(self._config, depth_decl)
+        self._config.depth_intrinsics = (horizontal_intrinsics(depth_decl)
+                                         if binding.get("depth_map") else None)
+        if depth_decl and binding.get("depth_map") and self._config.depth_intrinsics is None:
+            self._camera_notes.append("深度图缺少可用针孔内参 fx/cx，避障走廊按画面中心和水平视场角估算")
+        if binding.get("depth_map"):
+            self._depth_vertical = vertical_intrinsics(depth_decl)
+            if self._depth_vertical is None:
+                self._camera_notes.append("深度图缺少完整针孔内参，沿用原始深度判断障碍")
 
         objects_decl = for_topic(declarations, binding.get("objects"))
         self._objects_frame = (objects_decl.get("width") or 0,
@@ -655,11 +1136,8 @@ class NaviPlugin:
                     "message": f"已订阅 {self._binding['objects']}，但还没收到任何"
                                f"检测结果 —— 确认 vop 卡片在运行且相机有画面"}
 
-        # Same bar as the tracker's: something that would be *chased* after
-        # `confirm_hits` of `confirm_window` frames should be *listed* on the
-        # same evidence. The two used to disagree by an order of magnitude —
-        # ten frames to appear in this list, one frame to start driving a
-        # chassis — and the list was the strict one.
+        # Keep the object inventory stable across detector flicker. Target
+        # association itself uses the current matching detection.
         need = self._stability_bar(len(frames))
         items = policy_mod.stable_objects(frames, min_frames=need,
                                           config=self._config)
@@ -728,8 +1206,17 @@ class NaviPlugin:
             # A new target discards everything remembered about the old one —
             # the search direction and the stuck timer both refer to a target
             # that is no longer being chased.
+            self._publish_stop_if_moving()
+            self._cancel_active_action("导航被新指令替换")
+            obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State(target=target)
+            self._state.active_scan.obstacles = obstacles
+            self._last_decision = None
+            self._last_tick = 0.
+            self._command_window = (0., 0.)
             self._paused = False
+            with self._output_lock:
+                self._output_blocked = False
             # **The card mints this, agent-core does not supply it.** The ACP
             # contract runs the other way from what it looks like: an async tool
             # returns an `action_id` in its reply, agent-core parses it out and
@@ -737,7 +1224,7 @@ class NaviPlugin:
             # and the completion later refers back to it. Reading it out of
             # `args` — which is what this did first — finds nothing, so no
             # pending is ever registered and no completion can be matched.
-            self._acp_action_id = f"navi_{uuid.uuid4().hex[:12]}"
+            action_id = self._acp_action_id = f"navi_{uuid.uuid4().hex[:12]}"
             arrival = {"stop_distance_m": self._config.stop_distance_m,
                        "stop_tolerance_m": self._config.stop_tolerance_m,
                        "arrival_distance_m": self._config.arrival_distance_m}
@@ -747,7 +1234,7 @@ class NaviPlugin:
                # Without it in the reply the action completes instantly as far
                # as the barrier is concerned, and the completion POST below
                # later refers to an id nobody is waiting on.
-               "action_id": self._acp_action_id,
+               "action_id": action_id,
                **arrival,
                "degraded": self._degradations()}
 
@@ -788,53 +1275,73 @@ class NaviPlugin:
                    for k in keys)
 
     def _stop_navigation(self):
+        self._cancel_scheduled_motion(block=True)
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
-            action_id, self._acp_action_id = self._acp_action_id, ""
-            target = self._state.target
+            self._publish_stop_if_moving()
+            self._cancel_active_action("用户停止导航")
+            obstacles = self._state.active_scan.obstacles
             self._state = policy_mod.State()
-            if action_id:
-                result = {"status": "cancelled", "reason": "用户停止导航", "target": target}
-                threading.Thread(target=self._post_acp, args=(action_id, "failed", result),
-                                 daemon=True, name="navi_acp").start()
+            self._state.active_scan.obstacles = obstacles
         return {"state": "running", "message": "已停止导航，卡片仍在运行"}
 
     def _halt(self, halted: bool):
+        if halted:
+            self._cancel_scheduled_motion(block=True)
         with self._lock:
             if not self._running:
                 return {"state": "idle", "message": "卡片未在运行"}
             # A paused policy does not tick, so it cannot clear its own gain
             # schedule before resume. Keep the track, but restart gain gently.
+            if halted:
+                self._publish_stop_if_moving()
+                self._state.active_scan.invalidate()
+                self._state.commanded = (0., 0., 0.)
+            if self._paused != bool(halted):
+                self._last_tick = 0.
+                self._command_window = (0., 0.)
+                self._state.moving_for_s = 0.
+                self._state.dwa_progress.rebaseline()
             self._state.adaptive_fwd_scale = 1.0
             self._paused = bool(halted)
+            if not halted:
+                with self._output_lock:
+                    self._output_blocked = False
         return {"state": "paused" if halted else "running",
                 "target": self._state.target}
 
     def _stop(self, *, cancel_start=True):
+        self._cancel_scheduled_motion(block=True)
         with self._lock:
             if self._starting and cancel_start:
                 self._start_cancelled = True
             if not self._running:
                 return {"state": "idle"}
+            self._publish_stop_if_moving()
+            self._cancel_active_action("导航卡片已停止")
             self._running = False
             self._paused = False
             node, self._node = self._node, None
             timer, self._timer = self._timer, None
-            self._publisher = None
+            with self._output_lock:
+                command_timer, self._command_timer = self._command_timer, None
+                self._publisher = None
 
+        # Detach before destroying handles that may still be in the wait set.
+        if node is not None and self._executor is not None:
+            try:
+                self._executor.remove_node(node)
+            except Exception:                                 # noqa: BLE001
+                pass
         self._cancel_pending_depth_bind(node)
-        if timer is not None and node is not None:
-            try:
-                node.destroy_timer(timer)
-            except Exception:                                 # noqa: BLE001
-                pass
         if node is not None:
-            try:
-                if self._executor is not None:
-                    self._executor.remove_node(node)
-            except Exception:                                 # noqa: BLE001
-                pass
+            for active_timer in (timer, command_timer):
+                if active_timer is not None:
+                    try:
+                        node.destroy_timer(active_timer)
+                    except Exception:                         # noqa: BLE001
+                        pass
             try:
                 node.destroy_node()
             except Exception:                                 # noqa: BLE001
@@ -887,8 +1394,30 @@ class NaviPlugin:
                 return self._error(f"配置 {key} 无效：{error}")
 
         with self._lock:
-            if self._starting and changed:
+            refresh = "control_interface" in args
+            if self._starting and (changed or refresh):
                 return self._error("卡片正在启动，暂不能修改参数")
+            descriptor = self._descriptor
+            if refresh:
+                if not self._running:
+                    return {"status": "idle"}
+                descriptor = args["control_interface"]
+                if (not self._descriptor or not isinstance(descriptor, dict)
+                        or {key: value for key, value in self._descriptor.items() if key != "limits"}
+                        != {key: value for key, value in descriptor.items() if key != "limits"}):
+                    return self._error("下游动作空间已变更，请重新启动 Navi")
+                limits = descriptor.get("limits")
+                if not isinstance(limits, dict) or any(
+                        not isinstance(limits.get(key), (tuple, list))
+                        or len(limits[key]) != ACTION_DIM
+                        or any(type(value) not in (int, float) or not math.isfinite(value)
+                               for value in limits[key])
+                        for key in ("lower", "upper", "min_magnitude", "min_magnitude_moving",
+                                    "max_delta_per_step")
+                        if key in ("lower", "upper") or key in limits):
+                    return self._error("下游速度限制无效")
+                if any(lo > hi for lo, hi in zip(limits["lower"], limits["upper"])):
+                    return self._error("下游速度限制无效")
             # Stage a complete replacement so the policy never observes half
             # of a config request. Copy effective geometry adopted from the
             # camera/chassis; rebuilding from YAML would discard that reading.
@@ -897,33 +1426,42 @@ class NaviPlugin:
             except (TypeError, ValueError, OverflowError) as error:
                 return self._error(f"配置无效：{error}")
             notes = self._limit_notes
-            if self._running and changed:
+            if self._running and (changed or refresh):
                 # Restore requested ceilings before adoption, including those
                 # unchanged by this request. Otherwise an already-clamped
                 # ceiling loses its explanatory note on the next gain change.
-                for key in ("vx_max", "vy_max", "wz_max", "search_rate"):
+                for key in ("vx_max", "vy_max", "wz_max", "search_rate", "use_lateral"):
                     setattr(candidate, key, changed.get(
                         key, self._cfg.get(
                             key, policy_mod.Config.__dataclass_fields__[key].default)))
-                notes = policy_mod.adopt_limits(candidate, self._descriptor)
+                notes = policy_mod.adopt_limits(candidate, descriptor)
             if any(key in changed and getattr(candidate, key) != getattr(self._config, key)
                    for key in ("stop_distance_m",
                                "stop_tolerance_m", "slow_distance_m")):
                 # A successful gain/boundary change starts a fresh schedule;
                 # tracker state and unrelated navigation counters stay intact.
                 self._state.adaptive_fwd_scale = 1.0
+            if changed or (refresh and descriptor != self._descriptor):
+                if self._command_timer is not None or self._staged_dwa_command is not None:
+                    self._publish_stop_if_moving()
+                    self._command_window = (0., 0.)
             self._config = candidate
             self._cfg.update(changed)
             self._limit_notes = notes
+            if refresh and descriptor != self._descriptor:
+                self._descriptor = descriptor
+                self._descriptor_changed = True
             result = {"status": "configured", "config": changed,
                       "effective_config": {key: getattr(candidate, key)
                                            for key in changed}}
+            if refresh:
+                result["control_interface_updated"] = True
             if ignored:
                 result["ignored_parameters"] = ignored
             return result
 
     def _info(self):
-        with self._lock:
+        with self._lock, self._output_lock:
             decision = self._last_decision
             return {
                 "state": ("running" if self._running and not self._paused else
@@ -951,6 +1489,11 @@ class NaviPlugin:
                 "config": {**{key: getattr(self._config, key)
                               for key in _TUNING_FIELDS},
                            "max_obs_age_ms": self._config.max_obs_age_ms,
+                           "max_depth_age_ms": self._config.depth_age_limit_ms,
+                           "scan_odom_linear_tolerance_mps": self._config.scan_odom_linear_tolerance_mps,
+                           "max_feedback_gap_ms": self._config.max_feedback_gap_ms,
+                           "max_speed_age_ms": policy_mod.SPEED_SAMPLE_MAX_AGE_MS,
+                           "use_obstacle_history": self._config.use_obstacle_history,
                            "stop_tolerance_m": self._config.stop_tolerance_m,
                            "arrival_distance_m": self._config.arrival_distance_m,
                            "k_fwd": self._config.k_fwd,
@@ -963,8 +1506,18 @@ class NaviPlugin:
                            "search_rate": self._config.search_rate,
                            "use_lateral": self._config.use_lateral,
                            "obstacle_stop_m": self._config.obstacle_stop_m,
-                           "slow_distance_m": self._config.slow_distance_m},
+                           "slow_distance_m": self._config.slow_distance_m,
+                           "side_clearance_m": self._config.side_clearance_m,
+                           "local_planning": self._config.local_planning,
+                           "local_controller": self._config.local_controller,
+                           "dwa_horizon_s": self._config.dwa_horizon_s,
+                           "dwa_samples": self._config.dwa_samples,
+                           "local_geometry_ready": self._config.local_geometry is not None},
+                "downstream_limits": self._descriptor.get("limits") or {},
                 "published": self._published,
+                "dwa": {"decision": deepcopy(self._state.dwa_trace),
+                        "totals": deepcopy(self._state.dwa_totals),
+                        "publication": deepcopy(self._dwa_publication)},
                 "gains": {
                     "forward": {"base": self._config.k_fwd,
                                 "effective": getattr(decision, "k_fwd_effective", None)},
@@ -1026,7 +1579,7 @@ class NaviPlugin:
                        "那是一个**角度**扇区，近处比机器人还窄（0.8 m 处只覆盖"
                        "±0.16 m），肩膀会擦到判据之外的东西。摘要还无法表达"
                        "「这一段有多少像素是有效的」，所以满是空洞的一段会被"
-                       "当成空旷")
+                       "当成空旷。到达需要有效的目标测距")
         if not self._binding.get("odom"):
             out.append("没接 state/odom —— 无卡死保护，撞上东西不会自己停；"
                        "目标被遮挡时只能按**指令**（而非实测）推算它去了哪；"
@@ -1141,17 +1694,21 @@ class NaviPlugin:
         `output_topics_for` 决定，是个确定的契约，不依赖时序。消息类型只在名字
         认不出来时作为兜底 —— 那时图里有没有发布者才真的有参考价值。
 
-        还没有数据不是错误：`observation()` 的过期检查已经覆盖它，而那条路径的
-        结论是「什么都不发，让下游 watchdog 停住底盘」，正是此时该做的事。
+        还没有数据不是错误：`observation()` 会把未收到或过期的输入视为缺失，
+        此时策略不会开始运动。
         """
         bound = {"objects": "", "depth_map": "", "depth_summary": "", "odom": "",
                  "image": ""}
         unknown = []
+        topics = tuple(topics)
 
         for topic in topics:
             role = self._role_of(topic)
             if not role:
-                role, hint = self._role_from_graph(node, topic)
+                declared = self._declared_format(input_bindings, topic) or self._declared_format(declarations, topic)
+                camera = declared == "image/jpeg" or (not declared and any(
+                    topic + suffix in topics for suffix in ("/objects", "/visual_depth", "/visual_depth_summary")))
+                role, hint = self._role_from_graph(node, topic, camera=camera)
                 if not role:
                     unknown.append(hint)
                     continue
@@ -1180,11 +1737,15 @@ class NaviPlugin:
         # on the canvas. It goes into the degradations.
         bound["unknown"] = unknown
 
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
         qos = _sensor_qos()
         if bound["depth_map"]:
+            # The map is authoritative for clearance. A summary must not
+            # refresh the age or identity of a different, retained map.
+            bound["depth_summary"] = ""
             topic = bound["depth_map"]
             # ``camera_info`` is optical metadata, not a wire-format registry.
             # Prefer the canvas binding when supplied; keep the declaration
@@ -1229,7 +1790,11 @@ class NaviPlugin:
                 if selected is None:
                     return False
                 callback = self._on_depth_map
-                node.create_subscription(selected, topic, callback, qos)
+                # The planner replaces its current depth map on every callback.
+                # Decoding older maps ahead of the newest one spends its time budget.
+                # Depth decoding and ground fitting must not serialize odom and detector callbacks.
+                node.create_subscription(selected, topic, callback, _sensor_qos(depth=1),
+                                         callback_group=MutuallyExclusiveCallbackGroup())
                 self._cancel_pending_depth_bind(node)
                 with self._lock:
                     if self._last_error.startswith(f"深度话题 {topic} 等待超过"):
@@ -1268,6 +1833,11 @@ class NaviPlugin:
                 self._depth_bind_topic = topic
                 self._depth_bind_deadline = time.monotonic() + _DEPTH_TYPE_WAIT_S
                 self._depth_bind_timer = node.create_timer(0.1, retry_depth)
+            vendor = camera_mod.for_topic(declarations, topic).get("vendor")
+            mount = camera_mod.mount_topic(vendor) if isinstance(vendor, dict) else None
+            if mount:
+                bound["body_mount"] = mount
+                node.create_subscription(String, mount, lambda msg: self._on_string("body_mount", msg), qos)
         if bound["image"]:
             # Kept as bytes and decoded only when a frame is drawn: the camera
             # runs at 15 fps and the overlay at 5, so decoding on arrival would
@@ -1288,12 +1858,16 @@ class NaviPlugin:
                 return role
         return ""
 
-    def _role_from_graph(self, node, topic: str):
+    def _role_from_graph(self, node, topic: str, *, camera=False):
         """兜底：名字认不出时问 ROS 图。返回 (role, hint)。
 
         到这里才看发布者是合理的 —— 名字已经没能给出答案，图是仅剩的线索。
         """
         types = dict(node.get_topic_names_and_types()).get(topic) or []
+        if not types and camera:
+            # Use the explicit JPEG binding or the source of a connected
+            # perception output while DDS discovery is still settling.
+            return "image", ""
 
         # Hardware depth topics do not always follow perception's
         # `/visual_depth` naming convention. If ROS tells us this is an Image
@@ -1376,7 +1950,26 @@ class NaviPlugin:
             elif role == "depth_summary":
                 self._depth_bands = depth_mod.bands_from_summary(payload)
                 self._depth_ms = now
+            elif role == "body_mount":
+                stamp = payload.get("stamp_ns")
+                if type(stamp) is int and stamp > 0:
+                    self._mounts[stamp] = camera_mod.capture_mount(self._depth_vendor, payload)
+                    if len(self._mounts) > 32:
+                        self._mounts.pop(next(iter(self._mounts)))
             elif role == "odom":
+                sample = odom_mod.measured_obstacle_pose(payload, self._depth_vendor)
+                history = self._obstacle_poses
+                if sample is None or not 0 <= now - sample[1].stamp_ms <= self._odom_max_age_ms:
+                    history.clear()
+                elif not history:
+                    history.append(sample)
+                elif sample[0] > history[-1][0]:
+                    if (sample[1].frame != history[-1][1].frame or
+                            sample[0] - history[-1][0] > policy_mod.ODOM_GAP_MS * 10**6):
+                        history.clear()
+                    history.append(sample)
+                elif sample[0] == history[-1][0] and sample != history[-1]:
+                    history.clear()
                 # All three axes the policy uses, not just `vx`. The stuck
                 # detector only ever wanted forward speed, but the tracker
                 # compensates its prediction for the robot's whole twist —
@@ -1388,20 +1981,75 @@ class NaviPlugin:
                 # that cannot answer "am I moving" must not look stopped, and
                 # one that cannot answer "am I turning" must not have its own
                 # rotation assumed to be zero.
-                self._odom = {axis: odom_mod.axis_of(payload, axis)
+                self._odom = {axis: odom_mod.axis_of(payload, axis) if payload.get("valid") is not False else None
                               for axis in ("vx", "vy", "wz")}
                 stamp = payload.get("stamp_ms")
+                self._odom_received_ms = now
+                previous_source = self._odom_source_ms
+                self._odom_source_ms = (int(stamp) if isinstance(stamp, (int, float))
+                                        and not isinstance(stamp, bool)
+                                        and math.isfinite(stamp) and stamp > 0 else None)
+                # A stamped body fix keeps its measurement time and coordinate frame
+                # when DWA falls back from capture pairing to ordinary motion feedback.
+                if sample is not None and self._odom_source_ms is not None:
+                    pose = sample[1]
+                else:
+                    pose = odom_mod.planar_pose(payload, self._odom_source_ms)
+                if (pose is not None or payload.get("valid") is False or (previous_source is not None
+                        and (self._odom_source_ms is None or self._odom_source_ms < previous_source))):
+                    self._lateral_depth_reference = None
+                    self._lateral_pose_bias = 0.
+                previous = self._motion_pose
+                if pose is None or pose != previous:
+                    feedback = (pose.feedback_since(previous, policy_mod.ODOM_GAP_MS)
+                                if previous is not None and pose is not None else None)
+                    self._pose_feedback = (previous.stamp_ms, feedback) if feedback is not None else None
+                    if (pose is None or previous is None or pose.frame != previous.frame
+                            or pose.stamp_ms > previous.stamp_ms):
+                        self._motion_pose = pose
+                # Pose-only streams keep their absolute pose reference. Once
+                # a stream supplies velocity, keep one continuous history and
+                # fill individual missing axes from fresh pose deltas.
+                if self._velocity_history or any(axis is not None for axis in odom_mod.planar_axes(self._odom)):
+                    feedback_odom = self._odom
+                    if self._fresh_motion_pose(now) is not None and self._pose_feedback is not None:
+                        feedback_odom = {**self._odom, "pose_feedback": self._pose_feedback[1]}
+                    self._velocity_history.append((now, self._odom_source_ms,
+                                                   odom_mod.planar_feedback(feedback_odom)))
+                timing = self._odom_interface.get("timing") or {}
+                vendor = payload.get("vendor")
+                vendor = vendor if isinstance(vendor, dict) else {}
+                stamp_source = vendor.get("stamp_source", timing.get("stamp_source", "robot"))
+                # A single-sample packet dates its speed with stamp_ms. When
+                # component times are present, only the speed time can date it.
+                samples = self._received_speed_samples
+                speed_ms = None
+                twist = odom_mod.planar_feedback(self._odom)
+                if stamp_source == "received":
+                    stamps = vendor.get("sample_timestamps_ms")
+                    if "sample_timestamps_ms" not in vendor:
+                        speed_ms = stamp
+                    elif isinstance(stamps, dict):
+                        speed_ms = stamps.get("speed")
+                    self._odom["component_speed_ms"] = speed_ms
+                    self._odom["received_speed_ms"] = speed_ms if type(speed_ms) is int and twist is not None else None
+                if type(speed_ms) is not int or not 0 < speed_ms <= now or twist is None:
+                    samples.clear()
+                elif not samples or speed_ms > samples[-1][1]:
+                    samples.append((now, speed_ms, twist))
+                elif speed_ms != samples[-1][1] or twist != samples[-1][2]:
+                    samples.clear()
+                if len(samples) == 2 and samples[0][0] < samples[1][1]:
+                    # The second update originated after Navi saw the first.
+                    self._odom["received_speed_pair"] = tuple(samples)
+                self._odom_stamp_verified = (timing.get("stamp_source") == "robot"
+                                             and stamp_source == "robot")
                 if self._odom_interface:
                     # A declared interface makes stamp_ms authoritative. An
                     # absent/non-finite stamp is not silently upgraded to a
                     # fresh receipt-time sample, because the declared maximum
                     # measurement delay would then be meaningless.
-                    if (isinstance(stamp, (int, float))
-                            and not isinstance(stamp, bool)
-                            and math.isfinite(stamp)):
-                        self._odom_ms = int(stamp)
-                    else:
-                        self._odom_ms = 0
+                    self._odom_ms = self._odom_source_ms or 0
                 else:
                     # Backwards compatibility for old producers whose timing
                     # contract predates stamp_source.
@@ -1413,13 +2061,85 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
-    def _set_depth_map(self, depth):
+    def _observe_lateral_pose_bias(self, frame, source, received_ms):
+        config = self._config
+        geometry = config.local_geometry
+        if (self._state.target or self._wire_moving or self._motion_pose is not None or not source
+                or config.local_controller != "dwa" or not config.use_lateral or config.scan_geometry is not None
+                or geometry is None or geometry.horizontal is None or geometry.vertical is None):
+            self._lateral_depth_reference = None
+            return
+        reference = self._lateral_depth_reference
+        if reference is None or not 0 < received_ms - reference[0] <= 900 or source <= reference[1]:
+            self._lateral_depth_reference = received_ms, source, frame
+            return
+        before_ms, _, before = reference
+        elapsed = (received_ms - before_ms) / 1000
+        if elapsed < .5:
+            return
+        self._lateral_depth_reference = received_ms, source, frame
+        samples = [(stamp, identity, motion) for stamp, identity, motion in self._velocity_history
+                   if before_ms <= stamp <= received_ms]
+        gap = config.max_feedback_gap_ms
+        if (len(samples) < 3 or samples[0][0] - before_ms > gap or received_ms - samples[-1][0] > gap
+                or any(identity is None or motion is None for _, identity, motion in samples)
+                or any(not (0 < b[1] - a[1] <= gap and 0 < b[0] - a[0] <= gap)
+                       for a, b in zip(samples, samples[1:]))):
+            return
+        if any(abs(vx) > .01 or abs(wz) > .01 or abs(vy) > policy_mod.STILL_LINEAR
+               for _, _, (vx, vy, wz) in samples):
+            return
+        speeds = [motion[1] for _, _, motion in samples]
+        reported = median(speeds)
+        if abs(reported) < .015 or max(speeds) - min(speeds) > .01:
+            return
+        fx, cx, _, cy = local_path.intrinsics_for(geometry, *frame.shape)
+        displacement = depth_mod.opening_lateral_shift(before, frame, fx, cx, cy)
+        if displacement is not None:
+            bias = reported - displacement / elapsed
+            self._lateral_pose_bias = bias if .015 <= abs(bias) <= policy_mod.STILL_LINEAR else 0.
+
+    def _set_depth_map(self, depth, *, capture_ms=None, source_stamp_ns=None, source_frame=None,
+                       received_ms=None):
+        received_ms = int(time.time() * 1000) if received_ms is None else received_ms
+        horizontal = self._config.depth_intrinsics
+        vertical = self._depth_vertical
+        ground = None
+        if horizontal is not None and vertical is not None:
+            ground = depth_mod.ground_mask(depth, horizontal, vertical)
+        bands = depth_mod.nearest_by_band(depth)
+        projection = local_path.DepthProjection.received(depth, ground)
+        config = self._config
+        geometry = config.scan_geometry or config.local_geometry
+        flanks = passing = visible = (False, False)
+        if (config.local_controller == "dwa" and not config.use_obstacle_history
+                and geometry is not None and geometry.front == 0. and not self._binding.get("body_mount")):
+            flanks, passing, visible = local_path.front_flank_observations(
+                projection, geometry, policy_mod._keepout_m(config))
         with self._obs_lock:
-            self._depth_map = depth
-            self._depth_bands = depth_mod.nearest_by_band(depth)
-            self._depth_ms = int(time.time() * 1000)
+            expected_frame = self._depth_vendor.get("frame_id")
+            if expected_frame and source_frame and source_frame != expected_frame:
+                return
+            source = source_stamp_ns or (capture_ms * 10**6 if capture_ms else None)
+            if source and source == self._depth_source_ns:
+                # A repeated exposure is still the same observation.
+                return
+            self._observe_lateral_pose_bias(projection.frame, source, received_ms)
+            self._depth_map = projection.frame
+            self._depth_ground = projection.ground
+            self._depth_projection = projection
+            self._depth_front_flank_ms = tuple(received_ms if hit else stamp
+                                               for hit, stamp in zip(flanks, self._depth_front_flank_ms))
+            self._depth_passing_flanks = tuple((received_ms if near else stamp, seen)
+                                               for near, seen, (stamp, _) in
+                                               zip(passing, visible, self._depth_passing_flanks))
+            self._depth_bands = bands
+            self._depth_ms = received_ms
+            self._depth_source_ns = source or None
+            self._depth_source_ms = capture_ms or None
 
     def _on_depth_map(self, message):
+        received_ms = int(time.time() * 1000)
         data = bytes(getattr(message, "data", b"") or b"")
         if not data:
             return
@@ -1429,9 +2149,14 @@ class NaviPlugin:
             with self._lock:
                 self._last_error = f"深度图解码失败：{error}"
             return
-        self._set_depth_map(depth)
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        ns = stamp.sec * 10**9 + stamp.nanosec if stamp is not None else None
+        self._set_depth_map(depth, capture_ms=ns // 10**6 if ns else None, source_stamp_ns=ns,
+                            source_frame=getattr(getattr(message, "header", None), "frame_id", None),
+                            received_ms=received_ms)
 
     def _open_publisher(self):
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
         from rclpy.node import Node
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
@@ -1446,31 +2171,1046 @@ class NaviPlugin:
             self._view_thread = threading.Thread(
                 target=self._view_worker, daemon=True, name="navi_view")
             self._view_thread.start()
-        self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick)
+        # Sensor callbacks can refresh snapshots while the planner runs.
+        self._timer = node.create_timer(1.0 / max(self._rate_hz, 0.1), self._tick,
+                                        callback_group=MutuallyExclusiveCallbackGroup())
         self._executor.add_node(node)
         with self._lock:
             self._node = node
 
     # ── the loop ─────────────────────────────────────────────────────────────
 
-    def observation(self):
+    def _fresh_motion_pose(self, now):
+        pose = self._motion_pose
+        max_age = min(self._config.max_obs_age_ms, self._odom_max_age_ms)
+        if pose is not None and 0 <= now - pose.stamp_ms <= max_age:
+            return pose
+        return None
+
+    def observation(self, *, with_capture_timing=False):
         """The three inputs, with anything stale replaced by None.
 
         Staleness is checked here rather than in the policy so that "too old"
         and "never arrived" are the same thing to the decision — both mean the
         card cannot see, and both must stop the robot.
         """
-        now = int(time.time() * 1000)
+        return self._observation_snapshot(with_capture_timing=with_capture_timing)[:3]
+
+    def _observation_snapshot(self, *, with_capture_timing):
         max_age = self._config.max_obs_age_ms
+        depth_age = self._config.depth_age_limit_ms
         with self._obs_lock:
-            objects = self._objects if now - self._objects_ms <= max_age else None
-            fresh_depth = now - self._depth_ms <= max_age
-            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands)}
-                     if fresh_depth else None)
+            now = int(time.time() * 1000)
+            objects_ms = self._objects_ms
+            objects = self._objects if now - objects_ms <= max_age else None
+            fresh_depth = now - self._depth_ms <= depth_age
+            depth = ({"map": self._depth_map, "bands": dict(self._depth_bands),
+                      "frame_id": self._depth_ms} if fresh_depth else None)
+            if depth is not None and self._depth_map is not None:
+                depth["receipt_timed"] = True
+            if depth is not None and self._depth_ground is not None:
+                depth["ground"] = self._depth_ground
+            if depth is not None:
+                if self._depth_projection is not None and self._depth_projection.frame is depth["map"]:
+                    depth["grid_projection"] = self._depth_projection
+                if any(stamp is not None for stamp in self._depth_front_flank_ms):
+                    depth["front_flank_ms"] = self._depth_front_flank_ms
+                blind_flanks = tuple(None if seen else stamp for stamp, seen in self._depth_passing_flanks)
+                if any(stamp is not None for stamp in blind_flanks):
+                    depth["blind_passing_flank_ms"] = blind_flanks
+                if with_capture_timing:
+                    depth["control_ms"] = now
+                    ns = self._depth_source_ns
+                    if self._binding.get("body_mount"):
+                        depth["body_mount_required"] = True
+                    if ns is not None:
+                        # The header identifies the paired extrinsics. Timing
+                        # and pose registration use the same receipt clock.
+                        depth["source_stamp_ns"] = ns
+                        mount = self._mounts.get(ns)
+                        if mount is not None:
+                            depth["body_from_optical"], depth["mount_accuracy_validated"] = mount
+                    # This host-clock stamp is the entrance to depth production.
+                    # Keep receipt freshness and target tracking on their existing clocks.
+                    if (ns is not None and 0 < ns // 10**6 < self._depth_ms
+                            and self._depth_vendor.get("timestamp_source") == "driver_receive"):
+                        depth["obstacle_driver_ms"] = ns // 10**6
+                        depth["obstacle_driver_pose"] = odom_mod.obstacle_pose_at(self._obstacle_poses, ns)
+                    pose = None
+                    if (ns is not None and depth.get("body_from_optical") is not None
+                            and 0 <= self._depth_ms - ns // 10**6 < depth_age):
+                        # This mount was matched on the declared capture clock.
+                        pose = odom_mod.obstacle_pose_at(self._obstacle_poses, ns)
+                        if pose is not None:
+                            depth["capture_ms"] = ns // 10**6
+                    if pose is None:
+                        pose = odom_mod.obstacle_pose_at(self._obstacle_poses, self._depth_ms * 10**6)
+                    if pose is not None:
+                        depth["obstacle_capture_pose"] = pose
+                if self._depth_source_ms is not None:
+                    depth["source_frame_id"] = self._depth_source_ms
             odom_age = now - self._odom_ms
             odom = (self._odom
                     if 0 <= odom_age <= self._odom_max_age_ms else None)
-        return objects, depth, odom
+            if with_capture_timing and odom is not None:
+                pose = self._fresh_motion_pose(now)
+                if self._obstacle_poses:
+                    measured = self._obstacle_poses[-1][1]
+                    if 0 <= now - measured.stamp_ms <= policy_mod.ODOM_GAP_MS:
+                        odom = {**odom, "obstacle_pose": measured}
+                if pose is not None:
+                    since_ms, rates = self._pose_feedback or (pose.stamp_ms, None)
+                    odom = {**odom, "motion_pose": pose, "pose_feedback": rates,
+                            "pose_feedback_since_ms": since_ms, "control_ms": now}
+                received_ms = self._odom_received_ms or self._odom_ms
+                if 0 <= now - received_ms <= self._config.max_feedback_gap_ms:
+                    odom = {**odom, "received_ms": received_ms}
+                    if self._odom_source_ms is not None:
+                        odom["source_sample_id"] = self._odom_source_ms
+                    if self._velocity_history:
+                        odom["velocity_history"] = tuple(self._velocity_history)
+                    if self._lateral_pose_bias and pose is None:
+                        odom["lateral_pose_bias"] = self._lateral_pose_bias
+                if self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
+                    odom = {**odom, "stamp_ms": self._odom_ms}
+        depth, odom = policy_mod.camera_odometry_inputs(self._config, self._state, depth, odom)
+        return objects, depth, odom, objects_ms
+
+    def _forward_check(self, decision, previous_twist, depth, odom, objects_ms, *, renewable=True,
+                       target_source=None, input_revision=None):
+        """Copy the inputs needed to recheck a command without running the planner."""
+        config, state = self._config, self._state
+        scan, route = state.active_scan, state.view_detour
+        straight_distance = state.dwa_trace.get("straight_handoff")
+        straight_handoff = (state.committed_route or state.published_straight_handoff) if straight_distance else None
+        angle_controlled = decision.dwa_acceptance is not None and decision.dwa_acceptance.angle_controlled
+        guard = decision.dwa_acceptance.motion_guard if decision.dwa_acceptance else None
+        probe = guard is not None and guard.probe_region
+        retained_detour = (decision.dwa_acceptance is not None and decision.dwa_acceptance.locks_detour
+                           and decision.dwa_acceptance.followed_route)
+        corner_only = (guard is not None and guard.corner_only
+                       or state.camera_arc_selected and state.dwa_trace.get("corner_only"))
+        if (not config.local_planning or depth is None or depth.get("map") is None
+                or depth.get("capture_invalid") or not decision.values or not any(decision.values)
+                or (decision.values[0] <= 0 and decision.dwa_acceptance is None)
+                or (decision.distance_m is None and not (probe or angle_controlled or corner_only or retained_detour))
+                or (not objects_ms and renewable) or (scan.active and not angle_controlled)
+                or (scan.result_frame and not (scan.receipt_only and state.checked_prefix))
+                or (not angle_controlled and decision.status != policy_mod.APPROACHING
+                    and not (decision.status == policy_mod.AVOIDING and state.avoidance_yaw_override
+                             and route is not None))):
+            return None
+        geometry = (route.geometry if route is not None else config.scan_geometry or config.local_geometry)
+        if geometry is None:
+            return None
+        mount_frame = None
+        if state.use_body_mount:
+            capture_pose = depth.get("obstacle_capture_pose")
+            if capture_pose is None or depth.get("body_from_optical") is None:
+                return None
+            mount_frame = capture_pose.frame
+        elif depth.get("body_mount_required") and state.use_body_mount is not False:
+            return None
+        acceptance = decision.dwa_acceptance
+        motion_guard = acceptance.motion_guard if acceptance is not None else None
+        squares = None if straight_distance else scan.near_squares
+        remembered = (None if straight_distance else
+                      scan.historical_hits if squares is not None else scan.remembered_hits)
+        if (not straight_distance and remembered is None and squares is None
+                and (scan.obstacles.has_occupied or scan.near_obstacles.has_occupied)):
+            if motion_guard is None or scan.obstacles.has_occupied:
+                return None
+            # Retained near cells can be outside the current finite grid.
+            # Distinguish a registered empty projection from missing pose
+            # registration; only the former preserves the selected proof.
+            pose, reference = motion_guard.pose, scan.pose_registration
+            if (reference is not None
+                    and reference[0].frame == scan.near_obstacles.frame == ("navi_relative", scan.motion_frame)):
+                # An absolute fix registers the selected pose while retained
+                # near cells keep their continuous relative frame.
+                pose = policy_mod._registered_dwa_pose(pose, (reference[1], reference[0]))
+            remembered = scan.near_obstacles.project(pose)
+            if remembered is None or remembered.any():
+                return None
+        memory_ms = scan.control_ms or depth.get("control_ms") or depth["frame_id"]
+        if scan.near_hits is not None and scan.near_revision:
+            memory_ms = min(memory_ms, scan.near_revision)
+        occupied = None
+        if (mount_frame is None and scan.receipt_only and scan.views and
+                geometry is config.local_geometry and scan.views[-1][0] == depth["frame_id"]
+                and scan.matches_route_view(depth)):
+            occupied = scan.views[-1][3]
+        if straight_distance or probe or (motion_guard is not None and target_source is None):
+            renewable = False
+        depth_ms = depth_mod.observation_ms(depth)
+        if motion_guard is not None and scan.current_frame:
+            depth_ms = min(depth_ms, scan.current_frame)
+        track = state.tracker.track
+        fix = track.measured_point if track is not None else None
+        # The first detour creates its anchor just after selecting the route.
+        # Bind it only when it describes the very same measured planning goal.
+        anchor = state.goal_anchor
+        if (motion_guard is not None and motion_guard.goal is not None and motion_guard.target_revision[0] is None
+                and motion_guard.association is None and motion_guard.measured_target is not None
+                and anchor is not None and anchor.frame is not None and not anchor.target_missing
+                and anchor.reference_ms == motion_guard.checked_ms and track is not None
+                and track.state == CONFIRMED and track.observed and track.front_fix is not None
+                and fix is not None and fix.observation_ms is not None and target_source is not None
+                and track.source == target_source and anchor.generation == track.generation == motion_guard.generation
+                and anchor.frame == track.frame and tuple(track.front_fix) == (anchor.x, anchor.y)
+                and math.dist(anchor.frame.grid_point((anchor.x, anchor.y), geometry), motion_guard.goal) < 1e-9):
+            revision = policy_mod.dwa_target_revision(state)
+            if revision[1] == motion_guard.target_revision[1]:
+                motion_guard = replace(motion_guard, target_revision=revision, deadline_ms=min(
+                    motion_guard.deadline_ms, fix.observation_ms + config.depth_age_limit_ms))
+        direct_association = None
+        if (motion_guard is None and config.local_controller == "dwa"
+                and (target_source is not None or state.camera_arc_selected)
+                and (anchor is None or state.camera_arc_selected)
+                and track is not None and track.observed and track.navigation_range_known
+                and track.source == target_source):
+            stamp = depth.get("control_ms") or depth["frame_id"]
+            pose = policy_mod.target_body_pose(stamp, odom, odom_mod.planar_feedback(odom),
+                                               depth.get("obstacle_capture_pose"))
+            direct_association = track.snapshot(stamp), pose
+        passage = None
+        if state.camera_arc_selected and state.view_detour is not None and occupied is not None:
+            capture = depth.get("capture_ms") or depth_ms
+            previous_passage = state.published_camera_passage
+            if (previous_passage is not None and previous_passage.corridor_corner
+                    and state.dwa_trace.get("retained_route")):
+                passage = previous_passage.advance(config, state.view_detour, occupied, capture,
+                                                   corner_only=bool(state.dwa_trace.get("corner_only")))
+            else:
+                passage = policy_mod.CameraPassage(state.view_detour, occupied, capture,
+                                                    track.generation if track else None, state.view_detour.corridor_corner)
+        return _ForwardCheck(geometry, depth["frame_id"], depth.get("source_frame_id"),
+                             objects_ms, straight_distance or decision.distance_m,
+                             previous_twist, mount_frame,
+                             (odom or {}).get("source_sample_id"), (odom or {}).get("received_ms"),
+                             remembered, memory_ms, occupied, squares,
+                             decision.dwa_acceptance.guard_horizon_s if decision.dwa_acceptance else 0.,
+                             renewable, scan.control_ms or depth.get("control_ms") or depth["frame_id"],
+                             motion_guard, state.target, target_source,
+                             motion_guard.front_required if motion_guard else False, objects_ms,
+                             input_revision, motion_guard.memory_revision if motion_guard else None,
+                             motion_guard.target_revision if motion_guard else None,
+                             depth_ms, motion_guard, fix.observation_ms if fix else None,
+                             (objects_ms, input_revision[2]) if (
+                                 fix is not None and input_revision and motion_guard is not None
+                                 and motion_guard.association is not None and target_source is not None
+                                 and target_source == motion_guard.association.source) else None,
+                             direct_association, camera_passage=passage, target_source_ms=fix.capture_ms if fix else None,
+                             straight_handoff=straight_handoff, straight_forward=straight_distance is not None)
+
+    def _registered_dwa_scene(self, check, depth, odom, now_ms, depth_ms, geometry, twists, *, scan, sources,
+                              anchor_changed):
+        """Express current and retained measurements at the new prediction origin."""
+        guard = check.motion_guard
+        current = policy_mod.dwa_grid_pose(sources, geometry, now_ms, odom)
+        reference = policy_mod.dwa_pose_reference(sources, odom)
+        old = policy_mod.dwa_registration(guard.pose, current, guard.checked_ms, now_ms, geometry, twists,
+                                          reference=reference)
+
+        def registration(stamp, capture=None, *, grid_pose=None):
+            pose = grid_pose or policy_mod.dwa_grid_pose(sources, geometry, stamp, odom, capture=capture)
+            if capture is None and grid_pose is None:
+                # Memory can predate planning by a few milliseconds. Register it
+                # from the nearest retained measurement in the same frame.
+                for saved in (check.planning_guard.pose, guard.pose):
+                    if saved is not None and (pose is None or (saved.frame == pose.frame
+                            and abs(stamp - saved.stamp_ms) < abs(stamp - pose.stamp_ms))):
+                        pose = saved
+            return policy_mod.dwa_registration(pose, current, stamp, now_ms, geometry, twists,
+                                               reference=reference)
+
+        view = registration(*policy_mod.dwa_depth_origin(depth, depth_ms))
+        projection = local_path.DepthProjection.for_observation(depth)
+        grid = projection.grid_for(geometry, require_valid_depth=True, check_free_space=guard.visibility_required)
+        if grid is None:
+            return None
+        shadow = local_path.occluded_cells(*grid, geometry) if guard.visibility_required else None
+        cells = local_path.front_corner_sweep_grid(
+            projection.frame, geometry, policy_mod._keepout_m(self._config), grid[1],
+            guard_blind_sides=not self._config.use_obstacle_history)
+        occupied = policy_mod.dwa_depth_layers(depth, cells, depth_ms, view, registration, self._config)
+        occupied += policy_mod.dwa_front_flank_guard(depth, self._config, geometry, now_ms)
+        if not self._config.use_obstacle_history:
+            remembered = policy_mod.dwa_remembered(sources, registration)
+        elif sources.views and sources.current_frame:
+            rolling, remembered = policy_mod.dwa_obstacles(scan, sources, geometry, registration)
+            occupied += rolling
+        else:
+            original = check.planning_guard
+            source = registration(original.checked_ms, grid_pose=original.pose)
+            occupied += tuple(source.squares(cells) for cells in original.observed)
+            remembered = (tuple(source.squares(cells) for cells in original.remembered)
+                          + policy_mod.dwa_remembered(sources, registration))
+
+        goal, goal_error = guard.goal, guard.goal_error
+        if guard.goal is not None:
+            goal = tuple(old.points(guard.goal))
+            goal_error += old.error(math.hypot(*guard.goal))
+        anchor = self._state.goal_anchor
+        if guard.goal is not None and anchor is not None and anchor_changed:
+            anchor_ms = scan.control_ms or guard.checked_ms
+            anchor_tf = registration(anchor_ms)
+            point = (anchor.frame.grid_point((anchor.x, anchor.y), geometry) if anchor.frame is not None else
+                     local_path.target_in_grid(geometry, anchor.x, -anchor.y))
+            goal, goal_error = tuple(anchor_tf.points(point)), anchor_tf.error(math.hypot(*point))
+        measured_target = None
+        if guard.measured_target is not None:
+            point, error = guard.measured_target
+            measured_target = tuple(old.points(point)), error + old.error(math.hypot(*point))
+        track = self._state.tracker.track
+        if not guard.corner_only and guard.association is None and track is not None and track.generation == guard.generation:
+            measured_target = policy_mod.dwa_measured_target(
+                track, geometry, now_ms, self._config.depth_age_limit_ms, registration,
+                track_ms=scan.control_ms or guard.checked_ms)
+        return current, view, occupied, remembered, goal, goal_error, measured_target, shadow
+
+    def _dwa_target_match(self, check, objects, depth, odom, objects_ms, geometry, front_required, *,
+                          follow_route=False):
+        """Compare a confirmed association to the detector frame without consuming it."""
+        guard = check.planning_guard
+        association = guard.association
+        reference = guard.association_pose
+        source = observation_source(objects)
+        if association is None or not objects_ms:
+            return None
+        original_receipt = None
+        if check.target_source is None:
+            # Host receipts order this otherwise unstamped stream inside its
+            # fixed window. A first producer stamp may establish a new floor.
+            if check.renewable or association.latest_source is not None:
+                return None
+            original_receipt = source is None and objects_ms == check.target_ms
+            stamp = association.reference_ms if original_receipt else objects_ms
+        else:
+            if source is None or source < check.target_source:
+                return None
+            if source != check.target_source and objects_ms < check.target_receipt_ms:
+                return None
+            if source == association.source:
+                # A newer depth or feedback sample does not move a reused detector box.
+                stamp = association.reference_ms
+            elif source == check.target_source:
+                stamp = check.target_receipt_ms
+            else:
+                stamp = objects_ms
+        elapsed = max(0., (stamp - association.reference_ms) / 1000)
+        # The route can outlive its planner's association snapshot. Match
+        # against the tracker's newer confirmed association. The matcher
+        # still needs a measured range for the new detection.
+        if (follow_route and source is not None
+                and elapsed > self._config.max_coast_s - association.since_obs_s):
+            track = self._state.tracker.track
+            recent = self._state.dwa_association
+            if recent is not None and track is not None and track.observed:
+                fix, pose = recent
+                if (fix.generation == association.generation == track.generation
+                        and association.source is not None and association.source < fix.source == track.source <= source
+                        and (fix.source == source or fix.reference_ms <= stamp)
+                        and (reference is None or reference.frame == pose.frame)):
+                    association, reference = fix, pose
+                    if source == fix.source:
+                        stamp = fix.reference_ms
+                    elapsed = (stamp - fix.reference_ms) / 1000
+        axes = odom_mod.planar_feedback(odom)
+        delta = (0., 0., 0.)
+        if elapsed:
+            pose = policy_mod.target_body_pose(stamp, odom, axes, depth.get("obstacle_capture_pose"))
+            if pose and reference and pose.frame != reference.frame:
+                return None
+            delta = policy_mod.target_body_delta(reference, association.reference_ms, stamp, odom, axes, pose)
+        if front_required and not association.front_required:
+            association = replace(association, front_required=True)
+        config = replace(self._config, scan_geometry=geometry)
+        return match_observation(association, objects, depth, ego_motion=delta, elapsed_s=elapsed,
+                                 target=check.target, config=config, original_receipt=original_receipt,
+                                 allow_missing_surface=follow_route)
+
+    def _new_person_fronts(self, check, objects, depth, objects_ms, now_ms, geometry):
+        """Measure new person boxes for spacing, without changing target association or its clock."""
+        config = self._config
+        if (check.target != "person" or not check.target_receipt_ms < objects_ms <= now_ms
+                or now_ms - objects_ms >= config.max_obs_age_ms):
+            return ()
+        source = observation_source(objects)
+        track = self._state.tracker.track
+        floor = track.latest_source if track is not None else None
+        if ((check.target_source is not None and (source is None or source <= check.target_source))
+                or (floor is not None and (source is None or source < floor))):
+            return ()
+        fronts = []
+        for person in target_objects(objects, "person", config):
+            box = person.get("bbox_norm")
+            representative, front = (depth_mod.person_box_measurement(
+                depth["map"], box, geometry.horizontal, depth.get("ground")) if box else (None, None))
+            if front is not None:
+                # An unassociated box can contain a nearer foreground patch.
+                # Require support from the box's representative depth before
+                # using this ray as evidence of a closer person.
+                if representative > front[0]:
+                    front = (representative, front[1] * representative / front[0])
+            fronts.append(front)
+        return tuple(fronts)
+
+    def _person_front_too_close(self, prediction, fronts, geometry, view, stop_distance):
+        for front in fronts:
+            if front is None:
+                continue
+            point = local_path.target_in_grid(geometry, front[0], -front[1])
+            if dwa.minimum_target_distance(prediction, view.points(point)) < (
+                    stop_distance + view.error(math.hypot(*point)) - 1e-10):
+                return True
+        return False
+
+    def _outgoing_person_standoff(self, check, values, now_ms, deadline_ms, snapshot):
+        """Check newly seen people against the packet's remaining motion and braking."""
+        objects, depth, odom, objects_ms = snapshot
+        depth_ms = depth_mod.observation_ms(depth)
+        config = self._config
+        if (check is None or not any(values[:2]) or depth_ms is None or depth.get("capture_invalid")
+                or depth.get("map") is None or not 0 <= now_ms - depth_ms < config.depth_age_limit_ms):
+            return False
+        geometry = check.geometry
+        if check.mount_frame is not None and depth.get("body_from_optical") is not None:
+            geometry = replace(geometry, base_from_optical=depth["body_from_optical"])
+        fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
+        if not any(front is not None for front in fronts):
+            return False
+        command = tuple(values[i] for i in (0, 1, 5))
+        previous = self._wire_twist or check.previous_twist
+        measured = odom_mod.planar_feedback(odom) or previous
+        rates = measured, previous, command
+        depth_ms = min(depth_ms, depth.get("capture_ms") or depth_ms)
+        scan = self._state.active_scan
+        odom = odom or {}
+        source = policy_mod.dwa_grid_pose(scan, geometry, depth_ms, odom, capture=depth.get("obstacle_capture_pose"))
+        current = policy_mod.dwa_grid_pose(scan, geometry, now_ms, odom)
+        try:
+            view = policy_mod.dwa_registration(source, current, depth_ms, now_ms, geometry, rates,
+                                               reference=policy_mod.dwa_pose_reference(scan, odom))
+        except policy_mod.DwaFrameMismatch:
+            view = policy_mod.dwa_registration(None, None, depth_ms, now_ms, geometry, rates)
+        admission = max(0., (deadline_ms - now_ms) / 1000)
+        hold = admission + (config.watchdog_ms + 50) / 1000
+        stop_distance = config.stop_distance_m
+        track = self._state.tracker.track
+        association = check.direct_association
+        if (association is not None and track is not None and track.observed
+                and association[0].generation == track.generation and track.front_reference is not None
+                and len(fronts) == 1 and fronts[0] is not None
+                and math.dist(fronts[0], track.front_reference) <= policy_mod.FORWARD_CLEARANCE_MARGIN_M):
+            # A consistent update of the tracked front leaves the range
+            # controller in charge. Brake if even an immediate stop would
+            # enter the inner ring edge. Other fronts check the whole packet.
+            command = (0., 0., 0.)
+            admission = hold = 0.
+            stop_distance = config.arrival_min_distance_m
+        mode = "camera_approx" if geometry.front == 0. else "body"
+        prediction = motion.predict_motion(measured, previous, command, hold_s=hold,
+                                           latency_s=admission, geometry=geometry, mode=mode,
+                                           acceleration=config.motion_acceleration, braking=config.motion_braking)
+        return self._person_front_too_close(prediction, fronts, geometry, view, stop_distance)
+
+    def _recheck_dwa_motion(self, check, values, max_age, now_ms, snapshot, *, renew, diagnostics,
+                            handoff_deadline_ms=None, scan=None, route_room=None,
+                            packet_deadline_ms=None, check_outgoing=False, cover_slower_feedback=False,
+                            target_refresh=False, corner_route=None, keep_detour=False):
+        """Reuse the selected physical proof within its window or rebuild a complete stop."""
+        config, state = self._config, self._state
+        scan = state.active_scan if scan is None else scan
+        guard = check.motion_guard
+        objects, depth, odom, objects_ms = snapshot
+
+        def reject(reason):
+            diagnostics["reason"] = reason
+            return None
+
+        if depth is None or depth.get("capture_invalid") or depth.get("map") is None:
+            return reject("stale_observation")
+        measured = odom_mod.planar_feedback(odom)
+        if measured is None or odom.get("received_ms") is None:
+            return reject("no_feedback")
+        source, feedback = depth.get("source_frame_id"), odom.get("source_sample_id")
+        depth_id = depth["frame_id"] if source is None else source
+        prior_depth_id = check.frame_id if check.source_id is None else check.source_id
+        feedback_id = odom["received_ms"] if feedback is None else feedback
+        prior_feedback_id = check.feedback_ms if check.feedback_source is None else check.feedback_source
+        if ((source is None) != (check.source_id is None) or (feedback is None) != (check.feedback_source is None)
+                or depth_id < prior_depth_id or feedback_id < prior_feedback_id):
+            return reject("stale_observation")
+        depth_ms = depth_mod.observation_ms(depth)
+        odom_ms = min(odom["received_ms"], odom.get("stamp_ms", odom["received_ms"]))
+        if route_room is not None and "received_speed_ms" in odom:
+            speed_ms = odom.get("component_speed_ms")
+            if type(speed_ms) is not int or speed_ms != odom["received_speed_ms"] or speed_ms > now_ms:
+                return reject("no_feedback")
+            odom_ms = min(odom_ms, speed_ms)
+        if depth_id == prior_depth_id:
+            depth_ms = min(depth_ms, check.depth_ms)
+        if feedback_id == prior_feedback_id:
+            odom_ms = min(odom_ms, check.feedback_ms)
+        fresh = depth_id > prior_depth_id or feedback_id > prior_feedback_id
+        target_source = observation_source(objects)
+        newer_target = (check.target_source is not None and target_source is not None
+                        and target_source > check.target_source and check.target_receipt_ms < objects_ms)
+        if route_room is not None and target_source is not None and target_source == check.target_source:
+            # A fixed-window sweep matched this frame without taking its receipt
+            # time. On a tracked route it still supplies its one clock.
+            newer_target = check.target_ms < check.target_receipt_ms == objects_ms
+        fresh = fresh or (target_refresh and newer_target)
+        refresh_target = (renew and check.renewable and fresh and handoff_deadline_ms is None
+                          and guard.association is not None and newer_target and objects_ms <= now_ms)
+        # A newer receipt buys time only if the frozen association matches below.
+        target_ms = (depth_ms if guard.corner_only else
+                     objects_ms if refresh_target or check_outgoing else (check.target_ms or check.checked_ms))
+        obs_ms = min(target_ms, depth_ms, odom_ms)
+        deadline = int(min(now_ms + self._ttl_ms, target_ms + min(max_age, config.max_obs_age_ms),
+                           depth_ms + config.depth_age_limit_ms, odom_ms + min(
+                               self._odom_max_age_ms, config.max_feedback_gap_ms), obs_ms + max_age))
+        if not check_outgoing and not (renew and check.renewable and fresh):
+            deadline = min(deadline, guard.deadline_ms)
+        if route_room is not None:
+            deadline = min(deadline, packet_deadline_ms)
+        if not max(target_ms, depth_ms, odom_ms) <= now_ms < deadline:
+            return reject("publish_expired")
+        command = tuple(values[i] for i in (0, 1, 5))
+        previous = self._wire_twist if self._wire_twist is not None else check.previous_twist
+        revision = _motion_inputs(objects, depth, odom)
+        if _feedback_pose_jump(check.input_revision, revision, config.max_feedback_gap_ms, config):
+            return reject("geometry_mismatch")
+        sources = policy_mod.dwa_scene_sources(scan, now_ms, odom)
+        memory_revision = sources.revision
+        target_revision = policy_mod.dwa_target_revision(state)
+        track = state.tracker.track
+        if guard.probe_region:
+            if track is None or not track.observed or track.generation != guard.generation:
+                return reject("target_missing")
+            if track.image_region != guard.probe_region:
+                return reject("stale_observation")
+            if not check.target_receipt_ms <= objects_ms <= now_ms or (
+                    check.target_source is not None and (target_source is None or target_source < check.target_source)):
+                return reject("stale_observation")
+            if revision[2] != check.input_revision[2]:
+                people = list(target_objects(objects, check.target, config))
+                if not people:
+                    return reject("target_missing")
+                # A moved detection needs a new heading from the planner.
+                if not any((tuple(obj.get("position") or ()), tuple(obj.get("bbox_norm") or ())) == guard.probe_region
+                           for obj in people):
+                    return reject("stale_observation")
+        if (guard.association is not None and check.target_source is None
+                and not check.target_receipt_ms <= objects_ms <= now_ms):
+            return reject("target_missing")
+        if (guard.association is not None and check.target_source is not None
+                and (target_source is None or target_source < check.target_source
+                     or (target_source != check.target_source and objects_ms < check.target_receipt_ms))):
+            return reject("target_missing")
+        if (guard.association is not None and track is not None and track.generation == guard.generation
+                and track.latest_source is not None and (target_source is None or target_source < track.latest_source)):
+            # The live tracker can consume an intervening source without
+            # changing identity. Its ordering floor also applies at first send.
+            return reject("target_missing")
+        if (packet_deadline_ms is None and not refresh_target and check.input_revision == revision and check.memory_revision == memory_revision
+                and check.matches_target_receipt(objects_ms) and check.target_revision == target_revision
+                and deadline <= guard.deadline_ms and guard.measured == measured
+                and previous in (guard.previous, command)):
+            return obs_ms, deadline, guard.check.accepted, check
+
+        geometry = check.geometry
+        mount = depth.get("body_from_optical")
+        capture_pose = depth.get("obstacle_capture_pose")
+        if mount is not None and mount[0, 2] < .75:
+            return reject("geometry_mismatch")
+        if check.mount_frame is not None:
+            pose = odom.get("obstacle_pose") or odom.get("motion_pose")
+            if (mount is None or capture_pose is None or pose is None
+                    or capture_pose.frame != check.mount_frame or pose.frame != check.mount_frame):
+                return reject("geometry_mismatch")
+            calibrated = depth.get("mount_accuracy_validated") is True
+            geometry = replace(geometry, base_from_optical=mount, free_space_validated=calibrated)
+        front_required = bool(not guard.corner_only and track is not None and track.front_required)
+        live_point = None
+        target_pending = False
+        range_pending = False
+        # A later depth exposure can measure a different surface at the old
+        # pixels. Keep an associated range tied to its detector frame.
+        same_target = ((route_room is not None or check_outgoing)
+                              and not check.bearing_only and check.input_revision is not None
+                              and guard.association is not None and guard.measured_target is not None
+                              and track is not None and track.observed and track.generation == guard.generation
+                              and front_required == check.front_required
+                              and target_source is not None and target_source == check.target_source
+                              and objects_ms == check.target_receipt_ms
+                              and revision[2] == check.input_revision[2])
+        same_target_sample = same_target and revision[0] == check.input_revision[0]
+        retained_detection = (same_target and guard.pose is not None and check.target_capture_ms is not None
+                              and check.target_detection == (objects_ms, revision[2])
+                              and depth_ms > check.target_capture_ms)
+        if retained_detection:
+            obs_ms = min(obs_ms, check.target_capture_ms)
+            deadline = min(deadline, check.target_capture_ms + config.depth_age_limit_ms, obs_ms + max_age)
+            if not check.target_capture_ms <= now_ms < deadline:
+                return reject("publish_expired")
+        elif not same_target_sample and (guard.association is not None
+                or (front_required and not check.front_required and not guard.probe_region)):
+            match = self._dwa_target_match(check, objects, depth, odom, objects_ms, geometry, front_required,
+                                           follow_route=packet_deadline_ms is not None)
+            if match is None:
+                if refresh_target:
+                    return reject("target_missing")
+                target_pending = True
+            elif match.point is None:
+                anchor = state.goal_anchor
+                if (keep_detour and match.image_region and anchor is not None
+                        and anchor.generation == guard.generation == match.generation):
+                    # Keep the checked route and its original target deadline.
+                    # A bearing without a range cannot redirect this detour.
+                    refresh_target = False
+                    obs_ms = min(obs_ms, check.target_ms or guard.checked_ms)
+                    deadline = min(deadline, guard.deadline_ms, obs_ms + max_age)
+                    if now_ms >= deadline:
+                        return reject("publish_expired")
+                elif route_room is not None and match.image_region and match.image_region[0]:
+                    bearing = float(match.image_region[0][0])
+                    dx, dy, _ = command
+                    yaw_limit = policy_mod._scan_yaw_rate(config, math.copysign(1., bearing))
+                    yaw = -policy_mod._clamp(bearing * config.half_fov_rad, yaw_limit)
+                    vx = min(math.hypot(dx, dy), config.vx_max * policy_mod._alignment_scale(bearing, config))
+                    visual = [vx, 0., 0., 0., 0., yaw]
+                    visual = policy_mod.apply_deadband(visual, self._deadband_for(visual))
+                    if not visual[0]:
+                        return reject("target_range_unavailable")
+                    command = visual[0], 0., visual[5]
+                    route_room = min(route_room, config.approach_check_distance_m)
+                    diagnostics["visual_command"] = visual
+                elif not check_outgoing or guard.measured_target is None:
+                    return reject("target_range_unavailable")
+                range_pending = True
+            else:
+                surface = match.standoff_point or match.point
+                live_point = surface[0], -surface[1]
+        elif (front_required and not guard.probe_region and revision[2] != check.input_revision[2] and isinstance(objects, dict)
+              and any(target_objects(objects, check.target, config))):
+            target_pending = True
+        memory_first_send = (target_pending and handoff_deadline_ms is None and guard.association is None
+                             and check.target == "person" and track is not None and track.state in (CONFIRMED, COASTING)
+                             and track.front_fix is not None and check.target_receipt_ms <= objects_ms <= now_ms
+                             and (track.latest_source is None or
+                                  (target_source is not None and target_source >= track.latest_source))
+                             and any(target_objects(objects, "person", config)))
+        if target_pending:
+            anchor = state.goal_anchor
+            generation = track.generation if track is not None else None
+            planned_anchor = check.planning_guard.target_revision[0]
+            if ((handoff_deadline_ms is None and not memory_first_send)
+                    or guard.generation != generation):
+                return reject("target_missing")
+            if anchor is None or planned_anchor is None:
+                # A checked route can use the same track's measured front
+                # without ever freezing a goal. Neither anchor may change.
+                if not (anchor is None and planned_anchor is None
+                        and memory_first_send and guard.measured_target is not None):
+                    return reject("target_missing")
+            else:
+                # A frozen detour can still belong to an earlier track.
+                planned_generation = planned_anchor[4]
+                if anchor.generation != planned_generation or (memory_first_send and generation != planned_generation):
+                    return reject("target_missing")
+            # Retain the original window and validate the full stop against the new scene.
+            deadline = min(deadline, guard.deadline_ms)
+            if handoff_deadline_ms is not None:
+                deadline = min(deadline, handoff_deadline_ms)
+            if now_ms >= deadline:
+                return reject("publish_expired")
+
+        twists = (measured, previous, command, *(row[2] for row in odom.get("velocity_history", ())
+                                                if row[2] is not None))
+        anchor_changed = target_revision[0] != check.target_revision[0]
+        try:
+            scene = self._registered_dwa_scene(
+                check, depth, odom, now_ms, depth_ms, geometry, twists, scan=scan, sources=sources,
+                anchor_changed=anchor_changed)
+        except policy_mod.DwaFrameMismatch:
+            return reject("geometry_mismatch")
+        if scene is None:
+            return reject("stale_observation")
+        current, view, occupied, remembered, goal, goal_error, front_constraint, shadow = scene
+        if guard.probe_region and guard.probe_region[1]:
+            front = depth_mod.front_surface(depth["map"], guard.probe_region[1], geometry.horizontal,
+                                            depth.get("ground"))
+            if front is not None:
+                point = local_path.target_in_grid(geometry, front[0], -front[1])
+                front_constraint = tuple(view.points(point)), view.error(math.hypot(*point))
+        if retained_detection:
+            if (current is None or current.stamp_ms < guard.pose.stamp_ms
+                    or not 0 <= now_ms - current.stamp_ms < min(self._odom_max_age_ms, config.max_feedback_gap_ms)):
+                return reject("geometry_mismatch")
+        admission = (deadline - now_ms) / 1000
+        boundary = None
+        if route_room is not None:
+            hold = admission + (config.watchdog_ms + 50) / 1000
+            boundary = motion.TravelBudget(route_room)
+        elif packet_deadline_ms is not None:
+            # A new scene can veto the outstanding packet without sending another.
+            # Include a receipt at the end of its original TTL and the resulting watchdog.
+            hold = max(0., (packet_deadline_ms + config.watchdog_ms + 50 - now_ms) / 1000)
+            admission = min(admission, hold)
+        else:
+            hold = policy_mod.dwa_hold(config, admission)
+        if corner_route is not None:
+            planned = check.planning_guard
+            if planned.pose is None or current is None or current.stamp_ms < planned.pose.stamp_ms:
+                return reject("no_feedback")
+            try:
+                transform = policy_mod.dwa_registration(
+                    planned.pose, current, planned.checked_ms, now_ms, geometry, twists,
+                    reference=policy_mod.dwa_pose_reference(sources, odom))
+            except policy_mod.DwaFrameMismatch:
+                return reject("geometry_mismatch")
+            room = (dwa.remaining_route_length(transform.points(corner_route)) - planned.route_error
+                    - transform.error(math.hypot(*corner_route[-1])))
+            boundary = motion.TravelBudget(room)
+        prediction = motion.predict_motion(measured, previous, command, hold_s=hold,
+                                           latency_s=admission, geometry=geometry, mode=guard.footprint.mode,
+                                           acceleration=config.motion_acceleration, braking=config.motion_braking)
+        feedback_room = None
+        speed_only = (route_room is not None and current is not None and current.frame[0] == "navi_relative"
+                      and revision[1][3:5] == (None, None))
+        if speed_only or (cover_slower_feedback and measured[1:] == (0., 0.)
+                and 0. < measured[0] <= min(previous[0], command[0])):
+            # Reserve half a cell for movement during a speed-only check.
+            # For slower straight feedback, initial speeds converge under
+            # the same commands. Reserve part of the cell for that difference.
+            padding = local_path.RESOLUTION / 2
+            speed_error = 0. if speed_only else measured[0] * prediction.duration
+            poses = prediction.camera_poses if guard.footprint.mode == "camera_approx" else prediction.body_poses
+            if speed_error < padding and (shadow is None or policy_mod.dwa_trace_visible(
+                    poses, shadow, view, pad_cell=True)):
+                feedback_room = padding - speed_error
+                prediction = replace(prediction, position_error=prediction.position_error + padding,
+                                     straight_axis=None, interval_errors=tuple(
+                                         (linear + padding, angular) for linear, angular in prediction.interval_errors))
+                if boundary is not None:
+                    boundary = replace(boundary, consumed_m=feedback_room)
+        if live_point is not None:
+            point = local_path.target_in_grid(geometry, *live_point)
+            front_constraint = tuple(view.points(point)), view.error(math.hypot(*point))
+        checking_route = route_room is not None or corner_route is not None
+        result = motion.evaluate_motion(
+            prediction, terminal_boundary=boundary, footprint=guard.footprint,
+            occupied=occupied, remembered=remembered,
+            supported_region=local_path.SUPPORTED_REGION,
+            original_goal=goal if guard.cached_goal_standoff_m else None,
+            stop_distance_m=(guard.cached_goal_standoff_m + goal_error) if guard.cached_goal_standoff_m else 0.)
+        # A newly measured front can veto a translating packet even when
+        # this check only confirms the original admission window.
+        new_front = live_point is not None or (
+            guard.association is None and target_revision[1] != check.target_revision[1])
+        translating = any(command[:2]) or any(measured[:2]) or any(previous[:2])
+        if checking_route or (translating and (memory_first_send or new_front)):
+            result = dwa.check_measured_standoff(prediction, result, front_constraint, config.stop_distance_m)
+        if translating and anchor_changed and goal is not None:
+            old_anchor, new_anchor = check.target_revision[0], target_revision[0]
+            if old_anchor is not None and new_anchor is not None and old_anchor[:2] != new_anchor[:2]:
+                result = dwa.check_measured_standoff(prediction, result, (goal, goal_error), config.stop_distance_m)
+        if result.accepted and translating:
+            fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
+            if self._person_front_too_close(prediction, fronts, geometry, view, config.stop_distance_m):
+                result = replace(result, accepted=False, reason="target_standoff")
+            elif memory_first_send and (not fronts or any(front is None for front in fronts)):
+                return reject("target_missing")
+        if not result.accepted:
+            diagnostics["reason"] = result.reason
+            return obs_ms, deadline, False, check
+        if shadow is not None:
+            poses = prediction.camera_poses if guard.footprint.mode == "camera_approx" else prediction.body_poses
+            if not policy_mod.dwa_trace_visible(poses, shadow, view):
+                diagnostics["reason"] = "occluded_prefix"
+                return obs_ms, deadline, False, check
+        if check_outgoing:
+            return obs_ms, deadline, True, check
+        newer_guard = replace(guard, checked_ms=now_ms, deadline_ms=deadline, prediction_horizon_s=hold,
+                              pose=current, goal=goal, goal_error=goal_error, measured=measured,
+                              previous=previous, observed=occupied, remembered=remembered,
+                              measured_target=front_constraint, trace=prediction, check=result)
+        newer = replace(check, target_ms=objects_ms if refresh_target else check.target_ms,
+                        geometry=geometry, motion_guard=newer_guard, frame_id=depth["frame_id"],
+                        source_id=source, feedback_source=feedback, feedback_ms=odom_ms, depth_ms=depth_ms,
+                        input_revision=revision, target_revision=target_revision, memory_revision=memory_revision,
+                        target_source=target_source if live_point is not None or range_pending or guard.probe_region else check.target_source,
+                        target_receipt_ms=(objects_ms if guard.probe_region or (live_point is not None or range_pending) and
+                                           (target_source is None or target_source != check.target_source)
+                                            else check.target_receipt_ms),
+                        target_capture_ms=depth_ms if live_point is not None else check.target_capture_ms,
+                        target_source_ms=depth.get("capture_ms") if live_point is not None else check.target_source_ms,
+                        target_detection=(objects_ms, revision[2]) if live_point is not None else check.target_detection,
+                        front_required=check.front_required if target_pending else front_required,
+                        guard_horizon_s=prediction.duration, forward_feedback_room_m=feedback_room,
+                        bearing_only=range_pending)
+        return obs_ms, deadline, True, newer
+
+    def _new_observation_after_duplicate(self, check, depth, odom, objects_ms, latest, now_ms):
+        """Recover a slow first plan only with a newly measured, associated detection."""
+        guard = check.planning_guard
+        track, anchor = self._state.tracker.track, self._state.goal_anchor
+        source = observation_source(latest[0])
+        if (guard is None or guard.probe_region or guard.association is not None or track is None
+                or not track.observed or track.accepted_detection or not track.navigation_range_known
+                or track.generation != guard.generation or track.source is None or check.target_source != track.source
+                or (anchor is not None and (anchor.generation != track.generation or anchor.target_missing))
+                or source is None or source <= track.source or not objects_ms < latest[3] <= now_ms):
+            return None
+        measured = policy_mod.target_body_pose(guard.checked_ms, odom, guard.measured, depth.get("obstacle_capture_pose"))
+        guard = replace(guard, association=track.snapshot(guard.checked_ms), association_pose=measured)
+        return replace(check, planning_guard=guard, motion_guard=guard, target_receipt_ms=objects_ms,
+                       target_ms=objects_ms, renewable=True)
+
+    def _recheck_forward(self, check, values, max_age, now_ms, *, allow_same_depth=False,
+                         snapshot=None, diagnostics=None, renew=True, handoff_deadline_ms=None,
+                         refresh_direct=False, recheck_feedback=False, command_only=False):
+        """Try the short motion against current depth and feedback without retiming either."""
+        config = self._config
+        if check.motion_guard is not None:
+            if snapshot is None:
+                snapshot = self._observation_snapshot(with_capture_timing=True)
+            return self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
+                                            renew=renew, diagnostics=diagnostics if diagnostics is not None else {},
+                                            handoff_deadline_ms=handoff_deadline_ms)
+        distance_ms = check.target_ms or check.checked_ms
+        target_age = min(max_age, config.max_obs_age_ms)
+        if not refresh_direct and not distance_ms <= now_ms < distance_ms + target_age:
+            return None
+        objects, depth, odom, receipt = (self._observation_snapshot(with_capture_timing=True)
+                                        if snapshot is None else snapshot)
+        if depth is None or depth.get("capture_invalid") or depth.get("map") is None:
+            return None
+        source = depth.get("source_frame_id")
+        feedback = (odom or {}).get("source_sample_id")
+        same_depth = (allow_same_depth and depth["frame_id"] == check.frame_id
+                      and source is not None and source == check.source_id
+                      and feedback is not None and check.feedback_source is not None
+                      and (feedback > check.feedback_source or (
+                          recheck_feedback and feedback == check.feedback_source)))
+        if (not same_depth and (depth["frame_id"] <= check.frame_id
+                                or (check.source_id is not None and (source or 0) <= check.source_id))):
+            return None
+        geometry = check.geometry
+        mount = depth.get("body_from_optical")
+        if mount is not None and mount[0, 2] < .75:
+            return None
+        if check.mount_frame is not None:
+            capture_pose = depth.get("obstacle_capture_pose")
+            pose = (odom or {}).get("obstacle_pose") or (odom or {}).get("motion_pose")
+            if mount is None or capture_pose is None or pose is None or capture_pose.frame != check.mount_frame or (
+                    pose.frame != check.mount_frame):
+                return None
+            geometry = replace(geometry, base_from_optical=mount)
+        depth_ms = depth_mod.observation_ms(depth)
+        measured = odom_mod.planar_feedback(odom)
+        received_ms = (odom or {}).get("received_ms")
+        odom_ms, feedback_source = None, None
+        if command_only:
+            measured = self._wire_twist
+            if measured is None or check.mount_frame is not None:
+                return None
+        else:
+            if measured is None or received_ms is None:
+                return None
+            odom_ms = min(received_ms, odom.get("stamp_ms", received_ms))
+            feedback_source = odom.get("source_sample_id")
+            if check.feedback_source is not None and feedback_source is not None:
+                if feedback_source < check.feedback_source:
+                    return None
+                if feedback_source == check.feedback_source and check.feedback_ms is not None:
+                    odom_ms = min(odom_ms, check.feedback_ms)
+        if refresh_direct and check.direct_association is not None:
+            association, pose = check.direct_association
+            source = observation_source(objects)
+            if (source is not None and source > check.target_source and distance_ms < receipt <= now_ms
+                    and now_ms - receipt < target_age
+                    and not any(target_objects(objects, check.target, config))):
+                if diagnostics is not None:
+                    diagnostics["reason"] = "target_missing"
+                return None
+            track = self._state.tracker.track
+            if (source is not None and source > check.target_source and distance_ms < receipt <= now_ms
+                    and now_ms - receipt < target_age
+                    and track is not None and track.observed and track.generation == association.generation
+                    and (track.latest_source is None or source >= track.latest_source)
+                    and self._state.reacquire_generation is None and not _feedback_pose_jump(
+                        check.input_revision, _motion_inputs(objects, depth, odom), config.max_feedback_gap_ms, config)):
+                current = policy_mod.target_body_pose(receipt, odom, measured, depth.get("obstacle_capture_pose"))
+                if pose is not None and current is not None and pose.frame != current.frame:
+                    return None
+                elapsed = max(0., (receipt - association.reference_ms) / 1000)
+                delta = policy_mod.target_body_delta(pose, association.reference_ms, receipt, odom, measured, current)
+                match = match_observation(association, objects, depth, ego_motion=delta, elapsed_s=elapsed,
+                                          target=check.target, config=replace(config, scan_geometry=geometry))
+                if match is not None:
+                    bearing = math.atan2(-match.point[1], match.point[0]) / config.half_fov_rad
+                    cap = config.vx_max * policy_mod._alignment_scale(bearing, config)
+                    if values[0] > cap + 1e-9:
+                        (moving_floor, _), _ = policy_mod._local_velocity_limits(config, 1.)
+                        deadband = self._deadband_for(values)
+                        floor = max(moving_floor, deadband[0] if deadband is not None else 0.)
+                        if any(values[1:5]) or cap <= 0. or cap < floor:
+                            return None
+                        check = replace(check, direct_vx=cap)
+                    distance_ms = receipt
+                    check = replace(check, target_ms=receipt, target_source=source,
+                                    distance_m=min(check.distance_m, match.range_m))
+        target_deadline = distance_ms + target_age
+        stamps = (distance_ms, depth_ms) if command_only else (distance_ms, depth_ms, odom_ms)
+        obs_ms = min(stamps)
+        deadline = min(target_deadline, depth_ms + config.depth_age_limit_ms, obs_ms + max_age)
+        if command_only and handoff_deadline_ms is not None:
+            deadline = min(deadline, handoff_deadline_ms)
+        elif not command_only:
+            deadline = min(deadline, odom_ms + min(self._odom_max_age_ms, config.max_feedback_gap_ms))
+        deadline = int(deadline)
+        if not max(stamps) <= now_ms < deadline:
+            return None
+        occupied = check.occupied if same_depth and check.mount_frame is None else None
+        if occupied is None:
+            grid = local_path.project_observation(depth, geometry, require_valid_depth=True,
+                                                  check_free_space=False)
+            if grid is None:
+                return None
+            occupied = grid[1]
+        clear = True
+        if command_only:
+            command_vx = check.direct_vx if check.direct_vx is not None else values[0]
+            speeds = (measured, check.previous_twist, (command_vx, values[1], values[5]))
+            if self._wire_twist is not None:
+                speeds += (self._wire_twist,)
+            speed = max(math.hypot(vx, vy) for vx, vy, _ in speeds)
+            range_ms = min(distance_ms, check.target_source_ms or check.target_capture_ms or distance_ms)
+            travel = speed * ((deadline - range_ms + config.watchdog_ms + 50) / 1000)
+            travel += speed ** 2 / (2 * config.motion_braking[0])
+            if travel > check.distance_m - config.stop_distance_m:
+                if diagnostics is not None:
+                    diagnostics["reason"] = "target_standoff"
+                return None
+            ahead = policy_mod.projected_forward_clearance(occupied, geometry, config)
+            delayed_travel = speed * (depth_ms - depth.get("obstacle_driver_ms", depth_ms)) / 1000
+            clear = not (ahead is not None and ahead + policy_mod.FORWARD_CLEARANCE_MARGIN_M < check.distance_m
+                         and ahead <= policy_mod.forward_stop_line(config, speed) + delayed_travel)
+        elif check.direct_association is not None or not same_depth:
+            previous = self._wire_twist or check.previous_twist
+            command = (values[0] if check.direct_vx is None else check.direct_vx, values[1], values[5])
+            rates = measured, previous, command
+            scan = self._state.active_scan
+            reference = policy_mod.dwa_pose_reference(scan, odom)
+            current_pose = policy_mod.dwa_grid_pose(scan, geometry, now_ms, odom)
+
+            def registration(stamp, capture):
+                pose = policy_mod.dwa_grid_pose(scan, geometry, stamp, odom, capture=capture)
+                return policy_mod.dwa_registration(pose, current_pose, stamp, now_ms,
+                                                   geometry, rates, reference=reference)
+
+            try:
+                view = registration(*policy_mod.dwa_depth_origin(depth, depth_ms))
+                layers = policy_mod.dwa_depth_layers(depth, occupied, depth_ms, view, registration, config)
+            except policy_mod.DwaFrameMismatch:
+                return None
+            mode = "camera_approx" if geometry.front == 0. else "body"
+            footprint = motion.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
+                                            config.clearance_margin_m, mode)
+            admission = min(self._ttl_ms, deadline - now_ms) / 1000
+            trace = motion.predict_motion(measured, previous, command,
+                                          hold_s=admission + (config.watchdog_ms + 50) / 1000,
+                                          latency_s=admission, geometry=geometry, mode=mode,
+                                          acceleration=config.motion_acceleration, braking=config.motion_braking)
+            result = motion.evaluate_motion(
+                trace, footprint=footprint, remembered=(),
+                occupied=layers + policy_mod.dwa_front_flank_guard(depth, config, geometry, now_ms),
+                supported_region=local_path.SUPPORTED_REGION, original_goal=None, stop_distance_m=0.,
+                cull_obstacles=True)
+            clear = result.accepted
+            if diagnostics is not None and not clear:
+                diagnostics["reason"] = result.reason
+        newer = replace(check, geometry=geometry, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
+                        feedback_source=feedback_source, feedback_ms=odom_ms, occupied=occupied)
+        return obs_ms, deadline, clear, newer
+
+    def _plan_camera_successor(self, check, values, max_age, now_ms, *, snapshot=None):
+        """Plan a new camera arc when the earlier snapshot has already expired."""
+        if check is None or check.mount_frame is not None:
+            return None
+        passage = check.camera_passage
+        corner = passage is not None and passage.corridor_corner
+        if check.direct_association is None and not corner:
+            return None
+        objects, depth, odom, receipt = (self._observation_snapshot(with_capture_timing=True)
+                                        if snapshot is None else snapshot)
+        source = observation_source(objects)
+        if (depth is None or depth.get("capture_invalid") or odom is not None
+                or (depth.get("body_mount_required") and self._state.use_body_mount is not False)
+                or depth["frame_id"] <= check.frame_id):
+            return None
+        config = self._config
+        capture = depth.get("capture_ms") or depth["frame_id"]
+        geometry = check.geometry
+        match = None
+        if (check.direct_association is not None and check.target_receipt_ms < receipt <= now_ms
+                and (check.target_source is None or (source is not None and source > check.target_source))):
+            association, _ = check.direct_association
+            match = match_observation(association, objects, depth, ego_motion=(0., 0., 0.),
+                                      elapsed_s=(receipt - association.reference_ms) / 1000,
+                                      target=check.target, config=replace(config, scan_geometry=geometry),
+                                      original_receipt=False)
+        corner_only = match is None and corner and not any(target_objects(objects, check.target, config))
+        if match is None and not corner_only:
+            return None
+        depth_ms = depth_mod.observation_ms(depth)
+        obs_ms = depth_ms if corner_only else min(depth_ms, receipt)
+        deadline = int(min(now_ms + self._ttl_ms, obs_ms + max_age, depth_ms + config.depth_age_limit_ms))
+        if not depth_ms <= now_ms < deadline:
+            return None
+        grid = local_path.project_observation(depth, geometry, require_valid_depth=True, check_free_space=False)
+        if grid is None:
+            return None
+        goal = None if corner_only else local_path.target_in_grid(geometry, match.point[0], -match.point[1])
+        previous = self._wire_twist or check.previous_twist
+        occupied = policy_mod.camera_arc_obstacles(
+            depth, config, geometry, now_ms, grid[1], previous, self._state.command_tail)
+        proof = replace(check, previous_twist=previous, frame_id=depth["frame_id"], source_id=depth.get("source_frame_id"),
+                        depth_ms=depth_ms, target_ms=0 if corner_only else receipt, target_receipt_ms=receipt,
+                        target_source=source, distance_m=None if corner_only else match.range_m,
+                        input_revision=_motion_inputs(objects, depth, odom))
+        if passage is not None:
+            route = passage.register(config, geometry, grid[1], capture,
+                                     previous=previous, residual=self._state.command_tail)
+            if route is not None:
+                command = policy_mod.camera_route_command(
+                    route, config, goal, policy_mod.passing_speed_limit(depth, config, now_ms, config.vx_max),
+                    previous, self._state.command_tail,
+                    (deadline - now_ms) / 1000, occupied=occupied, require_turn=False)
+                if command is not None:
+                    vx, vy, wz = command
+                    candidate = [vx, vy, 0., 0., 0., wz]
+                    if policy_mod.apply_deadband(candidate, self._deadband_for(candidate)) == candidate:
+                        proof = replace(proof,
+                                        camera_passage=(passage.advance(config, route, grid[1], capture,
+                                                                       corner_only=corner_only)
+                                                        if passage.corridor_corner else
+                                                        replace(passage, route=route, occupied=grid[1], capture_ms=capture)))
+                        return obs_ms, deadline, proof, candidate
+        if corner_only:
+            return None
+        for scale in (1., .75):
+            candidate = [value * scale for value in values]
+            if policy_mod.apply_deadband(candidate, self._deadband_for(candidate)) != candidate:
+                continue
+            command = tuple(candidate[i] for i in (0, 1, 5))
+            if policy_mod.camera_arc_clear(geometry, config, command, previous,
+                                           self._state.command_tail, (deadline - now_ms) / 1000, occupied=occupied):
+                return obs_ms, deadline, proof, candidate
+        return None
 
     def next_command(self):
         """One tick of the policy, as a message or None.
@@ -1478,17 +3218,157 @@ class NaviPlugin:
         Public and ROS-free so the whole decision path — including the sequence
         numbers and the two timestamps — is testable without a node.
         """
-        now = time.time()
-        dt = (now - self._last_tick) if self._last_tick else 1.0 / self._rate_hz
-        self._last_tick = now
+        self._staged_forward_check = None
+        self._staged_diagnostic = None
+        self._staged_dwa_command = None
+        tick = time.monotonic()
+        control_period_s = 1.0 / self._rate_hz
+        previous_tick = self._last_tick
+        dt = tick - previous_tick if previous_tick else control_period_s
+        self._last_tick = tick
+        with self._output_lock:
+            started, deadline = self._command_window
+            outgoing_arc = self._scheduled_command
+            self._state.published_dwa_route = None
+            self._state.published_camera_passage = None
+            if (outgoing_arc is not None and outgoing_arc.sent and tick < outgoing_arc.expires_at
+                    and outgoing_arc.forward_check is not None and self._wire_moving
+                    and outgoing_arc.forward_check.straight_handoff is not None):
+                # Remember the handoff for this target even through a brief stop.
+                self._state.published_straight_handoff = outgoing_arc.forward_check.straight_handoff
+            if (outgoing_arc is not None and outgoing_arc.sent and tick < outgoing_arc.expires_at
+                    and outgoing_arc.camera_arc_end_ms is not None and outgoing_arc.forward_check is not None):
+                self._state.published_camera_passage = outgoing_arc.forward_check.camera_passage
+            if (outgoing_arc is not None and outgoing_arc.sent and tick < outgoing_arc.expires_at
+                    and self._continuing_dwa_output(outgoing_arc.dwa_origin)):
+                accepted = outgoing_arc.dwa_origin.acceptance
+                if accepted.route_points and accepted.motion_guard.pose is not None:
+                    self._state.published_dwa_route = accepted
+            committed = self._state.committed_route
+            track = self._state.tracker.track
+            if (self._state.published_dwa_route is None and committed is not None
+                    and (committed.locks_detour or self._state.dwa_trace.get("wait_for_committed_route")
+                         or (self._state.target == "person" and track is not None
+                             and (not track.observed or not track.navigation_range_known)
+                             and committed.motion_guard is not None and track.generation == committed.motion_guard.generation))):
+                self._state.published_dwa_route = committed
+            if self._config.local_controller == "dwa" and self._wire_twist is not None:
+                # A preview or an expired candidate did not change the chassis
+                # request. Sweep handoff from what was actually published.
+                self._state.commanded = self._wire_twist
+                self._state.commanded_vx = self._wire_twist[0]
+            self._state.dwa_handoff_yaw_step = (
+                min(self._config.motion_acceleration[2], self._config.motion_braking[2]) * control_period_s
+                if self._wire_moving and tick < deadline else 0.)
+        coverage = max(0., min(tick, deadline) - max(previous_tick or tick, started))
 
-        objects, depth, odom = self.observation()
+        objects, depth, odom, objects_ms = self._observation_snapshot(
+            with_capture_timing=self._config.local_planning or self._config.local_controller == "dwa")
+        max_age = ((self._descriptor or {}).get("rate") or {}).get("max_obs_age_ms")
+        bounded_age = type(max_age) in (int, float) and 0 < max_age < math.inf
+        frame_ms = depth_mod.observation_ms(depth)
+        if bounded_age and frame_ms is not None and depth.get("control_ms", frame_ms) - frame_ms >= max_age:
+            depth["capture_invalid"] = True
+        input_revision, selection_constraints, admission_ms = None, None, 0
+        dwa_time_left = None
+        epoch, action_id = self._output_epoch, self._acp_action_id
+        if self._config.local_controller == "dwa":
+            input_revision = _motion_inputs(objects, depth, odom)
+            selection_constraints = self._dwa_constraints()
+            planning_ms = (depth or {}).get("control_ms") or int(time.time() * 1000)
+            capture = frame_ms or planning_ms
+            feedback = (odom or {}).get("received_ms") or planning_ms
+            feedback = min(feedback, (odom or {}).get("stamp_ms", feedback))
+            admission_deadline = min(planning_ms + self._ttl_ms, capture + self._config.depth_age_limit_ms)
+            if odom is not None or self._config.odom_expected:
+                admission_deadline = min(admission_deadline,
+                                         feedback + min(self._odom_max_age_ms, self._config.max_feedback_gap_ms))
+            if bounded_age or (odom is None and not self._config.odom_expected):
+                planning_age = max_age if bounded_age else self._config.max_obs_age_ms
+                corner = (self._state.published_dwa_route is not None and self._state.published_dwa_route.corridor_corner
+                          or self._state.published_camera_passage is not None
+                          and self._state.published_camera_passage.corridor_corner)
+                target_stamp = objects_ms if objects and objects_ms else planning_ms
+                if corner and not any(target_objects(objects, self._state.target, self._config)):
+                    target_stamp = planning_ms
+                admission_deadline = min(admission_deadline, min(capture, feedback, target_stamp) + planning_age)
+                if (depth and (depth.get("receipt_timed") or depth.get("capture_ms")) and not depth.get("capture_invalid")
+                        and admission_deadline > planning_ms):
+                    # Leave part of a tick for first-write validation and publishing.
+                    reserve_s = min(control_period_s / 4, (admission_deadline - planning_ms) / 4000)
+                    cutoff = time.monotonic() + (admission_deadline / 1000 - time.time()) - reserve_s
+                    dwa_time_left = lambda: cutoff - time.monotonic()
+            admission_ms = max(0, int(admission_deadline - planning_ms))
+        previous_twist = self._state.commanded
+        was_moving = any(previous_twist)
+        previous_scan = self._state.active_scan
+        had_scan_motion = (previous_scan.active or previous_scan.advance_m is not None
+                           or self._state.detour_leg is not None)
+        issued_yaw = previous_scan.issued_yaw
+        previous_turn_stop_ms = previous_scan.turn_stop_ms
+        previous_turn_deadline = previous_scan.turn_until_ms
+        idle_for_s = self._state.idle_for_s
+        scan_guarded = previous_scan.active or bool(previous_scan.result_frame)
+        was_searching = (self._config.local_planning and self._last_decision is not None
+                         and self._last_decision.status == policy_mod.SEARCHING)
         decision = policy_mod.step(detections=objects, depth=depth, odom=odom,
                                    config=self._config, state=self._state,
-                                   dt=dt)
+                                   dt=dt, control_period_s=control_period_s, command_dt_s=coverage,
+                                   command_interrupted=bool(deadline and tick > deadline), dwa_admission_ms=admission_ms,
+                                   objects_ms=objects_ms, dwa_time_left=dwa_time_left)
+        now = time.time()
+        scan = self._state.active_scan
         self._last_decision = decision
+        if decision.predicted_search:
+            continuing_turn = (was_searching and outgoing_arc is not None and outgoing_arc.sent
+                    and outgoing_arc.turn is None and outgoing_arc.dwa_origin is None
+                    and outgoing_arc.expires_at > time.monotonic()
+                    and outgoing_arc.message["values"] == decision.values)
+            # Keep the existing lease for an isolated miss. A longer gap can
+            # admit only the same yaw, swept again against the latest depth.
+            if continuing_turn and decision.hold_search:
+                return None
+            if not continuing_turn:
+                decision.hold_search = decision.predicted_search = False
+                decision.values = [0.] * ACTION_DIM
+                decision.status, decision.reason = policy_mod.AVOIDING, "原地搜索：上一条转向窗口已结束"
+                self._state.search_feedback_ms = None
+                self._state.commanded = (0., 0., 0.)
+                return self._command_message(decision.values, now, int(now * 1000))
+        if (self._command_timer is not None and self._config.local_planning
+                and decision.status == policy_mod.BLIND
+                and (depth is None or depth.get("capture_invalid"))):
+            # A missing observation can't authorize a new packet. The
+            # publisher still owns any previously admitted command window.
+            decision.reason = policy_mod.DEPTH_CAPTURE_STALE
+            if not decision.publishes:
+                if deadline > tick:
+                    self._state.commanded = previous_twist
+                return None
+        origin = (self._dwa_origin(decision.dwa_acceptance, selection_constraints, epoch, action_id, had_scan_motion)
+                  if decision.dwa_acceptance is not None else None)
+        if self._config.local_controller == "dwa":
+            self._state.dwa_trace.update(target=self._state.target, action_id=self._acp_action_id)
+        command_only = self._config.local_planning and self._state.motion_source == "command"
         if not decision.publishes:
-            return None
+            if origin is not None:
+                self._veto_dwa(origin, "postcheck_veto")
+            # An inconclusive planning tick leaves the already checked
+            # command to the control timer and its existing watchdog.
+            search_turn = was_searching and previous_twist[2] and not any(previous_twist[:2])
+            quiet_dwa = (self._config.local_controller == "dwa"
+                         and not search_turn
+                         and decision.status not in (policy_mod.ARRIVED, policy_mod.FAILED))
+            if quiet_dwa or (self._config.watchdog_ms <= 300
+                    and not (scan_guarded or was_searching or command_only)) or not was_moving:
+                if deadline > tick:
+                    self._state.commanded = previous_twist
+                return None
+            self._command_window = (0., 0.)
+            decision.values = [0.0] * ACTION_DIM
+            message = self._command_message(decision.values, now, int(now * 1000))
+            self._remember_decision(message, epoch, action_id)
+            return message
 
         # Lift the command out of the robot's deadband, or drop it to zero. The
         # threshold comes from the downstream descriptor — it is a property of
@@ -1500,9 +3380,277 @@ class NaviPlugin:
         # also translates inflates a small correction and creates weaving.
         values = policy_mod.apply_deadband(decision.values,
                                            self._deadband_for(decision.values))
-
-        obs_ms = self._objects_ms or int(now * 1000)
-        return self._command_message(values, now, obs_ms)
+        checked_search = self._config.local_planning and decision.status == policy_mod.SEARCHING
+        if (values != decision.values and self._config.local_planning
+                and (self._state.avoidance_yaw_override or scan_guarded or scan.active or checked_search)):
+            values = decision.values = [0.] * ACTION_DIM
+            decision.reason = "底盘速度死区会改变已检查的运动；保持停车"
+        now_ms = int(now * 1000)
+        obs_ms = (now_ms if objects is None and self._state.goal_anchor is not None
+                  else objects_ms or now_ms)
+        if (self._config.watchdog_ms > 300 or decision.status == policy_mod.BLIND or scan_guarded or scan.active
+                or was_searching) and not any(values):
+            # A hold applies now, even when the last input is about to expire.
+            obs_ms = now_ms
+        elif (self._config.local_planning and any(values)
+                and depth is not None and depth.get("frame_id") is not None):
+            obs_ms = min(obs_ms, depth_mod.observation_ms(depth, scan.single_depth_ms or depth["frame_id"]))
+            motion_pose = (odom or {}).get("motion_pose")
+            if motion_pose is not None and (scan.pose_origin is not None or not odom.get("velocity_history")):
+                obs_ms = min(obs_ms, motion_pose.stamp_ms)
+            if ((scan_guarded or checked_search or self._state.checked_prefix) and odom is not None
+                    and not decision.predicted_search):
+                stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
+                obs_ms = min(obs_ms, odom.get(stamp_key, obs_ms))
+                if scan.current_frame:
+                    obs_ms = min(obs_ms, scan.current_frame)
+        camera_arc = self._state.camera_arc_selected
+        if camera_arc and not bounded_age:
+            max_age, bounded_age = self._config.max_obs_age_ms, True
+        stale = (self._config.local_planning and any(values)
+                 and bounded_age and max_age <= now_ms - obs_ms)
+        prefix_deadline = None
+        if self._state.checked_prefix and any(values):
+            stamp_key = "received_ms" if scan.receipt_only else "stamp_ms"
+            feedback_ms = (odom or {}).get(stamp_key, (odom or {}).get("received_ms"))
+            depth_ms = depth_mod.observation_ms(depth, scan.current_frame)
+            if feedback_ms is not None and depth_ms:
+                prefix_deadline = min(feedback_ms + self._config.max_feedback_gap_ms,
+                                      depth_ms + self._config.depth_age_limit_ms)
+        recheck_deadline = None
+        recheck_blocked = False
+        guard = origin.acceptance.motion_guard if origin else None
+        corner_only = bool((guard is not None and guard.corner_only)
+                           or (camera_arc and self._state.dwa_trace.get("corner_only")))
+        if corner_only and depth is not None:
+            obs_ms = min(depth_mod.observation_ms(depth),
+                         (odom or {}).get("received_ms", now_ms), now_ms)
+            stale = bounded_age and max_age <= now_ms - obs_ms
+        target_observed = (origin.acceptance.target_observed if origin is not None else
+                           objects is not None and not corner_only)
+        visual_probe = guard is not None and guard.probe_region
+        straight_handoff = self._state.dwa_trace.get("straight_handoff")
+        forward_check = (self._forward_check(decision, previous_twist, depth, odom,
+                                             objects_ms if target_observed or visual_probe else 0,
+                                             renewable=target_observed and bounded_age, input_revision=input_revision,
+                                             target_source=observation_source(objects))
+                         if (origin is not None or camera_arc or straight_handoff
+                             or (bounded_age and (objects is not None or corner_only)))
+                         and values == decision.values else None)
+        if straight_handoff and forward_check is None and any(values):
+            values = decision.values = [0.] * ACTION_DIM
+            decision.status, decision.reason = policy_mod.AVOIDING, "直行缺少有效观测，保留原路线"
+            obs_ms = now_ms
+        if camera_arc and forward_check is not None:
+            forward_check = replace(forward_check, target_receipt_ms=objects_ms)
+        selected_arc = camera_arc or (origin is not None and bool(origin.acceptance.route_points))
+        if (camera_arc or straight_handoff) and any(values):
+            prefix_deadline = planning_ms + admission_ms
+            if forward_check is not None and forward_check.target_capture_ms is not None:
+                prefix_deadline = min(prefix_deadline, forward_check.target_capture_ms + self._config.depth_age_limit_ms)
+        # An expired candidate has no executable arc. The planner can try
+        # to form a fresh proof before handing any result to the publisher.
+        route_deadline = (forward_check.motion_guard.deadline_ms if origin is not None
+                          and origin.acceptance.route_points and forward_check is not None
+                          and forward_check.motion_guard is not None else None)
+        expired_route_proof = route_deadline is not None and now_ms >= route_deadline
+        needs_refresh = (not selected_arc or (not camera_arc and (
+            stale or expired_route_proof or (prefix_deadline is not None and now_ms >= prefix_deadline))))
+        short_prefix = (prefix_deadline is not None
+                        and prefix_deadline - now_ms <= 2000 * control_period_s)
+        latest = None
+        recheck = forward_check
+        if (needs_refresh and bounded_age and short_prefix and origin is not None and not origin.acceptance.angle_controlled
+                and forward_check is not None and not forward_check.renewable):
+            latest = self._observation_snapshot(with_capture_timing=True)
+            recheck = self._new_observation_after_duplicate(forward_check, depth, odom, objects_ms, latest, now_ms)
+        if (needs_refresh and recheck is not None and recheck.renewable and bounded_age
+                and (short_prefix or expired_route_proof or obs_ms + max_age - now_ms < 1000 * control_period_s)):
+            original_deadline = min(obs_ms + max_age, now_ms + self._ttl_ms)
+            if prefix_deadline is not None:
+                original_deadline = min(original_deadline, prefix_deadline)
+            if expired_route_proof:
+                original_deadline = min(original_deadline, route_deadline)
+            recheck_diagnostics = {}
+            if recheck is forward_check:
+                refreshed = self._recheck_forward(recheck, values, max_age, now_ms, allow_same_depth=short_prefix,
+                                                  diagnostics=recheck_diagnostics)
+            else:
+                refreshed = self._recheck_dwa_motion(recheck, values, max_age, now_ms, latest, renew=True,
+                                                     diagnostics=recheck_diagnostics)
+            now = time.time()
+            now_ms = int(now * 1000)
+            stale = max_age <= now_ms - obs_ms
+            if refreshed is not None and not refreshed[2]:
+                recheck_blocked = True
+            elif refreshed is not None and refreshed[0] <= now_ms < refreshed[1]:
+                checked_obs_ms, checked_deadline, clear, newer = refreshed
+                if (clear and checked_deadline > original_deadline and (recheck is forward_check or (
+                        newer.target_ms == latest[3] and newer.target_source == observation_source(latest[0])))):
+                    if recheck is not forward_check:
+                        origin = replace(origin, acceptance=replace(origin.acceptance, motion_guard=newer.motion_guard))
+                    obs_ms, recheck_deadline, forward_check = checked_obs_ms, checked_deadline, newer
+                    recheck_note = "已用新深度复检" if newer.frame_id != depth["frame_id"] else "已用新反馈复检"
+                    decision.reason = f"{decision.reason}，{recheck_note}"
+                    stale = False
+        expired_camera = camera_arc and any(values) and now_ms >= prefix_deadline
+        continue_camera = (decision.reason == policy_mod.NO_LOCAL_ROUTE and outgoing_arc is not None
+                           and outgoing_arc.camera_arc_end_ms is not None and outgoing_arc.sent
+                           and outgoing_arc.successor is None and now_ms < outgoing_arc.expires_ms
+                           and time.monotonic() < outgoing_arc.expires_at)
+        if expired_camera or continue_camera:
+            if continue_camera:
+                check, command = outgoing_arc.forward_check, outgoing_arc.message["values"]
+            else:
+                check, command = forward_check, values
+            candidate = self._plan_camera_successor(
+                check, command, max_age if bounded_age else self._config.max_obs_age_ms, now_ms)
+            now = time.time()
+            now_ms = int(now * 1000)
+            if candidate is not None and candidate[0] <= now_ms < candidate[1]:
+                obs_ms, recheck_deadline, forward_check, values = candidate
+                stale = False
+                decision.values = values
+                if continue_camera:
+                    camera_arc = self._state.camera_arc_selected = True
+                    decision.reason = "局部规划：沿已执行的曲率接续下一段"
+        if (self._state.checked_prefix or camera_arc or straight_handoff) and any(values) and not stale and recheck_deadline is None:
+            recheck_deadline = prefix_deadline
+            if recheck_deadline is None or now_ms >= recheck_deadline:
+                values = decision.values = [0.] * ACTION_DIM
+                decision.reason = "局部规划：弧段所用深度或运动反馈已到期，停车"
+                obs_ms = now_ms
+                recheck_deadline = None
+        buffered_turn = values[5] and scan.turn_until_ms and scan.buffered_turn
+        if buffered_turn and not stale and not previous_turn_deadline and depth is not None:
+            checked_ms = depth.get("control_ms")
+            if checked_ms is not None and checked_ms <= now_ms < scan.turn_until_ms:
+                # The first burst has not reached the wire. Give the checked
+                # duration to the controller, with the original freshness cap.
+                scan.turn_until_ms += now_ms - checked_ms
+        if buffered_turn and not stale and type(max_age) in (int, float) and 0 < max_age < math.inf:
+            scan.turn_until_ms = min(scan.turn_until_ms, int(obs_ms + max_age))
+        expired_turn = values[5] and scan.turn_until_ms and now_ms >= scan.turn_until_ms
+        if buffered_turn:
+            # A renewed command may not bridge an expiry that happened while
+            # the planner was running, even with a fresh feedback snapshot.
+            expired_turn = expired_turn or (scan is previous_scan and previous_turn_deadline
+                                            and now_ms >= previous_turn_deadline)
+        if expired_turn or stale or recheck_blocked:
+            if scan is not previous_scan or not issued_yaw:
+                scan.issued_yaw = False
+            if expired_turn:
+                scan.turn_until_ms = 0
+                scan.turn_stop_ms = now_ms
+                status, reason = policy_mod.AVOIDING, "主动观察：转向指令窗口已到期，停车等待新反馈"
+            elif recheck_blocked:
+                status, reason = policy_mod.AVOIDING, "局部规划：新深度复检发现扫掠区有障碍，停车等候重规划"
+            else:
+                status = policy_mod.BLIND
+                reason = f"规划完成时观测已到期（{now_ms - obs_ms} ms ≥ {max_age:g} ms）；停车"
+                depth_timing = depth or {}
+                log.info("navi expired observation: depth_stamp_ns=%s depth_received_ms=%s "
+                         "planning_started_ms=%s planning_finished_ms=%d observation_ms=%d",
+                         depth_timing.get("source_stamp_ns"), depth_timing.get("frame_id"),
+                         depth_timing.get("control_ms"), now_ms, obs_ms)
+                if scan.active and scan.receipt_only and not scan.command_only:
+                    if scan.buffered_turn and obs_ms == depth_mod.observation_ms(depth_timing):
+                        scan.pause_for_depth(now_ms)
+                    else:
+                        scan.hold_for_replan("主动观察：规划所用观测已到期，停车后重规划")
+            self._state.adaptive_fwd_scale = 1.
+            self._state.moving_for_s = 0.
+            values = [0.] * ACTION_DIM
+            hold = policy_mod.Decision(values, status, reason,
+                                       distance_m=decision.distance_m, bearing=decision.bearing)
+            if (self._config.local_controller == "dwa"
+                    and self._state.dwa_progress.requires_feedback):
+                self._last_decision = hold
+            else:
+                self._state.idle_for_s = idle_for_s
+                self._last_decision = policy_mod._account_idle(hold, self._state, self._config, dt)
+            obs_ms = now_ms
+        publication_veto = None
+        changed = origin is not None and values != self._dwa_values(origin)
+        stopped = (self._config.local_controller == "dwa" and not any(values)
+                   and any(self._state.dwa_trace.get("final_twist") or ()))
+        if changed or stopped:
+            expired = stale or expired_turn or (prefix_deadline is not None and now_ms >= prefix_deadline)
+            if recheck_blocked:
+                publication_veto = recheck_diagnostics.get("reason") or "footprint_collision"
+            else:
+                publication_veto = "publish_expired" if expired else "postcheck_veto"
+        if changed:
+            values = [0.] * ACTION_DIM
+            if publication_veto == "postcheck_veto":
+                selected_values = self._dwa_values(origin)
+                detail = ("deadband_changed" if policy_mod.apply_deadband(
+                    selected_values, self._deadband_for(selected_values)) != selected_values else "values_changed")
+                self._note_dwa_veto_detail(origin, "postselection", detail)
+            self._veto_dwa(origin, publication_veto)
+            decision.values = values
+            self._last_decision.values = values
+            obs_ms = now_ms
+            forward_check = None
+            recheck_deadline = None
+        if scan.turn_stop_ms is not None and scan.turn_stop_ms != previous_turn_stop_ms:
+            # Bracket the outgoing stop, including time spent planning it.
+            scan.turn_stop_ms = now_ms
+        if values != decision.values or not any(values[:2]) or values[5]:
+            self._state.detour_leg = self._state.executing_leg = None
+        self._state.commanded = (values[0], values[1], values[5])
+        if values[0] <= .05:
+            self._state.moving_for_s = 0.
+        message = self._command_message(values, now, obs_ms)
+        if decision.predicted_search and any(values):
+            message["ttl_ms"] = min(message["ttl_ms"], self._config.max_feedback_gap_ms,
+                                    depth_mod.observation_ms(depth) + self._config.depth_age_limit_ms - now_ms)
+        if origin is not None and forward_check is not None and forward_check.motion_guard is not None:
+            proof_end = forward_check.motion_guard.deadline_ms
+            recheck_deadline = min(proof_end, recheck_deadline or proof_end)
+        if recheck_deadline is not None:
+            message["ttl_ms"] = min(message["ttl_ms"], recheck_deadline - now_ms)
+        if values[5] and scan.turn_until_ms:
+            message["ttl_ms"] = min(message["ttl_ms"], scan.turn_until_ms - now_ms)
+            if buffered_turn:
+                scan.turn_until_ms = now_ms + message["ttl_ms"]
+        if origin is not None and any(values):
+            rejection = self._dwa_publish_rejection(message, origin, now_ms)
+            if rejection is not None:
+                publication_veto = rejection
+                self._veto_dwa(origin, rejection)
+                values = [0.] * ACTION_DIM
+                message = dict(message, values=values, obs_stamp_ms=now_ms, ttl_ms=self._ttl_ms)
+                forward_check = None
+            else:
+                origin = replace(origin, forward_check=forward_check)
+                self._staged_dwa_command = (message["seq"], origin)
+        if any(values):
+            if forward_check is not None and self._state.executing_leg is None:
+                self._staged_forward_check = (message["seq"], forward_check)
+            issued = time.monotonic()
+            self._command_window = (issued, issued + min(message["ttl_ms"], self._config.watchdog_ms) / 1000)
+        else:
+            self._command_window = (0., 0.)
+        expired_route = bool(publication_veto == "publish_expired" and origin is not None
+                             and (origin.acceptance.route_points or origin.acceptance.motion_guard.probe_region)
+                             and not recheck_blocked and not expired_turn
+                             and decision.status not in (policy_mod.ARRIVED, policy_mod.FAILED))
+        self._remember_decision(
+            message, epoch, action_id, publication_veto if origin is None else None,
+            expired_route=expired_route,
+            discarded_proposal=publication_veto in _DISCARD_WITHOUT_STOP and not expired_turn)
+        if self._config.local_controller == "dwa":
+            trace = self._state.dwa_trace
+            log_state = (epoch, action_id, decision.status, any(message["values"]),
+                         trace.get("controller_used"), trace.get("branch"),
+                         trace.get("fallback_reason"), trace.get("veto_reason"))
+            report = log_state != self._dwa_decision_log_state or self._state.decision_id % _DWA_LOG_EVERY == 0
+            self._dwa_decision_log_state = log_state
+            level = logging.INFO if report else logging.DEBUG
+            if log.isEnabledFor(level):
+                log.log(level, "navi dwa decision: %s", _decision_log(trace))
+        return message
 
     def _command_message(self, values, now, obs_ms):
         """Build one guarded normal-navigation command."""
@@ -1532,12 +3680,12 @@ class NaviPlugin:
         # "joint6" when it is the yaw rate, and the reader concludes the robot
         # is driving six joints.
         #
-        # Every N commands rather than every one: the descriptor is a hundred
-        # numbers and a constant — it cannot change after negotiation — so
-        # carrying it at 10 Hz would multiply the command stream for nothing.
+        # Every N commands and immediately after a limit refresh. Carrying
+        # the entire declaration at 10 Hz would multiply the command stream.
         # The first command always carries it, so a panel opened at any time has
         # names straight away instead of waiting out a cycle.
-        if self._seq % _DESCRIPTOR_EVERY == 1:
+        if self._descriptor_changed or self._seq % _DESCRIPTOR_EVERY == 1:
+            self._descriptor_changed = False
             # With a downstream, echo its descriptor — real limits are what
             # give the panel's range bars a scale. Without one, still carry the
             # axis names: the order is the protocol's, not anyone's to ask.
@@ -1564,19 +3712,77 @@ class NaviPlugin:
         return list(moving)
 
     def _tick(self):
-        with self._lock:
-            publisher = self._publisher
-            if publisher is None or not self._running or self._paused:
+        entered = time.monotonic()
+        with self._output_lock:
+            if self._scheduled_command is not None and self._scheduled_command.stop_reason is not None:
+                self._dispatch_command()
                 return
+        with self._lock:
+            if self._publisher is None or not self._running or self._paused or self._starting:
+                return
+            publishing = False
             try:
-                message = self.next_command()
-                if message is not None:
-                    from std_msgs.msg import String
-                    payload = String()
-                    payload.data = json.dumps(message, ensure_ascii=False)
-                    publisher.publish(payload)
-                    self._published += 1
+                with self._output_lock:
+                    epoch = self._output_epoch
+                    stop, self._output_stop = self._output_stop, None
+                if stop is not None:
+                    stamp, reason, replan = stop
+                    self._command_window = (0., 0.)
+                    self._state.commanded = (0., 0., 0.)
+                    self._state.commanded_vx = 0.
+                    self._state.detour_leg = self._state.executing_leg = None
+                    scan = self._state.active_scan
+                    if reason == DEPTH_RECHECK_HOLD and scan.buffered_turn:
+                        scan.pause_for_depth(stamp)
+                    elif reason == TURN_SPEED_REDUCTION and scan.buffered_turn:
+                        with self._obs_lock:
+                            measured = self._velocity_history[-1][2] if self._velocity_history else None
+                        scan.reduce_turn_speed(self._config.wz_max, measured[2] if measured else scan.motion[2])
+                    elif replan and scan.active and scan.receipt_only and not scan.command_only:
+                        scan.hold_for_replan(reason)
+                    elif scan.buffered_turn:
+                        scan.turn_until_ms = 0
+                        # A candidate discarded before publication has no motion to brake.
+                        scan.turn_stop_ms = None if reason == _UNSENT_TURN else stamp
+                started = time.monotonic()
+                previous = self._last_tick
+                # If publication discovers the lost target, take one new snapshot
+                # and plan its checked search in this tick, outside the output lock.
+                for attempt in range(2):
+                    searching = self._state.reacquire_generation is not None
+                    message = self.next_command()
+                    decided = time.monotonic()
+                    with self._output_lock:
+                        if self._config.local_controller == "dwa" and epoch != self._output_epoch:
+                            self._supersede_message(message)
+                            return
+                        self._can_replan_search = not attempt and not searching
+                        try:
+                            if self._command_timer is not None:
+                                if not self._stage_command(message, epoch):
+                                    return
+                            elif message is not None:
+                                publishing = True
+                                self._publish_command(message)
+                                publishing = False
+                        finally:
+                            self._can_replan_search = False
+                        if (attempt or searching or self._state.reacquire_generation is None
+                                or epoch != self._output_epoch):
+                            break
+                finished = time.monotonic()
+                period = 1.0 / self._rate_hz
+                interval = self._last_tick - previous if previous else 0.
+                if self._config.local_planning and (interval > 2 * period or finished - entered > period):
+                    log.info("navi slow tick: interval=%.1f ms lock=%.1f ms decision=%.1f ms publish=%.1f ms seq=%s",
+                             interval * 1000, (started - entered) * 1000, (decided - started) * 1000,
+                             (finished - decided) * 1000, message["seq"] if message is not None else None)
             except Exception as error:                        # noqa: BLE001
+                if self._scheduled_command is None or self._scheduled_command.stop_reason is None:
+                    self._cancel_scheduled_motion(dwa_reason="publish_error" if publishing else "planning_error")
+                self._command_window = (0., 0.)
+                self._state.moving_for_s = 0.
+                self._state.detour_leg = self._state.executing_leg = None
                 self._last_error = f"{type(error).__name__}: {error}"
                 log.warning("navi tick failed: %s", error)
                 return
@@ -1587,7 +3793,2090 @@ class NaviPlugin:
         # precisely when the robot stops explaining itself.
         self._publish_view()
 
-        self._maybe_complete()
+        with self._output_lock:
+            executing_arc = self._arc_in_progress(self._scheduled_command, int(time.time() * 1000))
+        if not executing_arc:
+            self._maybe_complete()
+
+    def _dwa_constraints(self):
+        """Values whose change invalidates an already checked DWA command."""
+        config = self._config
+        geometry = config.scan_geometry or config.local_geometry
+        footprint = (None if geometry is None else
+                     (geometry.front, geometry.rear, geometry.height,
+                      geometry.horizontal, geometry.vertical,
+                      geometry.free_space_validated, tuple(geometry.base_from_optical.flat)))
+        fields = ("local_controller", "local_planning", "vx_max", "vy_max", "wz_max", "use_lateral",
+                  "floor_vx", "floor_vy", "floor_wz", "floor_vx_moving", "floor_vy_moving",
+                  "floor_wz_moving", "left_vy_limit", "right_vy_limit", "left_wz_limit",
+                  "right_wz_limit", "half_width_m", "stop_distance_m", "max_feedback_gap_ms", "use_obstacle_history",
+                  "watchdog_ms", "dwa_horizon_s", "motion_acceleration", "motion_braking")
+        return (tuple(getattr(config, key) for key in fields), config.depth_age_limit_ms,
+                footprint, config.scan_geometry is not None, config.depth_intrinsics, config.half_fov_rad,
+                self._ttl_ms, json.dumps((self._descriptor or {}).get("limits") or {}, sort_keys=True))
+
+    def _dwa_origin(self, acceptance, constraints, epoch, action_id, had_scan_motion):
+        guard = acceptance.motion_guard
+        return _DwaOrigin(acceptance, epoch, id(self._state), guard.target_name, action_id, constraints,
+                          guard.generation, handoff=had_scan_motion and not acceptance.angle_controlled)
+
+    @staticmethod
+    def _dwa_values(origin):
+        vx, vy, wz = origin.tracking_command or origin.acceptance.command
+        return [vx, vy, 0., 0., 0., wz]
+
+    def _dwa_for_message(self, message):
+        staged = self._staged_dwa_command
+        return staged[1] if staged is not None and staged[0] == message["seq"] else None
+
+    def _dwa_publish_rejection(self, message, origin, now_ms, *, sent=False):
+        self._dwa_veto_detail = None
+        track = self._state.tracker.track
+        if (origin.epoch != self._output_epoch or origin.state_id != id(self._state)
+                or origin.target != self._state.target or origin.action_id != self._acp_action_id
+                or (origin.generation != (track.generation if track else None)
+                    and not (track is None and (origin.acceptance.motion_guard.corner_only
+                                                or sent and self._continuing_dwa_output(origin))))
+                # The planner can consume a miss before its replacement result
+                # is ready. An already sent command keeps its original window
+                # and still passes the target/physical recheck below; a first
+                # send cannot borrow that continuation privilege.
+                or (origin.acceptance.target_observed and (track is None or not track.observed)
+                    and not self._continuing_dwa_output(origin))
+                or self._output_blocked or self._paused or not self._running
+                or (self._scheduled_command is not None and self._scheduled_command.stop_reason is not None)):
+            return "superseded"
+        if not sent:
+            expires_ms = message["stamp_ms"] + message["ttl_ms"]
+            if origin.forward_check is not None and origin.forward_check.motion_guard is not None:
+                expires_ms = min(expires_ms, origin.forward_check.motion_guard.deadline_ms)
+            max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
+            if type(max_age) in (int, float) and 0 < max_age < math.inf:
+                expires_ms = min(expires_ms, message["obs_stamp_ms"] + max_age)
+            if not message["stamp_ms"] <= now_ms < expires_ms:
+                return "publish_expired"
+        values = message["values"]
+        if values != self._dwa_values(origin):
+            return self._note_dwa_veto_detail(origin, "publish_contract", "values_changed")
+        if origin.constraints != self._dwa_constraints():
+            return self._note_dwa_veto_detail(origin, "publish_contract", "constraints_changed")
+        if policy_mod.apply_deadband(values, self._deadband_for(values)) != values:
+            return self._note_dwa_veto_detail(origin, "publish_contract", "deadband_changed")
+        config = self._config
+        vx, vy, wz = origin.tracking_command or origin.acceptance.command
+        (floor_x, cap_x), (floor_y, cap_y) = policy_mod._local_velocity_limits(
+            config, -1. if vy > 0 else 1.)
+        floor_wz = (config.floor_wz_moving if (vx or vy) and config.floor_wz_moving is not None
+                    else config.floor_wz)
+        cap_wz = policy_mod._scan_yaw_rate(config, -1. if wz > 0 else 1.)
+        if vx < 0 or any(value and not floor <= abs(value) <= cap
+                         for value, floor, cap in ((vx, floor_x, cap_x), (vy, floor_y, cap_y),
+                                                   (wz, floor_wz, cap_wz))):
+            return self._note_dwa_veto_detail(origin, "publish_contract", "policy_axis_bounds")
+        limits = self._descriptor.get("limits") or {}
+        lower, upper = limits.get("lower"), limits.get("upper")
+        if lower and upper and any(not lo <= value <= hi for value, lo, hi in zip(values, lower, upper)):
+            return self._note_dwa_veto_detail(origin, "publish_contract", "descriptor_bounds")
+        return None
+
+    def _note_dwa_veto_detail(self, origin, stage, detail):
+        # One bounded diagnostic slot, bound to the actual decision. It cannot
+        # change eligibility or attach an old command's failure to a new one.
+        self._dwa_veto_detail = origin.diagnostic, stage, detail
+        return "postcheck_veto"
+
+    def _remember_decision(self, message, epoch, action_id, veto=None, *,
+                           expired_route=False, discarded_proposal=False):
+        if self._config.local_controller == "dwa":
+            state = self._state
+            identity = _DecisionIdentity(state.decision_id, epoch, id(state), state.target, action_id,
+                                         veto or state.dwa_trace.get("veto_reason"), expired_route,
+                                         discarded_proposal)
+            self._staged_diagnostic = message["seq"], identity
+            if veto is not None:
+                self._dwa_event(identity, "veto", veto)
+
+    def _diagnostic_for(self, message):
+        staged = self._staged_diagnostic
+        return staged[1] if staged is not None and staged[0] == message["seq"] else None
+
+    def _dwa_event(self, identity, event, reason=None, *, packet=None, write_ms=None):
+        publication = dict(decision_id=identity.decision_id, epoch=identity.epoch, state_id=identity.state_id,
+                           target=identity.target, action_id=identity.action_id, event=event, reason=reason)
+        detail = self._dwa_veto_detail
+        if reason == "postcheck_veto" and detail is not None and all(
+                getattr(detail[0], key) == getattr(identity, key)
+                for key in ("decision_id", "epoch", "state_id", "target", "action_id")):
+            publication.update(veto_stage=detail[1], veto_detail=detail[2])
+        previous = self._dwa_publication
+        if (event == "veto" and previous is not None and previous["event"] in ("veto", "stopped")
+                and all(previous[key] == value for key, value in publication.items() if key != "event")):
+            return
+        trace = self._state.dwa_trace
+        current = id(self._state) == identity.state_id and trace.get("decision_id") == identity.decision_id
+        if event == "veto" and current:
+            trace.update(fallback_reason="publication_veto", veto_reason=reason)
+            for key in ("veto_stage", "veto_detail"):
+                if key in publication:
+                    trace[key] = publication[key]
+        if packet is not None:
+            wire = dict(wire_seq=packet["seq"], wire_values=list(packet["values"]))
+            if write_ms is not None:
+                wire.update(write_ms=write_ms, admission_remaining_ms=packet["stamp_ms"] + packet["ttl_ms"] - write_ms)
+            publication.update(wire)
+            if current:
+                trace.update(wire)
+        self._dwa_publication = publication
+        report = (event != "published" or previous is None or previous["event"] != "published"
+                  or previous["epoch"] != identity.epoch or self._published % _DWA_LOG_EVERY == 0)
+        level = logging.INFO if report else logging.DEBUG
+        if log.isEnabledFor(level):
+            log.log(level, "navi dwa publication: %s", json.dumps(publication, ensure_ascii=False))
+
+    def _fresh_first_send(self, origin, snapshot, now_ms):
+        """Can this unsent translation earn a new window from a full physical check?"""
+        check = origin.forward_check
+        if (check is None or not check.renewable or check.motion_guard is None
+                or self._state.decision_id != origin.acceptance.decision_id
+                or self._dwa_last_published == origin.identity
+                or check.motion_guard.association is None or origin.acceptance.angle_controlled
+                or self._continuing_dwa_output(origin)):
+            return False
+        objects, depth, odom, receipt = snapshot
+        if not depth or depth.get("capture_invalid") or not odom:
+            return False
+        depth_id = depth.get("source_frame_id", depth.get("frame_id"))
+        odom_id = odom.get("source_sample_id", odom.get("received_ms"))
+        if (depth_id == (check.source_id or check.frame_id)
+                and odom_id == (check.feedback_source or check.feedback_ms)):
+            return False
+        depth_ms = depth_mod.observation_ms(depth) or 0
+        feedback_ms = min(odom.get("received_ms", 0), odom.get("stamp_ms", now_ms))
+        if (not 0 <= now_ms - depth_ms < self._config.depth_age_limit_ms
+                or not 0 <= now_ms - feedback_ms < min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)):
+            return False
+        source = observation_source(objects)
+        if source is None or check.target_source is None:
+            return False
+        if source > check.target_source:
+            return check.target_receipt_ms < receipt <= now_ms
+        return (source == check.target_source and receipt == check.target_receipt_ms
+                and 0 <= now_ms - check.target_ms < self._config.max_obs_age_ms
+                and _motion_inputs(objects, None, None)[2] == check.input_revision[2])
+
+    def _recheck_dwa_inputs(self, origin, values, now_ms):
+        """A newer observation must be checked before the command reaches the wire."""
+        check = origin.forward_check
+        if check is None:
+            return self._note_dwa_veto_detail(origin, "physical_recheck", "missing_forward_check"), None
+        snapshot = self._observation_snapshot(with_capture_timing=True)
+        max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
+        if not (type(max_age) in (int, float) and 0 < max_age < math.inf):
+            max_age = self._config.max_obs_age_ms
+        diagnostics = {}
+        if check.motion_guard is None:
+            return self._note_dwa_veto_detail(origin, "physical_recheck", "missing_motion_guard"), None
+        corner_route = origin.acceptance.route_points if check.motion_guard.corner_only else None
+        handoff_deadline = None
+        if self._continuing_dwa_output(origin):
+            handoff_deadline = self._wire_dwa_origin.forward_check.motion_guard.deadline_ms
+        # Either planning time or a late depth exposure can consume the first-send window.
+        period = math.ceil(1000 / self._rate_hz)
+        work = self._scheduled_command
+        outgoing = work.previous_route if work is not None else None
+        cover_slower_feedback = bool(outgoing is not None and outgoing.repeat_until is not None
+                                     and origin.acceptance.route_points
+                                     and 0 < min(outgoing.expires_ms, outgoing.repeat_until[0]) - now_ms <= 2 * period)
+        for attempt in range(2):
+            slow_first_send = (now_ms - origin.acceptance.motion_guard.checked_ms >= period
+                               and origin.forward_check.motion_guard.deadline_ms - now_ms <= 2 * period)
+            depth = snapshot[1] or {}
+            original_depth_ms = origin.forward_check.depth_ms
+            depth_deadline = original_depth_ms + min(max_age, self._config.depth_age_limit_ms)
+            latest_ms = depth.get("frame_id") if depth.get("receipt_timed") else depth.get("capture_ms")
+            newer_exposure = ((latest_ms or 0) > original_depth_ms
+                              and depth_deadline - now_ms <= period)
+            renew = (slow_first_send or newer_exposure) and self._fresh_first_send(origin, snapshot, now_ms)
+            # A fixed-window check can match a new detector frame without
+            # taking its timestamp. Renew from the original association so
+            # the newer frame has to earn its own deadline on a fresh sweep.
+            if renew or check.motion_guard.deadline_ms > origin.forward_check.motion_guard.deadline_ms:
+                check = origin.forward_check
+            checked = self._recheck_dwa_motion(check, values, max_age, now_ms, snapshot,
+                                               renew=renew, diagnostics=diagnostics,
+                                               handoff_deadline_ms=handoff_deadline,
+                                               cover_slower_feedback=cover_slower_feedback,
+                                               corner_route=corner_route)
+            now_ms = int(time.time() * 1000)
+            if checked is not None and checked[2] and not checked[0] <= now_ms < checked[1]:
+                diagnostics["reason"] = "publish_expired"
+                checked = None
+            if checked is None or not checked[2]:
+                reason = diagnostics.get("reason", "postcheck_veto")
+                if attempt == 0 and reason in ("stale_observation", "no_feedback", "geometry_mismatch",
+                                                "target_missing", "publish_expired"):
+                    latest = self._observation_snapshot(with_capture_timing=True)
+                    changed = _motion_inputs(*latest[:3]) != _motion_inputs(*snapshot[:3]) or latest[3] != snapshot[3]
+                    if changed and (reason != "publish_expired" or self._fresh_first_send(origin, latest, now_ms)):
+                        snapshot = latest
+                        diagnostics.clear()
+                        continue
+                return reason, None
+            newer = checked[3]
+            # Either a cached comparison or a rebuild can overlap a new sample.
+            # Compare the result with the newest snapshot before sending.
+            checked_receipt = snapshot[3]
+            snapshot = self._observation_snapshot(with_capture_timing=True)
+            revision = _motion_inputs(*snapshot[:3])
+            if (newer.matches_target_receipt(snapshot[3]) and (not renew or snapshot[3] == newer.target_receipt_ms)
+                    and _only_expired_views(newer.memory_revision, policy_mod.dwa_memory_revision(
+                        self._state.active_scan, now_ms), now_ms)
+                    and policy_mod.dwa_target_revision(self._state) == newer.target_revision):
+                gap = min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)
+                if revision == newer.input_revision or (checked_receipt == snapshot[3] and (
+                        _continuous_feedback_update(newer.input_revision, revision, gap,
+                                                    stationary=False, unchanged=True)
+                        or (outgoing is None and origin.acceptance.route_points
+                            and _feedback_within_sweep(newer, revision, values, gap)))):
+                    return None, checked
+                if (cover_slower_feedback and checked_receipt == snapshot[3]
+                        and now_ms < min(outgoing.expires_ms, outgoing.repeat_until[0])
+                        and time.monotonic() < min(outgoing.expires_at, outgoing.repeat_until[1])
+                        and _slower_forward_within_sweep(newer, revision, gap)):
+                    return None, checked
+                if (checked_receipt == snapshot[3] and _continuous_feedback_update(
+                        newer.input_revision, revision, gap, stationary=False)):
+                    work = self._scheduled_command
+                    previous = work.previous_route if work is not None else None
+                    if (origin.acceptance.route_points and origin.forward_check.renewable and not origin.handoff
+                            and previous is not None and self._continuing_dwa_output(previous.dwa_origin)):
+                        return "handoff_inputs_updated", None
+                    # Depth and target stayed fixed while odometry advanced. Reuse
+                    # the projected pixels, register every layer on the new pose and
+                    # recheck the latest complete stop inside the existing deadline.
+                    guard = newer.motion_guard
+                    fixed = (replace(newer, motion_guard=replace(guard, deadline_ms=checked[1]))
+                             if guard.deadline_ms > checked[1] else newer)
+                    compact = self._recheck_dwa_motion(fixed, values, max_age, now_ms, snapshot, renew=False,
+                                                       diagnostics={}, handoff_deadline_ms=handoff_deadline,
+                                                       corner_route=corner_route)
+                    if compact is not None and compact[2]:
+                        latest = self._observation_snapshot(with_capture_timing=True)
+                        now_ms = int(time.time() * 1000)
+                        current = _motion_inputs(*latest[:3])
+                        if (compact[0] <= now_ms < compact[1]
+                                and (current == revision or (outgoing is None and origin.acceptance.route_points and
+                                     _feedback_within_sweep(compact[3], current, values, gap)))
+                                and latest[3] == snapshot[3] and _only_expired_views(compact[3].memory_revision,
+                                    policy_mod.dwa_memory_revision(self._state.active_scan, now_ms), now_ms)
+                                and policy_mod.dwa_target_revision(self._state) == compact[3].target_revision):
+                            return None, compact
+                        snapshot = latest
+            check = newer
+        if origin.acceptance.route_points and now_ms < checked[1]:
+            if (origin.acceptance.motion_guard.corner_only
+                    or any(target_objects(snapshot[0], origin.target, self._config))):
+                # Both sweeps passed but newer evidence overtook them.
+                return "handoff_inputs_updated", None
+            if isinstance(snapshot[0], dict) and snapshot[3] > checked[3].target_receipt_ms:
+                return "target_missing", None
+        return "stale_observation", None
+
+    def _continuing_dwa_output(self, origin):
+        return bool(origin is not None and self._wire_moving and self._wire_dwa_origin is not None
+                    and self._wire_dwa_origin.identity == origin.identity
+                    and self._dwa_last_published == origin.identity)
+
+    @staticmethod
+    def _goal_beyond_local_grid(origin):
+        goal = origin.forward_check.planning_guard.goal
+        if goal is None:
+            return False
+        goal_f, goal_r = goal
+        (min_f, min_r), (max_f, max_r) = local_path.SUPPORTED_REGION
+        return not (min_f <= goal_f <= max_f and min_r <= goal_r <= max_r)
+
+    def _veto_dwa(self, origin, reason):
+        self._dwa_event(origin.diagnostic, "veto", reason)
+        state, trace = self._state, self._state.dwa_trace
+        # An older queued command must not rewrite a newer planner decision.
+        if origin.state_id != id(state) or trace.get("decision_id") != origin.acceptance.decision_id:
+            return
+        if reason == "target_missing" and origin.generation is not None and state.reacquire_generation is None:
+            state.reacquire_generation = origin.generation
+            state.reacquire_receipt_ms = int(time.time() * 1000)
+            with self._obs_lock:
+                state.reacquire_source = observation_source(self._objects)
+            state.missing_frames = 0
+        if trace.get("accepted_twist") is not None and self._dwa_last_published != origin.identity:
+            state.dwa_totals["accepted_ticks"] = max(0, state.dwa_totals.get("accepted_ticks", 0) - 1)
+        trace.update(accepted_twist=None, controller_used="stop", veto_reason=reason)
+        state.dwa_selected = state.checked_prefix = False
+        state.commanded = (0., 0., 0.)
+        state.commanded_vx = 0.
+        if self._last_decision is not None:
+            self._last_decision.dwa_acceptance = None
+            if self._last_decision.values and any(self._last_decision.values):
+                self._last_decision.values = [0.] * ACTION_DIM
+                action = "等待续接" if reason in _DISCARD_WITHOUT_STOP else "停车"
+                self._last_decision.reason = f"局部规划：已检查的DWA指令失效，{action}（{reason}）"
+
+    def _claim_dwa_output(self, message, origin):
+        """Under the output lock, transfer a live scan/leg slot to this exact result."""
+        if origin is None or origin.acceptance.angle_controlled:
+            return origin
+        old = self._scheduled_command
+        if not origin.handoff and not (old is not None and (old.turn is not None or old.leg is not None)):
+            return origin
+        if self._dwa_publish_rejection(message, origin, int(time.time() * 1000)) is not None:
+            return origin
+        self._output_epoch += 1
+        self._scheduled_command = None
+        origin = replace(origin, epoch=self._output_epoch, handoff=False)
+        self._staged_dwa_command = message["seq"], origin
+        return origin
+
+    def _supersede_message(self, message):
+        if message is None:
+            return
+        origin = self._dwa_for_message(message)
+        if origin is not None:
+            self._veto_dwa(origin, "superseded")
+        else:
+            identity = self._diagnostic_for(message)
+            if identity is not None:
+                self._dwa_event(identity, "veto", "superseded")
+
+    def _route_feedback_missing(self, odom, now_ms):
+        if odom is None or odom.get("received_ms") is None or odom_mod.planar_feedback(odom) is None:
+            return True
+        stamp = odom.get("received_speed_ms", odom.get("received_ms"))
+        return type(stamp) is not int or not 0 <= now_ms - stamp < self._config.max_feedback_gap_ms
+
+    def _check_predicted_outgoing_route(self, work, snapshot, now_ms, *, renew, target_pending=False,
+                                        timing=False):
+        """Recheck the actual wire twist on the previously admitted route."""
+        config, state = self._config, self._state
+        origin, check = work.dwa_origin, work.forward_check
+        objects, depth, odom, objects_ms = snapshot
+        track = state.tracker.track
+        command = self._wire_twist
+        if (not work.sent or not self._wire_moving or check is None or not command or not any(command[:2])
+                or self._output_blocked or self._paused or not self._running
+                or config.use_obstacle_history or depth is None or depth.get("capture_invalid")
+                or state.arrived or state.failed_reason or work.turn is not None or work.leg is not None
+                or work.camera_arc_end_ms is not None or work.stop_reason is not None):
+            return None
+        guard, geometry = check.motion_guard, check.geometry
+        direct = origin is None
+        if direct:
+            diagnostic = work.diagnostic
+            association = check.direct_association
+            if (not target_pending or association is None or check.distance_m is None or diagnostic is None
+                    or diagnostic.epoch != self._output_epoch or diagnostic.state_id != id(state)
+                    or diagnostic.action_id != self._acp_action_id or diagnostic.target != state.target
+                    or (track is not None and track.observed and track.generation != association[0].generation)
+                    or policy_mod.apply_deadband(work.message["values"], self._deadband_for(work.message["values"]))
+                        != work.message["values"]):
+                return None
+        elif (not self._continuing_dwa_output(origin) or not origin.acceptance.route_points
+              or origin.acceptance.angle_controlled or origin.acceptance.corridor_corner
+              or (track is not None and track.generation != origin.generation)
+              or self._dwa_publish_rejection(work.message, origin, now_ms, sent=True) is not None):
+            return None
+        coast_end_ms = None
+        target_ms = objects_ms
+        if target_pending:
+            if policy_mod.parking_target_unobserved(config, state):
+                return None
+            # A duplicate or missed detection cannot renew the receipt of the
+            # last range-confirmed target. A newly swept route may omit that receipt.
+            target_ms = check.target_ms
+            receipt = state.dwa_target_receipt
+            if not target_ms and origin is not None and receipt is not None and receipt[0] == origin.generation:
+                target_ms = receipt[1]
+            if state.target != "person" or not target_ms or target_ms > now_ms:
+                return None
+            # An open front-camera detour must not outlive the target's short
+            # coast. Other routes retain their independently bounded room.
+            coast_s = config.idle_timeout_s
+            if origin is not None and policy_mod.lateral_camera_detour(config, geometry, origin.acceptance):
+                coast_s = min(coast_s, config.max_coast_s)
+            coast_end_ms = target_ms + round(coast_s * 1000)
+        elif (track is None or not track.observed or objects is None):
+            return None
+        depth_ms = depth_mod.observation_ms(depth)
+        max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or config.max_obs_age_ms
+        if (depth_ms is None or not 0 <= now_ms - depth_ms < min(config.depth_age_limit_ms, max_age)
+                or (not target_pending and not 0 <= now_ms - target_ms < min(config.max_obs_age_ms, max_age))):
+            return None
+        mount = depth.get("body_from_optical")
+        if check.mount_frame is not None:
+            capture = depth.get("obstacle_capture_pose")
+            if mount is None or capture is None or capture.frame != check.mount_frame:
+                return None
+            if direct:
+                geometry = replace(geometry, base_from_optical=mount)
+            elif not np.array_equal(mount, geometry.base_from_optical):
+                return None
+        match = None
+        if not direct and not target_pending:
+            match = self._dwa_target_match(check, objects, depth, odom, objects_ms, geometry,
+                                           check.front_required, follow_route=True)
+            if match is None or match.point is None:
+                return None
+        observation_ms = depth_ms if target_pending else min(depth_ms, objects_ms)
+        period_ms = math.ceil(1000 / self._rate_hz)
+        # Cover another depth interval on straight, non-lateral motion. The
+        # braking sweep below includes the entire extended command window.
+        hold_periods = 3 if not config.use_lateral and not command[2] else 2
+        deadline_ms = int(min(now_ms + min(self._ttl_ms, hold_periods * period_ms),
+                              depth_ms + config.depth_age_limit_ms, observation_ms + max_age,
+                              coast_end_ms if target_pending else objects_ms + config.max_obs_age_ms))
+        if now_ms >= deadline_ms:
+            return None
+        visibility_required = guard is not None and guard.visibility_required
+        projection = local_path.DepthProjection.for_observation(depth)
+        grid = projection.grid_for(geometry, require_valid_depth=True, check_free_space=visibility_required)
+        if grid is None:
+            return None
+        partial = odom_mod.planar_axes(odom)
+        previous = guard.previous if guard is not None else check.previous_twist
+        measured = tuple(value if value is not None else requested for value, requested in zip(partial, command))
+        rates = (command, previous, (0., 0., 0.), measured)
+        if guard is not None:
+            rates += (guard.measured,)
+        bounds = tuple(tuple(bound(axis) for axis in zip(*rates)) for bound in (min, max))
+        speed = max(math.hypot(*v[:2]) for v in rates)
+        unobserved_travel = 0.
+        if target_pending:
+            # A slowing feedback sample cannot add back distance that could
+            # already have been travelled before this check.
+            speed_cap = math.hypot(config.vx_max, config.vy_max if config.use_lateral else 0.)
+            unobserved_travel = (now_ms - target_ms) * max(speed, speed_cap) / 1000
+        motion_room = policy_mod.MAX_PREDICTED_DETOUR_TRAVEL_M - unobserved_travel
+        source_ms, _ = policy_mod.dwa_depth_origin(depth, depth_ms)
+        registration = policy_mod.dwa_registration(None, None, source_ms, now_ms, geometry, rates)
+        occupied = (registration.squares(grid[1]),) + policy_mod.dwa_front_flank_guard(
+            depth, config, geometry, now_ms)
+        scan = state.active_scan
+        remembered = ()
+        if scan.near_obstacles.has_occupied:
+            if scan.near_projection.origin is None:
+                return None
+            sources = policy_mod.dwa_scene_sources(scan, now_ms, odom)
+            current = policy_mod.dwa_grid_pose(sources, geometry, now_ms, odom)
+            reference = policy_mod.dwa_pose_reference(sources, odom)
+
+            def register_near(stamp, *, grid_pose):
+                return policy_mod.dwa_registration(grid_pose, current, stamp, now_ms, geometry, rates,
+                                                    reference=reference)
+
+            try:
+                remembered = policy_mod.dwa_remembered(sources, register_near)
+            except policy_mod.DwaFrameMismatch:
+                return None
+        if direct:
+            travel = speed * (config.watchdog_ms + deadline_ms - now_ms + 50) / 1000
+            travel += speed ** 2 / (2 * config.motion_braking[0])
+            room = min(check.distance_m - config.stop_distance_m - unobserved_travel, motion_room)
+            obstacle = policy_mod.projected_forward_clearance(grid[1], geometry, config)
+            if travel >= room or (obstacle is not None and
+                    obstacle + policy_mod.FORWARD_CLEARANCE_MARGIN_M < check.distance_m and obstacle <= travel):
+                return None
+            mode = "body" if config.scan_geometry is not None else "camera_approx"
+            footprint = motion.FootprintSpec(geometry.front, geometry.rear, config.half_width_m,
+                                            config.clearance_margin_m, mode)
+            prediction = motion.predict_motion(measured, previous, command,
+                                               hold_s=(config.watchdog_ms + deadline_ms - now_ms + 50) / 1000,
+                                               latency_s=0., geometry=geometry, mode=mode,
+                                               acceleration=config.motion_acceleration, braking=config.motion_braking,
+                                               initial_bounds=bounds)
+            fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
+            if self._person_front_too_close(prediction, fronts, geometry, registration, config.stop_distance_m):
+                return None
+            if not motion.evaluate_motion(
+                    prediction, footprint=footprint, occupied=occupied, remembered=remembered,
+                    supported_region=local_path.SUPPORTED_REGION, original_goal=None,
+                    stop_distance_m=0., terminal_boundary=motion.TravelBudget(room)).accepted:
+                return None
+            return _PredictedRouteCheck(work, _motion_inputs(*snapshot[:3]), objects_ms, observation_ms,
+                                        deadline_ms, depth_ms, coast_end_ms, bounds)
+        end = max(work.expires_ms, work.message["stamp_ms"] + work.message["ttl_ms"] + config.watchdog_ms,
+                  deadline_ms + config.watchdog_ms if renew else now_ms)
+        prediction = motion.predict_motion(command, command, command, hold_s=(end - now_ms + 50) / 1000,
+                                           latency_s=0., geometry=geometry, mode=guard.footprint.mode,
+                                           acceleration=config.motion_acceleration, braking=config.motion_braking,
+                                           initial_bounds=bounds)
+        planned = check.planning_guard
+        if planned.pose is None or guard.pose is None or planned.pose.frame != guard.pose.frame:
+            return None
+        anchor = policy_mod.dwa_registration(planned.pose, guard.pose, planned.checked_ms, guard.checked_ms,
+                                            geometry, rates)
+        route = tuple(map(tuple, anchor.points(origin.acceptance.route_points)))
+        elapsed = (now_ms - guard.checked_ms) / 1000
+        if elapsed < 0.:
+            return None
+        # Consume the unseen translation from the original path. Camera
+        # frames can refresh collision evidence, but cannot reset this room.
+        room = dwa.remaining_route_length(route) - elapsed * speed
+        room -= anchor.error(math.hypot(*route[-1]))
+        if target_pending:
+            room = min(room, motion_room)
+        if room <= 0.:
+            return None
+        if renew:
+            past = motion.predict_motion(guard.measured, guard.previous, command, hold_s=elapsed,
+                                         latency_s=0., geometry=geometry, mode=guard.footprint.mode,
+                                         acceleration=config.motion_acceleration, braking=config.motion_braking,
+                                         stop=False)
+            prior_path = past.camera_poses if guard.footprint.mode == "camera_approx" else past.body_poses
+            future_path = prediction.camera_poses if guard.footprint.mode == "camera_approx" else prediction.body_poses
+            pose = local_path.GridTransform(*prior_path[-1])
+            positions = pose.points([point[:2] for point in future_path[:prediction.moving_count]])
+            if not dwa.stays_on_route(route, positions, guard.footprint.half_width):
+                return None
+        result = motion.evaluate_motion(
+            prediction, footprint=guard.footprint, occupied=occupied, remembered=remembered,
+            supported_region=local_path.SUPPORTED_REGION, original_goal=None,
+            stop_distance_m=0., terminal_boundary=motion.TravelBudget(room))
+        fronts = self._new_person_fronts(check, objects, depth, objects_ms, now_ms, geometry)
+        if match is not None and match.standoff_point is not None:
+            fronts += (match.standoff_point,)
+        if not result.accepted or self._person_front_too_close(
+                prediction, fronts, geometry, registration, config.stop_distance_m):
+            return None
+        if visibility_required:
+            shadow = local_path.occluded_cells(*grid, geometry)
+            poses = prediction.camera_poses if guard.footprint.mode == "camera_approx" else prediction.body_poses
+            if not policy_mod.dwa_trace_visible(poses, shadow, registration):
+                return None
+        return _PredictedRouteCheck(work, _motion_inputs(*snapshot[:3]), objects_ms, observation_ms, deadline_ms,
+                                    depth_ms, coast_end_ms, bounds if target_pending or timing else None)
+
+    def _prediction_inputs_current(self, proof):
+        latest = self._observation_snapshot(with_capture_timing=True)
+        now_ms = int(time.time() * 1000)
+        current = _motion_inputs(*latest[:3])
+        if (self._scheduled_command is not proof.work or latest[3] != proof.objects_ms
+                or now_ms >= proof.deadline_ms):
+            return False
+        if proof.motion_bounds is None:
+            return current == proof.revision and self._route_feedback_missing(latest[2], now_ms)
+        if current == proof.revision:
+            return True
+        if not _continuous_feedback_update(
+                proof.revision, current, self._config.max_feedback_gap_ms, stationary=False):
+            return False
+        low, high = proof.motion_bounds
+        prior = proof.revision[1][5][-1]
+        history = current[1][5]
+        return all(lo <= v <= hi for _, _, twist in history[history.index(prior) + 1:]
+                   for v, lo, hi in zip(twist, low, high))
+
+    def _continue_predicted_route(self, work, snapshot, now_ms, *, target_pending=False, timing=False):
+        period_ms = math.ceil(1000 / self._rate_hz)
+        depth_ms = depth_mod.observation_ms(snapshot[1])
+        if work.forward_check is None:
+            return False
+        last_depth = work.predicted_depth_ms or work.forward_check.depth_ms
+        renew = (depth_ms is not None and depth_ms > last_depth
+                 and (now_ms - work.message["stamp_ms"] >= period_ms
+                      or now_ms + period_ms >= work.expires_ms or time.monotonic() >= work.expires_at))
+        proof = self._check_predicted_outgoing_route(work, snapshot, now_ms, renew=renew,
+                                                    target_pending=target_pending, timing=timing)
+        if proof is None:
+            return False
+        if not self._prediction_inputs_current(proof):
+            return None
+        if not renew:
+            return now_ms < work.expires_ms and time.monotonic() < work.expires_at
+        message = dict(work.message, obs_stamp_ms=proof.observation_ms)
+        message.pop("control_interface", None)
+        stamp = int(time.time() * 1000)
+        published = self._published
+        decision = self._last_decision
+        if decision is not None:
+            reason = decision.reason
+            decision.reason = ("目标暂不可用，沿当前路线续发" if target_pending else
+                               "局部规划：按上一条指令预测运动，沿当前路线续发")
+        written = (self._send_scheduled(message, stamp, proof.deadline_ms - stamp,
+                                       dwa_origin=work.dwa_origin, diagnostic=work.diagnostic, prediction=proof)
+                   and self._published > published and self._wire_moving)
+        if decision is not None and not written:
+            decision.reason = reason
+        return written
+
+    def _continue_without_target(self, work, now_ms):
+        if work is None:
+            return False
+        continued = self._continue_predicted_route(
+            work, self._observation_snapshot(with_capture_timing=True), now_ms, target_pending=True)
+        if continued is None and self._scheduled_command is work:
+            # One newer depth frame can overtake the sweep. Check it before
+            # abandoning the already admitted action.
+            continued = self._continue_predicted_route(
+                work, self._observation_snapshot(with_capture_timing=True),
+                int(time.time() * 1000), target_pending=True)
+        if not continued:
+            return False
+        self._state.commanded = self._wire_twist
+        self._state.commanded_vx = self._wire_twist[0]
+        decision = self._last_decision
+        if decision is not None:
+            decision.values = list(work.message["values"])
+            decision.status = policy_mod.AVOIDING if work.dwa_origin is not None else policy_mod.APPROACHING
+            decision.reason = "目标暂不可用，沿当前路线续发"
+        return True
+
+    def _retain_checked_route(self, work, now_ms, *, rejected=None, check_outgoing_sweep=False):
+        # A failed handoff does not extend the checked route or authorize a
+        # wire write. The controller owns its next physical check.
+        if work is None or not work.sent or work.repeat_until is None:
+            return False
+        origin = work.dwa_origin
+        now = time.monotonic()
+        track = self._state.tracker.track
+        if (not self._continuing_dwa_output(origin) or not origin.acceptance.route_points
+                or track is None or not track.observed or self._state.reacquire_generation is not None
+                or not work.message["stamp_ms"] <= now_ms < min(work.expires_ms, work.repeat_until[0])
+                or now >= min(work.expires_at, work.repeat_until[1])
+                or self._dwa_publish_rejection(work.message, origin, now_ms, sent=True) is not None):
+            return False
+        if check_outgoing_sweep:
+            # A failed replacement can intersect a different obstacle than the
+            # packet already on the wire. Check only that packet's stopping envelope.
+            snapshot = self._observation_snapshot(with_capture_timing=True)
+            max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+            checked = self._recheck_dwa_motion(
+                origin.forward_check, work.message["values"], max_age, now_ms, snapshot, renew=True,
+                diagnostics={}, scan=copy(self._state.active_scan),
+                packet_deadline_ms=work.message["stamp_ms"] + work.message["ttl_ms"])
+            if (checked is None or not checked[2]
+                    or time.monotonic() >= min(work.expires_at, work.repeat_until[1])
+                    or int(time.time() * 1000) >= min(work.expires_ms, work.repeat_until[0])):
+                return False
+            latest = self._observation_snapshot(with_capture_timing=True)
+            revision = _motion_inputs(*snapshot[:3])
+            current = _motion_inputs(*latest[:3])
+            if current[0] != revision[0] or current[2] != revision[2] or latest[3] != snapshot[3]:
+                return False
+            work.retry_after_rejection = True
+        if rejected is not None:
+            self._veto_dwa(rejected, "publish_expired")
+        self._state.commanded = self._wire_twist
+        self._state.commanded_vx = self._wire_twist[0]
+        self._command_window = (work.expires_at - self._config.watchdog_ms / 1000, work.expires_at)
+        self._scheduled_command = work
+        if self._last_decision is not None:
+            self._last_decision.reason = "候选路线未通过发布复检，控制器保留上一条路线"
+        return True
+
+    def _hold_route_for_search(self, work, now_ms, *, rejected=None):
+        if (work is None or not work.sent or work.repeat_until is None
+                or not self._continuing_dwa_output(work.dwa_origin)):
+            return False
+        route_end, route_end_at = work.repeat_until
+        expires_ms = min(work.expires_ms, route_end)
+        expires_at = min(work.expires_at, route_end_at)
+        if now_ms >= expires_ms or time.monotonic() >= expires_at:
+            return False
+        if rejected is not None:
+            self._veto_dwa(rejected, "target_missing")
+        # Let the admitted packet end in its original execution window.
+        # Suppress route repeats while the planner selects a search turn.
+        work.expires_ms, work.expires_at = expires_ms, expires_at
+        work.repeat_until = None
+        work.expiry_stop_reason = "target_missing"
+        self._scheduled_command = work
+        self._state.commanded = self._wire_twist
+        self._state.commanded_vx = self._wire_twist[0]
+        return True
+
+    def _arc_in_progress(self, work, now_ms):
+        """An admitted translation owns the wire until its checked window ends."""
+        if work is None or not work.sent or not self._wire_moving:
+            return False
+        if not (now_ms < work.expires_ms and time.monotonic() < work.expires_at):
+            return False
+        if work.camera_arc_end_ms is not None:
+            return now_ms < work.camera_arc_end_ms
+        origin = work.dwa_origin
+        return (self._continuing_dwa_output(origin) and bool(origin.acceptance.route_points)
+                and now_ms < origin.forward_check.motion_guard.deadline_ms)
+
+    @staticmethod
+    def _fixed_arc(work):
+        return (work.camera_arc_end_ms is not None
+                or work.dwa_origin is not None and work.dwa_origin.acceptance.corridor_corner)
+
+    def _stage_command(self, message, epoch):
+        """Hand the publisher one checked result. New work replaces old work."""
+        with self._output_lock:
+            if epoch != self._output_epoch or self._output_blocked:
+                self._supersede_message(message)
+                return False
+            if self._scheduled_command is not None and self._scheduled_command.stop_reason is not None:
+                return False
+            now_ms = int(time.time() * 1000)
+            active = self._scheduled_command
+            decision = self._last_decision
+            track = self._state.tracker.track
+            if (active is not None and self._config.local_controller == "dwa"
+                    and self._state.target == "person" and decision is not None
+                    and decision.status in (policy_mod.SEARCHING, policy_mod.ALIGNING, policy_mod.AVOIDING,
+                                            policy_mod.BLIND, policy_mod.APPROACHING)
+                    and (decision.target_pending or track is None or not track.observed or
+                         (track.front_required and track.front_fix is None))
+                    and self._continue_without_target(active, now_ms)):
+                return True
+            finish_ms = None
+            if (message is not None and any(message["values"])
+                    and now_ms < message["stamp_ms"] + message["ttl_ms"]
+                    and self._arc_in_progress(active, now_ms) and self._fixed_arc(active)):
+                # The next arc can wait for this one, while the actual wire
+                # command remains the origin for motion accounting.
+                self._state.commanded = self._wire_twist
+                self._state.commanded_vx = self._wire_twist[0]
+                finish_ms = min(active.expires_ms, active.camera_arc_end_ms
+                                if active.camera_arc_end_ms is not None
+                                else active.dwa_origin.forward_check.motion_guard.deadline_ms)
+                self._command_window = (time.monotonic() - (now_ms - active.message["stamp_ms"]) / 1000,
+                                        active.expires_at)
+            self._pending_route = None
+            if (message is None and self._last_decision is not None and self._last_decision.hold_search
+                    and active is not None and active.sent
+                    and active.turn is None and active.dwa_origin is None
+                    and now_ms < active.expires_ms and time.monotonic() < active.expires_at
+                    and active.message["values"] == self._last_decision.values):
+                return True
+            if ((message is None or not any(message["values"])) and active is not None and active.sent
+                    and self._last_decision is not None
+                    and self._last_decision.reason == policy_mod.DEPTH_CAPTURE_STALE):
+                _, depth, _, _ = self._observation_snapshot(with_capture_timing=True)
+                now_ms = int(time.time() * 1000)
+                max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+                fresh = (depth is not None and not depth.get("capture_invalid")
+                         and 0 <= now_ms - depth_mod.observation_ms(depth) < max_age)
+                if not fresh:
+                    return True
+            if message is None:
+                if self._scheduled_command is not None:
+                    if not self._retain_checked_route(self._scheduled_command, int(time.time() * 1000)):
+                        self._cancel_scheduled_motion(dwa_reason="superseded")
+                return True
+            now = time.monotonic()
+            command_only = not self._config.odom_expected and self._state.motion_source == "command"
+            diagnostic = self._diagnostic_for(message)
+            proposal = self._dwa_for_message(message)
+            if ((diagnostic is not None and diagnostic.expired_route)
+                    or (proposal is not None and proposal.acceptance.route_points
+                        and now_ms >= message["stamp_ms"] + message["ttl_ms"])):
+                if self._retain_checked_route(self._scheduled_command, now_ms, rejected=proposal):
+                    return True
+            if not any(message["values"]):
+                if diagnostic is not None and diagnostic.discarded_proposal:
+                    return True
+                if command_only and (not self._wire_moving
+                                     or (self._last_decision is not None
+                                         and self._last_decision.status == policy_mod.BLIND)):
+                    self._scheduled_command = None
+                    return True
+                no_route = (self._last_decision is not None and
+                            self._last_decision.reason in (policy_mod.NO_LOCAL_ROUTE, policy_mod.NO_ROUTE_CONTINUATION))
+                if (active is not None and active.sent and active.dwa_origin is not None
+                        and self._last_decision is not None
+                        and self._last_decision.reason in (policy_mod.FEEDBACK_STALE, policy_mod.FEEDBACK_SWITCH)):
+                    snapshot = self._observation_snapshot(with_capture_timing=True)
+                    if self._continue_predicted_route(
+                            active, snapshot, now_ms, timing=not self._route_feedback_missing(snapshot[2], now_ms)):
+                        self._state.commanded = self._wire_twist
+                        self._last_decision.values = list(active.message["values"])
+                        self._last_decision.reason = "局部规划：按上一条指令预测运动，维持当前路线"
+                        return True
+                if (no_route and active is not None and active.camera_arc_end_ms is not None
+                        and active.sent and now_ms < active.expires_ms and now < active.expires_at):
+                    # There is no successor. The already swept packet can end
+                    # on its own driver lease without an intermediate zero.
+                    return True
+                blocked_candidate = (diagnostic is not None
+                                     and diagnostic.veto_reason in ("footprint_collision", "remembered_obstacle"))
+                search_timed_out = (diagnostic is not None and diagnostic.decision_id == self._state.decision_id
+                                    and self._last_decision is not None
+                                    and self._last_decision.status in (policy_mod.ALIGNING, policy_mod.AVOIDING)
+                                    and self._state.dwa_trace.get("fallback_reason") == "search_deadline"
+                                    and diagnostic.veto_reason is None)
+                if ((no_route or blocked_candidate or search_timed_out)
+                        and self._retain_checked_route(self._scheduled_command, now_ms, check_outgoing_sweep=True)):
+                    return True
+                self._scheduled_command = None
+                self._send_scheduled(dict(message, obs_stamp_ms=now_ms), now_ms, self._ttl_ms,
+                                     diagnostic=self._diagnostic_for(message))
+                return True
+            previous = self._scheduled_command
+            if (previous is not None and (previous.turn is not None or previous.leg is not None)
+                    and previous.sent and (now >= previous.expires_at or now_ms >= previous.expires_ms)):
+                self._cancel_scheduled_motion(stop=(now_ms, "速度指令窗口已到期", False))
+                return False
+            origin = self._dwa_for_message(message)
+            camera_arc = command_only and self._state.camera_arc_selected
+            if finish_ms is not None:
+                if not (camera_arc or (origin is not None and origin.acceptance.route_points)):
+                    return True
+            else:
+                origin = self._claim_dwa_output(message, origin)
+            if (finish_ms is None and origin is not None and previous is not None and previous.repeat_until is not None
+                    and previous.checking_new_target
+                    and min(previous.expires_ms, previous.repeat_until[0]) - now_ms <= math.ceil(1000 / self._rate_hz)
+                    and self._queue_route_candidate(message, origin, previous, now_ms)):
+                # The controller already has a sweep in flight. Avoid taking
+                # its last chance to publish with a locked first-send check.
+                return True
+            expires_ms = message["stamp_ms"] + message["ttl_ms"]
+            max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms")
+            if type(max_age) in (int, float) and 0 < max_age < math.inf:
+                expires_ms = min(expires_ms, int(message["obs_stamp_ms"] + max_age))
+            scan = self._state.active_scan
+            turn = None
+            leg = self._state.executing_leg
+            feedback = None
+            depth_grid = None
+            if (leg is not None and scan.receipt_only and scan.buffered_odom and scan.poses
+                    and scan.pose_origin is None and leg.geometry is self._config.local_geometry
+                    and self._state.use_body_mount is not True
+                    and any(message["values"][:2]) and not message["values"][5]):
+                feedback = replace(scan, poses=deque(scan.poses, maxlen=scan.poses.maxlen),
+                                   views=deque(), phase="idle")
+                if scan.current_frame:
+                    expires_ms = min(expires_ms, scan.current_frame + self._config.depth_age_limit_ms)
+                if (previous is not None and previous.leg is not None and previous.leg.geometry is leg.geometry
+                        and previous.feedback.occluded_route == feedback.occluded_route):
+                    depth_grid = previous.depth_grid
+            else:
+                leg = None
+            if (scan.buffered_turn and scan.turn_sweep is not None and scan.poses
+                    and message["values"][5] and not any(message["values"][1:5])
+                    and (not message["values"][0] or scan.turn_sweep.twists is not None)):
+                # Only the copied integration state belongs to the publisher.
+                turn = replace(scan, poses=deque((scan.poses[-1],), maxlen=scan.poses.maxlen))
+                if scan.current_frame:
+                    expires_ms = min(expires_ms, scan.current_frame + self._config.depth_age_limit_ms)
+            expires_at = now + max(0, min(message["ttl_ms"], expires_ms - now_ms)) / 1000
+            previous_motion = (tuple(previous.message["values"][:2])
+                               if previous is not None and previous.sent else (0., 0.))
+            staged = self._staged_forward_check
+            forward_check = staged[1] if staged is not None and staged[0] == message["seq"] else None
+            work = _ScheduledCommand(
+                dict(message, values=list(message["values"])), expires_ms, expires_at, turn,
+                leg=leg, feedback=feedback, depth_grid=depth_grid,
+                checked_pose=scan.pose if leg is not None else None, previous_motion=previous_motion,
+                forward_check=forward_check, command_only=command_only,
+                camera_arc_end_ms=expires_ms if camera_arc else None,
+                dwa_origin=origin, diagnostic=diagnostic)
+            if finish_ms is not None:
+                if turn is None and leg is None and expires_ms > finish_ms:
+                    active.successor = work
+                return True
+            self._scheduled_command = work
+            if turn is None:
+                # Deliver a new result immediately. The independent timer
+                # can repeat the checked prefix while the next search runs.
+                if (previous is not None and previous.repeat_until is not None and origin is not None
+                        and (origin.acceptance.route_points or origin.acceptance.motion_guard.probe_region)):
+                    work.previous_route = previous
+                try:
+                    self._dispatch_command()
+                    if (camera_arc and not work.sent and self._scheduled_command is work
+                            and previous is not None and previous.camera_arc_end_ms is not None
+                            and previous.sent and time.monotonic() < previous.expires_at):
+                        self._scheduled_command = previous
+                finally:
+                    work.previous_route = None
+            return True
+
+    def _check_scheduled_leg(self, work, now_ms, remaining_ms):
+        with self._obs_lock:
+            history = tuple(self._velocity_history)
+            frame, ground = self._depth_map, self._depth_ground
+            projection = self._depth_projection
+            depth_ms = self._depth_ms
+            source = self._depth_source_ms
+            odom_ms = self._odom_ms
+        config = self._config
+        feedback, leg = work.feedback, work.leg
+        stop = feedback.sync_buffered_motion(history, now_ms)
+        if stop is not None:
+            return stop
+        if not 0 <= now_ms - odom_ms <= self._odom_max_age_ms:
+            return "局部规划：运动反馈已到期，停车后重规划", True
+        if (work.depth_grid is not None and source is not None and work.depth_grid[0] is not None
+                and source <= work.depth_grid[0]):
+            if source < work.depth_grid[0]:
+                return "局部规划：深度帧顺序倒退，停车后重规划", True
+            depth_ms = work.depth_grid[1]
+        if not 0 <= now_ms - depth_ms < config.depth_age_limit_ms or not depth_mod.has_valid_returns(frame):
+            return "局部规划：深度暂不可用，停车后重规划", True
+        if (work.depth_grid is None or work.depth_grid[:2] != (source, depth_ms)):
+            observation = {"map": frame, "ground": ground, "grid_projection": projection}
+            grid = local_path.project_observation(observation, leg.geometry, require_valid_depth=True,
+                                                  check_free_space=feedback.occluded_route)
+            shadow = local_path.occluded_cells(*grid, leg.geometry) if feedback.occluded_route and grid is not None else None
+            work.depth_grid = (source, depth_ms, grid, shadow)
+        command = tuple(work.message["values"][:2])
+        brake_horizon = (config.watchdog_ms + 50) / 1000
+        horizon = brake_horizon + min(remaining_ms, config.depth_age_limit_ms) / 1000
+        # The image was taken before this command. Cover motion since that
+        # frame as well as the braking horizon, even if it is reused.
+        previous = command if work.sent else work.previous_motion
+        velocities = feedback.motion[:2], previous, command
+        shadow = work.depth_grid[3]
+        if shadow is not None and any(local_path.visible_prefix(
+                ((0., 0.), (vx * horizon, -vy * horizon)), shadow) < 2 for vx, vy in velocities):
+            return "局部规划：前进段进入遮挡区，等待新视角复检", True
+        velocity = max(math.hypot(*v) for v in velocities)
+        keep = policy_mod._keepout_m(config)
+        radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), keep)
+        padding = (velocity + radius * abs(feedback.motion[2])) * (now_ms - depth_ms) / 1000
+        reason = leg.check(feedback.pose, feedback.motion, previous, command, work.depth_grid[2],
+                           keep, horizon, brake_horizon, padding=padding)
+        if reason is not None:
+            return reason, True
+        remembered = feedback.remembered_hits
+        if remembered is not None and remembered.any():
+            radius = math.hypot(max(leg.geometry.front, leg.geometry.rear), keep) + velocity * horizon
+            padding = (math.dist(feedback.pose[:2], work.checked_pose[:2])
+                       + radius * (abs(feedback.pose[2] - work.checked_pose[2])
+                                   + abs(feedback.motion[2]) * horizon))
+            if not local_path.transition_clear((None, remembered), leg.geometry, keep,
+                                               horizon, velocities, padding=padding):
+                return "局部规划：执行段扫掠区有已记录障碍，停车后重规划", True
+        return None
+
+    def _check_route_control(self, origin, check, max_age, now_ms, snapshot, scan, diagnostics, *,
+                             renew, packet_deadline_ms, target_refresh=False, cover_slower_feedback=False):
+        odom = snapshot[2] or {}
+        original = check.planning_guard
+        current = policy_mod.dwa_grid_pose(scan, check.geometry, now_ms, odom)
+        measured = odom_mod.planar_feedback(odom)
+        if (original.pose is None or current is None or measured is None
+                or not 0 <= now_ms - current.stamp_ms < min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)
+                or (check.motion_guard.pose is not None and current.stamp_ms < check.motion_guard.pose.stamp_ms)):
+            diagnostics["reason"] = "no_feedback"
+            return None, None
+        try:
+            transform = policy_mod.dwa_registration(
+                original.pose, current, original.checked_ms, now_ms, check.geometry,
+                (measured, self._wire_twist or measured), reference=policy_mod.dwa_pose_reference(scan, odom))
+        except policy_mod.DwaFrameMismatch:
+            diagnostics["reason"] = "geometry_mismatch"
+            return None, None
+        cfg = self._config
+        points = transform.points(origin.acceptance.route_points)
+        nominal = policy_mod.passing_speed_limit(snapshot[1] or {}, cfg, now_ms,
+                                                 math.hypot(*origin.acceptance.command[:2]))
+        route_error = transform.error(math.hypot(*origin.acceptance.route_points[-1]))
+        yaw_limit = (-policy_mod._scan_yaw_rate(cfg, 1.), policy_mod._scan_yaw_rate(cfg, -1.))
+        track = self._state.tracker.track
+        view_bearing = None
+        blocker_exit = origin.acceptance.blocker_exit
+        camera_detour = (cfg.use_lateral and origin.acceptance.locks_detour
+                         and not origin.acceptance.corridor_corner and origin.acceptance.passage_exit is None)
+        protect_view = (origin.target == "person"
+                        and policy_mod.lateral_camera_detour(cfg, check.geometry, origin.acceptance))
+        if ((camera_detour or protect_view) and track is not None
+                and track.generation == original.generation and track.observed and track.navigation_range_known):
+            yaw_limit = dwa.view_yaw_limits(yaw_limit, track.bearing_rad, cfg.half_fov_rad,
+                                            original.prediction_horizon_s, protect_person_view=protect_view)
+            if (camera_detour and blocker_exit is not None and abs(track.bearing_rad) > cfg.half_fov_rad / 2
+                    and not local_path.passage_ahead(transform.points(blocker_exit))):
+                view_bearing = track.bearing_rad
+        checked = values = previous_values = None
+        previous = self._wire_twist or original.previous
+        best = None
+        best_cost = math.inf
+        swept_into_obstacle = skip_turn_samples = False
+        keep_detour = self._state.committed_route is origin.acceptance
+        (forward_floor, _), (lateral_floor, _) = policy_mod._local_velocity_limits(cfg, 1.)
+        ramping_lateral = previous[1] if abs(measured[1]) < lateral_floor else 0.
+        yaw_step = min(cfg.motion_acceleration[2], cfg.motion_braking[2]) / self._rate_hz
+        try_sidestep = (cfg.use_lateral and yaw_step < cfg.floor_wz_moving and view_bearing is None
+                        and (previous[2] != 0. or abs(measured[2]) > policy_mod.STILL_YAW))
+        can_crawl = ((cfg.use_lateral and cfg.floor_wz_moving > 0.)
+                     or (not cfg.use_lateral and check.geometry.front == 0.))
+        crawl = can_crawl and forward_floor <= nominal * dwa.ROUTE_CRAWL_SCALE
+        for steering, scale in dwa.pursuit_options(yaw_limit,
+                                                  fallback_scales=(dwa.ROUTE_CRAWL_SCALE,) if crawl else ()):
+            if scale == dwa.ROUTE_CRAWL_SCALE and (best is not None or not swept_into_obstacle):
+                break
+            hold_heading = steering != yaw_limit
+            if hold_heading and not (try_sidestep or (best is None and swept_into_obstacle)):
+                break
+            if skip_turn_samples and not hold_heading:
+                continue
+            tracked = dwa.track_route(
+                points, nominal * scale, original.prediction_horizon_s, steering,
+                body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral,
+                yaw_floor=cfg.floor_wz_moving, lateral_floor=lateral_floor, view_bearing=view_bearing,
+                steering_horizon=cfg.dwa_horizon_s if camera_detour and check.geometry.front == 0. else None,
+                hold_heading=hold_heading, ramping_lateral=ramping_lateral, lateral_step=cfg.lateral_step,
+                previous_yaw=previous[2], measured_yaw=measured[2], yaw_step=yaw_step)
+            if tracked is None:
+                break
+            (vx, vy, wz), room = tracked
+            (_, max_x), (_, max_y) = policy_mod._local_velocity_limits(cfg, -1. if vy > 0 else 1.)
+            if max_y < lateral_floor:
+                vy = 0.
+            candidate = [min(vx, max_x), math.copysign(min(abs(vy), max_y), vy), 0., 0., 0., wz]
+            candidate = policy_mod.apply_deadband(candidate, self._deadband_for(candidate))
+            if room <= route_error:
+                break
+            if (not any(candidate[:2]) or candidate == previous_values
+                    or (hold_heading and not candidate[1] and not swept_into_obstacle)):
+                continue
+            previous_values = candidate
+            diagnostics.pop("reason", None)
+            checked = self._recheck_dwa_motion(
+                check, candidate, max_age, now_ms, snapshot, renew=renew, diagnostics=diagnostics, scan=scan,
+                route_room=room - route_error, packet_deadline_ms=packet_deadline_ms,
+                cover_slower_feedback=(cover_slower_feedback or target_refresh or self._goal_beyond_local_grid(origin)),
+                target_refresh=target_refresh, keep_detour=keep_detour)
+            values = diagnostics.pop("visual_command", candidate)
+            if checked is not None and checked[2]:
+                result = checked[3].motion_guard.check
+                cost = dwa.pursuit_cost(tuple(values[i] for i in (0, 1, 5)), previous, nominal, yaw_limit, result,
+                                        lateral_camera=cfg.use_lateral and check.geometry.front == 0.)
+                if cost < best_cost:
+                    best_cost = cost
+                    best = checked, values, diagnostics.copy()
+                if (scale == 1. and result.min_clearance_m >= dwa.PREFERRED_CLEARANCE_M
+                        and values[5] * previous[2] >= 0.):
+                    if not try_sidestep:
+                        break
+                    skip_turn_samples = True
+            else:
+                reason = diagnostics.get("reason")
+                swept_into_obstacle |= bool(reason == "footprint_collision" and (wz or previous[2]))
+                if (checked is None or reason not in
+                        ("insufficient_room", "outside_grid", "footprint_collision", "occluded_prefix", "target_standoff")
+                        or (not (wz or previous[2] or try_sidestep) and not hold_heading
+                            and reason not in ("insufficient_room", "target_standoff"))):
+                    break
+            if int(time.time() * 1000) >= packet_deadline_ms:
+                break
+        if best is not None:
+            checked, values, selected_diagnostics = best
+            diagnostics.clear()
+            diagnostics.update(selected_diagnostics)
+        if values is None:
+            diagnostics.setdefault("reason", "route_end")
+        return checked, values
+
+    def _repeat_dwa_command(self, work):
+        # Recompute the twist on the planner's frozen route from live feedback.
+        # Its lifetime and the last admitted packet's watchdog are independent.
+        with self._output_lock:
+            origin = work.dwa_origin
+            now_ms = int(time.time() * 1000)
+            started = time.monotonic()
+            route_end, route_end_at = work.repeat_until or (work.expires_ms, work.expires_at)
+            cutoff, cutoff_at = min(route_end, work.expires_ms), min(route_end_at, work.expires_at)
+            if self._scheduled_command is not work or not self._continuing_dwa_output(origin):
+                return
+            check = origin.forward_check
+            fixed_arc = self._fixed_arc(work)
+            snapshot = self._observation_snapshot(with_capture_timing=True)
+            if (not fixed_arc and origin.acceptance.route_points
+                    and not self._config.use_obstacle_history and self._route_feedback_missing(snapshot[2], now_ms)):
+                continued = self._continue_predicted_route(work, snapshot, now_ms)
+                if continued is not False:
+                    return
+                if work.predicted_depth_ms is not None:
+                    self._cancel_scheduled_motion(stop=(now_ms, "局部规划：预测续发复检未通过", False),
+                                                  dwa_reason="predicted_route_veto")
+                    return
+            if (not fixed_arc and origin.acceptance.route_points
+                    and cutoff - now_ms <= math.ceil(1000 / self._rate_hz)):
+                if self._continue_predicted_route(work, snapshot, now_ms, timing=True):
+                    return
+                if self._state.target == "person" and self._continue_without_target(work, now_ms):
+                    return
+            if now_ms >= cutoff or started >= cutoff_at or (work.repeat_until is None and not fixed_arc):
+                return
+            revision = _motion_inputs(*snapshot[:3])
+            odom = snapshot[2] or {}
+            target_refresh = False
+            if "received_speed_ms" in odom:
+                speed_ms = odom.get("component_speed_ms")
+                fresh_feedback = (type(speed_ms) is int and speed_ms == odom["received_speed_ms"]
+                                  and check.motion_guard.checked_ms < speed_ms <= now_ms)
+                source = observation_source(snapshot[0])
+                target_refresh = (not fresh_feedback and type(speed_ms) is int
+                                  and speed_ms == odom["received_speed_ms"]
+                                  and 0 <= now_ms - speed_ms < min(self._odom_max_age_ms,
+                                                                   self._config.max_feedback_gap_ms)
+                                  and cutoff - now_ms <= math.ceil(2000 / self._rate_hz)
+                                  and source is not None and check.target_source is not None
+                                  and source > check.target_source and snapshot[3] > check.target_receipt_ms)
+            else:
+                sample = odom.get("source_sample_id")
+                fresh_feedback = sample is not None and check.feedback_source is not None and sample > check.feedback_source
+            new_scene = revision[0] != check.input_revision[0] or revision[2] != check.input_revision[2]
+            if not fresh_feedback and not target_refresh and not new_scene and odom:
+                message = work.message
+                deadline = min(cutoff, check.motion_guard.deadline_ms, message["stamp_ms"] + message["ttl_ms"])
+                period = math.ceil(1000 / self._rate_hz)
+                if (work.repeat_until is not None and origin.acceptance.followed_route and work.successor is None
+                        and 0 < deadline - now_ms <= period and now_ms - message["stamp_ms"] >= period
+                        and revision == check.input_revision and snapshot[3] == check.target_receipt_ms
+                        and self._repeat_state_current(check, now_ms)
+                        and self._dwa_publish_rejection(message, origin, now_ms) is None):
+                    # Reuse exactly the admitted sweep, including its wire deadline.
+                    packet = dict(message)
+                    packet.pop("control_interface", None)
+                    self._send_scheduled(packet, now_ms, deadline - now_ms,
+                                         dwa_origin=origin, diagnostic=work.diagnostic)
+                return
+            work.checking_new_target = target_refresh
+            # Keep scratch caches and pose registration local to this attempt.
+            scan = copy(self._state.active_scan)
+            max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+        # Projection and the full receive-watchdog/braking sweep may overlap
+        # cancellation or a replacement plan. Reclaim the wire only afterwards.
+        diagnostics = {}
+        if (fresh_feedback or target_refresh) and not fixed_arc:
+            checked, values = self._check_route_control(
+                origin, check, max_age, now_ms, snapshot, scan, diagnostics, renew=True,
+                packet_deadline_ms=cutoff, target_refresh=target_refresh)
+        else:
+            # A new obstacle/target can veto the outstanding wire command even
+            # if the driver has repeated its most recent speed measurement.
+            values = work.message["values"]
+            outgoing = check
+            if fixed_arc and not any(target_objects(snapshot[0], origin.target, self._config)):
+                # Detector loss does not steer a committed corner. Depth still
+                # checks the actual packet's braking envelope.
+                outgoing = replace(check, motion_guard=replace(check.motion_guard,
+                                                               association=None, corner_only=True))
+            checked = self._recheck_dwa_motion(outgoing, values, max_age, now_ms, snapshot, renew=not fixed_arc,
+                                               diagnostics=diagnostics, scan=scan,
+                                               packet_deadline_ms=work.message["stamp_ms"] + work.message["ttl_ms"],
+                                               check_outgoing=fixed_arc,
+                                               corner_route=origin.acceptance.route_points if fixed_arc else None)
+        # New scene evidence needs its own sweep. When the next timer visit
+        # may be too late, also retry once if feedback or planner state
+        # overtook the sweep.
+        retries = 0
+        same_scene_retried = False
+        gap = min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)
+        retry_window_ms = math.ceil(2000 / self._rate_hz)
+        period = 1 / self._rate_hz
+        while not fixed_arc and (fresh_feedback or target_refresh) and checked is not None and checked[2]:
+            latest = self._observation_snapshot(with_capture_timing=True)
+            newer = _motion_inputs(*latest[:3])
+            scene_changed = newer[0] != revision[0] or newer[2] != revision[2] or latest[3] != snapshot[3]
+            now_ms = int(time.time() * 1000)
+            now = time.monotonic()
+            if now_ms >= cutoff or now >= cutoff_at:
+                return
+            early_retry = False
+            if not scene_changed:
+                proof = checked[3]
+                # Leave the next 10 Hz visit time for a sweep if it is
+                # already imminent, even after this visit ran over a tick.
+                until_next = period - (now - started) % period
+                # After a rejected handoff, reserve an extra control period
+                # for one bounded retry before the outgoing packet expires.
+                early_retry = work.retry_after_rejection and cutoff - now_ms <= retry_window_ms + math.ceil(period * 1000)
+                if (same_scene_retried or (not early_retry and cutoff_at - now > until_next + period / 2)
+                        or (self._repeat_feedback_admitted(origin, proof, newer, values, gap)
+                            and self._repeat_state_current(proof, now_ms))):
+                    break
+                same_scene_retried = True
+            if retries >= 2 and cutoff - now_ms > retry_window_ms:
+                # The next timer visit still has time for the newest evidence.
+                break
+            with self._output_lock:
+                if (self._scheduled_command is not work or work.dwa_origin is not origin
+                        or not self._continuing_dwa_output(origin)):
+                    return
+                if early_retry:
+                    work.retry_after_rejection = False
+                scan = copy(self._state.active_scan)
+            checked, values = self._check_route_control(
+                origin, checked[3], max_age, now_ms, latest, scan, diagnostics, renew=True,
+                packet_deadline_ms=cutoff, target_refresh=target_refresh)
+            snapshot, revision = latest, newer
+            odom = latest[2] or {}
+            retries += 1
+        reason = diagnostics.get("reason")
+        if (not fixed_arc and (fresh_feedback or target_refresh) and (checked is None or not checked[2])
+                and reason in ("target_range_unavailable", "target_standoff")):
+            now_ms = int(time.time() * 1000)
+            if now_ms < cutoff and time.monotonic() < cutoff_at:
+                if (reason == "target_range_unavailable"
+                        and self._repeat_feedback_admitted(
+                            origin, check, (*revision[:2], check.input_revision[2]), work.message["values"], gap)
+                        and _only_expired_views(check.memory_revision, policy_mod.dwa_memory_revision(
+                            self._state.active_scan, now_ms), now_ms)):
+                    return
+                # Check the actual packet's complete stop without renewing it.
+                outgoing = self._recheck_dwa_motion(
+                    check, work.message["values"], max_age, now_ms, snapshot, renew=False,
+                    diagnostics=diagnostics, scan=copy(self._state.active_scan),
+                    packet_deadline_ms=work.message["stamp_ms"] + work.message["ttl_ms"], check_outgoing=True)
+                latest = self._observation_snapshot(with_capture_timing=True)
+                if (outgoing is not None and outgoing[2] and latest[3] == snapshot[3]
+                        and _motion_inputs(*latest[:3]) == revision
+                        and time.monotonic() < cutoff_at):
+                    return
+                checked = None if outgoing is not None and outgoing[2] else outgoing
+        with self._output_lock:
+            if (self._scheduled_command is not work or work.dwa_origin is not origin
+                    or not self._continuing_dwa_output(origin)):
+                return
+            now_ms = int(time.time() * 1000)
+            if checked is None or not checked[2]:
+                reason = diagnostics.get("reason", "postcheck_veto")
+                if checked is None and diagnostics.get("reason") != "target_standoff":
+                    latest = self._observation_snapshot(with_capture_timing=True)
+                    if revision != _motion_inputs(*latest[:3]) or latest[3] != snapshot[3]:
+                        return
+                if (reason in ("target_missing", "target_range_unavailable")
+                        and self._continue_without_target(work, now_ms)):
+                    return
+                if (reason == "target_missing" and not fixed_arc and now_ms < cutoff
+                        and time.monotonic() < cutoff_at and any(target_objects(snapshot[0], origin.target, self._config))
+                        and self._repeat_feedback_admitted(
+                            origin, check, (*revision[:2], check.input_revision[2]), work.message["values"], gap)
+                        and _only_expired_views(check.memory_revision, policy_mod.dwa_memory_revision(
+                            self._state.active_scan, now_ms), now_ms)):
+                    # The visible detector update alone cannot revoke this
+                    # packet's admitted motion. Wait for the next checked view.
+                    return
+                if (diagnostics.get("reason") == "target_missing" and isinstance(snapshot[0], dict)
+                        and revision[0] == check.input_revision[0]
+                        and not any(target_objects(snapshot[0], origin.target, self._config))
+                        and self._hold_route_for_search(work, now_ms, rejected=origin)):
+                    return
+                if reason in _DISCARD_WITHOUT_STOP:
+                    # Leave the already sent packet on its original deadline.
+                    # The next tick can try new evidence without renewing it here.
+                    return
+                self._cancel_scheduled_motion(stop=(now_ms, "局部规划：续发复检未通过", False),
+                                              dwa_reason=reason)
+                return
+            track = self._state.tracker.track
+            if (fixed_arc or not (fresh_feedback or target_refresh) or track is None or not track.observed
+                    or (target_refresh and checked[3].target_ms <= check.target_ms)):
+                return
+            obs_ms, deadline, _, proof = checked
+            remaining = min(deadline - now_ms, cutoff - now_ms, int((cutoff_at - time.monotonic()) * 1000))
+            if remaining <= 0:
+                return
+            message = dict(work.message, values=values, obs_stamp_ms=obs_ms)
+            message.pop("control_interface", None)
+            tracked_origin = replace(origin, forward_check=proof, tracking_command=tuple(values[i] for i in (0, 1, 5)))
+            self._send_scheduled(message, now_ms, remaining, dwa_origin=tracked_origin,
+                                 diagnostic=work.diagnostic, repeat_feedback=odom)
+
+    def _repeat_feedback_admitted(self, origin, proof, revision, values, gap):
+        return (revision == proof.input_revision
+                or _continuous_feedback_update(proof.input_revision, revision, gap, stationary=False, unchanged=True)
+                or _speed_only_feedback_within_sweep(proof, revision, values, gap, int(time.time() * 1000))
+                or _slower_forward_within_sweep(proof, revision, gap)
+                or (self._goal_beyond_local_grid(origin) and _feedback_within_sweep(proof, revision, values, gap)))
+
+    def _repeat_state_current(self, proof, now_ms):
+        return (_only_expired_views(proof.memory_revision, policy_mod.dwa_memory_revision(
+                    self._state.active_scan, now_ms), now_ms)
+                and policy_mod.dwa_target_revision(self._state) == proof.target_revision)
+
+    def _queue_route_candidate(self, message, origin, previous, now_ms):
+        if (previous is None or previous.repeat_until is None or origin.handoff
+                or not origin.acceptance.route_points or not origin.forward_check.renewable
+                or origin.forward_check.planning_guard.association is None
+                or origin.forward_check.planning_guard.pose is None
+                or not self._retain_checked_route(previous, now_ms)):
+            return False
+        self._pending_route = message, origin
+        return True
+
+    def _dispatch_route_candidate(self):
+        with self._output_lock:
+            pending, previous = self._pending_route, self._scheduled_command
+            if pending is None:
+                return False
+            message, origin = pending
+            now_ms = int(time.time() * 1000)
+            now = time.monotonic()
+            if (previous is None or previous.repeat_until is None or not self._continuing_dwa_output(previous.dwa_origin)
+                    or self._dwa_publish_rejection(message, origin, now_ms, sent=True) is not None
+                    or now_ms >= min(previous.expires_ms, previous.repeat_until[0])
+                    or now >= min(previous.expires_at, previous.repeat_until[1])):
+                self._pending_route = None
+                self._veto_dwa(origin, "superseded")
+                return False
+            check = origin.forward_check
+            planned = check.planning_guard
+            route_end = planned.checked_ms + round(planned.prediction_horizon_s * 1000)
+            route_end_at = now + (route_end - now_ms) / 1000
+            handoff_cutoff = min(previous.expires_ms, previous.repeat_until[0])
+            handoff_cutoff_at = min(previous.expires_at, previous.repeat_until[1])
+            if now_ms >= route_end:
+                self._pending_route = None
+                self._veto_dwa(origin, "publish_expired")
+                return False
+            scan = copy(self._state.active_scan)
+            max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+            snapshot = self._observation_snapshot(with_capture_timing=True)
+        diagnostics = {}
+        checked, values = self._check_route_control(origin, check, max_age, now_ms, snapshot, scan, diagnostics,
+                                                   renew=True, packet_deadline_ms=route_end,
+                                                   cover_slower_feedback=handoff_cutoff - now_ms <= math.ceil(1000 / self._rate_hz))
+        with self._output_lock:
+            if self._pending_route is not pending or self._scheduled_command is not previous:
+                return False
+            self._pending_route = None
+            now_ms = int(time.time() * 1000)
+            now = time.monotonic()
+            if now_ms >= handoff_cutoff or now >= handoff_cutoff_at:
+                self._veto_dwa(origin, "publish_expired")
+                return False
+            if checked is None or not checked[2]:
+                self._veto_dwa(origin, diagnostics.get("reason", "postcheck_veto"))
+                return False
+            obs_ms, deadline, _, proof = checked
+            remaining = min(deadline - now_ms, int((route_end_at - now) * 1000))
+            if remaining <= 0:
+                self._veto_dwa(origin, "publish_expired")
+                return False
+            candidate = dict(message, values=values, stamp_ms=now_ms, obs_stamp_ms=obs_ms, ttl_ms=remaining)
+            origin = replace(origin, forward_check=proof, tracking_command=tuple(values[i] for i in (0, 1, 5)))
+            rejection = self._dwa_publish_rejection(candidate, origin, now_ms)
+            if rejection is not None:
+                self._veto_dwa(origin, rejection)
+                return False
+            work = _ScheduledCommand(candidate, now_ms + remaining, now + remaining / 1000, None,
+                                     forward_check=proof, dwa_origin=origin, diagnostic=origin.diagnostic,
+                                     repeat_until=(route_end, route_end_at), previous_route=previous)
+            self._scheduled_command = work
+            self._send_scheduled(candidate, now_ms, remaining, dwa_origin=origin, repeat_feedback=snapshot[2])
+            work.previous_route = None
+            if self._continuing_dwa_output(origin):
+                work.sent = True
+                return True
+            if self._scheduled_command is work:
+                self._scheduled_command = previous
+                self._veto_dwa(origin, "stale_observation")
+            return False
+
+    def _prepare_camera_arc(self, work, now_ms):
+        snapshot = self._observation_snapshot(with_capture_timing=True)
+        depth = snapshot[1]
+        if depth is None or depth["frame_id"] <= work.camera_successor_frame:
+            return False
+        work.camera_successor_frame = depth["frame_id"]
+        age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+        if (work.forward_check is None or policy_mod.apply_deadband(
+                work.message["values"], self._deadband_for(work.message["values"])) != work.message["values"]):
+            return False
+        candidate = self._plan_camera_successor(work.forward_check, work.message["values"], age, now_ms,
+                                                 snapshot=snapshot)
+        if candidate is None:
+            return False
+        obs_ms, deadline, proof, values = candidate
+        with self._output_lock:
+            now_ms = int(time.time() * 1000)
+            now = time.monotonic()
+            remaining = deadline - now_ms
+            if (self._scheduled_command is not work or work.successor is not None
+                    or remaining <= 0
+                    or now >= work.expires_at or now_ms >= work.expires_ms
+                    or deadline <= work.camera_arc_end_ms):
+                return False
+            message = dict(work.message, stamp_ms=now_ms, obs_stamp_ms=obs_ms, ttl_ms=remaining,
+                           values=values)
+            message.pop("control_interface", None)
+            work.successor = _ScheduledCommand(
+                message, deadline, now + remaining / 1000, None, forward_check=proof,
+                command_only=True, camera_arc_end_ms=deadline, diagnostic=work.diagnostic)
+            return True
+
+    def _dispatch_command(self):
+        camera_to_prepare = None
+        with self._output_lock:
+            active = self._scheduled_command
+            now_ms = int(time.time() * 1000)
+            if (active is not None and active.sent and self._wire_moving and active.forward_check is not None
+                    and self._outgoing_person_standoff(
+                        active.forward_check, active.message["values"], now_ms,
+                        min(active.expires_ms, active.message["stamp_ms"] + active.message["ttl_ms"]),
+                        self._observation_snapshot(with_capture_timing=True))):
+                self._cancel_scheduled_motion(stop=(now_ms, "局部规划：目标间距不足，停车", True),
+                                              dwa_reason="target_standoff")
+                return
+            executing = self._arc_in_progress(active, now_ms)
+            if (active is not None and active.camera_arc_end_ms is not None and active.sent
+                    and active.successor is None and active.forward_check is not None
+                    and self._running and self._publisher is not None and not self._output_blocked and not self._paused
+                    and self._wire_moving and now_ms < active.expires_ms and time.monotonic() < active.expires_at
+                    and active.camera_arc_end_ms - now_ms <= 1000 / self._rate_hz):
+                camera_to_prepare = active
+            elif not executing and active is not None and active.successor is not None:
+                work, active.successor = active.successor, None
+                remaining = min(work.expires_ms - now_ms, round((work.expires_at - time.monotonic()) * 1000))
+                if (remaining > 0 and not self._output_blocked and not self._paused
+                        and self._running and self._publisher is not None
+                        and (work.dwa_origin is None or self._dwa_publish_rejection(
+                            work.message, work.dwa_origin, now_ms) is None)):
+                    self._scheduled_command = work
+                    work.previous_route = active
+                    published = self._published
+                    self._send_scheduled(work.message, now_ms, remaining, dwa_origin=work.dwa_origin,
+                                         diagnostic=work.diagnostic)
+                    work.previous_route = None
+                    if self._published > published and self._wire_moving:
+                        work.sent = True
+                        return
+                    if self._scheduled_command is work:
+                        self._scheduled_command = active
+            if (active is not None and active.dwa_origin is None and active.expiry_stop_reason == "target_missing"
+                    and self._last_decision is not None and self._last_decision.target_pending
+                    and self._continue_without_target(active, now_ms)):
+                return
+        if camera_to_prepare is not None:
+            if self._prepare_camera_arc(camera_to_prepare, now_ms):
+                self._dispatch_command()
+            return
+        if self._dispatch_route_candidate():
+            return
+        work = self._scheduled_command
+        if (work is not None and work.sent and work.dwa_origin is not None
+                and (work.repeat_until is not None or self._fixed_arc(work)
+                     or work.dwa_origin.acceptance.route_points)):
+            with self._output_lock:
+                if self._scheduled_command is not work or work.checking:
+                    return
+                work.checking = True
+                pending_before = self._pending_route
+            try:
+                self._repeat_dwa_command(work)
+            finally:
+                with self._output_lock:
+                    finish_handoff = work.checking_new_target
+                    work.checking_new_target = False
+                    work.checking = False
+            if self._scheduled_command is not work:
+                return
+            if (finish_handoff and self._pending_route is not None and self._pending_route is not pending_before
+                    and self._dispatch_route_candidate()):
+                return
+        with self._output_lock:
+            if not self._running or self._publisher is None:
+                return
+            now_ms = int(time.time() * 1000)
+            work = self._scheduled_command
+            if work is not None and work.stop_reason is not None:
+                # A stop is still owed even while paused or after the motion's
+                # deadline. Each timer dispatch attempts exactly one packet.
+                if self._send_scheduled(None, now_ms, self._ttl_ms,
+                                        dwa_origin=work.dwa_origin, diagnostic=work.diagnostic,
+                                        stop_reason=work.stop_reason):
+                    if self._scheduled_command is work:
+                        self._scheduled_command = None
+                return
+            if work is None:
+                return
+            if self._output_blocked or self._paused:
+                return
+            remaining_ms = min(work.expires_ms - now_ms, round((work.expires_at - time.monotonic()) * 1000))
+            if work.command_only and work.turn is None and work.leg is None:
+                if remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
+                    self._scheduled_command = None
+                    return
+                if work.sent:
+                    if work.camera_arc_end_ms is None:
+                        self._repeat_command_only(work, now_ms)
+                    return
+            rejection = (self._dwa_publish_rejection(work.message, work.dwa_origin, now_ms, sent=work.sent)
+                         if work.dwa_origin is not None else None)
+            stop = (rejection, False) if rejection is not None else None
+            if stop is None and (work.turn is not None and not work.sent and not self._wire_moving
+                    and now_ms >= work.message["stamp_ms"]
+                    and remaining_ms < math.ceil(1000 / self._rate_hz)):
+                stop = (_UNSENT_TURN, False)
+            elif stop is None and (remaining_ms <= 0 or now_ms < work.message["stamp_ms"]):
+                stop = ("速度指令窗口已到期", False)
+            elif stop is None and work.sent and work.dwa_origin is not None:
+                # Eligible repeats already ran outside the output lock above.
+                return
+            elif stop is None and work.turn is not None:
+                with self._obs_lock:
+                    history = tuple(self._velocity_history)
+                    depth_ok = (0 <= now_ms - self._depth_ms <= self._config.depth_age_limit_ms
+                                and depth_mod.has_valid_returns(self._depth_map))
+                if depth_ok:
+                    stop = work.turn.check_turn_feedback(history, now_ms, self._config.wz_max)
+                else:
+                    stop = (DEPTH_RECHECK_HOLD, True)
+            elif stop is None and work.leg is not None:
+                stop = self._check_scheduled_leg(work, now_ms, remaining_ms)
+                now_ms = int(time.time() * 1000)
+                remaining_ms = min(work.expires_ms - now_ms,
+                                   round((work.expires_at - time.monotonic()) * 1000))
+                if remaining_ms <= 0 or now_ms < work.message["stamp_ms"]:
+                    stop = ("速度指令窗口已到期", False)
+                elif stop is None and now_ms - work.feedback.poses[-1][0] > work.feedback.max_feedback_gap_ms:
+                    stop = ("局部规划：运动反馈已到期，停车后重规划", True)
+            renewed = False
+            recheck_diagnostics = {}
+            may_renew = (work.camera_arc_end_ms is None and work.forward_check is not None and work.forward_check.renewable
+                         and not (work.dwa_origin is not None and (work.dwa_origin.acceptance.angle_controlled
+                                                                 or work.dwa_origin.acceptance.corridor_corner))
+                         and remaining_ms <= math.ceil(2000 / self._rate_hz))
+            if stop is None and may_renew:
+                max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+                # The final timer visit can be arbitrarily close to cutoff.
+                # Start matching new target evidence in the full recheck window.
+                refresh_direct = (work.sent and work.dwa_origin is None and work.turn is None and work.leg is None
+                                  and work.forward_check.direct_association is not None
+                                  and not self._state.failed_reason)
+                snapshot = self._observation_snapshot(with_capture_timing=True) if refresh_direct else None
+                checked = self._recheck_forward(work.forward_check, work.message["values"],
+                                                max_age, now_ms, allow_same_depth=True,
+                                                diagnostics=recheck_diagnostics, snapshot=snapshot,
+                                                refresh_direct=refresh_direct)
+                now_ms = int(time.time() * 1000)
+                remaining_ms = min(work.expires_ms - now_ms,
+                                   round((work.expires_at - time.monotonic()) * 1000))
+                if (refresh_direct and checked is not None and checked[2]
+                        and checked[3].target_ms != work.forward_check.target_ms):
+                    # Only a completed check can replace the running window.
+                    latest = self._observation_snapshot(with_capture_timing=True)
+                    revision = _motion_inputs(*snapshot[:3])
+                    current = _motion_inputs(*latest[:3])
+                    gap = min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)
+                    if (remaining_ms > 0 and latest[3] == snapshot[3] and current != revision
+                            and (current[0] != revision[0] or _continuous_feedback_update(
+                                 revision, current, gap, stationary=False))):
+                        # Keep the matched range and check the latest depth or
+                        # measured twist before the outgoing window closes.
+                        checked = self._recheck_forward(checked[3], work.message["values"], max_age, now_ms,
+                                                        allow_same_depth=True, snapshot=latest, recheck_feedback=True,
+                                                        diagnostics=recheck_diagnostics)
+                        now_ms = int(time.time() * 1000)
+                        remaining_ms = min(work.expires_ms - now_ms,
+                                           round((work.expires_at - time.monotonic()) * 1000))
+                        revision = current
+                        latest = self._observation_snapshot(with_capture_timing=True)
+                        current = _motion_inputs(*latest[:3])
+                    track = self._state.tracker.track
+                    association, _ = work.forward_check.direct_association
+                    if (remaining_ms <= 0 or self._state.failed_reason or self._state.reacquire_generation is not None
+                            or track is None or not track.observed or track.generation != association.generation
+                            or latest[3] != snapshot[3] or current != revision):
+                        checked = None
+                if (checked is None and recheck_diagnostics.get("reason") == "target_missing"
+                        and self._continue_without_target(work, now_ms)):
+                    return
+                if checked is None and recheck_diagnostics.get("reason"):
+                    stop = ("局部规划：续发所用目标或运动约束已失效", True)
+                # The old window can elapse while a new observation is
+                # being checked. A still-valid new check has its own deadline.
+                if checked is not None and checked[0] <= now_ms < checked[1]:
+                    obs_ms, deadline, clear, newer = checked
+                    if not clear:
+                        stop = ("局部规划：续发前扫掠复检发现障碍", True)
+                        recheck_diagnostics.setdefault("reason", "footprint_collision")
+                    elif min(now_ms + self._ttl_ms, deadline) > now_ms + remaining_ms:
+                        work.forward_check = newer
+                        work.message = dict(work.message, obs_stamp_ms=obs_ms)
+                        if newer.direct_vx is not None:
+                            values = list(work.message["values"])
+                            values[0] = newer.direct_vx
+                            work.message["values"] = values
+                        remaining_ms = min(self._ttl_ms, deadline - now_ms)
+                        if work.dwa_origin is not None:
+                            work.message = dict(work.message, stamp_ms=now_ms, ttl_ms=remaining_ms)
+                            work.dwa_origin = replace(work.dwa_origin, forward_check=newer)
+                        work.expires_ms = now_ms + remaining_ms
+                        work.expires_at = time.monotonic() + remaining_ms / 1000
+                        renewed = True
+                    elif work.dwa_origin is not None:
+                        work.forward_check = newer
+                        work.dwa_origin = replace(work.dwa_origin, forward_check=newer)
+                if stop is None and remaining_ms <= 0:
+                    stop = ("速度指令窗口已到期", False)
+            if stop is not None:
+                reason = rejection or recheck_diagnostics.get("reason")
+                if reason is None and remaining_ms <= 0:
+                    reason = work.expiry_stop_reason or "publish_expired"
+                self._cancel_scheduled_motion(stop=(now_ms, *stop), dwa_reason=reason)
+                return
+            # Turns and fixed legs can repeat within the existing window.
+            # Other forward motion requires a newly checked observation.
+            if not work.sent or renewed or work.turn is not None or work.leg is not None:
+                message = work.message
+                if work.sent and "control_interface" in message:
+                    message = message.copy()
+                    del message["control_interface"]
+                published = self._published
+                written = self._send_scheduled(message, now_ms, remaining_ms,
+                                               dwa_origin=work.dwa_origin, diagnostic=work.diagnostic)
+                if (work.camera_arc_end_ms is not None
+                        or (work.dwa_origin is not None and work.dwa_origin.acceptance.route_points)):
+                    written = self._published > published and self._wire_moving
+                work.sent = work.sent or written
+                if (work.dwa_origin is not None and self._wire_dwa_origin is not None
+                        and self._wire_dwa_origin.identity == work.dwa_origin.identity):
+                    work.dwa_origin = self._wire_dwa_origin
+                    work.forward_check = self._wire_dwa_origin.forward_check
+
+    def _repeat_command_only(self, work, now_ms):
+        """Check new depth before repeating an unexpired camera-frame approach."""
+        check = work.forward_check
+        if check is None or not check.renewable or not self._wire_moving:
+            return
+        max_age = (self._descriptor.get("rate") or {}).get("max_obs_age_ms") or self._config.max_obs_age_ms
+        snapshot = self._observation_snapshot(with_capture_timing=True)
+        diagnostics = {}
+        checked = self._recheck_forward(check, work.message["values"], max_age, now_ms,
+                                        snapshot=snapshot, diagnostics=diagnostics, command_only=True,
+                                        handoff_deadline_ms=work.expires_ms)
+        now_ms = int(time.time() * 1000)
+        reason = diagnostics.get("reason")
+        if checked is not None and not checked[2]:
+            reason = "footprint_collision"
+        if reason is not None:
+            self._cancel_scheduled_motion(stop=(now_ms, "局部规划：续发复检触发停车", True),
+                                          dwa_reason=reason)
+            return
+        if checked is None:
+            return
+        _, deadline, _, newer = checked
+        work.forward_check = newer
+        remaining = min(work.expires_ms - now_ms, deadline - now_ms,
+                        round((work.expires_at - time.monotonic()) * 1000))
+        # New depth may veto the outgoing motion. Only the original, still
+        # current target observation can authorize it to be sent again.
+        latest = self._observation_snapshot(with_capture_timing=True)
+        if (remaining <= 0 or latest[3] != check.target_receipt_ms or latest[1] is None
+                or (latest[1]["frame_id"], latest[1].get("source_frame_id")) != (newer.frame_id, newer.source_id)):
+            return
+        message = dict(work.message)
+        message.pop("control_interface", None)
+        self._send_scheduled(message, now_ms, remaining, diagnostic=work.diagnostic)
+
+    def _next_wire_seq(self, requested):
+        """Allocate under the output lock, including attempts the transport may lose."""
+        self._wire_seq = max(self._wire_seq + 1, requested)
+        return self._wire_seq
+
+    def _send_scheduled(self, message, now_ms, ttl_ms, *, dwa_origin=None, diagnostic=None, stop_reason=None,
+                        repeat_feedback=None, prediction=None):
+        """Serialize wire sequence numbers for plan results and checked repeats."""
+        seq = message["seq"] if message is not None else 0
+        if self._command_timer is not None:
+            seq = self._next_wire_seq(seq)
+        if message is None:
+            packet = build_message(seq=seq, values=[0.] * ACTION_DIM, mode=CONTROL_MODE,
+                                   dof=ACTION_DIM, source=f"mcp__actucore__{self.PREFIX}",
+                                   stamp_ms=now_ms, obs_stamp_ms=now_ms, ttl_ms=ttl_ms,
+                                   priority=int(self._cfg.get("priority", 50)))
+        else:
+            packet = dict(message, seq=seq, stamp_ms=now_ms, ttl_ms=ttl_ms)
+        try:
+            if prediction is not None:
+                moving = self._publish_checked_command(packet, dwa_origin, diagnostic, stop_reason,
+                                                       prediction=prediction)
+            else:
+                moving = (self._publish_command(packet, dwa_origin=dwa_origin, diagnostic=diagnostic,
+                                            stop_reason=stop_reason, repeat_feedback=repeat_feedback)
+                      if dwa_origin is not None or diagnostic is not None
+                      else self._publish_command(packet))
+        except Exception as error:                            # noqa: BLE001
+            log.warning("navi velocity publish failed: %s", error)
+            pending_stop = self._scheduled_command is not None and self._scheduled_command.stop_reason is not None
+            if dwa_origin is not None and any(packet["values"]) and not pending_stop:
+                self._cancel_scheduled_motion(stop=(now_ms, "局部规划：速度发布失败，等待重规划", False),
+                                              dwa_reason="publish_error")
+            return False
+        self._wire_moving = moving if isinstance(moving, bool) else any(packet["values"])
+        return True
+
+    def _cancel_scheduled_motion(self, *, block=False, stop=None, dwa_reason=None):
+        with self._output_lock:
+            self._pending_route = None
+            work = self._scheduled_command
+            origin = ((work.dwa_origin if work is not None else None)
+                      or (self._staged_dwa_command[1] if self._staged_dwa_command is not None else None)
+                      or self._wire_dwa_origin)
+            diagnostic = work.diagnostic if work is not None else self._wire_diagnostic
+            reason = ((work.stop_reason if work is not None else None)
+                      or dwa_reason or ("postcheck_veto" if stop is not None else "superseded"))
+            if origin is not None:
+                self._veto_dwa(origin, reason)
+            elif diagnostic is not None and stop is not None:
+                self._dwa_event(diagnostic, "veto", reason)
+            self._output_epoch += 1
+            self._output_blocked |= block
+            timed_motion = (work is not None and work.sent
+                            and (work.turn is not None or work.leg is not None
+                                 or (origin is not None and origin.acceptance.angle_controlled)))
+            if (not block and not timed_motion and dwa_reason in _DISCARD_WITHOUT_STOP
+                    and (work is None or work.stop_reason is None)):
+                self._output_stop = stop
+                self._scheduled_command = None
+                return
+            if self._command_timer is None:
+                if origin is not None and self._wire_moving and self._publisher is not None:
+                    now = time.time()
+                    try:
+                        self._publish_command(self._command_message([0.] * ACTION_DIM, now, int(now * 1000)),
+                                              dwa_origin=origin, diagnostic=diagnostic, stop_reason=reason)
+                    except Exception as error:                # noqa: BLE001
+                        log.warning("navi stop command failed: %s", error)
+                return
+            self._output_stop = stop
+            self._scheduled_command = None
+            if stop is not None:
+                log.info("navi velocity hold: %s", stop[1])
+            if self._wire_moving and self._publisher is not None:
+                self._send_scheduled(None, int(time.time() * 1000), self._ttl_ms,
+                                     dwa_origin=origin, diagnostic=diagnostic, stop_reason=reason)
+
+    def _publish_command(self, message, *, dwa_origin=None, diagnostic=None, stop_reason=None, repeat_feedback=None):
+        with self._output_lock:
+            return self._publish_checked_command(message, dwa_origin, diagnostic, stop_reason, repeat_feedback=repeat_feedback)
+
+    def _publish_checked_command(self, message, dwa_origin, diagnostic, stop_reason, *,
+                                 repeat_feedback=None, prediction=None):
+        from std_msgs.msg import String
+
+        renewed_first_send = False
+        origin = dwa_origin
+        if origin is None and diagnostic is None:
+            origin = self._dwa_for_message(message)
+            diagnostic = self._diagnostic_for(message) if self._command_timer is None else None
+        if not any(message["values"]) and diagnostic is None and origin is None:
+            origin, diagnostic = self._wire_dwa_origin, self._wire_diagnostic
+        if origin is not None and origin.handoff and any(message["values"]):
+            origin = self._claim_dwa_output(message, origin)
+        if origin is not None:
+            diagnostic = origin.diagnostic
+        if (stop_reason is None and diagnostic is not None and diagnostic.discarded_proposal
+                and not any(message["values"])):
+            return self._wire_moving
+        if (prediction is not None and origin is None
+                and (message["values"] != prediction.work.message["values"] or not self._prediction_inputs_current(prediction))):
+            return self._wire_moving
+        straight_handoff = None
+        if origin is None and prediction is None and any(message["values"][:2]):
+            work = self._scheduled_command
+            staged = self._staged_forward_check
+            check = None
+            if self._command_timer is not None and work is not None:
+                check = work.forward_check
+            elif staged is not None and staged[0] == message["seq"]:
+                check = staged[1]
+            if check is not None:
+                now_ms = int(time.time() * 1000)
+                snapshot = self._observation_snapshot(with_capture_timing=True)
+                straight_handoff = check.straight_handoff
+                front_blocked = False
+                if check.straight_forward:
+                    near_hits = (self._state.active_scan.near_hits
+                                 if check.mount_frame is None and check.geometry.front == 0. else None)
+                    cap = policy_mod.straight_handoff_speed(
+                        snapshot[1], self._config, check.distance_m,
+                        odom_mod.planar_feedback(snapshot[2]), self._wire_twist or check.previous_twist,
+                        near_hits=near_hits)
+                    if cap < message["values"][0]:
+                        values = [cap, *message["values"][1:]]
+                        front_blocked = cap <= 0. or policy_mod.apply_deadband(values, self._deadband_for(values)) != values
+                        if not front_blocked:
+                            message = dict(message, values=values)
+                if front_blocked or self._outgoing_person_standoff(check, message["values"], now_ms,
+                                                  message["stamp_ms"] + message["ttl_ms"],
+                                                  snapshot):
+                    self._scheduled_command = None
+                    stop_reason = "forward_obstacle" if front_blocked else "target_standoff"
+                    message = dict(message, values=[0.] * ACTION_DIM, stamp_ms=now_ms,
+                                   obs_stamp_ms=now_ms, ttl_ms=self._ttl_ms)
+        if origin is not None and any(message["values"]):
+            now_ms = int(time.time() * 1000)
+            rejection = self._dwa_publish_rejection(message, origin, now_ms, sent=prediction is not None)
+            work = self._scheduled_command
+            if prediction is not None:
+                if (rejection is not None or not self._continuing_dwa_output(origin)
+                        or message["values"] != prediction.work.message["values"]
+                        or not self._prediction_inputs_current(prediction)):
+                    return self._wire_moving
+            elif rejection is None and repeat_feedback is not None:
+                proof = origin.forward_check
+                latest = self._observation_snapshot(with_capture_timing=True)
+                revision = _motion_inputs(*latest[:3])
+                gap = min(self._odom_max_age_ms, self._config.max_feedback_gap_ms)
+                feedback = latest[2] or {}
+                speed_ms = feedback.get("component_speed_ms")
+                if ("received_speed_ms" in repeat_feedback and (type(speed_ms) is not int
+                        or speed_ms != feedback.get("received_speed_ms") or not 0 <= now_ms - speed_ms < gap
+                        or speed_ms < repeat_feedback["component_speed_ms"])):
+                    return self._wire_moving
+                if (latest[3] != proof.target_receipt_ms
+                        or not self._repeat_feedback_admitted(origin, proof, revision, message["values"], gap)
+                        or not self._repeat_state_current(proof, now_ms)):
+                    return self._wire_moving
+            elif rejection is None:
+                # An unsent route does not own the wire. Reuse its original
+                # proof for unchanged inputs, or check the newer stopping sweep.
+                rejection, checked = self._recheck_dwa_inputs(origin, message["values"], now_ms)
+                now_ms = int(time.time() * 1000)
+                if checked is not None:
+                    obs_ms, deadline, _, proof = checked
+                    renewed_first_send = deadline > origin.forward_check.motion_guard.deadline_ms
+                    if renewed_first_send:
+                        if self._state.decision_id != origin.acceptance.decision_id:
+                            rejection = "superseded"
+                        elif not obs_ms <= now_ms < deadline:
+                            rejection = "publish_expired"
+                        else:
+                            message = dict(message, stamp_ms=now_ms, obs_stamp_ms=obs_ms, ttl_ms=deadline - now_ms)
+                    else:
+                        message = dict(message, ttl_ms=min(message["ttl_ms"], deadline - message["stamp_ms"]))
+                    wire_deadline = message["stamp_ms"] + message["ttl_ms"]
+                    if wire_deadline < proof.motion_guard.deadline_ms:
+                        proof = replace(proof, motion_guard=replace(proof.motion_guard, deadline_ms=wire_deadline))
+                    origin = replace(origin, forward_check=proof)
+                rejection = rejection or self._dwa_publish_rejection(message, origin, now_ms)
+            if rejection is not None:
+                previous = work.previous_route if work is not None else None
+                if rejection == "handoff_inputs_updated" and self._queue_route_candidate(message, origin, previous, now_ms):
+                    self._dwa_event(origin.diagnostic, "deferred", "stale_observation")
+                    return self._wire_moving
+                if rejection == "handoff_inputs_updated":
+                    # The retained route's controller sweeps the unchecked
+                    # inputs on its next visit, inside the window already sent.
+                    rejection = "stale_observation"
+                if rejection in ("target_missing", "target_range_unavailable") and previous is not None:
+                    self._scheduled_command = previous
+                    if self._continue_without_target(previous, now_ms):
+                        self._dwa_event(origin.diagnostic, "deferred", rejection)
+                        return True
+                    if self._scheduled_command is previous:
+                        self._scheduled_command = work
+                self._veto_dwa(origin, rejection)
+                if (rejection == "target_missing" and self._can_replan_search
+                        and self._state.reacquire_generation is not None
+                        and self._hold_route_for_search(previous, now_ms)):
+                    return True
+                if rejection in _DISCARD_WITHOUT_STOP:
+                    if not self._retain_checked_route(previous, now_ms) and work is self._scheduled_command:
+                        self._scheduled_command = None
+                    return self._wire_moving
+                if rejection in ("footprint_collision", "remembered_obstacle") and self._retain_checked_route(
+                        previous, now_ms, check_outgoing_sweep=True):
+                    return self._wire_moving
+                stop_reason = rejection
+                message = dict(message, values=[0.] * ACTION_DIM, stamp_ms=now_ms,
+                               obs_stamp_ms=now_ms, ttl_ms=self._ttl_ms)
+        # With no outstanding motion there is nothing to brake. Drop only
+        # this rejected plan so the checked search can take the wire slot.
+        if (self._can_replan_search and not self._wire_moving and not any(message["values"])
+                and self._state.reacquire_generation is not None
+                and (stop_reason or (diagnostic and diagnostic.veto_reason)) == "target_missing"
+                and diagnostic is not None and diagnostic.state_id == id(self._state)
+                and diagnostic.decision_id == self._state.decision_id):
+            work = self._scheduled_command
+            if (work is not None and work.stop_reason is None and work.dwa_origin is not None
+                    and origin is not None and work.dwa_origin.identity == origin.identity):
+                self._scheduled_command = None
+            if work is None or work.stop_reason is None:
+                return False
+        if self._command_timer is None:
+            # Direct plans and their timer-dispatched stop retries share this
+            # sequence. Resolve plan-sequence-specific proof before renumbering.
+            message = dict(message, seq=self._next_wire_seq(message["seq"]))
+        payload = String()
+        payload.data = json.dumps(message, ensure_ascii=False)
+        write_ms, write_tick = int(time.time() * 1000), time.monotonic()
+        work = self._scheduled_command
+        moving = any(message["values"])
+        if origin is not None and moving and origin.acceptance.route_points and not (
+                message["stamp_ms"] <= write_ms < message["stamp_ms"] + message["ttl_ms"]):
+            self._veto_dwa(origin, "publish_expired")
+            return self._wire_moving
+        if work is not None and work.command_only and moving:
+            if (write_tick >= work.expires_at or not message["stamp_ms"] <= write_ms
+                    < min(work.expires_ms, message["stamp_ms"] + message["ttl_ms"])):
+                return self._wire_moving
+        if repeat_feedback is not None and moving:
+            write_before, write_before_at = work.repeat_until
+            previous = work.previous_route
+            if previous is not None:
+                write_before = min(write_before, previous.expires_ms, previous.repeat_until[0])
+                write_before_at = min(write_before_at, previous.expires_at, previous.repeat_until[1])
+            if (write_ms >= write_before or write_tick >= write_before_at or not message["stamp_ms"] <= write_ms
+                    < message["stamp_ms"] + message["ttl_ms"]):
+                return self._wire_moving
+        camera_write = moving and work is not None and work.camera_arc_end_ms is not None
+        try:
+            with self._obs_lock if camera_write or prediction is not None else nullcontext():
+                if prediction is not None and not self._prediction_inputs_current(prediction):
+                    return self._wire_moving
+                if camera_write:
+                    check = work.forward_check
+                    snapshot = self._observation_snapshot(with_capture_timing=True)
+                    if (check is None or self._wire_twist not in (None, check.previous_twist)
+                            or snapshot[3] != check.target_receipt_ms
+                            or _motion_inputs(*snapshot[:3]) != check.input_revision):
+                        if diagnostic is not None:
+                            self._dwa_event(diagnostic, "veto", "stale_observation")
+                        return self._wire_moving
+                    write_ms, write_tick = int(time.time() * 1000), time.monotonic()
+                    if (write_tick >= work.expires_at or write_ms >= message["stamp_ms"] + message["ttl_ms"]
+                            or write_ms >= work.camera_arc_end_ms):
+                        if diagnostic is not None:
+                            self._dwa_event(diagnostic, "veto", "publish_expired")
+                        return self._wire_moving
+                self._publisher.publish(payload)
+        except Exception:
+            if origin is not None:
+                self._veto_dwa(origin, "publish_error")
+            elif diagnostic is not None:
+                self._dwa_event(diagnostic, "veto", "publish_error")
+            if (not any(message["values"]) and
+                    (origin is not None or (self._config.local_controller == "dwa" and self._wire_moving))):
+                # Keep the owed zero even if policy issued it before entering
+                # observation. The next dispatch retries once before any motion.
+                self._scheduled_command = _ScheduledCommand(
+                    dict(message), 0, 0., None, dwa_origin=origin, diagnostic=diagnostic,
+                    stop_reason=stop_reason or "publish_error")
+            raise
+        self._published += 1
+        if moving and renewed_first_send:
+            remaining = message["stamp_ms"] + message["ttl_ms"] - write_ms
+            self._command_window = (write_tick, write_tick + min(remaining, self._config.watchdog_ms) / 1000)
+        work = self._scheduled_command
+        if moving and work is not None and work.camera_arc_end_ms is not None:
+            watchdog = (self._descriptor.get("rate") or {}).get("watchdog_ms")
+            if watchdog == self._config.watchdog_ms:
+                work.expires_ms = write_ms + watchdog
+                work.expires_at = write_tick + watchdog / 1000
+                self._command_window = (write_tick, work.expires_at)
+        if moving and prediction is not None:
+            remaining = message["stamp_ms"] + message["ttl_ms"] - write_ms
+            watchdog = (self._descriptor.get("rate") or {}).get("watchdog_ms")
+            lease = watchdog if watchdog == self._config.watchdog_ms else min(remaining, self._config.watchdog_ms)
+            work.message = message
+            work.predicted_depth_ms = prediction.depth_ms
+            work.expires_ms = write_ms + lease
+            if prediction.coast_end_ms is not None:
+                work.expires_ms = min(work.expires_ms, prediction.coast_end_ms)
+                work.expiry_stop_reason = "target_missing"
+            else:
+                work.expiry_stop_reason = None
+            work.expires_at = write_tick + (work.expires_ms - write_ms) / 1000
+            if origin is not None:
+                work.repeat_until = work.expires_ms, work.expires_at
+            self._command_window = (write_tick, work.expires_at)
+        elif (moving and origin is not None and work is not None and work.dwa_origin is not None
+                and work.dwa_origin.identity == origin.identity):
+            # TTL is an admission deadline. Once written, ordinary translation
+            # has the receive-watchdog hold already swept by dwa_hold().
+            guard = origin.forward_check.motion_guard
+            if renewed_first_send:
+                work.message, work.forward_check, work.dwa_origin = message, origin.forward_check, origin
+                work.predicted_depth_ms = None
+                work.expires_ms = guard.deadline_ms
+                work.expires_at = write_tick + (work.expires_ms - write_ms) / 1000
+            watchdog = (self._descriptor.get("rate") or {}).get("watchdog_ms")
+            if ((message["values"][0] > 0 or (self._config.use_lateral and message["values"][1]))
+                    and work.turn is None and work.leg is None
+                    and not origin.acceptance.angle_controlled and type(watchdog) in (int, float)
+                    and 0 < watchdog == self._config.watchdog_ms <= guard.prediction_horizon_s * 1000):
+                if (not work.sent and origin.forward_check.renewable and guard.association is not None
+                        and origin.acceptance.route_points and origin.forward_check.planning_guard.pose is not None):
+                    planned = origin.forward_check.planning_guard
+                    end = planned.checked_ms + round(planned.prediction_horizon_s * 1000)
+                    work.repeat_until = end, write_tick + (end - write_ms) / 1000
+                work.message, work.forward_check, work.dwa_origin = message, origin.forward_check, origin
+                if repeat_feedback is not None:
+                    work.predicted_depth_ms = None
+                    work.expiry_stop_reason = None
+                work.retry_after_rejection = False
+                work.expires_ms = write_ms + watchdog
+                work.expires_at = write_tick + watchdog / 1000
+                self._command_window = (write_tick, work.expires_at)
+            else:
+                work.expires_ms = min(work.expires_ms, guard.deadline_ms)
+                work.expires_at = min(work.expires_at, write_tick + (work.expires_ms - write_ms) / 1000)
+        self._wire_moving = moving
+        self._wire_twist = tuple(message["values"][i] for i in (0, 1, 5))
+        self._wire_dwa_origin = origin if moving else None
+        self._wire_diagnostic = diagnostic if moving else None
+        if moving:
+            state = self._state
+            if origin is not None and origin.acceptance.route_points and origin.forward_check is not None:
+                state.committed_route = origin.acceptance
+                state.route_in_view = local_path.Detour(
+                    None, origin.acceptance.route_points, origin.forward_check.geometry)
+            elif camera_write:
+                state.committed_route = None
+                state.route_in_view = work.forward_check.camera_passage.route
+            elif work is not None and work.leg is not None:
+                state.route_in_view = None
+            else:
+                if straight_handoff is not None and state.committed_route is straight_handoff:
+                    state.goal_anchor = state.dwa_guidance = None
+                state.committed_route = state.route_in_view = None
+        totals = self._state.dwa_totals
+        if origin is not None and moving:
+            if self._dwa_last_published != origin.identity:
+                totals["published_decisions"] = totals.get("published_decisions", 0) + 1
+                self._dwa_last_published = origin.identity
+            totals["published_packets"] = totals.get("published_packets", 0) + 1
+        if moving and diagnostic is not None:
+            self._dwa_event(diagnostic, "published", packet=message, write_ms=write_ms)
+        elif not moving and (origin is not None or self._config.local_controller == "dwa"):
+            totals["stop_packets"] = totals.get("stop_packets", 0) + 1
+            reason = stop_reason or (diagnostic.veto_reason if diagnostic is not None else None) or "policy_stop"
+            reasons = totals.setdefault("stop_reasons", {})
+            reasons[reason] = reasons.get(reason, 0) + 1
+            if diagnostic is not None:
+                self._dwa_event(diagnostic, "stopped", reason, packet=message)
+            if origin is not None:
+                work = self._scheduled_command
+                if work is not None and work.dwa_origin is not None and work.dwa_origin.identity == origin.identity:
+                    if work.stop_reason is not None:
+                        self._scheduled_command = None
+                    else:
+                        self._cancel_scheduled_motion(stop=(int(time.time() * 1000), reason, False),
+                                                      dwa_reason=reason)
+        return moving
+
+    def _publish_stop_if_moving(self):
+        if self._scheduled_command is not None and self._scheduled_command.stop_reason is not None:
+            return
+        if (self._command_timer is not None or self._staged_dwa_command is not None
+                or self._wire_dwa_origin is not None):
+            self._cancel_scheduled_motion()
+            self._state.commanded = (0., 0., 0.)
+            self._state.commanded_vx = 0.
+            return
+        scan = self._state.active_scan
+        if ((self._config.watchdog_ms <= 300 and not (scan.active or scan.result_frame))
+                or self._publisher is None
+                or not any(self._state.commanded)):
+            return
+        now = time.time()
+        try:
+            self._publish_command(self._command_message([0.0] * ACTION_DIM, now, int(now * 1000)))
+        except Exception as error:                            # noqa: BLE001
+            log.warning("navi stop command failed: %s", error)
+            return
+        self._state.commanded = (0.0, 0.0, 0.0)
+        self._state.commanded_vx = 0.0
 
     def _publish_view(self):
         """Hand the current decision to the render thread. **Never render here.**
@@ -1612,13 +5901,94 @@ class NaviPlugin:
         self._view_next_at = now + 1.0 / self._view_hz
 
         track = self._state.tracker.track
+        detour, key = self._state.view_detour, self._state.local_plan.key
+        proposal = self._state.dwa_proposal
+        leg = self._state.executing_leg
+        scan = self._state.active_scan
+        pose = scan.pose
+        selected_route = scan.route_segment and scan.phase in ("brake", "turn", "evaluate")
+        wire_route = None
+        if self._command_timer is not None:
+            with self._output_lock:
+                work = self._scheduled_command
+                wire_route = self._state.route_in_view
+                if work is None or not work.sent or now >= work.expires_at:
+                    leg = None
+                elif work.leg is not None:
+                    leg, pose = work.leg, work.feedback.pose
+        executing = None if leg is None else local_path.Detour(
+            None, ((0., 0.), leg.remaining(pose)), leg.geometry)
+        ended = (self._last_decision is not None
+                 and self._last_decision.status in (policy_mod.IDLE, policy_mod.ARRIVED, policy_mod.FAILED))
+        project_executing = wire_route is None
+        if wire_route is not None:
+            executing = wire_route
+        if ended:
+            executing = None
+        project_detour = True
         with self._obs_lock:
-            jpeg = self._image_jpeg
+            objects, objects_ms = self._objects, self._objects_ms
+            image_age = int(time.time() * 1000) - self._image_ms
+            jpeg = (self._image_jpeg if self._image_ms and 0 <= image_age <= self._config.max_obs_age_ms
+                    else None)
+            depth, ground = self._depth_map, self._depth_ground
+            if ended or executing is not None:
+                detour = None
+            elif self._command_timer is not None and isinstance(proposal, policy_mod.DwaProposal):
+                detour = None
+            elif isinstance(proposal, policy_mod.DwaProposal):
+                if not self._state.dwa_selected:
+                    detour = None
+                elif proposal.branch in ("route", "reachable_prefix"):
+                    detour = proposal.reference
+                # A newer exposure can arrive while planning. The renderer
+                # can show a schematic path until that exposure is planned.
+                projection = self._state.dwa_projection
+                project_detour = projection is not None and depth is projection.frame
+            elif not selected_route and (key is None or self._depth_ms != key[0]):
+                detour = None
+        if not ended and selected_route and detour is None and executing is None and scan.advance_m is not None:
+            geometry = self._config.scan_geometry or self._config.local_geometry
+            if geometry is not None:
+                origin = scan.advance_origin
+                if origin is None:
+                    f, r, heading = scan.origin if scan.origin_set else scan.pose
+                    origin = (f, r, heading + scan.directions[0] * scan.turn_angle)
+                selected = policy_mod.PathLeg(geometry, (scan.advance_m, 0.), origin)
+                detour = local_path.Detour(None, ((0., 0.), selected.remaining(scan.pose)), geometry)
+        person = track is not None and track.front_required
+        person_box = person_range = None
+        box_last_seen = False
+        if person and track.front_box:
+            fix = track.measured_point
+            now_ms = int(time.time() * 1000)
+            current_box = (track.observed and track.since_obs_s * 1000 < self._config.max_obs_age_ms
+                           and 0 <= now_ms - objects_ms < self._config.max_obs_age_ms
+                           and observation_source(objects) == track.source
+                           and any(tuple(obj.get("bbox_norm") or ()) == track.front_box
+                                   for obj in (objects or {}).get("objects") or ()))
+            if current_box:
+                person_box = track.front_box
+                if (fix is not None and fix.box == person_box and fix.observation_ms
+                        and track.front_fix is not None
+                        and 0 <= now_ms - fix.observation_ms < self._config.depth_age_limit_ms):
+                    person_range = math.hypot(*fix.point)
+            elif track.drivable and track.since_obs_s <= self._config.max_coast_s:
+                person_box, box_last_seen = track.front_box, True
         snapshot = {
+            "person": person,
+            "person_box": person_box,
+            "person_range": person_range,
+            "box_last_seen": box_last_seen,
             # Arrays and payloads are *replaced* by their callbacks, never
             # mutated in place, so holding a reference is a safe snapshot.
-            "depth_m": self._depth_map,
-            "objects": self._objects,
+            "depth_m": depth,
+            "ground": ground,
+            "detour": detour,
+            "executing": executing,
+            "project_detour": project_detour,
+            "project_executing": project_executing,
+            "objects": objects,
             "jpeg": jpeg,
             "decision": self._last_decision,
             "track": self._state.tracker.describe(),
@@ -1665,10 +6035,13 @@ class NaviPlugin:
                     depth_m=snapshot["depth_m"],
                     decision=snapshot["decision"],
                     track=snapshot["track"],
-                    box=box, measured=measured,
+                    box=box, measured=measured, box_last_seen=snapshot["box_last_seen"],
                     clearance=snapshot["clearance"],
                     coverage=snapshot["coverage"],
                     rgb_jpeg=snapshot["jpeg"], blend=self._view_blend,
+                    ground=snapshot["ground"], detour=snapshot["detour"],
+                    executing=snapshot["executing"], project_detour=snapshot["project_detour"],
+                    project_executing=snapshot["project_executing"],
                     config=self._config)
                 message = CompressedImage()
                 message.format = "jpeg"
@@ -1722,9 +6095,11 @@ class NaviPlugin:
         threading one through it to draw a picture would put display concerns
         into the estimator. The cost is that this is a *display-time* guess —
         the nearest detection by bearing, of the right name — and when the
-        detector is not seeing the target at all there is simply no box, which
-        is itself the thing worth showing.
+        detector is not seeing a non-person target there is no box. The
+        person overlay uses the tracker association copied by the tick.
         """
+        if snapshot.get("person"):
+            return snapshot["person_box"], snapshot["person_range"]
         payload = snapshot["objects"] or {}
         target = snapshot["target"]
         bearing = snapshot["bearing"]
@@ -1754,6 +6129,14 @@ class NaviPlugin:
             measured = None
         return best, measured
 
+    def _cancel_active_action(self, reason: str):
+        """Settle the replaced or stopped action while the caller holds _lock."""
+        action_id, self._acp_action_id = self._acp_action_id, ""
+        if action_id:
+            result = {"status": "cancelled", "reason": reason, "target": self._state.target}
+            threading.Thread(target=self._post_acp, args=(action_id, "failed", result),
+                             daemon=True, name="navi_acp").start()
+
     def _maybe_complete(self):
         """Report the outcome once, on arrival **or** failure.
 
@@ -1761,24 +6144,18 @@ class NaviPlugin:
         action that failed sits open until the ACP timeout, holding the barrier
         and telling nobody why.
         """
-        decision = self._last_decision
-        if decision is None:
-            return
-        if decision.status == policy_mod.ARRIVED:
-            status = "completed"
-        elif decision.status == policy_mod.FAILED:
-            status = "failed"
-        else:
-            return
-
         with self._lock:
+            decision = self._last_decision
+            if decision is None or decision.status not in (policy_mod.ARRIVED, policy_mod.FAILED):
+                return
+            status = "completed" if decision.status == policy_mod.ARRIVED else "failed"
             action_id, self._acp_action_id = self._acp_action_id, ""
-        if not action_id:
-            return
-
-        result = {"status": decision.status, "reason": decision.reason,
-                  "target": self._state.target,
-                  "distance_m": decision.distance_m}
+            if not action_id:
+                return
+            result = {"status": decision.status, "reason": decision.reason,
+                      "target": self._state.target, "distance_m": decision.distance_m}
+            if status == "failed" and self._state.partial_result is not None:
+                result.update(self._state.partial_result)
         threading.Thread(target=self._post_acp, args=(action_id, status, result),
                          daemon=True, name="navi_acp").start()
 

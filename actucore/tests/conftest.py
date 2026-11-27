@@ -77,6 +77,9 @@ for _path, _names in _STUBS.items():
     setattr(sys.modules[_pkg], "msg", _mod)
 
 _rclpy = sys.modules.setdefault("rclpy", types.ModuleType("rclpy"))
+_groups = sys.modules.setdefault("rclpy.callback_groups", types.ModuleType("rclpy.callback_groups"))
+if not hasattr(_groups, "MutuallyExclusiveCallbackGroup"):
+    _groups.MutuallyExclusiveCallbackGroup = object
 _qos = sys.modules.setdefault("rclpy.qos", types.ModuleType("rclpy.qos"))
 for _enum, _members in (
     ("ReliabilityPolicy", {"BEST_EFFORT": "best_effort", "RELIABLE": "reliable"}),

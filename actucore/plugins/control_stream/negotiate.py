@@ -233,23 +233,21 @@ def effective_rate(capabilities: dict, descriptor: dict, requested_hz=None) -> f
     return rate
 
 
-def ttl_ms(rate_hz: float, descriptor: dict) -> int:
+def ttl_ms(rate_hz: float, descriptor: dict, *, periods: float = 2.) -> int:
     """How long a command stays valid.
 
-    Two periods, floored at 50 ms and capped by the driver's watchdog. The
-    reasoning is in phanthymotus/docs/vla-integration.md §"频率与 ttl 的由来":
-    a generous ttl
-    removes the protection while still appearing to provide it, because a stale
-    command then executes and the robot resumes from a pause on an old picture.
-    Longer than the watchdog is meaningless — the driver has already given up.
+    Use the requested periods with a 50 ms floor, then apply the watchdog and optional
+    command TTL caps. The TTL cap can preserve the command admission window
+    when the driver's receive watchdog allows a longer gap between commands.
     """
     period_ms = 1000.0 / rate_hz if rate_hz > 0 else 33.0
-    ttl = max(50.0, period_ms * 2)
-    watchdog = ((descriptor or {}).get("rate") or {}).get("watchdog_ms")
-    try:
-        watchdog = float(watchdog)
-    except (TypeError, ValueError):
-        watchdog = 0.0
-    if watchdog > 0:
-        ttl = min(ttl, watchdog)
+    ttl = max(50.0, period_ms * periods)
+    limits = (descriptor or {}).get("rate") or {}
+    for key in ("watchdog_ms", "max_command_ttl_ms"):
+        try:
+            limit = float(limits.get(key))
+        except (TypeError, ValueError):
+            continue
+        if limit > 0:
+            ttl = min(ttl, limit)
     return int(ttl)

@@ -73,6 +73,27 @@ def _brief(obj) -> str:
     return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
 
 
+def _make_ros_executor():
+    from rclpy.exceptions import InvalidHandle
+
+    destroyed = object()
+
+    class ActuCoreExecutor(rclpy.executors.MultiThreadedExecutor):
+        def _take_timer(self, timer):
+            try:
+                return super()._take_timer(timer)
+            except InvalidHandle:
+                # A queued timer can outlive the card that destroyed it.
+                # Return normally so rclpy releases its callback group.
+                return destroyed
+
+        async def _execute_timer(self, timer, ready):
+            if ready is not destroyed:
+                await super()._execute_timer(timer, ready)
+
+    return ActuCoreExecutor()
+
+
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
 
 import queue as _queue
@@ -374,7 +395,7 @@ def main():
     os.environ.setdefault("ROS_LOG_LEVEL", "WARN")
 
     rclpy.init()
-    executor = rclpy.executors.MultiThreadedExecutor()
+    executor = _make_ros_executor()
     _bundle  = ActuCoreBundle(cfg, executor)
 
     def _spin():

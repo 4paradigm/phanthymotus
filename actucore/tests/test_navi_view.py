@@ -77,6 +77,33 @@ def test_no_usable_reading_draws_no_corridor():
         assert V.corridor_edges(bad, config, 640) is None
 
 
+@pytest.mark.parametrize(("stop", "expected"), [
+    (.45, {(256, 343), (384, 343)}),
+    (.60, {(249, 354), (391, 354)}),
+    (.90, {(230, 385), (410, 385)}),
+])
+def test_route_edges_project_the_detour_and_stop_short_of_the_target(stop, expected):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    path = ((0., 0.), (.8, .0), (1.2, .2), (1.6, .2))
+
+    lines = V.route_lines(depth, ground, geometry, path, (2., 0.), .31, 640, 480,
+                          stop_distance_m=stop)
+
+    assert ((196, 440), (291, 373), False) in lines
+    assert ((444, 440), (456, 373), False) in lines
+    assert not any(dashed for _, _, dashed in lines)
+    direct = V.route_lines(depth, ground, geometry, (), (2., 0.), .31, 640, 480,
+                           stop_distance_m=stop)
+    assert direct and all(dashed for _, _, dashed in direct)
+    assert expected <= {end for _, end, _ in direct}
+
+
 def _decision(vx=0.0, vy=0.0, wz=0.0, status="approaching", distance=None):
     return P.Decision([vx, vy, 0.0, 0.0, 0.0, wz], status, "reason",
                       distance_m=distance, bearing=0.0)
@@ -197,7 +224,7 @@ def test_the_corridor_narrows_in_the_image_as_the_clearance_grows():
     image exists to show."""
     def edges(clearance):
         frame = _render(clearance=clearance)
-        lit = np.where((frame[400] == V._CORRIDOR).all(axis=1))[0]
+        lit = np.where((frame[374:412] == V._CORRIDOR).all(axis=2).any(axis=0))[0]
         return lit.min(), lit.max()
 
     near_l, near_r = edges(0.8)
@@ -215,7 +242,7 @@ def test_a_blocked_corridor_is_drawn_in_the_warning_colour():
 @needs_cv2
 def test_no_corridor_reading_draws_no_corridor():
     frame = _render(clearance=None)
-    assert not (frame == np.array(V._CORRIDOR)).all(axis=2).any()
+    assert not (frame[:-32] == np.array(V._CORRIDOR)).all(axis=2).any()
 
 
 # ── the target ───────────────────────────────────────────────────────────────
@@ -307,6 +334,29 @@ def test_a_tracked_range_that_disagrees_with_the_measurement_is_flagged():
 
 
 @needs_cv2
+def test_person_overlay_shows_only_the_associated_measurement(monkeypatch):
+    labels = []
+    monkeypatch.setattr(V, "_text", lambda frame, label, *args, **kwargs: labels.append(label))
+    _render(box=(.3, .3, .6, .8), measured=2.,
+            track={"name": "person", "state": "confirmed", "range_m": .63})
+    assert "meas 2.00m" in labels
+    assert all("0.63m" not in label for label in labels)
+
+
+@needs_cv2
+def test_person_overlay_marks_the_last_seen_box_without_a_range(monkeypatch):
+    labels = []
+    edges = []
+    monkeypatch.setattr(V, "_text", lambda frame, label, *args, **kwargs: labels.append(label))
+    monkeypatch.setattr(V, "_dashed_line", lambda frame, a, b, colour: edges.append((a, b, colour)))
+    _render(box=(.3, .3, .6, .8), measured=2., box_last_seen=True, clearance=None,
+            track={"name": "person", "state": "coasting", "range_m": .63})
+    assert len(edges) == 4
+    assert "last seen" in labels
+    assert all("meas" not in label for label in labels)
+
+
+@needs_cv2
 def test_both_numbers_are_drawn_when_a_measurement_exists():
     plain = _render(box=(0.3, 0.3, 0.6, 0.8),
                     track={"state": "confirmed", "range_m": 1.23})
@@ -316,20 +366,69 @@ def test_both_numbers_are_drawn_when_a_measurement_exists():
 
 
 @needs_cv2
-def test_the_corridor_reads_as_a_width_not_as_two_stray_lines():
-    """Asked about twice, which is the design feedback.
-
-    Two bare verticals read as unrelated marks, and nothing connected them to
-    the half-width printed in a corner. A cross-bar with arrow ends is the
-    drawing convention for "this is a width", and the number belongs on the bar.
-    """
+def test_the_fallback_corridor_uses_dashed_guides_without_a_dimension_bar():
     frame = _render(clearance=1.0)
     left, right = V.corridor_edges(1.0, P.Config(), 640)
     bar = int(480 * 0.30)
 
     between = frame[bar, left + 8:right - 8]
-    lit = (between == np.array(V._CORRIDOR)).all(axis=1).sum()
-    assert lit > (right - left) * 0.5, "两条竖线之间没有横杆把它们连起来"
+    assert not (between == V._CORRIDOR).all(axis=1).any()
+    guides = (frame[150:350] == V._CORRIDOR).all(axis=2).any(axis=1)
+    assert guides.any() and not guides.all()
+
+
+@needs_cv2
+@pytest.mark.parametrize("route_kind", ["detour", "executing"])
+def test_route_is_drawn_with_two_white_corridor_edges(route_kind):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    config = P.Config(half_width_m=.25)
+    keep = config.half_width_m + config.clearance_margin_m
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    route = Detour(None, ((.8, 0.), (1.05, 0.), (1.3, .2), (1.8, .2)), geometry)
+    frame = _render(depth_m=depth, ground=ground, clearance=None, config=config, **{route_kind: route})
+    route_color = (frame == (255, 255, 255)).all(axis=2)
+    # The horizontal focal length is twice the vertical focal length times
+    # the floor height, so each row projects twice the half-width in pixels.
+    rows = np.arange(400, 430)
+    half_span = np.rint(2 * keep * (rows - 240)).astype(int)
+    assert route_color[rows, 320 - half_span].all()
+    assert route_color[rows, 320 + half_span].all()
+    assert not route_color[rows, 320].any()
+    turn_span = round(2 * keep * (363 - 240))
+    assert route_color[363, 369 - turn_span] and route_color[363, 369 + turn_span]
+
+
+@needs_cv2
+@pytest.mark.parametrize("route_kind", ["detour", "executing"])
+@pytest.mark.parametrize("project", [True, False], ids=["no-ground", "new-depth"])
+def test_unprojectable_route_stays_centered_in_the_main_view(route_kind, project):
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = None if project else np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    route = Detour(None, ((0., 0.), (.25, 0.), (.8, .3), (1.2, .24)), geometry)
+    config = P.Config(half_width_m=.25)
+    keep = config.half_width_m + config.clearance_margin_m
+    frame = _render(depth_m=depth, ground=ground, clearance=1., config=config,
+                    **{route_kind: route, f"project_{route_kind}": project})
+    baseline = _render(depth_m=depth, ground=ground, clearance=1.)
+
+    white = (frame == (255, 255, 255)).all(axis=2)
+    # The schematic uses the same half-width and perspective scale on both sides.
+    rows = np.arange(410, 435)
+    half_span = np.rint(640 * .5 * keep * (rows / 480 - .6) / .31).astype(int)
+    assert white[rows, 320 - half_span].all()
+    assert white[rows, 320 + half_span].all()
+    assert not white[rows, 320].any()
+    assert np.array_equal(frame[:145, 500:], baseline[:145, 500:])
 
 
 @needs_cv2
@@ -387,3 +486,46 @@ def test_a_corrupt_jpeg_falls_back_to_the_depth_map():
     the frame it was handed is garbage."""
     frame = _render(rgb_jpeg=b"not a jpeg", depth_m=_depth(1.0))
     assert frame.shape == (480, 640, 3)
+
+
+
+@needs_cv2
+def test_executing_segment_takes_precedence_over_candidate():
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
+    tangent = (np.arange(480) - 240) / 400
+    depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
+    ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    candidate = Detour((.15, -.03), ((0., 0.), (.8, .3), (1.2, .3)), geometry)
+    active = Detour(None, ((0., 0.), (.8, -.15)), geometry)
+    preview = _render(depth_m=depth, ground=ground, detour=candidate)
+    executing = _render(depth_m=depth, ground=ground, detour=candidate, executing=active)
+    published_only = _render(depth_m=depth, ground=ground, executing=active)
+    assert not np.array_equal(executing, preview)
+    assert np.array_equal(executing, published_only)
+
+
+@needs_cv2
+def test_route_monitor_draws_selected_and_executing_routes_without_ground():
+    from plugins.navi.camera import HorizontalIntrinsics
+    from plugins.navi.local_path import Detour, camera_square
+
+    geometry = camera_square(HorizontalIntrinsics(8, 6, 4), (8, 6, 4), .21)
+    candidate = Detour(None, ((0., 0.), (.8, .3)), geometry)
+    active = Detour(None, ((0., 0.), (.8, -.3)), geometry)
+    baseline = _render(ground=None, clearance=None)
+    preview = _render(ground=None, clearance=None, detour=candidate)
+    executing = _render(ground=None, clearance=None, detour=candidate, executing=active)
+    assert not np.array_equal(preview, baseline)
+    assert np.array_equal(executing, _render(ground=None, clearance=None, detour=active))
+    assert np.array_equal(executing[:145, 500:], baseline[:145, 500:])
+
+
+@needs_cv2
+def test_target_box_has_no_dashed_line_to_the_robot():
+    frame = _render(ground=None, clearance=None, box=(.25, .25, .75, .5))
+    target = (frame == V._TARGET).all(axis=2)
+    assert target[240, 320]
+    assert not target[260:430, 300:340].any()

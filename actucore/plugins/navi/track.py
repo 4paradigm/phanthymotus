@@ -14,12 +14,9 @@ and answers "where is it now" every tick, whether or not it was seen this tick.
 
 Nothing here is new. Three ideas, each from a paper that earned it:
 
-* **A track has a lifecycle, and the thresholds are symmetric** (SORT's
-  `min_hits` / `max_age`). Before this, navi took **one** frame to start
-  chasing something and **ten** to give up — and that asymmetry points the
-  wrong way, because starting is the direction that moves a robot. Ultralytics'
-  ByteTrack gets this right by default (a new `STrack` is `is_activated=False`
-  until it matches again, so two frames), and we ask for three of five.
+* **A track has a bounded lifetime.** Use the first detection that passes
+  confidence and association checks. Keep the target through a short miss
+  and expire it when the prediction is no longer reliable.
 
 * **Low-confidence detections are not noise; they are what occlusion looks
   like** (ByteTrack, MOT20: ID switches down 71%). A detection below the
@@ -72,15 +69,22 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
-TENTATIVE = "tentative"    # seen, not yet trusted enough to move a robot
+from .depth import observation_ms
+from .odom import PlanarPose
+
 CONFIRMED = "confirmed"
 COASTING = "coasting"      # not seen this tick; position is predicted
-REACQUIRING = "reacquiring"  # something matched after a coast, not yet believed
 LOST = "lost"
+
+# VOP's chromatic bins are circular. Adjacent bins can describe the same
+# appearance after a small shift in the detector box or lighting.
+_HUE_WHEEL = ("red", "orange", "yellow", "lime", "green", "teal", "cyan",
+              "azure", "blue", "violet", "magenta", "pink")
+
 
 # Body frame throughout: x forward, y **left**, metres. Same convention as
 # motus.control/1's twist and motus.odom/1, so `vx`/`vy`/`wz` mean here exactly
@@ -109,6 +113,90 @@ def polar_of(point) -> tuple[float, float]:
     return math.hypot(x, y), math.atan2(-y, x)
 
 
+@dataclass(frozen=True)
+class ObservationFrame:
+    """Planar map from camera-forward/left coordinates to the body pivot."""
+
+    axes: tuple
+    origin: tuple
+
+    @classmethod
+    def from_geometry(cls, geometry):
+        if geometry is None:
+            return None
+        mount = geometry.base_from_optical
+        axes = ((mount[0, 2], -mount[0, 0]), (mount[1, 2], -mount[1, 0]))
+        front_offset = geometry.half_length if geometry.front == 0. else 0.
+        return cls(axes, (mount[0, 3] + front_offset, mount[1, 3]))
+
+    def grid_point(self, point, geometry):
+        """Project a point in this retained camera frame into the body's grid."""
+        forward, left = np.asarray(self.axes) @ point + self.origin
+        if geometry.front == 0.:
+            forward -= geometry.half_length
+        return forward, -left
+
+
+@dataclass(frozen=True)
+class MeasuredPoint:
+    """Last real range point, kept in its original optical frame for standoff."""
+
+    point: tuple[float, float]
+    frame: ObservationFrame | None
+    capture_ms: int | None
+    capture_pose: PlanarPose | None
+    standoff_point: tuple[float, float] | None = None
+    box: tuple | None = None
+    received_ms: int | None = None
+
+    @property
+    def observation_ms(self):
+        return self.received_ms if self.received_ms is not None else self.capture_ms
+
+
+@dataclass(frozen=True)
+class AssociationSnapshot:
+    """Numerical evidence for an established track at one prediction time."""
+
+    generation: int
+    reference_ms: int
+    mean: tuple
+    cov: tuple
+    name: str
+    hue: str
+    state: str
+    since_obs_s: float
+    range_known: bool
+    front_required: bool
+    front_reference: tuple | None
+    front_age_s: float
+    front_frame_id: int | None
+    has_front_fix: bool
+    source: float | None
+    latest_source: float | None
+    image_region: tuple | None
+    frame: ObservationFrame | None
+
+
+@dataclass(frozen=True)
+class TargetMatch:
+    generation: int
+    source: float | None
+    point: tuple[float, float] | None  # camera forward, left, when a surface was measured
+    range_m: float | None
+    image_region: tuple | None = None
+    standoff_point: tuple[float, float] | None = None
+
+
+def observation_source(detections):
+    stamp = (detections or {}).get("timestamp")
+    return stamp if type(stamp) in (int, float) and math.isfinite(stamp) else None
+
+
+def _image_region(obj):
+    return (tuple(obj.get("position") or ()), tuple(obj.get("bbox_norm") or ()))
+
+
 @dataclass
 class Track:
     """One followed object. `mean` is [x, y, vx, vy] in the current body frame."""
@@ -117,52 +205,84 @@ class Track:
     cov: np.ndarray
     hue: str = ""
     name: str = ""
-    state: str = TENTATIVE
+    state: str = CONFIRMED
     hits: int = 0
-    history: deque = field(default_factory=lambda: deque(maxlen=8))
-    coast_s: float = 0.0
     age_s: float = 0.0
     # The last real observation and how long ago it was, for the re-update on
-    # re-acquisition. Without it the coast's own velocity is all that is left,
-    # and that is exactly the quantity that has been accumulating error.
+    # re-acquisition. It is transported into the current body frame at each
+    # prediction so the difference between observations excludes ego motion.
     last_obs: np.ndarray | None = None
     since_obs_s: float = 0.0
-    # Whether depth has ever actually reported a range for this object. A track
-    # can exist without one — the summary-only depth path has no reading for a
-    # band with nothing in it — and the policy has to be able to tell, because
-    # "assumed 3 m" must not be allowed to decide when the robot has arrived.
+    # Whether depth has ever provided a range for steering, including the
+    # summary-only band estimate. A bearing-only track has a placeholder range.
     range_known: bool = False
+    # Evidence applied on the current step. The range is the target's depth
+    # map sample before filtering, present only on the first use of that frame.
+    accepted_detection: bool = False
+    measured_range_m: float | None = None
+    measured_point: MeasuredPoint | None = None
 
-    # Matches accumulated since the track started coasting. Resurrecting a
-    # track decides what the robot chases, exactly as creating one does, so it
-    # is held to the same evidence — see `_hit`.
-    reacquire_hits: int = 0
+    # The goal uses the associated box measurement. Keep its nearest coherent
+    # surface independently for physical standoff checks.
+    front_required: bool = False
+    front_fix: np.ndarray | None = None
+    front_reference: np.ndarray | None = None  # last trusted fix, even after expiry
+    front_box: tuple | None = None
+    front_frame_id: int | None = None
+    front_age_s: float = 0.
+
+    generation: int = 0
+    source: float | None = None
+    latest_source: float | None = None  # remains ordered across an unstamped observation
+    image_region: tuple | None = None
+    frame: ObservationFrame | None = None
+
+    def record_range(self, range_m, point, depth, *, standoff_point=None):
+        self.measured_range_m = range_m
+        self.measured_point = MeasuredPoint(
+            tuple(point), self.frame, depth.get("capture_ms") or depth.get("frame_id") or depth.get("control_ms"),
+            depth.get("obstacle_capture_pose"), standoff_point, self.front_box,
+            depth.get("frame_id") if depth.get("receipt_timed") else None)
+
+    def snapshot(self, reference_ms):
+        return AssociationSnapshot(
+            self.generation, reference_ms, tuple(self.mean), tuple(map(tuple, self.cov)),
+            self.name, self.hue, self.state, self.since_obs_s, self.range_known, self.front_required,
+            tuple(self.front_reference) if self.front_reference is not None else None,
+            self.front_age_s, self.front_frame_id, self.front_fix is not None, self.source,
+            self.latest_source, self.image_region, self.frame)
 
     @property
     def drivable(self) -> bool:
-        """Whether this track may move the robot. Tentative ones may not."""
-        return self.state in (CONFIRMED, COASTING, REACQUIRING)
+        """Whether this track can serve as a navigation target."""
+        return self.state in (CONFIRMED, COASTING)
+
+    @property
+    def coast_s(self) -> float:
+        return self.since_obs_s if self.state == COASTING else 0.0
 
     @property
     def observed(self) -> bool:
-        """A live, believed fix — not a prediction and not a fresh guess.
-
-        What "arrived" is allowed to rest on. A coasted position is a good
-        enough reason to keep walking and a bad one to declare the journey over.
-        """
-        return self.state == CONFIRMED and self.coast_s == 0.0
+        """A matched detection with no intervening miss."""
+        return self.state == CONFIRMED
 
     @property
     def position(self) -> np.ndarray:
         return self.mean[:2]
 
     @property
+    def navigation_range_known(self) -> bool:
+        return self.front_fix is not None if self.front_required else self.range_known
+
+    @property
     def range_m(self) -> float:
-        return polar_of(self.position)[0]
+        point = self.front_fix
+        return polar_of(self.position if point is None else point)[0]
 
     @property
     def bearing_rad(self) -> float:
-        return polar_of(self.position)[1]
+        point = self.front_fix
+        return polar_of(self.position if point is None else point)[1]
 
     @property
     def position_std_m(self) -> float:
@@ -202,22 +322,331 @@ def _measurement_std(range_m: float, config) -> float:
     return max(config.range_std_m, range_m * config.bearing_std_rad)
 
 
+def observation_transform(ego_motion, frame, previous):
+    """Transport camera coordinates from the previous mount through the body to the current mount."""
+    dx, dy, yaw = ego_motion
+    rotation = _rotation(-yaw)
+    delta = np.array([dx, dy])
+    if frame is None:
+        return rotation, delta
+    previous = previous or frame
+    axes = np.asarray(frame.axes)
+    old_axes = np.asarray(previous.axes)
+    inverse = np.linalg.pinv(axes)
+    # p_new = A_new^-1 [R (A_old p_old + origin_old - d) - origin_new].
+    # Express the pivot displacement in the original image axes so stationary
+    # track points, front references, and the Kalman control share one transform.
+    linear = np.eye(2) + inverse @ (rotation @ old_axes - axes)
+    old_inverse = inverse if frame.axes == previous.axes else np.linalg.pinv(old_axes)
+    translation = old_inverse @ (delta + rotation.T @ frame.origin - previous.origin)
+    return linear, translation
+
+
+def _prediction(mean, cov, rotation, translation, dt, config, ego_measured):
+    # p' = R(p + v·dt − d),  v' = R·v
+    transition = np.zeros((4, 4))
+    transition[:2, :2] = rotation
+    transition[:2, 2:] = rotation * dt
+    transition[2:, 2:] = rotation
+    control = np.concatenate([-rotation @ translation, np.zeros(2)])
+
+    mean = transition @ mean + control
+    # Process noise: what the *target* might do that we have not modelled.
+    #
+    # With odometry wired, our own motion is known rather than guessed and
+    # contributes nothing here. **Without it, the twist above is what we
+    # asked for, not what happened** — and the two come apart in ordinary
+    # ways: `dry_run`, a command the driver refused because the robot is
+    # lying down, or the deadband zeroing a value the policy meant. Predict
+    # a rotation that never occurred and the filter spends every tick
+    # fighting observations that disagree with it, which shows up as an
+    # estimate swinging either side of a target that is standing still.
+    #
+    # So when the twist is commanded, the process noise is inflated: the
+    # filter leans on what it can see rather than on what we believe we did.
+    accel = config.target_accel_std
+    if not ego_measured:
+        accel *= config.commanded_ego_noise_factor
+    q_pos = (dt ** 4) / 4.0 * accel ** 2
+    q_cross = (dt ** 3) / 2.0 * accel ** 2
+    q_vel = (dt ** 2) * accel ** 2
+    noise = np.zeros((4, 4))
+    noise[:2, :2] = np.eye(2) * q_pos
+    noise[:2, 2:] = np.eye(2) * q_cross
+    noise[2:, :2] = np.eye(2) * q_cross
+    noise[2:, 2:] = np.eye(2) * q_vel
+    return mean, transition @ cov @ transition.T + noise
+
+
+def target_objects(detections, target, config):
+    """Eligible detector objects in their original order, including sustain evidence."""
+    from . import policy as policy_mod
+
+    objects = (detections or {}).get("objects") or []
+    wanted = (target or "").strip().lower()
+    if not wanted:
+        return
+
+    for obj in objects:
+        confidence = float(obj.get("confidence") or 0)
+        if confidence < config.sustain_confidence:
+            continue
+        key = policy_mod.object_key(obj).lower()
+        name = str(obj.get("name", "")).lower()
+        if key == wanted or name == wanted or wanted in name:
+            yield obj
+
+
+def _candidates(detections, depth, target: str, config, position) -> list:
+    """Detections that could be our target, each as a body-frame point.
+
+    The name/key matching is the same as it always was; what is new is that
+    a match is a *candidate*, not a decision.
+    """
+    from . import policy as policy_mod
+
+    out = []
+    for obj in target_objects(detections, target, config):
+        bearing_rad = policy_mod._bearing(obj) * config.half_fov_rad
+        range_m, surface = policy_mod._target_measurement(obj, depth, config)
+        measured = range_m is not None
+        if not measured:
+            # No depth at this object — a hole in the map, or the summary
+            # fallback with nothing in that band. Place it at the range we
+            # already believe, which makes this a bearing-only update in
+            # disguise: it can correct where the target is *pointing* and
+            # must not be allowed to claim anything about how far.
+            range_m = (polar_of(position)[0] if position is not None
+                       else config.assumed_range_m)
+        out.append({
+            "obj": obj,
+            "point": point_of(range_m, bearing_rad),
+            "confidence": float(obj.get("confidence") or 0),
+            "hue": policy_mod.hue_of(obj),
+            "name": obj.get("name") or "",
+            "range_measured": measured,
+            "surface": surface,
+            "range_m": range_m,
+        })
+    return out
+
+
+def _associate(candidates, config, position, cov=None, since_obs_s=0., hue="", *, person_box=None):
+    """Pick the candidate this track is looking at, or None.
+
+    ByteTrack's two stages, collapsed to one track: high-confidence
+    detections get first refusal; if none of them lands in the gate, the
+    low-confidence ones are tried against the same gate. A dim detection
+    that agrees with where we predicted the target to be is the target seen
+    through something; a dim detection anywhere else is background.
+    """
+    if not candidates:
+        return None
+
+    if position is None:
+        # Without a prior position to gate against, require high confidence.
+        confident = [c for c in candidates
+                     if c["confidence"] >= config.min_confidence]
+        if not confident:
+            return None
+        return max(confident, key=lambda c: c["confidence"])
+
+    if person_box and config.local_controller == "dwa" and hue in _HUE_WHEEL and len(candidates) > 1:
+        index = _HUE_WHEEL.index(hue)
+        similar_hues = {_HUE_WHEEL[(index + delta) % len(_HUE_WHEEL)] for delta in (-1, 0, 1)}
+        similar = [c for c in candidates if c["confidence"] >= config.min_confidence
+                   and c["hue"] in similar_hues and c["obj"].get("bbox_norm")]
+        if similar and len(similar) < len(candidates):
+            # A delayed depth image can sample the background inside the
+            # current person's box. If the image still supports the original
+            # identity, let a bad range coast instead of following a neighbour.
+            predicted_range, predicted_bearing = polar_of(position)
+            # Vertical extent gives continuity even while yaw sweeps both boxes
+            # across the frame and the predicted bearing lags the detector.
+            visual = min(similar, key=lambda c: (
+                abs(c["obj"]["bbox_norm"][1] - person_box[1])
+                + abs(c["obj"]["bbox_norm"][3] - person_box[3]),
+                abs(polar_of(c["point"])[1] - predicted_bearing),
+            ))
+            visual_ray = dict(visual, range_m=predicted_range,
+                              point=point_of(predicted_range, polar_of(visual["point"])[1]))
+            if _gate_cost(position, cov, since_obs_s, hue, visual_ray, config) is not None:
+                candidates = [c for c in similar if c["hue"] == visual["hue"]]
+
+    high = [c for c in candidates if c["confidence"] >= config.min_confidence]
+    low = [c for c in candidates if c["confidence"] < config.min_confidence]
+    for pool in (high, low):
+        best, best_cost = None, None
+        for candidate in pool:
+            cost = _gate_cost(position, cov, since_obs_s, hue, candidate, config)
+            if cost is None:
+                continue
+            if best_cost is None or cost < best_cost:
+                best, best_cost = candidate, cost
+        if best is not None:
+            return best
+    return None
+
+
+def _gate_cost(position, cov, since_obs_s, hue, candidate, config):
+    """Mahalanobis distance² to the prediction, or None if outside the gate.
+
+    The gate widens on its own while coasting, because the covariance
+    grows — which is the right behaviour and needs no separate rule: the
+    longer the target has been hidden, the further from the prediction we
+    are willing to believe it reappeared.
+    """
+    residual = candidate["point"] - position
+    std = _measurement_std(candidate["range_m"], config)
+    innovation = cov[:2, :2] + np.eye(2) * std ** 2
+    try:
+        cost = float(residual @ np.linalg.solve(innovation, residual))
+    except np.linalg.LinAlgError:              # pragma: no cover - degenerate
+        return None
+    if cost > config.gate_chi2:
+        return None
+
+    # **The gate widens while coasting, and that had no ceiling.** Growing
+    # it is right — the longer the target has been hidden, the further from
+    # the prediction it may legitimately reappear — but after 1.2 s the
+    # covariance alone opened it to about 3.7 m, and the detector's class is
+    # not stable enough to survive an opening that size. On r1_sz a track on
+    # a person four metres away was resurrected onto a traffic cone at 0.7 m
+    # that vop had labelled `person` for one frame, and the card then
+    # reported arrival.
+    #
+    # So it is also capped by what the target could physically have done:
+    # nothing moves faster than `max_target_speed`, and the ego motion is
+    # already in the prediction, so this residual is the target's own travel.
+    reach = (config.max_target_speed * max(since_obs_s, 1e-3)
+             + 3.0 * std)
+    if float(np.hypot(*residual)) > reach:
+        return None
+    # Colour is a tie-break, never a gate. `object_key` already excludes
+    # brightness because it swings with the lighting; hue is steadier but
+    # still flickers, and rejecting on it would drop a track for a cloud
+    # passing the window.
+    if hue and candidate["hue"] and candidate["hue"] != hue:
+        cost += config.hue_mismatch_cost
+    return cost
+
+
+def _front_point(point, config, reference, has_fix, range_known, position, dt):
+    if point is None:
+        return
+
+    range_m = polar_of(point)[0]
+    if reference is not None:
+        # A coherent foreground patch can lie inside the person's box.
+        # Require continuity with the last surface or the associated body
+        # position. Failed updates and expiry cannot widen the gate.
+        tolerance = 3.0 * _measurement_std(range_m, config)
+        reach = tolerance
+        if has_fix:
+            reach += config.max_target_speed * min(dt, config.max_obs_age_ms / 1000)
+        if (math.hypot(*(point - reference)) > reach
+                and (not range_known or math.hypot(*(point - position)) > tolerance)):
+            return
+
+    return point
+
+
+def _correct(mean, cov, candidate, config):
+    point = candidate["point"]
+    std = _measurement_std(candidate["range_m"], config)
+    if not candidate["range_measured"]:
+        # Bearing-only. Inflating the measurement noise is what stops
+        # this from asserting a range it never measured.
+        std *= config.bearingless_std_factor
+    measurement = np.zeros((2, 4))
+    measurement[0, 0] = measurement[1, 1] = 1.0
+    innovation = (measurement @ cov @ measurement.T
+                  + np.eye(2) * std ** 2)
+    gain = cov @ measurement.T @ np.linalg.inv(innovation)
+    mean = mean + gain @ (point - mean[:2])
+    cov = (np.eye(4) - gain @ measurement) @ cov
+
+    return mean, cov
+
+
+def match_observation(snapshot, detections, depth, *, ego_motion, elapsed_s, target, config,
+                      original_receipt=None, allow_missing_surface=False):
+    """Gate a current measurement against a copied track, without consuming evidence.
+
+    ego_motion is the displacement (forward, left, yaw) of the observation
+    body pivot since the snapshot, expressed in its original axes.
+    """
+    if (snapshot.state != CONFIRMED or not 0 <= elapsed_s <= config.max_coast_s - snapshot.since_obs_s
+            or not depth or depth.get("map") is None or depth.get("capture_invalid")):
+        return None
+    frame = ObservationFrame.from_geometry(config.scan_geometry or config.local_geometry)
+    rotation, translation = observation_transform(ego_motion, frame, snapshot.frame)
+    mean, cov = _prediction(np.asarray(snapshot.mean), np.asarray(snapshot.cov), rotation, translation,
+                            elapsed_s, config, True)
+    candidates = _candidates(detections, depth, target, config, mean[:2])
+    source = observation_source(detections)
+    if source is None:
+        # A fixed-window caller can identify an unstamped detector receipt
+        # only while this generation has never established a producer floor.
+        if original_receipt is None or snapshot.latest_source is not None:
+            return None
+        original_frame = original_receipt
+    else:
+        if snapshot.latest_source is not None and source < snapshot.latest_source:
+            return None
+        original_frame = source == snapshot.source
+    if original_frame and snapshot.image_region is not None:
+        # A reused detector frame still refers to its original image region.
+        candidates = [c for c in candidates if _image_region(c["obj"]) == snapshot.image_region]
+    person_box = snapshot.image_region[1] if snapshot.front_required and snapshot.image_region else None
+    candidate = _associate(candidates, config, mean[:2], cov, snapshot.since_obs_s + elapsed_s, snapshot.hue,
+                           person_box=person_box)
+    if candidate is None or not candidate["range_measured"]:
+        return None
+    point = candidate["point"]
+    box = candidate["obj"].get("bbox_norm")
+    if snapshot.front_required or (candidate["name"].lower() == "person" and box and config.depth_intrinsics):
+        frame = depth.get("source_frame_id") or depth.get("frame_id")
+        if (not box or config.depth_intrinsics is None or type(frame) is not int or frame <= 0
+                or (snapshot.front_frame_id is not None and frame < snapshot.front_frame_id)):
+            return None
+        reference = (rotation @ (np.asarray(snapshot.front_reference) - translation)
+                     if snapshot.front_reference is not None else None)
+        corrected, _ = _correct(mean, cov, candidate, config)
+        front_limit = config.depth_age_limit_ms if config.local_planning else config.max_obs_age_ms
+        has_fix = snapshot.has_front_fix and snapshot.front_age_s + elapsed_s <= front_limit / 1000
+        surface = candidate["surface"]
+        if candidate["name"].lower() != "person":
+            from .depth import front_surface
+            surface = front_surface(depth["map"], box, config.depth_intrinsics, depth.get("ground"))
+        surface = _front_point(surface, config, reference, has_fix, True, corrected[:2], elapsed_s)
+        if surface is None:
+            return (TargetMatch(snapshot.generation, source, None, None, _image_region(candidate["obj"]))
+                    if allow_missing_surface else None)
+        return TargetMatch(snapshot.generation, source, tuple(point), candidate["range_m"],
+                           standoff_point=tuple(surface))
+    return TargetMatch(snapshot.generation, source, tuple(point), polar_of(point)[0])
+
+
 class Tracker:
     """Holds the single track and the whole lifecycle. One instance per target."""
 
     def __init__(self):
         self.track: Track | None = None
-        # The payload stamp the lifecycle last counted. See `step`.
-        self._last_stamp = None
-        # Why the last tick did what it did — surfaced in info(), because a
-        # tracker that quietly refuses to confirm anything looks identical from
-        # outside to a camera with nothing in front of it.
+        self._generation = 0
+        self.matched_detections = None
+        self.reentry_visible = False
+        # Keep recent stamps across blind ticks and out-of-order delivery.
+        self._detection_stamps = deque(maxlen=64)
+        self._unmatched_recovery = None
+        self._range_frames = deque(maxlen=64)
+        # Expose why a target was lost or recovered in info().
         self.last_reason = ""
 
     # ── the tick ─────────────────────────────────────────────────────────────
 
     def step(self, *, detections, depth, target: str, config, ego, dt: float,
-             ego_measured: bool = True):
+             ego_measured: bool = True, receipt_ms: int = 0, retain_identity: bool = False):
         """Predict, associate, update. Returns the track if it may drive, else None.
 
         `ego` is our own twist as (vx, vy, wz) in the body frame. `ego_measured`
@@ -226,38 +655,171 @@ class Tracker:
         `detections` may be None (no fresh payload), which counts as a miss
         rather than as nothing happening.
         """
+        self.reentry_visible = False
+        expired = False
         if self.track is not None:
             self._predict(ego, dt, config, ego_measured)
-            self.track.age_s += dt
-            self.track.since_obs_s += dt
+            track = self.track
+            track.age_s += dt
+            track.since_obs_s += dt
+            track.accepted_detection = False
+            track.measured_range_m = None
+            track.front_age_s += dt
+            front_limit = config.depth_age_limit_ms if config.local_planning else config.max_obs_age_ms
+            if track.front_age_s > front_limit / 1000:
+                track.front_fix = None
+            # Expiry always ends coasting. A committed detour may still use
+            # the original position to associate fresh observations.
+            if track.since_obs_s > config.max_coast_s:
+                if retain_identity:
+                    track.state = LOST
+                    track.front_fix = None
+                    track.mean[2:] = 0.
+                else:
+                    self.track = None
+                expired = True
+                self.last_reason = (f"目标消失超过 {config.max_coast_s:.1f}s，"
+                                    "外推已不可信，放弃轨迹")
 
-        # **One payload is one piece of evidence, however many times it is read.**
-        #
-        # The policy ticks at `rate_hz` and the detector publishes at whatever
-        # rate it manages; on r1_sz those are 10 Hz and 3.6 Hz, so the card sees
-        # the same payload on roughly three consecutive ticks. Counting a hit
-        # each time turns "three of the last five frames" into "one frame, read
-        # three times" — which confirms a track off a single false positive,
-        # the exact failure this lifecycle exists to prevent. It would also fold
-        # the same measurement into the filter three times and shrink the
-        # covariance as if three cameras had agreed.
-        #
-        # Prediction still runs above: our own motion continues whether or not
-        # a new picture arrived. Only the *evidence* is skipped.
+        # Apply each detector sample to the filter once. Prediction and a
+        # new depth measurement can still advance between detector frames.
         stamp = (detections or {}).get("timestamp")
-        if detections is not None and stamp is not None and stamp == self._last_stamp:
-            return self.track if (self.track and self.track.drivable) else None
-        self._last_stamp = stamp
+        if stamp is None and detections is not None and receipt_ms:
+            stamp = ("receipt", receipt_ms)
+        depth_frame = None
+        if depth is not None and depth.get("map") is not None and not depth.get("capture_invalid"):
+            depth_frame = depth.get("source_frame_id") or depth.get("frame_id")
+        if stamp is not None:
+            # A late, previously unseen detector frame cannot refresh a DWA
+            # motion origin. Its producer clock is used only for ordering.
+            older = (config.local_controller == "dwa" and self.track is not None
+                     and isinstance(stamp, (int, float)) and self.track.latest_source is not None
+                     and stamp < self.track.latest_source)
+            repeated = stamp in self._detection_stamps
+            last = repeated and stamp == self._detection_stamps[-1]
+            pending = self._unmatched_recovery
+            # A rejected detector sample can be associated once a newer depth frame arrives.
+            retry = (last and expired and self.track is not None and pending is not None
+                     and pending[0] == stamp and type(depth_frame) is int
+                     and depth_frame > (pending[1] or 0))
+            if older or (repeated and not retry):
+                if last and self.track is not None:
+                    self._update_front(depth, config, dt)
+                return self.track if (self.track and self.track.drivable) else None
+            if not repeated:
+                self._detection_stamps.append(stamp)
 
-        candidates = self._candidates(detections, depth, target, config)
-        matched = self._associate(candidates, config)
+        track = self.track
+        position = track.position if track is not None else None
+        if expired and track is not None and target == "person" and track.front_reference is not None:
+            # Keep the measured front, transported by ego motion, as the
+            # association reference after the velocity prediction expires.
+            position = track.front_reference
+        candidates = _candidates(detections, depth, target, config, position)
+        all_candidates = candidates
+        pending_recovery = bool(expired and track is not None and target == "person" and receipt_ms and candidates)
+        association_age = track.since_obs_s if track is not None else 0.
+        if expired and track is not None:
+            # A fresh metric match can account for one observation window
+            # of motion, even if the original target was hidden much longer.
+            # Start from the predicted re-entry edge when the target is out
+            # of view. Nearby boxes across the image can pass the metric gate.
+            half_fov = config.half_fov_rad
+            reentry = min(half_fov, max(-half_fov, polar_of(position)[1]))
+            candidates = [candidate for candidate in candidates if candidate["range_measured"]
+                          and abs(polar_of(candidate["point"])[1] - reentry) <= half_fov]
+            association_age = min(association_age, config.max_obs_age_ms / 1000)
+        matched = (_associate(candidates, config, position, track.cov, association_age, track.hue,
+                              person_box=track.front_box)
+                   if track is not None else _associate(candidates, config, None))
+        if matched is None and pending_recovery and len(all_candidates) == 1 and not repeated:
+            candidate = all_candidates[0]
+            if (candidate["confidence"] >= config.min_confidence
+                    and candidate["hue"] and candidate["hue"] == track.hue
+                    and candidate["obj"].get("bbox_norm") and track.front_box):
+                prior_range, _ = polar_of(position)
+                beam = dict(candidate, range_m=prior_range,
+                            point=point_of(prior_range, polar_of(candidate["point"])[1]))
+                self.reentry_visible = _gate_cost(
+                    position, track.cov, association_age, track.hue, beam, config) is not None
+        if stamp is not None:
+            self._unmatched_recovery = (stamp, depth_frame) if matched is None and pending_recovery else None
 
-        if matched is None:
-            self._miss(dt, config, candidates)
-        else:
+        self.matched_detections = detections if matched is not None else None
+        if matched is not None:
             self._hit(matched, config)
+            if self.track.accepted_detection:
+                self.track.source = observation_source(detections)
+                if self.track.source is not None:
+                    self.track.latest_source = self.track.source
+                self.track.image_region = _image_region(matched["obj"])
+                box = matched["obj"].get("bbox_norm")
+                if matched["name"].lower() == "person" and box and config.depth_intrinsics is not None:
+                    self.track.front_required = True
+                self.track.front_box = tuple(box) if self.track.front_required and box else None
+                measurement = (matched["range_m"], matched["surface"]) if matched["name"].lower() == "person" else None
+                self._update_front(depth, config, dt, measurement)
+            if (self.track.accepted_detection and not self.track.front_required and matched["range_measured"]
+                    and depth is not None and depth.get("map") is not None
+                    and not depth.get("capture_invalid")):
+                depth_id = depth.get("source_frame_id", depth.get("frame_id"))
+                if depth_id is None or depth_id not in self._range_frames:
+                    self.track.record_range(matched["range_m"], matched["point"], depth)
+                    if depth_id is not None:
+                        self._range_frames.append(depth_id)
+        elif not expired:
+            self._miss(candidates)
+            if self.track is not None:
+                self._update_front(depth, config, dt)
 
         return self.track if (self.track and self.track.drivable) else None
+
+    def _update_front(self, depth, config, dt, measurement=None):
+        """Measure the associated person in the newest usable depth image."""
+        track = self.track
+        box = track.front_box
+        intrinsics = config.depth_intrinsics
+        if (not box or intrinsics is None or depth is None or depth.get("map") is None
+                or depth.get("capture_invalid")):
+            return
+        frame = depth.get("source_frame_id") or depth.get("frame_id")
+        if type(frame) is not int or frame <= 0 or (
+                track.front_frame_id is not None and frame <= track.front_frame_id):
+            return
+        track.front_frame_id = frame
+        stamp = observation_ms(depth)
+        now = depth.get("control_ms")
+        depth_age_ms = now - stamp if type(now) is int and type(stamp) is int else 0
+        coasting = not track.observed
+        if coasting and (track.front_fix is None or track.front_reference is None
+                         or track.since_obs_s * 1000 >= config.max_obs_age_ms
+                         or not 0 <= depth_age_ms < min(config.depth_age_limit_ms, config.max_obs_age_ms)):
+            return
+        if measurement is None:
+            from .depth import person_box_measurement
+            measurement = person_box_measurement(depth["map"], box, intrinsics, depth.get("ground"))
+        range_m, surface = measurement
+        point = _front_point(surface, config, track.front_reference, track.front_fix is not None,
+                             track.range_known, track.position, dt)
+        if point is None:
+            return
+        if coasting:
+            # The remembered crop can contain a new foreground object. Both
+            # the box range and the coherent front must agree with the
+            # transported target before the new depth can verify arrival.
+            tolerance = config.stop_tolerance_m
+            if (abs(range_m - track.range_m) > tolerance
+                    or math.dist(point, track.front_reference) > tolerance):
+                return
+            bearing = track.bearing_rad
+        else:
+            bearing = (track.image_region[0] or (0.,))[0] * config.half_fov_rad
+        track.front_fix = point_of(range_m, bearing)
+        track.front_reference = point
+        # Frame reception and processing may already have used part of
+        # the depth budget. Reading this frame again cannot renew it.
+        track.front_age_s = max(0, depth_age_ms) / 1000
+        track.record_range(range_m, track.front_fix, depth, standoff_point=tuple(point))
 
     # ── 1. predict: mostly a statement about our own motion ──────────────────
 
@@ -272,169 +834,25 @@ class Tracker:
         track = self.track
         vx, vy, wz = (float(ego[0] or 0.0), float(ego[1] or 0.0),
                       float(ego[2] or 0.0))
-        rotation = _rotation(-wz * dt)
-        translation = np.array([vx * dt, vy * dt], dtype=float)
+        geometry = (config.scan_geometry or config.local_geometry) if config.local_controller == "dwa" else None
+        frame = ObservationFrame.from_geometry(geometry)
+        rotation, translation = observation_transform((vx * dt, vy * dt, wz * dt), frame, track.frame)
+        track.frame = frame
 
-        # p' = R(p + v·dt − d),  v' = R·v
-        transition = np.zeros((4, 4))
-        transition[:2, :2] = rotation
-        transition[:2, 2:] = rotation * dt
-        transition[2:, 2:] = rotation
-        control = np.concatenate([-rotation @ translation, np.zeros(2)])
-
-        track.mean = transition @ track.mean + control
-
-        # Process noise: what the *target* might do that we have not modelled.
-        #
-        # With odometry wired, our own motion is known rather than guessed and
-        # contributes nothing here. **Without it, the twist above is what we
-        # asked for, not what happened** — and the two come apart in ordinary
-        # ways: `dry_run`, a command the driver refused because the robot is
-        # lying down, or the deadband zeroing a value the policy meant. Predict
-        # a rotation that never occurred and the filter spends every tick
-        # fighting observations that disagree with it, which shows up as an
-        # estimate swinging either side of a target that is standing still.
-        #
-        # So when the twist is commanded, the process noise is inflated: the
-        # filter leans on what it can see rather than on what we believe we did.
-        accel = config.target_accel_std
-        if not ego_measured:
-            accel *= config.commanded_ego_noise_factor
-        q_pos = (dt ** 4) / 4.0 * accel ** 2
-        q_cross = (dt ** 3) / 2.0 * accel ** 2
-        q_vel = (dt ** 2) * accel ** 2
-        noise = np.zeros((4, 4))
-        noise[:2, :2] = np.eye(2) * q_pos
-        noise[:2, 2:] = np.eye(2) * q_cross
-        noise[2:, :2] = np.eye(2) * q_cross
-        noise[2:, 2:] = np.eye(2) * q_vel
-        track.cov = transition @ track.cov @ transition.T + noise
+        track.mean, track.cov = _prediction(track.mean, track.cov, rotation, translation,
+                                            dt, config, ego_measured)
+        if track.last_obs is not None:
+            track.last_obs = rotation @ (track.last_obs - translation)
+        if track.front_reference is not None:
+            track.front_reference = rotation @ (track.front_reference - translation)
+            if track.front_fix is not None:
+                track.front_fix = rotation @ (track.front_fix - translation)
 
     # ── 2. associate ─────────────────────────────────────────────────────────
 
-    def _candidates(self, detections, depth, target: str, config) -> list:
-        """Detections that could be our target, each as a body-frame point.
-
-        The name/key matching is the same as it always was; what is new is that
-        a match is a *candidate*, not a decision.
-        """
-        from . import policy as policy_mod
-
-        objects = (detections or {}).get("objects") or []
-        wanted = (target or "").strip().lower()
-        if not wanted:
-            return []
-
-        out = []
-        for obj in objects:
-            confidence = float(obj.get("confidence") or 0)
-            if confidence < config.sustain_confidence:
-                continue
-            key = policy_mod.object_key(obj).lower()
-            name = str(obj.get("name", "")).lower()
-            if not (key == wanted or name == wanted or wanted in name):
-                continue
-
-            bearing_rad = policy_mod._bearing(obj) * config.half_fov_rad
-            range_m = policy_mod.target_distance(obj, depth, config)
-            measured = range_m is not None
-            if not measured:
-                # No depth at this object — a hole in the map, or the summary
-                # fallback with nothing in that band. Place it at the range we
-                # already believe, which makes this a bearing-only update in
-                # disguise: it can correct where the target is *pointing* and
-                # must not be allowed to claim anything about how far.
-                range_m = (self.track.range_m if self.track is not None
-                           else config.assumed_range_m)
-            out.append({
-                "obj": obj,
-                "point": point_of(range_m, bearing_rad),
-                "confidence": confidence,
-                "hue": policy_mod.hue_of(obj),
-                "name": obj.get("name") or "",
-                "range_measured": measured,
-                "range_m": range_m,
-            })
-        return out
-
-    def _associate(self, candidates, config):
-        """Pick the candidate this track is looking at, or None.
-
-        ByteTrack's two stages, collapsed to one track: high-confidence
-        detections get first refusal; if none of them lands in the gate, the
-        low-confidence ones are tried against the same gate. A dim detection
-        that agrees with where we predicted the target to be is the target seen
-        through something; a dim detection anywhere else is background.
-        """
-        if not candidates:
-            return None
-
-        if self.track is None:
-            # Nothing to gate against — only a confident detection may start a
-            # track, and it starts tentative. This is the half of the
-            # asymmetry that used to move the robot on a single frame.
-            confident = [c for c in candidates
-                         if c["confidence"] >= config.min_confidence]
-            if not confident:
-                return None
-            return max(confident, key=lambda c: c["confidence"])
-
-        high = [c for c in candidates if c["confidence"] >= config.min_confidence]
-        low = [c for c in candidates if c["confidence"] < config.min_confidence]
-        for pool in (high, low):
-            best, best_cost = None, None
-            for candidate in pool:
-                cost = self._gate_cost(candidate, config)
-                if cost is None:
-                    continue
-                if best_cost is None or cost < best_cost:
-                    best, best_cost = candidate, cost
-            if best is not None:
-                return best
-        return None
-
     def _gate_cost(self, candidate, config):
-        """Mahalanobis distance² to the prediction, or None if outside the gate.
-
-        The gate widens on its own while coasting, because the covariance
-        grows — which is the right behaviour and needs no separate rule: the
-        longer the target has been hidden, the further from the prediction we
-        are willing to believe it reappeared.
-        """
         track = self.track
-        residual = candidate["point"] - track.position
-        std = _measurement_std(candidate["range_m"], config)
-        innovation = track.cov[:2, :2] + np.eye(2) * std ** 2
-        try:
-            cost = float(residual @ np.linalg.solve(innovation, residual))
-        except np.linalg.LinAlgError:              # pragma: no cover - degenerate
-            return None
-        if cost > config.gate_chi2:
-            return None
-
-        # **The gate widens while coasting, and that had no ceiling.** Growing
-        # it is right — the longer the target has been hidden, the further from
-        # the prediction it may legitimately reappear — but after 1.2 s the
-        # covariance alone opened it to about 3.7 m, and the detector's class is
-        # not stable enough to survive an opening that size. On r1_sz a track on
-        # a person four metres away was resurrected onto a traffic cone at 0.7 m
-        # that vop had labelled `person` for one frame, and the card then
-        # reported arrival.
-        #
-        # So it is also capped by what the target could physically have done:
-        # nothing moves faster than `max_target_speed`, and the ego motion is
-        # already in the prediction, so this residual is the target's own travel.
-        reach = (config.max_target_speed * max(track.since_obs_s, 1e-3)
-                 + 3.0 * std)
-        if float(np.hypot(*residual)) > reach:
-            return None
-        # Colour is a tie-break, never a gate. `object_key` already excludes
-        # brightness because it swings with the lighting; hue is steadier but
-        # still flickers, and rejecting on it would drop a track for a cloud
-        # passing the window.
-        if track.hue and candidate["hue"] and candidate["hue"] != track.hue:
-            cost += config.hue_mismatch_cost
-        return cost
+        return _gate_cost(track.position, track.cov, track.since_obs_s, track.hue, candidate, config)
 
     # ── 3. update ────────────────────────────────────────────────────────────
 
@@ -442,34 +860,11 @@ class Tracker:
         point = candidate["point"]
         if self.track is None:
             self._create(candidate, config)
-            self.last_reason = (f"看到 {candidate['name']!r}，建立候选轨迹"
-                                f"（需 {config.confirm_hits} 帧确认）")
+            self.last_reason = f"已关联目标 {candidate['name']!r}"
             return
 
         track = self.track
-        was_coasting = track.state in (COASTING, REACQUIRING)
-
-        if was_coasting:
-            # **One frame resurrects a track; three create one.** That asymmetry
-            # is the same bug that made a single false positive start a chase,
-            # moved to the other end of the lifecycle — and it is worse here,
-            # because the gate is at its widest exactly when the evidence is at
-            # its thinnest. Until the count is met the track keeps coasting on
-            # its prediction: still drivable, still not jumped.
-            track.reacquire_hits += 1
-            track.history.append(True)
-            # `coast_s` deliberately keeps its value: until the match is
-            # accepted the position being published is still a prediction, and
-            # `describe()` should say so. It also bounds this state — at most
-            # `confirm_hits` ticks can pass before the track is either accepted
-            # or dropped by the coast budget.
-            if track.reacquire_hits < config.confirm_hits:
-                track.state = REACQUIRING
-                self.last_reason = (
-                    f"疑似重新看到目标（{track.reacquire_hits}/{config.confirm_hits}）"
-                    "，先按预测继续，确认了才接受它的位置")
-                return
-            track.reacquire_hits = 0
+        was_coasting = track.state in (COASTING, LOST)
 
         if was_coasting and track.last_obs is not None and track.since_obs_s > 1e-6:
             # OC-SORT's observation-centric re-update, in the form this state
@@ -481,54 +876,34 @@ class Tracker:
             track.mean = np.concatenate([point, velocity])
             track.cov = self._initial_cov(candidate, config)
         else:
-            std = _measurement_std(candidate["range_m"], config)
-            if not candidate["range_measured"]:
-                # Bearing-only. Inflating the measurement noise is what stops
-                # this from asserting a range it never measured.
-                std *= config.bearingless_std_factor
-            measurement = np.zeros((2, 4))
-            measurement[0, 0] = measurement[1, 1] = 1.0
-            innovation = (measurement @ track.cov @ measurement.T
-                          + np.eye(2) * std ** 2)
-            gain = track.cov @ measurement.T @ np.linalg.inv(innovation)
-            track.mean = track.mean + gain @ (point - track.position)
-            track.cov = (np.eye(4) - gain @ measurement) @ track.cov
+            track.mean, track.cov = _correct(track.mean, track.cov, candidate, config)
 
         _clamp_speed(track, config)
         track.hue = candidate["hue"] or track.hue
         track.range_known = track.range_known or candidate["range_measured"]
         track.hits += 1
-        track.history.append(True)
-        track.coast_s = 0.0
+        track.accepted_detection = True
         track.last_obs = point.copy()
         track.since_obs_s = 0.0
 
-        if track.state == TENTATIVE:
-            if track.hits >= config.confirm_hits:
-                track.state = CONFIRMED
-                self.last_reason = f"轨迹确认（{track.hits} 帧）"
-            else:
-                self.last_reason = (f"候选轨迹 {track.hits}/{config.confirm_hits} "
-                                    "帧，还不驱动底盘")
-        else:
-            if was_coasting:
-                self.last_reason = "目标重新出现，轨迹恢复"
-            else:
-                self.last_reason = ""
-            track.state = CONFIRMED
+        track.state = CONFIRMED
+        self.last_reason = "目标重新出现，轨迹恢复" if was_coasting else ""
 
     def _create(self, candidate, config):
+        self._generation += 1
         self.track = Track(
+            generation=self._generation,
+            frame=(ObservationFrame.from_geometry(config.scan_geometry or config.local_geometry)
+                   if config.local_controller == "dwa" else None),
             mean=np.concatenate([candidate["point"], np.zeros(2)]),
             cov=self._initial_cov(candidate, config),
             hue=candidate["hue"],
             name=candidate["name"],
-            state=TENTATIVE,
             hits=1,
             range_known=candidate["range_measured"],
+            accepted_detection=True,
             last_obs=candidate["point"].copy(),
         )
-        self.track.history.append(True)
 
     @staticmethod
     def _initial_cov(candidate, config) -> np.ndarray:
@@ -542,33 +917,14 @@ class Tracker:
 
     # ── 4. miss ──────────────────────────────────────────────────────────────
 
-    def _miss(self, dt: float, config, candidates):
+    def _miss(self, candidates):
         track = self.track
         if track is None:
             self.last_reason = ("视野里没有匹配目标的检测" if not candidates
                                 else "有疑似检测，但置信度不足以建立轨迹")
             return
 
-        track.history.append(False)
-
-        if track.state == TENTATIVE:
-            # A candidate that cannot keep showing up is dropped rather than
-            # kept around: it never moved the robot, and holding it would let a
-            # ghost win the gate against a real detection later.
-            if len(track.history) >= config.confirm_window and \
-                    track.hits < config.confirm_hits:
-                self.track = None
-                self.last_reason = "候选轨迹没能在窗口内确认，丢弃"
-            return
-
         track.state = COASTING
-        track.reacquire_hits = 0
-        track.coast_s += dt
-        if track.coast_s > config.max_coast_s:
-            self.track = None
-            self.last_reason = (f"目标消失超过 {config.max_coast_s:.1f}s，"
-                                "外推已不可信，放弃轨迹")
-            return
         self.last_reason = (f"目标暂时看不见（{track.coast_s:.1f}s），"
                             "按自身运动推算位置继续")
 
@@ -583,11 +939,12 @@ class Tracker:
             return {"state": LOST, "reason": self.last_reason}
         return {
             "state": track.state,
+            "name": track.name,
             "hits": track.hits,
             "coast_s": round(track.coast_s, 2),
             "age_s": round(track.age_s, 1),
             "observed": track.observed,
-            "range_m": round(track.range_m, 2) if track.range_known else None,
+            "range_m": round(track.range_m, 2) if track.navigation_range_known else None,
             "position_std_m": round(track.position_std_m, 2),
             "reason": self.last_reason,
         }

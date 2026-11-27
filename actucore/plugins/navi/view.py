@@ -34,6 +34,8 @@ import math
 
 import numpy as np
 
+from .local_path import intrinsics_for, optical_ground_plane
+
 # **The dashboard's own depth ramp, not a second one.**
 #
 # The first version used viridis, and the result was two panels side by side
@@ -202,9 +204,75 @@ def corridor_edges(clearance: float, config, width: int) -> tuple:
     if not clearance or not math.isfinite(clearance) or clearance <= 0:
         return None
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
+    intrinsics = getattr(config, "depth_intrinsics", None)
+    if intrinsics is not None:
+        fx, cx = intrinsics.for_width(width)
+        edge_px = fx * keep / clearance
+        return int(round(cx - edge_px)), int(round(cx + edge_px))
     edge = math.atan2(keep, max(clearance, 0.05))
     return (_column_of(-edge, config.half_fov_rad, width),
             _column_of(edge, config.half_fov_rad, width))
+
+
+def _target_guidance(geometry, start, target, stop_distance_m):
+    if target is None:
+        return None
+    distance, bearing = target
+    if not (math.isfinite(distance) and distance > 0 and math.isfinite(bearing)):
+        return None
+    x, z = distance * math.sin(bearing), distance * math.cos(bearing)
+    goal = (z, x)
+    if geometry is not None:
+        forward, left = geometry.base_from_optical[:2, :3] @ (x, 0., z)
+        goal = (forward, -left)
+    approach = math.dist(start, goal)
+    if approach <= stop_distance_m + .05:
+        return None
+    end = tuple(target_m + (start_m - target_m) * stop_distance_m / approach
+                for start_m, target_m in zip(start, goal))
+    return start, end
+
+
+def route_lines(depth_m, ground, geometry, points, target, keep, width, height, *,
+                stop_distance_m, pending=False):
+    """Project the route centerline, or its boundaries when keep is positive."""
+    if geometry is None or depth_m is None or ground is None or not (points or target):
+        return []
+    plane = optical_ground_plane(depth_m, geometry, ground)
+    if plane is None:
+        return []
+    optical_normal, offset = plane
+    transform = geometry.base_from_optical
+    rotation, origin = transform[:3, :3], transform[:3, 3]
+    normal = rotation @ optical_normal
+    if abs(normal[2]) < .5 * np.linalg.norm(normal):
+        return []
+    fx, cx, fy, cy = intrinsics_for(geometry, height, width)
+    sections = [(np.asarray(points, dtype=float), pending)] if points else []
+    guidance = _target_guidance(geometry, points[-1] if points else (0., 0.), target, stop_distance_m)
+    if guidance is not None:
+        sections.append((np.linspace(*guidance, num=25), True))
+
+    near = .10
+    lines = []
+    for centre, dashed in sections:
+        forward = centre[:, 0]
+        for side in ((-keep, keep) if keep else (0.,)):
+            right = centre[:, 1] + side
+            floor = (offset + normal @ origin - normal[0] * forward + normal[1] * right) / normal[2]
+            optical = (np.column_stack((forward, -right, floor)) - origin) @ rotation
+            for i, (a, b) in enumerate(zip(optical, optical[1:])):
+                if (dashed and len(centre) > 2 and i % 2 == 0) or max(a[2], b[2]) < near:
+                    continue
+                # Clip only the part behind the camera before projecting.
+                if a[2] < near:
+                    a = a + (b - a) * ((near - a[2]) / (b[2] - a[2]))
+                elif b[2] < near:
+                    b = b + (a - b) * ((near - b[2]) / (a[2] - b[2]))
+                start_px = (round(cx + fx * a[0] / a[2]), round(cy + fy * a[1] / a[2]))
+                end_px = (round(cx + fx * b[0] / b[2]), round(cy + fy * b[1] / b[2]))
+                lines.append((start_px, end_px, dashed))
+    return lines
 
 
 # Everything drawn on top gets a dark casing first.
@@ -236,6 +304,27 @@ def _line(frame, start, end, colour, thickness: int = 2):
     cv2.line(frame, start, end, colour, thickness, cv2.LINE_AA)
 
 
+def _route_stroke(frame, polylines):
+    import cv2
+
+    cv2.polylines(frame, polylines, False, _CASING, 6, cv2.LINE_AA)
+    cv2.polylines(frame, polylines, False, _CORRIDOR, 3, cv2.LINE_AA)
+
+
+def _schematic_route(route, width, height, *, keep):
+    """Draw the robot-relative route in the corridor area without a floor pose."""
+    if route is None or len(route.points) < 2:
+        return []
+    forward, right = np.asarray(route.points).T
+    scale = 1. / (1. + np.maximum(forward, 0.))
+    rows = height * (.60 + .31 * scale)
+    paths = []
+    for side in (-keep, keep):
+        columns = width * (.5 + .5 * (right + side) * scale)
+        paths.append(np.rint(np.column_stack((columns, rows))).astype(np.int32))
+    return paths
+
+
 def _arrow(frame, origin, dx, dy, colour, label: str):
     import cv2
 
@@ -246,8 +335,23 @@ def _arrow(frame, origin, dx, dy, colour, label: str):
         _text(frame, label, (end[0] + 6, end[1] + 4), colour, 0.45)
 
 
+def _dashed_line(frame, a, b, colour):
+    length = math.dist(a, b)
+    if not length:
+        return
+    offset = 0.
+    while offset < length:
+        start, end = max(0., offset), min(length, offset + 8.)
+        if start < end:
+            points = [tuple(round(x + (y - x) * t / length) for x, y in zip(a, b))
+                      for t in (start, end)]
+            _line(frame, *points, colour, thickness=2)
+        offset += 15.
+
+
 def render(*, depth_m, decision, track, box, clearance, coverage, config,
-           measured=None, rgb_jpeg=None, blend: float = 0.5,
+           measured=None, box_last_seen=False, rgb_jpeg=None, blend: float = 0.5,
+           ground=None, detour=None, executing=None, project_detour=True, project_executing=True,
            width: int = 640, height: int = 480):
     """One frame. Every input may be absent — the overlay still draws.
 
@@ -280,6 +384,18 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                                interpolation=cv2.INTER_NEAREST)
 
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
+    route, project = (executing, project_executing) if executing is not None else (detour, project_detour)
+    lines = (route_lines(depth_m, ground, route.geometry, route.points, None, keep,
+                         width, height, stop_distance_m=config.stop_distance_m)
+             if route is not None and project else ())
+    projected = []
+    for a, b, _ in lines:
+        visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
+        if visible:
+            projected.append(np.asarray((a, b), dtype=np.int32))
+    schematic = _schematic_route(route, width, height, keep=keep) if not projected else []
+    if projected or schematic:
+        _route_stroke(frame, projected or schematic)
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #
@@ -288,46 +404,38 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     # every range, which is the single fact that took longest to become visible.
     edges = corridor_edges(clearance, config, width)
     if edges:
-        left, right = edges
-        blocked = clearance <= config.obstacle_stop_m
-        colour = _WARN if blocked else _CORRIDOR
-
-        # **Drawn as a dimension, not as two lines.**
-        #
-        # Two bare verticals were asked about twice: they read as unrelated
-        # marks, and nothing connected them to the `+-0.33m` in the corner. A
-        # cross-bar with arrow ends is the drawing convention for "this is a
-        # width", and putting the number on the bar rather than in a corner is
-        # what makes it answer its own question.
-        bar = int(height * 0.30)
-        for x in (left, right):
-            _line(frame, (x, bar), (x, height), colour)
-        cv2.arrowedLine(frame, (left, bar), (right, bar), _CASING, 6,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (right, bar), (left, bar), _CASING, 6,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (left, bar), (right, bar), colour, 2,
-                        tipLength=0.04)
-        cv2.arrowedLine(frame, (right, bar), (left, bar), colour, 2,
-                        tipLength=0.04)
-        span = f"path {keep * 2:.2f}m wide"
-        (tw, _), _ = cv2.getTextSize(span, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        _text(frame, span, ((left + right - tw) // 2, bar - 8), colour, 0.5)
-        _text(frame,
-              f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
+        colour = _WARN if clearance <= config.obstacle_stop_m else _CORRIDOR
+        if route is None:
+            for far, near in zip(edges, corridor_edges(clearance * .5, config, width)):
+                visible, a, b = cv2.clipLine((0, 0, width, height),
+                                            (far, int(height * .62)), (near, height - 1))
+                if visible:
+                    _dashed_line(frame, a, b, colour)
+        _text(frame, f"clear to {clearance:.2f}m   cov {coverage * 100:.0f}%",
               (8, 24), colour, 0.55)
+    if edges or projected or schematic:
+        label = f"path {2 * keep:.2f}m wide" + (" (schematic)" if schematic else "")
+        _text(frame, label, (8, 46), _CORRIDOR, 0.5)
 
     # ── the target ───────────────────────────────────────────────────────────
     if box:
         x1, y1, x2, y2 = (int(box[0] * width), int(box[1] * height),
                           int(box[2] * width), int(box[3] * height))
-        cv2.rectangle(frame, (x1, y1), (x2, y2), _CASING, 5)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), _TARGET, 2)
         state = (track or {}).get("state", "")
         rng = (track or {}).get("range_m")
         label = f"{state}" + (f"  {rng:.2f}m" if rng is not None else "  ?m")
         colour = _TARGET
-        if measured is not None:
+        if box_last_seen:
+            vertices = ((x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1))
+            for a, b in zip(vertices, vertices[1:]):
+                _dashed_line(frame, a, b, _WARN)
+            label, colour = "last seen", _WARN
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), _CASING, 5)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), _TARGET, 2)
+        if not box_last_seen and (track or {}).get("name", "").lower() == "person":
+            label = f"meas {measured:.2f}m" if measured is not None else state
+        elif not box_last_seen and measured is not None:
             # **Both numbers, because the gap between them is a real failure
             # mode.** The tracked range is a filtered estimate that has been
             # ego-motion compensated every tick since the last observation, and
