@@ -3210,6 +3210,24 @@ weights, so it cannot drift out of order or out of date — and falls back to th
 Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
 resolve — a card saved before the switch must not come back as `state: error`.
 
+### Choosing a vop model
+
+The card's `model` (shared across instances) picks one row of
+`VOP_MODEL_BUNDLES` in `utils/model_downloader.py`; the enum on the card is
+that table's keys, so there is no second list to keep in step.
+
+| `model` | Weights | Input | Classes | Notes |
+|---|---|---|---|---|
+| `yoloe-26s-seg` | ultralytics YOLOE-26 s | 640×640 | 144 | default, fastest (`confidence: 0.3`) |
+| `ovdeim-m-768` | OV-DEIM-M (17.95M exported params) | 768×768 | 220 | opt-in, NMS-free end-to-end `(1, 300, 6)`, JP5.11 & JP6.1 (recommended `confidence: 0.45–0.51`) |
+
+Every row exports an NMS-free end-to-end head and decodes through the same
+`decode_detections` path without per-frame Python NMS. Each model downloads
+into its own `/models/vop/<model>/` directory so separate `vocab.json` files
+never overwrite each other. Switching `model` via `config` stops running
+instances (they share one engine), drops the old engine, and loads the new one
+on the next `start`.
+
 ### vop's streamed payload: `publish_bbox` and `publish_color`
 
 Two knobs govern what one detected object costs on the topic. **They affect the

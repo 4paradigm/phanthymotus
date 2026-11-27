@@ -62,6 +62,7 @@ def _plugin(cfg=None, model=None):
     ("yolov8s-world", "yoloe-26s-seg"),
     ("yoloe-26s", "yoloe-26s-seg"),
     ("yoloe-26s-seg", "yoloe-26s-seg"),
+    ("ovdeim-m-768", "ovdeim-m-768"),
     ("", "yoloe-26s-seg"),
 ])
 def test_legacy_model_names_still_resolve(configured, expected):
@@ -69,9 +70,258 @@ def test_legacy_model_names_still_resolve(configured, expected):
     assert vop_plugin.canonical_model_name(configured) == expected
 
 
-def test_unknown_model_name_is_left_alone():
-    """An explicit engine path is a dev-box escape hatch, not an alias miss."""
-    assert vop_plugin.canonical_model_name("/models/custom.engine") == "/models/custom"
+def test_explicit_engine_path_keeps_its_suffix():
+    """An explicit engine path is a dev-box escape hatch, not an alias miss.
+
+    `_resolve_engine` only takes the configured-file branch while the name still
+    ends in `.engine`, so stripping the suffix would make every such config
+    quietly miss the local file branch.
+    """
+    assert vop_plugin.canonical_model_name("/models/custom.engine") == "/models/custom.engine"
+
+
+# ── model registry and switching ─────────────────────────────────────────────
+
+def test_every_bundled_model_is_offered_on_the_card():
+    """The card's choice and the downloader's rows are one list."""
+    from utils.model_downloader import VOP_MODEL_BUNDLES
+
+    schema = vop_plugin.TOOLS[0]["configSchema"]["properties"]["model"]
+    assert schema["enum"] == list(VOP_MODEL_BUNDLES)
+    assert {"yoloe-26s-seg", "ovdeim-m-768"} <= set(schema["enum"])
+    assert schema["default"] == vop_plugin.DEFAULT_MODEL == "yoloe-26s-seg"
+    assert schema["scope"] == "shared"
+
+
+def test_each_model_downloads_into_its_own_directory(monkeypatch):
+    """Every bundle ships a vocab.json; sharing a directory would make two
+    models overwrite each other's on every switch."""
+    import utils.model_downloader as md
+
+    seen = []
+    monkeypatch.setattr(md, "ensure_verified_bundle",
+                        lambda name, model_dir, base_url, files, progress_cb=None:
+                        seen.append((model_dir, base_url, files)) or {})
+    monkeypatch.setattr(md, "require_models_subpath", lambda path: path)
+    for model in md.VOP_MODEL_BUNDLES:
+        for family in ("jp61", "jp511"):
+            md.ensure_vop_model("/models/vop", model=model, family=family)
+    assert len(seen) == 2 * len(md.VOP_MODEL_BUNDLES)
+    for model_dir, base_url, files in seen:
+        model = model_dir.rsplit("/", 1)[1]
+        assert model_dir == f"/models/vop/{model}"
+        assert base_url.startswith("https://")
+        assert "vocab.json" in files
+        assert any(name.endswith(".engine") for name in files)
+        for meta in files.values():
+            assert int(meta["size"]) > 0
+            assert len(meta["sha256"]) == 64
+
+
+def test_an_unknown_model_is_refused_by_the_downloader():
+    import utils.model_downloader as md
+
+    with pytest.raises(ValueError, match="Unknown vop model"):
+        md.ensure_vop_model("/models/vop", model="nonexistent-detector")
+
+
+def test_config_switches_the_model_and_stops_running_instances():
+    plugin, executor = _plugin(model=_FakeModel())
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    assert len(executor.nodes) == 1
+
+    reply = plugin.dispatch("vop", {"action": "config", "model": "ovdeim-m-768"})
+
+    assert reply["status"] == "configured"
+    assert reply["model"] == "ovdeim-m-768"
+    assert reply["stopped_instances"] == ["/cam/rgb"]
+    assert "model" not in reply["config"]
+    assert executor.nodes == [] and plugin._nodes == {}
+    # The old engine is dropped, so the next start loads the new one.
+    assert plugin._model is None
+    assert plugin._model_name == "ovdeim-m-768"
+    assert plugin._vocabulary == []
+
+
+def test_config_with_an_instance_id_still_switches_the_shared_model():
+    plugin, _ = _plugin(model=_FakeModel())
+    reply = plugin.dispatch("vop", {"action": "config", "instance_id": "cam",
+                                    "model": "ovdeim-m-768", "fps": 3})
+    assert plugin._model_name == "ovdeim-m-768"
+    assert plugin._instance_configs["cam"] == {"fps": 3}
+    assert reply["model"] == "ovdeim-m-768"
+
+
+def test_config_to_the_current_model_keeps_the_engine():
+    model = _FakeModel()
+    plugin, executor = _plugin(model=model)
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("vop", {"action": "config", "model": "yoloe-26s-seg"})
+    assert plugin._model is model
+    assert len(executor.nodes) == 1
+    plugin.dispatch("vop", {"action": "stop"})
+
+
+def test_an_unknown_model_in_config_changes_nothing():
+    model = _FakeModel()
+    plugin, _ = _plugin(model=model)
+    reply = plugin.dispatch("vop", {"action": "config", "model": "nonexistent-detector",
+                                    "fps": 2})
+    assert reply["status"] == "error"
+    assert "ovdeim-m-768" in reply["message"]
+    assert plugin._model is model
+    assert plugin._model_name == "yoloe-26s-seg"
+    assert plugin._fps != 2
+
+
+def test_a_switch_during_a_load_is_refused():
+    plugin, _ = _plugin()
+    plugin._model_loading = True
+    reply = plugin.dispatch("vop", {"action": "config", "model": "ovdeim-m-768"})
+    assert reply["status"] == "error"
+    assert plugin._model_name == "yoloe-26s-seg"
+
+
+def test_prefetch_vocabulary_ignores_stale_result_after_model_switch(monkeypatch, tmp_path):
+    """A slow vocab download started for the old model must not overwrite
+    the vocabulary slot after a switch to another model."""
+    import utils.model_downloader as md
+
+    old_vocab = tmp_path / "vocab.json"
+    old_vocab.write_text(json.dumps({"classes": ["old_only"]}), encoding="utf-8")
+
+    plugin, _ = _plugin()
+    plugin._vocabulary = []
+
+    def fake_ensure(name, model_dir, base_url, files, progress_cb=None):
+        # Simulate model switch happening while the download was in flight.
+        plugin._model_name = "ovdeim-m-768"
+        return {"vocab.json": str(old_vocab)}
+
+    monkeypatch.setattr(md, "ensure_verified_bundle", fake_ensure)
+    monkeypatch.setattr(md, "require_models_subpath", lambda path: path)
+    monkeypatch.setattr(md, "select_bundle_family", lambda bundles, family=None: "jp61")
+
+    plugin._prefetch_vocabulary()
+    assert plugin._vocabulary == []
+
+
+def test_info_while_loading_surfaces_download_progress():
+    """Card polling via info() must show live download progress instead of a fixed string."""
+    plugin, _ = _plugin()
+    plugin._model = None
+    plugin._model_name = "ovdeim-m-768"
+    plugin._model_loading = True
+    plugin._model_load_status = "Downloading ovdeim-m-768: 42% (19 / 45 MB)"
+    info = plugin.dispatch("vop", {"action": "info"})
+    assert info["state"] == "loading"
+    assert "42%" in info["desc"]
+    assert "ovdeim-m-768" in info["desc"]
+
+    plugin._model_load_status = None
+    fallback = plugin.dispatch("vop", {"action": "info"})
+    assert fallback["state"] == "loading"
+    assert "ovdeim-m-768" in fallback["desc"]
+
+
+def test_one_shot_cold_load_exposes_download_progress_in_info(monkeypatch, tmp_path):
+    """A cold recognize_by_photo download must report state=loading + live progress in info()."""
+    import plugins.vision_runtime as vr
+
+    img_path = tmp_path / "scene.jpg"
+    img_path.write_bytes(frame_bytes(64, 64))
+
+    plugin, _ = _plugin(cfg={"model": "ovdeim-m-768", "image_roots": [str(tmp_path)]})
+    plugin._model = None
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_resolve():
+        plugin._model_load_status = "Downloading ovdeim-m-768: 55% (25 / 45 MB)"
+        entered.set()
+        assert release.wait(timeout=5.0)
+        return "/tmp/fake.engine", ["person", "cup"]
+
+    fake_session = _FakeModel(rows=[(10, 10, 40, 40, 0.9, 0)])
+    fake_session.class_names = lambda: ["person", "cup"]
+
+    monkeypatch.setattr(plugin, "_resolve_engine", slow_resolve)
+    monkeypatch.setattr(vr, "VisionEngineSession", lambda path: fake_session)
+
+    box = {}
+
+    def run_photo():
+        box["reply"] = plugin.dispatch("vop", {
+            "action": "recognize_by_photo",
+            "image_path": str(img_path),
+        })
+
+    worker = threading.Thread(target=run_photo, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(timeout=5.0)
+        info = plugin.dispatch("vop", {"action": "info"})
+        assert info["state"] == "loading"
+        assert "55%" in info["desc"]
+        assert "ovdeim-m-768" in info["desc"]
+
+        # A concurrent model switch during the one-shot load must be refused.
+        refused = plugin.dispatch("vop", {"action": "config", "model": "yoloe-26s-seg"})
+        assert refused["status"] == "error"
+        assert plugin._model_name == "ovdeim-m-768"
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert box["reply"]["ok"] is True
+    assert box["reply"]["count"] == 1
+    after = plugin.dispatch("vop", {"action": "info"})
+    assert after["state"] == "idle"
+
+
+def test_switch_does_not_retire_nodes_when_refused_and_blocks_concurrent_load(monkeypatch):
+    """A rejected switch must leave running instances intact, and a switch that
+    claims teardown must not be preempted into a destructive partial failure."""
+    plugin, executor = _plugin(model=_FakeModel())
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    assert len(executor.nodes) == 1
+
+    # Case 1: load already in progress -> refused with zero nodes retired.
+    plugin._model_loading = True
+    refused = plugin.dispatch("vop", {"action": "config", "model": "ovdeim-m-768"})
+    assert refused["status"] == "error"
+    assert len(executor.nodes) == 1
+    assert "/cam/rgb" in plugin._nodes
+    plugin._model_loading = False
+
+    # Case 2: a concurrent start/load arrives mid-teardown -> switch still
+    # completes cleanly without returning an error after retiring /cam/rgb.
+    orig_retire = plugin._retire_node
+    concurrent_results = {}
+
+    def retire_with_concurrent_load(key):
+        res = orig_retire(key)
+        concurrent_results["start"] = plugin.dispatch(
+            "vop", {"action": "start", "input_topic": "/cam/other"}
+        )
+        try:
+            plugin._model = None
+            plugin._ensure_model()
+            concurrent_results["ensure"] = "loaded"
+        except RuntimeError as exc:
+            concurrent_results["ensure"] = str(exc)
+        return res
+
+    monkeypatch.setattr(plugin, "_retire_node", retire_with_concurrent_load)
+    reply = plugin.dispatch("vop", {"action": "config", "model": "ovdeim-m-768"})
+    assert reply["status"] == "configured"
+    assert reply["model"] == "ovdeim-m-768"
+    assert reply["stopped_instances"] == ["/cam/rgb"]
+    assert concurrent_results["start"]["state"] == "loading"
+    assert "switch in progress" in concurrent_results["ensure"]
+    assert plugin._nodes == {}
 
 
 # ── frozen vocabulary ────────────────────────────────────────────────────────

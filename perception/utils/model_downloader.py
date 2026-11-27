@@ -1273,32 +1273,77 @@ VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE_URL", f"{COS_BASE}/vision"
 # the file that was uploaded — the point of the pin is to catch a bad transfer,
 # and hashing the source cannot. (Same note as THAI_TTS_ARCHIVE / KOKORO.)
 #
-# vocab.json is byte-identical across both families; the two bundles carry
-# their own copy anyway so a family is one self-contained download.
+# vocab.json is byte-identical across both families of one model; the two
+# bundles carry their own copy anyway so a family is one self-contained
+# download.
+#
+# VOP_MODEL_BUNDLES is keyed by model name first, then by JetPack family: each
+# model is a choice on the card (plugins/vop.py's `model`), not a replacement
+# for the default. ensure_vop_model() keeps each model in its own subdirectory
+# under /models/vop/<model>/ because every bundle ships a vocab.json and their
+# vocabularies differ.
 _VOP_VOCAB = {
     "size": 1969,
     "sha256": "5aaa0f34df07fff0037318c4100f40bf55b62beb439b89f60b6641924f17fd3b",
 }
 
+VOP_OVDEIM_REVISION = "0498423d7ac0588529dd208a9c42925b375700d4"
+VOP_OVDEIM_BASE = os.environ.get(
+    "VOP_OVDEIM_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    f"vop-ovdeim-m-jp61-trt/resolve/{VOP_OVDEIM_REVISION}",
+)
+_VOP_OVDEIM_VOCAB = {
+    "size": 3446,
+    "sha256": "d35a6672dbc5472d05dc70ee5973846b19517cf4ba2f10e80a483d69cacf133c",
+}
+
 VOP_MODEL_BUNDLES = {
-    "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.4-orin-640",
-        "files": {
-            "yoloe-26s-seg.engine": {
-                "size": 24780908,
-                "sha256": "b8cb77a0685a399ef7d83dfc4d0777b54e66ea110d1085a005c4f153366e4099",
+    # 144 classes (COCO-80 + ROBOT_EXTRA), NMS-free end-to-end head. Default.
+    "yoloe-26s-seg": {
+        "jp61": {
+            "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.4-orin-640",
+            "files": {
+                "yoloe-26s-seg.engine": {
+                    "size": 24780908,
+                    "sha256": "b8cb77a0685a399ef7d83dfc4d0777b54e66ea110d1085a005c4f153366e4099",
+                },
+                "vocab.json": _VOP_VOCAB,
             },
-            "vocab.json": _VOP_VOCAB,
+        },
+        "jp511": {
+            "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp511-trt8.5-orin-640",
+            "files": {
+                "yoloe-26s-seg.engine": {
+                    "size": 23742701,
+                    "sha256": "49df478a308de3a1f996d4784d2b00245486c04a40e0b7b6005b7226674da4fe",
+                },
+                "vocab.json": _VOP_VOCAB,
+            },
         },
     },
-    "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp511-trt8.5-orin-640",
-        "files": {
-            "yoloe-26s-seg.engine": {
-                "size": 23742701,
-                "sha256": "49df478a308de3a1f996d4784d2b00245486c04a40e0b7b6005b7226674da4fe",
+    # 220 classes, 768x768 OV-DEIM-M (17.95M exported params), NMS-free
+    # end-to-end (1, 300, 6) output decoded by the same decode_detections path.
+    "ovdeim-m-768": {
+        "jp61": {
+            "base_url": f"{VOP_OVDEIM_BASE}/tensorrt-jp61-trt10.4-orin-768",
+            "files": {
+                "ovdeim-m-768-vop220.engine": {
+                    "size": 45065692,
+                    "sha256": "0d4dfecd578548e057169099c0b7b290af32df8108c67e6b9405819ac4ccbe1e",
+                },
+                "vocab.json": _VOP_OVDEIM_VOCAB,
             },
-            "vocab.json": _VOP_VOCAB,
+        },
+        "jp511": {
+            "base_url": f"{VOP_OVDEIM_BASE}/tensorrt-jp511-trt8.5-orin-768",
+            "files": {
+                "ovdeim-m-768-vop220.engine": {
+                    "size": 42025482,
+                    "sha256": "9f2686285d8a142769e71bcaea22e0e4350991dcc748d8dcaee05a8c14a6cb68",
+                },
+                "vocab.json": _VOP_OVDEIM_VOCAB,
+            },
         },
     },
 }
@@ -1567,10 +1612,14 @@ def ensure_depthart_model(model_dir: str = "/models/depthart", family: str | Non
                                  os.path.join(model_dir, key), key, progress_cb)
 
 
-def ensure_vop_model(model_dir: str, family: str | None = None,
-                     progress_cb=None) -> dict[str, str]:
-    """Ensure the vop detection engine + its frozen vocabulary are present."""
-    return _ensure_vision_bundle("vop", VOP_MODEL_BUNDLES, model_dir, family,
+def ensure_vop_model(model_dir: str, model: str = "yoloe-26s-seg",
+                     family: str | None = None, progress_cb=None) -> dict[str, str]:
+    """Ensure one vop model's detection engine + its frozen vocabulary are present."""
+    if model not in VOP_MODEL_BUNDLES:
+        raise ValueError(f"Unknown vop model {model!r}; available: "
+                         f"{sorted(VOP_MODEL_BUNDLES)}")
+    return _ensure_vision_bundle(f"vop/{model}", VOP_MODEL_BUNDLES[model],
+                                 os.path.join(model_dir, model), family,
                                  progress_cb=progress_cb)
 
 
