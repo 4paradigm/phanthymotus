@@ -3679,6 +3679,31 @@ path has its own `HandEngine` wrapper instead of reusing
 `VisionEngineSession`: feeding the wrong normalisation produces a confident
 hand in the wrong place, with nothing raising.
 
+#### Optional 30-class detector backend (`hand_backend: detector`)
+
+Setting `hands: true` with `hand_backend: detector` selects an opt-in
+two-engine detector path (`plugins/hand_gesture_detector.py`) instead of the
+default `rtmpose` keypoint channel:
+
+- **Models**: `YOLOv10n_hands` (~2.27M params) locates individual left/right
+  hand bounding boxes (`hand_bboxes`) and `YOLOv10n_gestures` (~2.27M params)
+  classifies 30 canonical gestures (23 single-hand + 7 two-hand combinations,
+  plus `no_gesture`). Both run as NMS-free end-to-end `(1, 300, 6)` FP16
+  TensorRT engines (640×640), lazily fetched into `/models/hand_gesture/<jp511|jp61>`
+  on first `start` or photo call (`HAND_DETECTOR_MODEL_BASE_URL` and
+  `HAND_GESTURE_MODEL_DIR` override the source and cache path). Upstream weights
+  originate from HaGRIDv2 (CC BY-SA 4.0, direct format conversion only).
+- **Body anchoring and zoom**: Detected single-hand boxes are anchored to the
+  person's own `left`/`right` wrist from COCO-17 (`yolo26s-pose` by default),
+  with an optional person-crop adaptive zoom (`hand_adaptive_zoom: true`) for
+  distant or small hands. On close-up frames where the body detector finds no
+  person, a synthetic person record is emitted so stream and photo outputs stay
+  consistent.
+- **Payloads**: Emits `hand_bboxes`, `hand_gestures`, `hand_gesture_scores`,
+  and `hands_seen` on `{topic}/poses` and `recognize_by_photo` without altering
+  the default `rtmpose` 21-keypoint path or the 17-point skeleton layout on
+  `{topic}/poses/skeleton`.
+
 ### Why the overlay is a third topic rather than drawn in the browser
 
 A dashboard renderer only ever sees **one** topic — `detail-panel.js` opens a
