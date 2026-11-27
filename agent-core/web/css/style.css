@@ -1362,6 +1362,8 @@ html, body {
   top: 12px;
   left: 16px;
   display: flex;
+  flex-wrap: wrap;
+  max-width: calc(100% - 24px);
   align-items: center;
   gap: 6px;
   background: var(--bg-card);
@@ -1413,6 +1415,18 @@ html, body {
 }
 .canvas-editor-bar .editor-btn--claim:hover {
   background: var(--accent-dim);
+}
+.canvas-editor-bar .editor-countdown {
+  font-variant-numeric: tabular-nums;
+}
+.canvas-editor-bar .editor-btn:disabled {
+  cursor: wait;
+  opacity: .55;
+}
+@media (pointer: coarse) {
+  .canvas-editor-bar .editor-btn {
+    min-height: 44px;
+  }
 }
 
 .canvas-controls {

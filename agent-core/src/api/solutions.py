@@ -994,12 +994,6 @@ async def apply(request: fastapi.Request, req: LoadRequest):
     if not req.confirm:
         return {'code': 428, 'error': '需要 confirm=true —— 载入会覆盖当前配置'}
 
-    conflict = _canvas_editor_conflict(req.session_id)
-    if conflict:
-        return {'code': 423,
-                'error': '有其他会话正在编辑画布，请先让对方退出编辑再载入',
-                'editor': conflict}
-
     token = _get_rc_token(request)
     loaded = await _load_solution(req, token)
     if not loaded.get('ok'):
@@ -1027,6 +1021,13 @@ async def apply(request: fastapi.Request, req: LoadRequest):
             return {'code': 409,
                     'error': '以下容器的版本还没对齐到方案记录的 tag，请先完成对齐',
                     'misaligned': misaligned}
+
+    # Recheck at the write boundary after the solution and device lookups.
+    conflict = _canvas_editor_conflict(req.session_id)
+    if conflict:
+        return {'code': 423,
+                'error': '有其他会话正在编辑画布，请先让对方退出编辑再载入',
+                'editor': conflict}
 
     applied: dict = {}
 
