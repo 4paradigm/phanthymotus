@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,6 +25,7 @@ from vision_stubs import (  # noqa: F401
 )
 
 import plugins.vop as vop_plugin  # noqa: E402
+from plugins.vop_tracking import _Track  # noqa: E402
 from plugins.vision_runtime import LetterboxMeta  # noqa: E402
 
 
@@ -238,6 +241,79 @@ def _node_with(plugin, executor):
     return executor.nodes[0]
 
 
+@pytest.mark.parametrize("class_filter, expected", [
+    ("box", ["box"]),
+    ("", ["box", "person"]),
+])
+def test_stream_class_filter(class_filter, expected):
+    plugin, executor = _plugin(model=_FakeModel(rows=[
+        [10, 10, 60, 60, 0.9, 0],
+        [100, 10, 150, 60, 0.85, 1],
+    ]))
+    plugin._vocabulary = ["box", "person"]
+    instance = {"instance_id": "test-card"}
+    plugin.dispatch("vop", {
+        **instance, "action": "config", "stream_class_filter": class_filter,
+        "publish_overlay": True,
+    })
+    plugin.dispatch("vop", {**instance, "action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    json_pub, image_pub = node.publishers
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+
+    assert _wait_until(lambda: bool(image_pub.messages))
+    objects = json.loads(json_pub.messages[0])["objects"]
+    assert [obj["name"] for obj in objects] == expected
+    assert len({obj["track_id"] for obj in objects}) == len(expected)
+
+
+def test_stream_suppresses_duplicate_geometry_and_overlapping_box_aliases():
+    plugin, executor = _plugin({"confidence": 0.2}, model=_FakeModel(rows=[
+        [11, 10, 61, 60, 0.26, 0],
+        [10, 10, 60, 60, 0.43, 1],
+        [10, 10, 60, 60, 0.25, 2],
+        [12, 10, 59, 60, 0.32, 2],
+        [100, 10, 150, 60, 0.65, 0],
+    ]))
+    plugin._vocabulary = ["box", "cardboard box", "book"]
+    node = _node_with(plugin, executor)
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+
+    json_pub = node.publishers[0]
+    assert _wait_until(lambda: bool(json_pub.messages))
+    objects = json.loads(json_pub.messages[0])["objects"]
+    assert [obj["name"] for obj in objects] == ["box", "book", "box"]
+    assert objects[0]["confidence"] == 0.43
+    assert len({obj["track_id"] for obj in objects}) == 3
+
+
+def test_box_whitelist_keeps_id_across_label_changes():
+    model = _FakeModel(rows=[[10, 10, 60, 60, 0.43, 1], [100, 10, 150, 60, 0.85, 2]])
+    plugin, executor = _plugin(model=model)
+    plugin._vocabulary = ["box", "cardboard box", "book"]
+    instance = {"instance_id": "test-card"}
+    plugin.dispatch("vop", {
+        **instance, "action": "config", "stream_class_filter": "box",
+        "confidence": 0.3, "fps": 10,
+    })
+    plugin.dispatch("vop", {**instance, "action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    messages = node.publishers[0].messages
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    assert _wait_until(lambda: len(messages) == 1)
+    first, = json.loads(messages[0])["objects"]
+    assert first["name"] == "box"
+    assert first["track_id"] == 1
+
+    model._output[0, 0, 5] = 0
+    time.sleep(0.11)
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    assert _wait_until(lambda: len(messages) == 2)
+    second, = json.loads(messages[1])["objects"]
+    assert second["name"] == "box"
+    assert second["track_id"] == first["track_id"]
+
+
 def test_objects_are_published_with_center_relative_coordinates():
     # 200x100 frame, box centered at (150, 25) → x_norm=+0.5, y_norm=-0.5
     plugin, executor = _plugin(model=_FakeModel())
@@ -318,8 +394,80 @@ def test_the_full_frame_path_publishes_decoded_objects():
     assert payload["objects"] == [
         {"name": "door", "position": [0.5, -0.5], "confidence": 0.9,
          "bbox": [100.0, 0.0, 200.0, 50.0],
-         "color": "black gray neutral", "brightness": 0.0}
+         "color": "black gray neutral", "brightness": 0.0, "track_id": 1}
     ]
+
+
+def test_vop_track_ids_follow_boxes_and_expire_after_missed_detections():
+    tracker = vop_plugin.VOPTracker()
+    left, right = (0, 0, 20, 20), (50, 0, 70, 20)
+
+    def update(now, boxes, scores, classes):
+        return tracker.update(np.array(boxes), np.array(scores), np.array(classes), now, 0.3)
+
+    assert update(0.0, [left, right], [0.9, 0.9], [1, 1]) == {0: 1, 1: 2}
+    assert update(0.2, [right, left], [0.9, 0.9], [1, 1]) == {0: 2, 1: 1}
+    for now in (0.4, 0.8, 1.2):
+        assert update(now, [right, left], [0.9, 0.2], [1, 1]) == {0: 2}
+    assert update(1.4, [right, left], [0.9, 0.9], [1, 1]) == {0: 2, 1: 1}
+    assert update(2.0, [right], [0.9], [1]) == {0: 2}
+    assert update(2.5, [right, left], [0.9, 0.9], [1, 1]) == {0: 2, 1: 3}
+    assert update(2.6, [right], [0.9], [2]) == {0: 4}
+
+
+def test_vop_reacquires_moving_object_at_predicted_position():
+    tracker = vop_plugin.VOPTracker()
+
+    def update(now, *positions):
+        boxes = np.array([(x, 0, x + 20, 20) for x in positions]).reshape(-1, 4)
+        return tracker.update(boxes, np.full(len(positions), 0.9),
+                              np.ones(len(positions)), now, 0.3)
+
+    for step in range(5):
+        assert update(step / 5, step * 8) == {0: 1}
+    assert update(1.0) == {}
+    assert update(1.2) == {}
+    assert update(1.4, 56) == {0: 1}  # No overlap with the last observed box at x=32.
+
+
+def test_vop_low_confidence_box_cannot_create_or_reactivate_a_track():
+    tracker = vop_plugin.VOPTracker()
+    box = np.array([[0, 0, 20, 20]])
+    classes = np.array([1])
+    assert tracker.update(box, np.array([0.2]), classes, 0.0, 0.3) == {}
+    assert tracker.update(box, np.array([0.9]), classes, 0.2, 0.3) == {0: 1}
+    assert tracker.update(box[:0], np.array([]), classes[:0], 0.4, 0.3) == {}
+    assert tracker.update(box, np.array([0.2]), classes, 1.0, 0.3) == {}
+    assert tracker.update(box, np.array([0.9]), classes, 1.4, 0.3) == {0: 2}
+
+
+def test_low_output_threshold_does_not_create_weak_tracks():
+    tracker = vop_plugin.VOPTracker()
+    boxes = np.array([[0, 0, 20, 20], [60, 0, 80, 20]])
+    classes = np.array([0, 0])
+    assert tracker.update(boxes, np.array([0.16, 0.27]), classes, 0.0, 0.1) == {}
+    assert tracker.update(boxes, np.array([0.70, 0.16]), classes, 0.1, 0.1) == {0: 1}
+    assert tracker.update(boxes, np.array([0.16, 0.16]), classes, 0.2, 0.1) == {0: 1}
+    assert tracker.update(boxes, np.array([0.70, 0.70]), classes, 0.3, 0.1) == {0: 1, 1: 2}
+
+
+def test_stream_omits_untracked_boxes_from_json_and_preview(monkeypatch):
+    model = _FakeModel(rows=[
+        [10, 10, 30, 30, 0.08, 0],
+        [40, 10, 60, 30, 0.18, 0],
+        [70, 10, 90, 30, 0.7, 0],
+    ])
+    plugin, executor = _plugin({"confidence": 0.05, "publish_overlay": True}, model)
+    node = _node_with(plugin, executor)
+    preview = []
+    monkeypatch.setattr(node, "_publish_overlay_frame",
+                        lambda frame, boxes, objects, header: preview.append((boxes.tolist(), objects)))
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    assert _wait_until(lambda: bool(preview))
+    boxes, objects = preview[0]
+    assert boxes == [[70.0, 10.0, 90.0, 30.0]]
+    assert json.loads(node.publishers[0].messages[0])["objects"] == objects
+    assert [obj["track_id"] for obj in objects] == [1]
 
 
 def test_low_confidence_detections_are_dropped():
@@ -332,6 +480,149 @@ def test_low_confidence_detections_are_dropped():
     pub = node.publishers[0]
     assert _wait_until(lambda: bool(pub.messages))
     assert json.loads(pub.messages[0])["objects"] == []
+
+
+@pytest.mark.parametrize("source_fps,target_fps,expected", [
+    (9, 10, 90), (15, 10, 100), (16, 10, 100),
+    (15, 15, 150), (16, 15, 150), (30, 15, 150),
+])
+def test_frame_throttle_keeps_its_rate_with_camera_jitter(
+        monkeypatch, source_fps, target_fps, expected):
+    import math
+
+    now = 10.0
+    monkeypatch.setattr(
+        vop_plugin, "time", SimpleNamespace(time=time.time, monotonic=lambda: now)
+    )
+    node = vop_plugin._VOPNode(
+        "/cam/rgb", _FakeModel(), confidence=0.3, fps=target_fps, node_suffix="frame_throttle"
+    )
+    message = _FakeCompressedImage()
+    accepted = 0
+    for index in range(source_fps * 10):
+        now = 10 + index / source_fps + 0.0015 * math.sin(index * 2.4)
+        node._image_cb(message)
+        if not node._frame_queue.empty():
+            assert node._frame_queue.get_nowait() is message
+            accepted += 1
+    assert expected - 1 <= accepted <= expected + 1
+
+
+@pytest.mark.parametrize("width,height,preview_width,preview_height", [
+    (200, 100, 200, 100),
+    (1600, 800, 960, 480),
+])
+def test_stream_can_publish_tracking_preview_with_bboxes_disabled(
+        width, height, preview_width, preview_height):
+    import cv2
+
+    plugin, executor = _plugin(
+        {"publish_overlay": True, "publish_bbox": False},
+        model=_FakeModel(rows=[[40, 40, 100, 90, 0.9, 1]]),
+    )
+    node = _node_with(plugin, executor)
+    source = _FakeCompressedImage(frame_bytes(width, height))
+    source.header.stamp = 123456
+    source.header.frame_id = "camera_rgb_optical_frame"
+    node._image_cb(source)
+    json_pub, image_pub = node.publishers
+    assert _wait_until(lambda: bool(image_pub.raw_messages))
+    assert image_pub.raw_messages[0].header.stamp == 123456
+    assert image_pub.raw_messages[0].header.frame_id == "camera_rgb_optical_frame"
+    detected = json.loads(json_pub.messages[0])["objects"][0]
+    assert detected["track_id"] == 1
+    assert "bbox" not in detected
+    assert image_pub.topic == json_pub.topic + "/overlay_img"
+    info = plugin.dispatch("vop", {"action": "info"})
+    assert info["topic_out"][1] == {"topic": image_pub.topic, "format": "image/jpeg"}
+    jpeg = image_pub.messages[0]
+    image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert image.shape == (preview_height, preview_width, 3)
+    # The label touches the top edge. Its text rasterization and JPEG
+    # artifacts differ across OpenCV builds, so check the unobstructed edge.
+    y = round(90 * preview_height / height)
+    x0, x1 = (round(x * preview_width / width) for x in (48, 93))
+    bottom_edge = image[y - 2:y + 3, x0:x1]
+    assert np.count_nonzero(bottom_edge.max(axis=2) > 100) >= x1 - x0
+
+
+def test_independent_track_filter_matches_the_dense_kalman_update():
+    box = np.array([10., 20., 60., 100.])
+    track = _Track(box, class_id=0, now=0.0)
+    mean = np.array([35., 60., 50., 80., 0., 0., 0., 0.])
+    covariance = np.diag([8. ** 2] * 4 + [80. ** 2] * 4)
+    identity = np.eye(8)
+    observe = identity[:4]
+    previous = 0.0
+    for now, offsets in [(0.15, [4, 3, 7, 1]), (0.5, [11, -2, 8, 4]), (1.0, [21, 1, 19, 7])]:
+        dt = now - previous
+        transition = identity.copy()
+        transition[:4, 4:] = np.eye(4) * dt
+        acceleration = np.vstack((np.eye(4) * (dt ** 2 / 2), np.eye(4) * dt))
+        covariance = transition @ covariance @ transition.T + mean[3] ** 2 * (
+            acceleration @ acceleration.T
+        )
+        mean = transition @ mean
+        track.predict(now)
+        np.testing.assert_allclose(track.mean, mean, atol=1e-10)
+
+        observed_box = box + offsets
+        measurement = np.r_[(observed_box[:2] + observed_box[2:]) / 2,
+                            observed_box[2:] - observed_box[:2]]
+        noise = np.eye(4) * (0.05 * measurement[3]) ** 2
+        cross = covariance @ observe.T
+        gain = np.linalg.solve(observe @ cross + noise, cross.T).T
+        mean += gain @ (measurement - observe @ mean)
+        residual = identity - gain @ observe
+        covariance = residual @ covariance @ residual.T + gain @ noise @ gain.T
+        track.correct(observed_box, now)
+        np.testing.assert_allclose(track.mean, mean, atol=1e-10)
+        np.testing.assert_allclose(track._position_variance, covariance.diagonal()[:4])
+        np.testing.assert_allclose(track._velocity_variance, covariance.diagonal()[4:])
+        np.testing.assert_allclose(track._position_velocity_covariance, covariance[:4, 4:].diagonal())
+        previous = now
+
+
+def test_info_declares_overlay_for_configured_instance_before_start():
+    plugin, _ = _plugin()
+    plugin.dispatch("vop", {
+        "action": "config", "instance_id": "preview-card", "publish_overlay": True,
+    })
+    base = {"action": "info", "input_topic": "/cam/rgb"}
+    preview = plugin.dispatch("vop", dict(base, instance_id="preview-card"))
+    plain = plugin.dispatch("vop", dict(base, instance_id="other-card"))
+    assert preview["state"] == "idle"
+    assert preview["instances"] == {}
+    assert plain["topic_out"] == [{"topic": "/cam/rgb/objects", "format": "data/json"}]
+    assert preview["topic_out"] == plain["topic_out"] + [
+        {"topic": "/cam/rgb/objects/overlay_img", "format": "image/jpeg"},
+    ]
+
+
+def test_stream_uses_weak_boxes_without_publishing_them(monkeypatch):
+    frame_time = 10.0
+    monkeypatch.setattr(
+        vop_plugin, "time", SimpleNamespace(time=time.time, monotonic=lambda: frame_time)
+    )
+    model = _FakeModel(rows=[[0, 0, 20, 20, 0.9, 1]])
+    plugin, executor = _plugin(model=model)
+    node = _node_with(plugin, executor)
+    pub = node.publishers[0]
+    frame = _FakeCompressedImage(frame_bytes(200, 100))
+
+    def publish_frame(x, score):
+        nonlocal frame_time
+        frame_time += 0.25
+        model._output[0, 0] = [x, 0, x + 20, 20, score, 1]
+        expected = len(pub.messages) + 1
+        node._image_cb(frame)
+        assert _wait_until(lambda: len(pub.messages) >= expected)
+        return json.loads(pub.messages[-1])["objects"]
+
+    assert publish_frame(0, 0.9)[0]["track_id"] == 1
+    for x in range(4, 25, 4):
+        assert publish_frame(x, 0.2) == []
+    assert publish_frame(28, 0.9)[0]["track_id"] == 1
 
 
 # ── discoverability ──────────────────────────────────────────────────────────
