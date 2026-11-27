@@ -70,6 +70,15 @@ def test_route_turning_horizon_does_not_change_the_braking_room_limit():
     assert command[2] == pytest.approx(2 * previous[2])
 
 
+@pytest.mark.parametrize("right", [-.13, .13])
+def test_route_pursuit_steers_when_its_sideways_component_is_below_the_floor(right):
+    choice = _run(((0., 0.), (1.6, right)), lateral=True, follow_published=True,
+                  floors=(.08, .12, .5, .20))
+    assert choice is not None and choice.check.accepted
+    vx, vy, yaw = choice.command
+    assert vx > 0. and vy == 0. and yaw * right < 0.
+
+
 @pytest.mark.parametrize("bearing", [-.44, .44])
 def test_lateral_detour_reserves_view_before_turning_away_from_person(bearing):
     lower, upper = dwa.view_yaw_limits((-.6, .6), bearing, .8, 2.4, protect_person_view=True)

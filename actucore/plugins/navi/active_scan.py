@@ -677,13 +677,15 @@ class ActiveScan:
                     if gap_speed_bounds is not None and received - last_stamp > self.max_feedback_gap_ms:
                         return self._hold_for_short_gap(samples, gap_speed_bounds)
                     return self._hold_for_feedback_gap()
-            if not 0 < received - last_stamp <= self.max_feedback_gap_ms:
+            if not 0 <= received - last_stamp <= self.max_feedback_gap_ms:
                 return self._hold_for_feedback_gap()
             intervals.append((received, velocity, (received - last_stamp) / 1000))
             last_stamp, last_source, last_motion = received, identity, velocity
         for received, velocity, dt in intervals:
-            self._integrate_motion(velocity, dt)
-            self.poses.append((received, self.pose, velocity[2]))
+            # Two newer producer samples can share a millisecond of receipt.
+            if dt:
+                self._integrate_motion(velocity, dt)
+                self.poses.append((received, self.pose, velocity[2]))
         if intervals:
             self.odom_source, self.motion = last_source, last_motion
         tolerance = self.odom_linear_tolerance_mps

@@ -434,7 +434,7 @@ def view_yaw_limits(limits, bearing, half_fov, horizon, *, protect_person_view=F
 
 
 def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None, yaw_floor=0.,
-                view_bearing=None, steering_horizon=None):
+                lateral_floor=0., view_bearing=None, steering_horizon=None):
     """Track the finite visible polyline in the current forward/right grid."""
     segments = _route_segments(points)
     remaining = remaining_route_length(points, segments=segments)
@@ -456,6 +456,9 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
         speed = min(speed, yaw_cap * (f * f + r * r) / (2. * abs(r)))
     turn_horizon = horizon if steering_horizon is None else steering_horizon
     vx, vy, wz = _preferred_command(((0., 0.), (f, r)), speed, turn_horizon, yaw_limit, differential=not lateral)
+    if 0. < abs(vy) < lateral_floor:
+        # Keep the planned steering without asking for an unusable sidestep.
+        vy = 0.
     if 0. < abs(wz) < yaw_floor:
         # A lateral offset resolved by the grid needs steering, even at low speed.
         minimum = math.copysign(yaw_floor, wz)
@@ -722,7 +725,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 break
             tracked = track_route(points, x_speed * scale, horizon, steering,
                                   body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
-                                  yaw_floor=floors[3], view_bearing=view_bearing, steering_horizon=steering_horizon)
+                                  yaw_floor=floors[3], lateral_floor=floors[1],
+                                  view_bearing=view_bearing, steering_horizon=steering_horizon)
             if tracked is None:
                 break
             command, room = tracked

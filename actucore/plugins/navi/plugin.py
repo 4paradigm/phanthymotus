@@ -312,6 +312,7 @@ class _ForwardCheck:
     camera_passage: policy_mod.CameraPassage | None = None
     target_source_ms: int | None = None
     straight_handoff: policy_mod.DwaAcceptance | None = None
+    straight_forward: bool = False
 
     def matches_target_receipt(self, receipt_ms):
         return (self.planning_guard.association is None or self.target_source is not None
@@ -2251,9 +2252,11 @@ class NaviPlugin:
             return None
         acceptance = decision.dwa_acceptance
         motion_guard = acceptance.motion_guard if acceptance is not None else None
-        squares = scan.near_squares
-        remembered = scan.historical_hits if squares is not None else scan.remembered_hits
-        if remembered is None and squares is None and (scan.obstacles.has_occupied or scan.near_obstacles.has_occupied):
+        squares = None if straight_distance else scan.near_squares
+        remembered = (None if straight_distance else
+                      scan.historical_hits if squares is not None else scan.remembered_hits)
+        if (not straight_distance and remembered is None and squares is None
+                and (scan.obstacles.has_occupied or scan.near_obstacles.has_occupied)):
             if motion_guard is None or scan.obstacles.has_occupied:
                 return None
             # Retained near cells can be outside the current finite grid.
@@ -2276,7 +2279,7 @@ class NaviPlugin:
                 geometry is config.local_geometry and scan.views[-1][0] == depth["frame_id"]
                 and scan.matches_route_view(depth)):
             occupied = scan.views[-1][3]
-        if straight_handoff is not None or probe or (motion_guard is not None and target_source is None):
+        if straight_distance or probe or (motion_guard is not None and target_source is None):
             renewable = False
         depth_ms = depth_mod.observation_ms(depth)
         if motion_guard is not None and scan.current_frame:
@@ -2321,7 +2324,7 @@ class NaviPlugin:
                 passage = policy_mod.CameraPassage(state.view_detour, occupied, capture,
                                                     track.generation if track else None, state.view_detour.corridor_corner)
         return _ForwardCheck(geometry, depth["frame_id"], depth.get("source_frame_id"),
-                             objects_ms, straight_distance if straight_handoff is not None else decision.distance_m,
+                             objects_ms, straight_distance or decision.distance_m,
                              previous_twist, mount_frame,
                              (odom or {}).get("source_sample_id"), (odom or {}).get("received_ms"),
                              remembered, memory_ms, occupied, squares,
@@ -2337,7 +2340,7 @@ class NaviPlugin:
                                  and motion_guard.association is not None and target_source is not None
                                  and target_source == motion_guard.association.source) else None,
                              direct_association, camera_passage=passage, target_source_ms=fix.capture_ms if fix else None,
-                             straight_handoff=straight_handoff)
+                             straight_handoff=straight_handoff, straight_forward=straight_distance is not None)
 
     def _registered_dwa_scene(self, check, depth, odom, now_ms, depth_ms, geometry, twists, *, scan, sources,
                               anchor_changed):
@@ -4712,13 +4715,14 @@ class NaviPlugin:
         best = None
         best_cost = math.inf
         swept_into_obstacle = False
+        lateral_floor, _ = policy_mod._local_velocity_limits(cfg, 1.)[1]
         for steering, scale in dwa.pursuit_options(yaw_limit, cfg.use_lateral):
             if steering != yaw_limit and (best is not None or not swept_into_obstacle):
                 break
             tracked = dwa.track_route(
                 points, nominal * scale, original.prediction_horizon_s, steering,
                 body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral,
-                yaw_floor=cfg.floor_wz_moving, view_bearing=view_bearing,
+                yaw_floor=cfg.floor_wz_moving, lateral_floor=lateral_floor, view_bearing=view_bearing,
                 steering_horizon=cfg.dwa_horizon_s if camera_detour and check.geometry.front == 0. else None)
             if tracked is None:
                 break
@@ -5476,9 +5480,16 @@ class NaviPlugin:
                 now_ms = int(time.time() * 1000)
                 snapshot = self._observation_snapshot(with_capture_timing=True)
                 straight_handoff = check.straight_handoff
-                front_blocked = straight_handoff is not None and message["values"][0] > policy_mod.straight_handoff_speed(
+                front_blocked = False
+                if check.straight_forward:
+                    cap = policy_mod.straight_handoff_speed(
                         snapshot[1], self._config, check.distance_m,
                         odom_mod.planar_feedback(snapshot[2]), self._wire_twist or check.previous_twist)
+                    if cap < message["values"][0]:
+                        values = [cap, *message["values"][1:]]
+                        front_blocked = cap <= 0. or policy_mod.apply_deadband(values, self._deadband_for(values)) != values
+                        if not front_blocked:
+                            message = dict(message, values=values)
                 if front_blocked or self._outgoing_person_standoff(check, message["values"], now_ms,
                                                   message["stamp_ms"] + message["ttl_ms"],
                                                   snapshot):

@@ -1412,6 +1412,55 @@ def test_detour_only_locks_an_inbound_first_half():
         assert policy._detour_still_locked(route, dwa.remaining_route_length(points), 4., 0.) == expected
 
 
+def test_straight_handoff_publishes_slower_speed_when_clearance_shrinks(monkeypatch):
+    from plugins.navi import policy
+
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    monkeypatch.setattr(policy, "_detour_still_locked", lambda *args: False)
+    advance_snapshot(snapshot, clock, 1100, vx=0.)
+    objects, depth, odom, _ = snapshot[0]
+    depth["map"].fill(5.)
+    snapshot[0] = dict(objects, timestamp=1.1), depth, odom, 1100
+    message = card.next_command()
+    assert message["values"][0] > 0.
+
+    advance_snapshot(snapshot, clock, 1110, vx=0.)
+    depth = snapshot[0][1]
+    depth["map"][220:370, 302:338] = card._config.obstacle_stop_m + .1
+    cap = policy.straight_handoff_speed(depth, card._config, card._last_decision.distance_m,
+                                        (0., 0., 0.), card._wire_twist)
+    assert 0. < cap < message["values"][0]
+    assert card._stage_command(message, card._output_epoch)
+    assert 0. < packets[-1]["values"][0] <= cap
+    assert packets[-1]["values"][1:] == [0.] * 5
+    assert packets[-1]["stamp_ms"] + packets[-1]["ttl_ms"] <= message["stamp_ms"] + message["ttl_ms"]
+    assert card._state.committed_route is None
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_only_a_clear_forward_corridor_can_bypass_unregistered_near_memory(monkeypatch, blocked):
+    card, packets, _, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    scan = card._state.active_scan
+    scan.use_obstacle_history = False
+    scan.near_obstacles.frame = ("navi_relative", object())
+    scan.near_obstacles.cells.add((5, 0))
+    snapshot[0][1]["map"].fill(5.)
+    if blocked:
+        snapshot[0][1]["map"][220:370, 302:338] = .25
+
+    message = card.next_command()
+    assert message is not None
+    assert card._stage_command(message, card._output_epoch)
+    assert (packets[-1]["values"][0] > 0.) is not blocked
+    assert packets[-1]["values"][1:] == [0.] * 5
+    assert scan.near_obstacles.cells
+
+
 def test_straight_handoff_slowing_uses_depth_source_and_control_times(monkeypatch):
     from plugins.navi import policy
 

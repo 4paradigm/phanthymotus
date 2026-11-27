@@ -489,6 +489,20 @@ def test_tianyi_buffered_turn_tolerates_a_short_feedback_gap():
     assert look.sync_buffered_motion(history, 1681)[1]
 
 
+def test_buffered_odom_keeps_its_frame_when_two_new_samples_share_a_receipt_ms():
+    look = scan.ActiveScan(receipt_only=True, buffered_odom=True, keep_physical_views=True)
+    look.poses.append((1000, look.pose, 0.))
+    look.odom_source = 990
+    frame = look.motion_frame
+    history = [(1100, 1084, (.2, 0., 0.)), (1100, 1090, (.3, 0., 0.))]
+
+    assert look.sync_buffered_motion(history, 1100) is None
+    assert look.motion_frame is frame
+    assert look.pose == pytest.approx((.02, 0., 0.))
+    assert look.motion == (.3, 0., 0.) and look.odom_source == 1090
+    assert [stamp for stamp, _, _ in look.poses] == [1000, 1100]
+
+
 @pytest.mark.parametrize("planning_ms,expected_ttl", [(282, 242), (399, 125), (400, 0)])
 def test_legacy_slow_first_buffered_turn_uses_unspent_observation_budget(monkeypatch, planning_ms, expected_ttl):
     from plugins.navi import plugin

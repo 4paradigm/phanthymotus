@@ -2198,6 +2198,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 # still comes from the newest exposure.
                 scan.near_free = None
             if near_hold is not None:
+                if not config.use_obstacle_history and not corner:
+                    straight = _straight_handoff(depth, config, state, published, None)
+                    if straight is not None:
+                        vx, vy, wz, status, reason = straight
+                        return Decision(_twist(vx, vy, wz), status, reason,
+                                        distance_m=state.dwa_trace["straight_handoff"])
                 return Decision(_twist(0., 0., 0.), AVOIDING, near_hold.reason)
         if scan.gap_recheck is not None:
             return Decision(_twist(0., 0., 0.), AVOIDING,
@@ -2533,6 +2539,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         dt=dt, desired_forward=speed if driving else 0.)
     if (person_approach and live and distance is not None and status == APPROACHING and vx > 0.
             and config.use_lateral and geometry.front == 0. and not scan.command_only
+            and not state.dwa_trace.get("straight_handoff")
             and not state.dwa_selected and not state.camera_arc_selected and state.executing_leg is None):
         # Near arrival, a proportional range request alone cannot account
         # for the current motion and the time the driver can hold the packet.
@@ -4096,7 +4103,7 @@ def _use_dwa(state, proposal, side):
 def _straight_handoff(depth, config, state, route, approach_speed):
     track = state.tracker.track
     if (track is None or not track.observed or not track.navigation_range_known
-            or track.generation != route.motion_guard.generation
+            or (route is not None and track.generation != route.motion_guard.generation)
             or abs(track.bearing_rad) > config.align_tol * config.half_fov_rad):
         return None
     distance = track.measured_range_m
@@ -4111,7 +4118,8 @@ def _straight_handoff(depth, config, state, route, approach_speed):
     vx = min(approach_speed, limit, cap)
     if vx > 0. and vx >= floor:
         state.dwa_trace["straight_handoff"] = distance
-        return vx, 0., 0., APPROACHING, "绕行结束，沿目标方向直行"
+        reason = "沿目标方向直行" if route is None else "绕行结束，沿目标方向直行"
+        return vx, 0., 0., APPROACHING, reason
     return None
 
 
@@ -4805,19 +4813,19 @@ class CameraPassage:
 def camera_route_command(route, config, target, nominal, previous, residual, admission,
                          *, occupied, require_turn):
     geometry = route.geometry
-    (floor_x, max_x), _ = _local_velocity_limits(config, 1.)
+    (floor_x, max_x), (floor_y, _) = _local_velocity_limits(config, 1.)
     yaw_limits = (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
     nominal = min(nominal, max_x)
     lookahead = max(.45, nominal * config.dwa_horizon_s)
     for scale in (1., .75, .5, .25):
         tracked = dwa.track_route(route.points, nominal * scale, config.dwa_horizon_s,
                                   yaw_limits, body_origin=(0., 0.), lateral=config.use_lateral,
-                                  lookahead_m=lookahead, yaw_floor=config.floor_wz_moving)
+                                  lookahead_m=lookahead, yaw_floor=config.floor_wz_moving, lateral_floor=floor_y)
         if tracked is None:
             break
         command, room = tracked
         cx, cy, yaw = command
-        (floor_y, max_y) = _local_velocity_limits(config, -1. if cy > 0. else 1.)[1]
+        _, max_y = _local_velocity_limits(config, -1. if cy > 0. else 1.)[1]
         if (cx <= 0. or cx < floor_x or (cy and not floor_y <= abs(cy) <= max_y)
                 or (yaw and not yaw_limits[0] <= yaw <= yaw_limits[1]) or (require_turn and not (cy or yaw))):
             continue
@@ -5106,6 +5114,11 @@ def _avoid(vx, vy, wz, depth, config: Config, status, reason, state=None,
                 corridor_clear = _target_corridor_clear(depth, config, scan, target_distance, target_bearing)
             needs_detour = not corridor_clear
             if path_clear and (needs_detour or checked_approach) and not continuing_detour:
+                if (state.target == "person" and config.local_controller == "dwa"
+                        and not config.use_obstacle_history and not scan.command_only):
+                    straight = _straight_handoff(depth, config, state, None, vx or desired_forward)
+                    if straight is not None:
+                        return straight
                 if (max(vx, desired_forward) > 0. and not scan.command_only and track is not None
                         and (track.observed or last_seen_range)):
                     route = Detour(None, ((0., 0.), target), geometry)
