@@ -536,7 +536,12 @@ One browser session edits a canvas at a time. If someone is already editing,
 another session can request a takeover from the canvas toolbar. The editor can hand
 over the latest saved layout, save the current layout and hand it over in one step,
 or decline. After 15 seconds without a response, the requester receives edit access
-and loads the latest saved layout.
+and loads the requested layout.
+
+When requesting a takeover, choose the current canvas or your own saved cards.
+Use **Save my cards** while editing to save the cards and connections in the
+current browser for that robot. A personal layout can replace the shared layout
+once edit access is granted and intelligent control has stopped.
 
 ### Real-Time Monitoring
 

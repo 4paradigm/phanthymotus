@@ -7,6 +7,8 @@ configuration in the SQLite config table.
 Includes editor lock: only one session can edit at a time.
 """
 
+from __future__ import annotations
+
 import asyncio
 from dataclasses import dataclass
 import json
@@ -65,6 +67,7 @@ class _Takeover:
     id: str
     requester: str
     deadline: float
+    layout: CanvasSnapshot | None = None
 
 
 _takeover: _Takeover | None = None
@@ -98,6 +101,7 @@ def _editor_state() -> dict:
         'editor_generation': _editor_generation,
         'takeover': ({
             'id': request.id, 'requester': request.requester,
+            'layout_source': 'personal' if request.layout is not None else 'shared',
             'remaining_seconds': max(0, math.ceil(request.deadline - time.monotonic())),
         } if request else None),
         'takeover_result': _takeover_result,
@@ -130,8 +134,17 @@ def _settle_takeover(outcome: str, *, grant: bool = False, release_reason: str =
     request = _takeover
     if request is None:
         return
+    if grant and request.layout is not None:
+        if _can_apply_personal_layout():
+            _apply_personal_layout(request.layout, request.requester)
+        else:
+            grant = False
+            outcome = 'takeover_layout_locked'
     _takeover = None
-    _takeover_result = {'id': request.id, 'requester': request.requester, 'outcome': outcome}
+    _takeover_result = {
+        'id': request.id, 'requester': request.requester, 'outcome': outcome,
+        'layout_source': 'personal' if request.layout is not None else 'shared',
+    }
     if grant:
         _set_editor(request.requester, outcome)
     elif release_reason:
@@ -144,7 +157,7 @@ def _release_editor(reason: str) -> None:
     if _takeover is None:
         _set_editor(None, reason)
     elif _requester_present(_takeover):
-        _settle_takeover('takeover_released', grant=True)
+        _settle_takeover('takeover_released', grant=True, release_reason=reason)
     else:
         _settle_takeover('takeover_cancelled', release_reason=reason)
 
@@ -312,11 +325,14 @@ def tool_config_key(mcp_id: str, tool_name: str, instance_id: str = '') -> str:
 
 
 
-class CanvasLayout(BaseModel):
+class CanvasSnapshot(BaseModel):
     cards:           list  = []
     connections:     list  = []
     execConnections: list  = []
     transform:       dict  = {}
+
+
+class CanvasLayout(CanvasSnapshot):
     session_id:      Optional[str] = None
     editor_generation: int | None = None
     editor_instance: str | None = None
@@ -324,6 +340,7 @@ class CanvasLayout(BaseModel):
 
 class TakeoverRequest(BaseModel):
     session_id: str
+    layout: CanvasSnapshot | None = None
 
 
 class TakeoverResponse(BaseModel):
@@ -372,14 +389,18 @@ async def request_takeover(body: TakeoverRequest):
         return _editor_conflict('Invalid canvas session.', 400)
     if _editor_session == session:
         return {'code': 200, **_editor_state()}
+    if body.layout is not None and not _can_apply_personal_layout():
+        return _editor_conflict('Stop intelligent control before applying a personal layout.')
     if _editor_session is None:
-        _set_editor(session, 'claim')
+        if body.layout is not None:
+            _apply_personal_layout(body.layout, session)
+        _set_editor(session, 'takeover_personal' if body.layout is not None else 'claim')
         return {'code': 200, **_editor_state()}
     if _takeover:
         if _takeover.requester == session:
             return {'code': 200, **_editor_state()}
         return _editor_conflict('Another takeover request is pending.')
-    _takeover = _Takeover(uuid4().hex, session, time.monotonic() + _TAKEOVER_TIMEOUT)
+    _takeover = _Takeover(uuid4().hex, session, time.monotonic() + _TAKEOVER_TIMEOUT, body.layout)
     _takeover_result = None
     asyncio.get_running_loop().call_later(_TAKEOVER_TIMEOUT, _takeover_timeout, _takeover.id)
     _broadcast_editor('takeover_requested')
@@ -410,8 +431,11 @@ async def respond_takeover(body: TakeoverResponse):
                     layout.session_id, layout.editor_generation, layout.editor_instance,
                 ):
                     return _editor_conflict('Not the current editor.', 403)
-                old_cards = _store_layout(layout)
+                if request.layout is None:
+                    old_cards = _store_layout(layout, body.session_id)
             _settle_takeover('takeover_approved', grant=True)
+            if _editor_session != request.requester:
+                return _editor_conflict('Stop intelligent control before applying a personal layout.')
         else:
             _settle_takeover('takeover_denied')
     else:
@@ -497,20 +521,29 @@ async def save_layout(layout: CanvasLayout):
 
     _editor_last_seen = time.monotonic()
 
-    old_cards = _store_layout(layout)
+    old_cards = _store_layout(layout, session_id)
     # An instance removed from the saved layout won't be found by stop-project.
     from api.config import stop_removed_cards
     await stop_removed_cards(old_cards, layout.cards)
     return {'code': 200}
 
 
-def _store_layout(layout: CanvasLayout) -> list:
+def _store_layout(layout: CanvasSnapshot, session_id: str) -> list:
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = layout.model_dump(
-        exclude={'session_id', 'editor_generation', 'editor_instance'},
-    )
-    notify_layout_changed(layout.session_id or '')
+    config.main['canvas_layout'] = layout.model_dump(include=set(CanvasSnapshot.model_fields))
+    notify_layout_changed(session_id)
     return old_cards
+
+
+def _can_apply_personal_layout() -> bool:
+    from api.config import canvas_replacement_allowed
+    return canvas_replacement_allowed()
+
+
+def _apply_personal_layout(layout: CanvasSnapshot, requester: str) -> None:
+    from api.config import stop_removed_cards
+    old_cards = _store_layout(layout, requester)
+    asyncio.get_running_loop().create_task(stop_removed_cards(old_cards, layout.cards))
 
 
 # ── Per-tool config CRUD ─────────────────────────────────────────────────────
