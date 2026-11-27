@@ -224,6 +224,106 @@ def test_info_while_loading_surfaces_download_progress():
     assert "ovdeim-m-768" in fallback["desc"]
 
 
+def test_one_shot_cold_load_exposes_download_progress_in_info(monkeypatch, tmp_path):
+    """A cold recognize_by_photo download must report state=loading + live progress in info()."""
+    import plugins.vision_runtime as vr
+
+    img_path = tmp_path / "scene.jpg"
+    img_path.write_bytes(frame_bytes(64, 64))
+
+    plugin, _ = _plugin(cfg={"model": "ovdeim-m-768", "image_roots": [str(tmp_path)]})
+    plugin._model = None
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_resolve():
+        plugin._model_load_status = "Downloading ovdeim-m-768: 55% (25 / 45 MB)"
+        entered.set()
+        assert release.wait(timeout=5.0)
+        return "/tmp/fake.engine", ["person", "cup"]
+
+    fake_session = _FakeModel(rows=[(10, 10, 40, 40, 0.9, 0)])
+    fake_session.class_names = lambda: ["person", "cup"]
+
+    monkeypatch.setattr(plugin, "_resolve_engine", slow_resolve)
+    monkeypatch.setattr(vr, "VisionEngineSession", lambda path: fake_session)
+
+    box = {}
+
+    def run_photo():
+        box["reply"] = plugin.dispatch("vop", {
+            "action": "recognize_by_photo",
+            "image_path": str(img_path),
+        })
+
+    worker = threading.Thread(target=run_photo, daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(timeout=5.0)
+        info = plugin.dispatch("vop", {"action": "info"})
+        assert info["state"] == "loading"
+        assert "55%" in info["desc"]
+        assert "ovdeim-m-768" in info["desc"]
+
+        # A concurrent model switch during the one-shot load must be refused.
+        refused = plugin.dispatch("vop", {"action": "config", "model": "yoloe-26s-seg"})
+        assert refused["status"] == "error"
+        assert plugin._model_name == "ovdeim-m-768"
+    finally:
+        release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert box["reply"]["ok"] is True
+    assert box["reply"]["count"] == 1
+    after = plugin.dispatch("vop", {"action": "info"})
+    assert after["state"] == "idle"
+
+
+def test_switch_does_not_retire_nodes_when_refused_and_blocks_concurrent_load(monkeypatch):
+    """A rejected switch must leave running instances intact, and a switch that
+    claims teardown must not be preempted into a destructive partial failure."""
+    plugin, executor = _plugin(model=_FakeModel())
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    assert len(executor.nodes) == 1
+
+    # Case 1: load already in progress -> refused with zero nodes retired.
+    plugin._model_loading = True
+    refused = plugin.dispatch("vop", {"action": "config", "model": "ovdeim-m-768"})
+    assert refused["status"] == "error"
+    assert len(executor.nodes) == 1
+    assert "/cam/rgb" in plugin._nodes
+    plugin._model_loading = False
+
+    # Case 2: a concurrent start/load arrives mid-teardown -> switch still
+    # completes cleanly without returning an error after retiring /cam/rgb.
+    orig_retire = plugin._retire_node
+    concurrent_results = {}
+
+    def retire_with_concurrent_load(key):
+        res = orig_retire(key)
+        concurrent_results["start"] = plugin.dispatch(
+            "vop", {"action": "start", "input_topic": "/cam/other"}
+        )
+        try:
+            plugin._model = None
+            plugin._ensure_model()
+            concurrent_results["ensure"] = "loaded"
+        except RuntimeError as exc:
+            concurrent_results["ensure"] = str(exc)
+        return res
+
+    monkeypatch.setattr(plugin, "_retire_node", retire_with_concurrent_load)
+    reply = plugin.dispatch("vop", {"action": "config", "model": "ovdeim-m-768"})
+    assert reply["status"] == "configured"
+    assert reply["model"] == "ovdeim-m-768"
+    assert reply["stopped_instances"] == ["/cam/rgb"]
+    assert concurrent_results["start"]["state"] == "loading"
+    assert "switch in progress" in concurrent_results["ensure"]
+    assert plugin._nodes == {}
+
+
 # ── frozen vocabulary ────────────────────────────────────────────────────────
 
 def test_set_classes_is_refused_with_the_vocabulary_named():

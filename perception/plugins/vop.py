@@ -617,12 +617,19 @@ class VideoObjectPerceptionPlugin:
         self._vocabulary: list[str] = []      # filled from the bundle's vocab.json
         self._model = None  # lazy load
         self._model_loading = False
+        self._model_switching = False
         self._model_load_error = None
         # The downloader's progress line while the engine bundle is being
         # fetched; None once it is in. Read by the "loading" replies below, so a
         # cold start reports how far along it is instead of a fixed sentence.
         self._model_load_status = None
+        # `_model_lock` serializes single-flight engine loading;
+        # `_model_state_lock` guards only fast in-memory state transitions
+        # (`_model`, `_model_name`, `_model_loading`, `_model_switching`,
+        # `_model_load_error`, `_model_load_status`, `_vocabulary`) and is never
+        # held across downloads, engine init, or `_retire_node()`.
         self._model_lock = threading.Lock()
+        self._model_state_lock = threading.Lock()
         self._nodes: dict[str, _VOPNode] = {}
         self._instance_configs: dict[str, dict] = {}  # per-instance config overrides
         # What the camera feeding each instance said about its optics
@@ -686,7 +693,7 @@ class VideoObjectPerceptionPlugin:
             )
             vocab = self._read_vocab(paths.get("vocab.json"))
             # The model may have been switched while this was downloading.
-            with self._model_lock:
+            with self._model_state_lock:
                 if vocab and not self._vocabulary and model == self._model_name:
                     self._vocabulary = vocab
                     log.info(f"[vop] vocabulary available before load: {len(vocab)} classes")
@@ -702,32 +709,37 @@ class VideoObjectPerceptionPlugin:
         model's detections under the new model's name.
         """
         name = canonical_model_name(str(requested))
-        if name not in VOP_MODELS:
-            return {"status": "error", "model": self._model_name,
-                    "message": f"Unknown vop model {requested!r}; "
-                               f"available: {', '.join(VOP_MODELS)}"}
-        if name == self._model_name:
-            return {"model": name}
-        if self._model_loading:
-            return {"status": "error", "model": self._model_name,
-                    "message": f"model {self._model_name!r} is still loading; "
-                               "retry the switch once it has finished"}
-        with self._nodes_lock:
-            keys = list(self._nodes)
-        for key in keys:
-            self._retire_node(key)
-        # The old engine is dropped, not closed: a one-shot recognize on another
-        # thread may still hold it mid-infer, and it is freed with that last
-        # reference.
-        with self._model_lock:
-            if self._model_loading:
+        with self._model_state_lock:
+            if name not in VOP_MODELS:
+                return {"status": "error", "model": self._model_name,
+                        "message": f"Unknown vop model {requested!r}; "
+                                   f"available: {', '.join(VOP_MODELS)}"}
+            if name == self._model_name:
+                return {"model": name}
+            if self._model_loading or self._model_switching:
                 return {"status": "error", "model": self._model_name,
                         "message": f"model {self._model_name!r} is still loading; "
                                    "retry the switch once it has finished"}
-            self._model = None
-            self._model_name = name
-            self._model_load_error = None
-            self._vocabulary = []
+            # Claim the switch before retiring any node so no concurrent load or
+            # start can sneak in mid-teardown and turn a refused switch into a
+            # destructive side effect.
+            self._model_switching = True
+        try:
+            with self._nodes_lock:
+                keys = list(self._nodes)
+            for key in keys:
+                self._retire_node(key)
+            # The old engine is dropped, not closed: a one-shot recognize on
+            # another thread may still hold it mid-infer, and it is freed with
+            # that last reference.
+            with self._model_state_lock:
+                self._model = None
+                self._model_name = name
+                self._model_load_error = None
+                self._vocabulary = []
+        finally:
+            with self._model_state_lock:
+                self._model_switching = False
         log.info(f"[vop] model switched to {name}; stopped {len(keys)} instance(s)")
         threading.Thread(target=self._prefetch_vocabulary, daemon=True,
                          name="vop_vocab_prefetch").start()
@@ -753,59 +765,80 @@ class VideoObjectPerceptionPlugin:
             f"tools/export_vision_engines.py and republish the bundle."
         )
 
-    def _ensure_model(self):
+    def _ensure_model(self, *, _from_bg_start: bool = False):
         if self._model is not None:
             return
         with self._model_lock:
-            if self._model is not None:
-                return
-
-            # No YOLO_CONFIG_DIR / TORCH_HOME setup any more: ultralytics is not
-            # in this path at all — the engine is run directly through
-            # utils.tensorrt_runtime. Only the cv2 repair below still matters,
-            # because the decode and letterbox use it.
-
-            # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
-            # and patch missing imshow for headless environments
+            with self._model_state_lock:
+                if self._model is not None:
+                    if _from_bg_start:
+                        self._model_loading = False
+                        self._model_load_status = None
+                    return
+                if self._model_switching:
+                    raise RuntimeError(
+                        f"model {self._model_name!r} switch in progress; retry shortly"
+                    )
+                # Both `start` and one-shot `recognize_by_photo`/`recognize_by_url`
+                # publish the same loading flag so concurrent `info()` sees live
+                # download progress rather than reporting `idle`.
+                self._model_loading = True
+                self._model_load_status = None
             try:
-                import cv2
-                # Test if cv2 is functional
-                _ = cv2.IMREAD_COLOR
-            except (ImportError, AttributeError):
-                import importlib.util, sys as _sys
-                import glob as _glob
-                # Find the .so directly
-                _so_candidates = _glob.glob("/usr/lib/python*/dist-packages/cv2/python-*/cv2.cpython-*.so")
-                if _so_candidates:
-                    _spec = importlib.util.spec_from_file_location("cv2", _so_candidates[0])
-                    _mod = importlib.util.module_from_spec(_spec)
-                    _spec.loader.exec_module(_mod)
-                    _sys.modules["cv2"] = _mod
+                # No YOLO_CONFIG_DIR / TORCH_HOME setup any more: ultralytics is not
+                # in this path at all — the engine is run directly through
+                # utils.tensorrt_runtime. Only the cv2 repair below still matters,
+                # because the decode and letterbox use it.
+
+                # Fix broken system cv2 on Jetson (circular import in mat_wrapper)
+                # and patch missing imshow for headless environments
+                try:
                     import cv2
-                else:
-                    import cv2  # let it fail naturally
+                    # Test if cv2 is functional
+                    _ = cv2.IMREAD_COLOR
+                except (ImportError, AttributeError):
+                    import importlib.util, sys as _sys
+                    import glob as _glob
+                    # Find the .so directly
+                    _so_candidates = _glob.glob("/usr/lib/python*/dist-packages/cv2/python-*/cv2.cpython-*.so")
+                    if _so_candidates:
+                        _spec = importlib.util.spec_from_file_location("cv2", _so_candidates[0])
+                        _mod = importlib.util.module_from_spec(_spec)
+                        _spec.loader.exec_module(_mod)
+                        _sys.modules["cv2"] = _mod
+                        import cv2
+                    else:
+                        import cv2  # let it fail naturally
 
-            if not hasattr(cv2, 'imshow'):
-                cv2.imshow = lambda *a, **k: None
-                cv2.waitKey = lambda *a, **k: 0
-                cv2.destroyAllWindows = lambda *a, **k: None
+                if not hasattr(cv2, 'imshow'):
+                    cv2.imshow = lambda *a, **k: None
+                    cv2.waitKey = lambda *a, **k: 0
+                    cv2.destroyAllWindows = lambda *a, **k: None
 
-            from plugins.vision_runtime import VisionEngineSession
+                from plugins.vision_runtime import VisionEngineSession
 
-            engine_path, vocab = self._resolve_engine()
-            log.info(f"[vop] loading engine: {engine_path}")
-            self._model = VisionEngineSession(engine_path)
-            # The engine's own metadata wins over the bundled vocab.json: it was
-            # written by the export that baked the classes into the weights, so
-            # it cannot be stale or out of order. vocab.json only covers an
-            # engine built without names.
-            self._vocabulary = self._model.class_names() or vocab
-            if not self._vocabulary:
-                log.warning("[vop] engine carries no class names and no vocab.json "
-                            "was readable — detections will be labelled by index")
-            log.info(f"[vop] engine loaded: {self._model_name} "
-                     f"input={self._model.input_size}, "
-                     f"{len(self._vocabulary)} classes")
+                engine_path, vocab = self._resolve_engine()
+                log.info(f"[vop] loading engine: {engine_path}")
+                session = VisionEngineSession(engine_path)
+                # The engine's own metadata wins over the bundled vocab.json: it was
+                # written by the export that baked the classes into the weights, so
+                # it cannot be stale or out of order. vocab.json only covers an
+                # engine built without names.
+                resolved_vocab = session.class_names() or vocab
+                if not resolved_vocab:
+                    log.warning("[vop] engine carries no class names and no vocab.json "
+                                "was readable — detections will be labelled by index")
+                with self._model_state_lock:
+                    self._model = session
+                    self._vocabulary = resolved_vocab
+                    self._model_load_error = None
+                log.info(f"[vop] engine loaded: {self._model_name} "
+                         f"input={session.input_size}, "
+                         f"{len(resolved_vocab)} classes")
+            finally:
+                with self._model_state_lock:
+                    self._model_loading = False
+                    self._model_load_status = None
 
     def _resolve_engine(self) -> tuple[str, list[str]]:
         """Return (engine path, frozen vocabulary) for the configured model.
@@ -1067,11 +1100,16 @@ class VideoObjectPerceptionPlugin:
 
         if action == "info":
             # Report loading/error state
-            if self._model_loading:
+            with self._model_state_lock:
+                is_loading = self._model_loading or self._model_switching
+                load_status = self._model_load_status
+                load_error = self._model_load_error
+                model_name = self._model_name
+            if is_loading:
                 return {
-                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
+                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": model_name,
                     "state": "loading",
-                    "desc": self._model_load_status or f"Loading {self._model_name} model...",
+                    "desc": load_status or f"Loading {model_name} model...",
                     # **The declaration does not wait for the engine.**
                     #
                     # This reply used to drop it, and agent-core records
@@ -1084,11 +1122,11 @@ class VideoObjectPerceptionPlugin:
                     # here.
                     **self._loading_camera_info(args, instance_id),
                 }
-            if self._model_load_error:
+            if load_error:
                 return {
-                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
+                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": model_name,
                     "state": "error",
-                    "desc": f"Model load failed: {self._model_load_error}",
+                    "desc": f"Model load failed: {load_error}",
                 }
             with self._nodes_lock:
                 nodes = dict(self._nodes)
@@ -1195,27 +1233,35 @@ class VideoObjectPerceptionPlugin:
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
             if running is None:
-                if self._model is None:
-                    if self._model_loading:
+                start_bg = False
+                with self._model_state_lock:
+                    if self._model_switching:
                         return {"state": "loading",
-                                "message": (self._model_load_status
-                                            or "Model is still loading, please wait...")}
-                    if self._model_load_error:
-                        return {"state": "error", "message": f"Model failed to load: {self._model_load_error}"}
-                    # Model not loaded yet — start loading in background
-                    self._model_loading = True
-                    self._model_load_error = None
-                    self._model_load_status = None
-
+                                "message": "Model switch in progress, please wait..."}
+                    if self._model is None:
+                        if self._model_loading:
+                            return {"state": "loading",
+                                    "message": (self._model_load_status
+                                                or "Model is still loading, please wait...")}
+                        if self._model_load_error:
+                            return {"state": "error", "message": f"Model failed to load: {self._model_load_error}"}
+                        # Model not loaded yet — claim loading atomically before
+                        # spawning the background loader so concurrent start or
+                        # config(model=...) sees it immediately.
+                        self._model_loading = True
+                        self._model_load_error = None
+                        self._model_load_status = None
+                        start_bg = True
+                if start_bg:
                     def _bg_start():
                         try:
-                            self._ensure_model()
-                            self._model_loading = False
-                            self._model_load_status = None
+                            self._ensure_model(_from_bg_start=True)
                             self._start_node(node_key, input_topic)
                         except Exception as e:
-                            self._model_loading = False
-                            self._model_load_error = str(e)
+                            with self._model_state_lock:
+                                self._model_loading = False
+                                self._model_load_status = None
+                                self._model_load_error = str(e)
                             log.error(f"[vop] model load failed: {e}", exc_info=True)
                     threading.Thread(target=_bg_start, daemon=True, name="vop_model_load").start()
                     return {"state": "loading", "input": input_topic or "",
