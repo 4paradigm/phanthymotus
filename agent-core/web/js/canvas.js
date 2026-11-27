@@ -78,19 +78,23 @@ const _pastEditorInstances = new Set();
 let _clearing = false;
 let _layoutGen = 0;  // bumped on every _reloadLayout; see _clearCanvas
 
+function _canvasBusy() { return _switchingCanvas || _takeoverBusy; }
+
 /**
  * Ensure current session holds the edit lock, auto-claiming it if free.
  * Returns true if editing may proceed, false if the canvas is occupied by
  * another session (in which case a toast + locked UI state is shown).
  */
 async function _ensureEdit({ forClear = false } = {}) {
-  if (_draftEditing) return !_takeoverBusy;
+  if (_canvasBusy()) return false;
+  if (_draftEditing) return true;
   if (_clearing && !forClear) {
     _showToast('正在清空画布，请稍候');
     return false;
   }
-  if (_editorSyncing || _takeoverBusy) return false;
+  if (_editorSyncing) return false;
   if (_isEditor) return true;
+  const layoutAtClaim = _layoutGen;
   try {
     const resp = await fetch('/api/canvas/claim-edit', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -99,8 +103,10 @@ async function _ensureEdit({ forClear = false } = {}) {
     const data = await resp.json();
     if (resp.ok) {
       _applyEditorState(data, { announce: false });
-      if (_isEditor) _showToast('已自动获取编辑权限');
-      return _isEditor && (!_clearing || forClear);
+      const mayEdit = _isEditor && !_draftEditing && !_canvasBusy()
+        && _layoutGen === layoutAtClaim && (!_clearing || forClear);
+      if (mayEdit) _showToast('已自动获取编辑权限');
+      return mayEdit;
     }
     if ('editor' in data) _applyEditorState(data);
     _showToast('画布正被其他用户编辑，可申请接管');
@@ -3338,7 +3344,7 @@ function _syncEmptyState() {
   const clearBtn = document.getElementById('canvas-clear');
   if (clearBtn) {
     clearBtn.disabled = _cards.length === 0 || _clearing || _editsLocked()
-      || _takeoverBusy || (!_draftEditing && !_isEditor && !!_currentEditor);
+      || _canvasBusy() || (!_draftEditing && !_isEditor && !!_currentEditor);
   }
 }
 
@@ -3369,7 +3375,8 @@ function _updateEditorUI() {
   const sharedStatus = ownsShared ? '你持有编辑权' : _currentEditor ? '他人编辑中' : '空闲';
   const applyHint = _draftEditing && (_projectEditLockReason() || (_takeover ? '请先处理接管申请' : ''));
   const applyBlocked = _draftEditing && (applyHint || (_currentEditor && !ownsShared));
-  const template = JSON.stringify([variant, _takeover?.id, _takeoverBusy, _editorInstance, applyHint,
+  const busy = _canvasBusy();
+  const template = JSON.stringify([variant, _takeover?.id, busy, _editorInstance, applyHint,
     _draftEditing && sharedStatus]);
   if (bar.dataset.state !== template) {
     bar.dataset.state = template;
@@ -3428,12 +3435,12 @@ function _updateEditorUI() {
       bar.insertAdjacentHTML('beforeend', '<button class="editor-btn" id="canvas-drafts-btn">我的草稿</button>');
       bar.querySelector('#canvas-drafts-btn').onclick = _showCanvasDrafts;
     }
-    for (const button of bar.querySelectorAll('button')) button.disabled = _takeoverBusy;
+    for (const button of bar.querySelectorAll('button')) button.disabled = busy;
     const apply = bar.querySelector('#canvas-apply-draft');
     if (apply && applyBlocked) apply.disabled = true;
   }
   _updateTakeoverCountdown();
-  _setCanvasReadonly((!_draftEditing && !_isEditor) || _takeoverBusy);
+  _setCanvasReadonly((!_draftEditing && !_isEditor) || busy);
   _syncEmptyState();
 }
 
@@ -3513,8 +3520,9 @@ function _saveWorkingDraft() {
 }
 
 async function _showCanvasDrafts() {
-  if (_switchingCanvas || _takeoverBusy || _draftEditing) return;
+  if (_canvasBusy() || _draftEditing || _clearing || _draggingCardId || _draggingConn) return;
   _switchingCanvas = true;
+  _updateEditorUI();
   try {
     if (!_draftStore) await _loadDraftStore();
     if (!_draftStore) {
@@ -3533,19 +3541,20 @@ async function _showCanvasDrafts() {
     _renderCanvasLayout(draft);
     _setCanvasTransform(draft.transform);
     _revealHandoffCards();
-    _updateEditorUI();
     _saveWorkingDraft();
   } catch (error) {
     console.warn('Could not open working draft', error);
     _showToast('无法读取草稿，请检查浏览器存储');
   } finally {
     _switchingCanvas = false;
+    _updateEditorUI();
   }
 }
 
 async function _leaveDraftCanvas() {
-  if (_switchingCanvas || !_draftEditing || !_saveWorkingDraft()) return false;
+  if (_switchingCanvas || !_draftEditing || _draggingCardId || _draggingConn || !_saveWorkingDraft()) return false;
   _switchingCanvas = true;
+  _updateEditorUI();
   try {
     const response = await fetch('/api/canvas/layout');
     if (!response.ok) return false;
@@ -3564,11 +3573,13 @@ async function _leaveDraftCanvas() {
     return false;
   } finally {
     _switchingCanvas = false;
+    _updateEditorUI();
   }
 }
 
 async function _applyWorkingDraft() {
-  if (!_draftEditing || _switchingCanvas || _takeoverBusy || _takeover || _projectEditLockReason()) return;
+  if (!_draftEditing || _canvasBusy() || _takeover || _projectEditLockReason()) return;
+  if (_draggingCardId || _draggingConn) return;
   if ((_currentEditor && _currentEditor !== _sessionId) || !_saveWorkingDraft()) return;
   _takeoverBusy = true;
   _updateEditorUI();
@@ -3595,7 +3606,7 @@ function _setCanvasTransform(view = {}) {
 }
 
 async function _requestTakeover() {
-  if (_takeoverBusy) return;
+  if (_canvasBusy()) return;
   _takeoverBusy = true;
   _updateEditorUI();
   try {
@@ -3608,15 +3619,18 @@ async function _requestTakeover() {
   }
 }
 
-async function _flushBeforeRelease() {
+async function _flushBeforeRelease(lease) {
   const fromDraft = !!_draftEditing;
-  const ownsEdit = () => fromDraft ? _currentEditor === _sessionId : _isEditor;
+  const ownsEdit = () => _currentEditor === _sessionId
+    && _editorGeneration === lease.editor_generation && _editorInstance === lease.editor_instance
+    && (fromDraft || _isEditor);
   if (!ownsEdit() || _clearing) return false;
   clearTimeout(_saveTimer);
   _saveTimer = null;
   let timer;
   const settled = await Promise.race([
-    Promise.allSettled([..._pendingLayoutSaves]).then(() => true),
+    Promise.allSettled([..._pendingLayoutSaves]).then(results =>
+      !fromDraft || results.every(result => result.status === 'fulfilled' && result.value)),
     new Promise(resolve => { timer = setTimeout(() => resolve(false), EDITOR_SAVE_TIMEOUT_MS); }),
   ]);
   clearTimeout(timer);
@@ -3624,7 +3638,7 @@ async function _flushBeforeRelease() {
 }
 
 async function _respondTakeover(action) {
-  if (_takeoverBusy || !_takeover) return;
+  if (_canvasBusy() || !_takeover) return;
   const requestId = _takeover.id;
   _takeoverBusy = true;
   _updateEditorUI();
@@ -3660,12 +3674,12 @@ function _setCanvasReadonly(readonly) {
 
 async function _releaseEdit() {
   const fromDraft = !!_draftEditing;
-  if (!(fromDraft ? _currentEditor === _sessionId : _isEditor) || _takeoverBusy) return;
+  if (!(fromDraft ? _currentEditor === _sessionId : _isEditor) || _canvasBusy()) return;
   const lease = _editorLease();
   _takeoverBusy = true;
   _updateEditorUI();
   try {
-    if (!(await _flushBeforeRelease())) {
+    if (!(await _flushBeforeRelease(lease))) {
       if (_currentEditor === _sessionId) _showToast('共享画布尚未保存，请重试');
       return;
     }

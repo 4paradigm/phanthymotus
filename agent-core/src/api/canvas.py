@@ -18,6 +18,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 import fastapi
+from jsonschema.validators import validator_for
 from pydantic import BaseModel
 
 import config
@@ -358,9 +359,12 @@ class TakeoverResponse(BaseModel):
     layout: CanvasLayout | None = None
 
 
+def _matches_editor_lease(generation: int | None, instance: str | None) -> bool:
+    return generation == _editor_generation and instance == _editor_instance
+
+
 def _holds_editor(session_id: str | None, generation: int | None, instance: str | None) -> bool:
-    return bool(session_id and session_id == _editor_session
-                and generation == _editor_generation and instance == _editor_instance)
+    return bool(session_id and session_id == _editor_session and _matches_editor_lease(generation, instance))
 
 
 # ── Editor Lock Endpoints ────────────────────────────────────────────────────
@@ -545,7 +549,7 @@ async def restore_draft(layout: CanvasLayout):
         return _editor_conflict('Invalid canvas session.', 400)
     if _editor_session and _editor_session != session_id:
         return _editor_conflict('Canvas is locked by another editor.', 423)
-    if layout.editor_generation != _editor_generation or layout.editor_instance != _editor_instance:
+    if not _matches_editor_lease(layout.editor_generation, layout.editor_instance):
         return _editor_conflict('Canvas edit state changed. Try again.', 409)
     if _takeover:
         return _editor_conflict('Resolve the current takeover request before restoring a draft.')
@@ -561,33 +565,42 @@ async def restore_draft(layout: CanvasLayout):
     return {'code': 200, **_editor_state()}
 
 
-def _draft_config_updates(layout: CanvasLayout) -> dict:
+_DraftConfigUpdates = dict[tuple[str, str, str], dict[str, Any]]
+
+
+def _draft_config_updates(layout: CanvasLayout) -> _DraftConfigUpdates:
     from tool_config import find_tool
     cards = {(card.get('mcpId'), card.get('toolName'), card.get('id')) for card in layout.cards}
     tools = {(mcp_id, tool_name) for mcp_id, tool_name, _ in cards}
-    updates = {}
+    updates: _DraftConfigUpdates = {}
     for entry in layout.draft_configs:
         tool = (entry.mcp_id, entry.tool_name)
-        if tool not in tools or (entry.instance_id and (*tool, entry.instance_id) not in cards):
+        address = (*tool, entry.instance_id)
+        if not entry.values or tool not in tools or (entry.instance_id and address not in cards):
             continue
         schema = find_tool(*tool).get('configSchema') or {}
         props = schema.get('properties') or {}
-        for name in entry.values:
+        validator = validator_for(schema)(schema)
+        for name, value in entry.values.items():
             field = props.get(name)
             if (field is None or field.get('x-sensitive', field.get('format') == 'password')
-                    or (field.get('scope') == 'instance') != bool(entry.instance_id)):
+                    or (field.get('scope') == 'instance') != bool(entry.instance_id)
+                    or next(validator.descend(value, field), None) is not None):
                 raise ValueError(f'Invalid draft setting {entry.tool_name}.{name}. Refresh the card settings.')
-        if entry.values:
-            key = tool_config_key(*tool, entry.instance_id)
-            updates[key] = {**(config.main.get(key) or {}), **entry.values}
+        if address not in updates:
+            updates[address] = dict(config.main.get(tool_config_key(*address)) or {})
+        updates[address].update(entry.values)
     return updates
 
 
-def _store_layout(layout: CanvasSnapshot, session_id: str, settings: dict | None = None) -> list:
+def _store_layout(
+    layout: CanvasSnapshot, session_id: str, settings: _DraftConfigUpdates | None = None,
+) -> list:
     old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
     snapshot = layout.model_dump(include=set(CanvasSnapshot.model_fields))
     if settings:
-        config.main.update({**settings, 'canvas_layout': snapshot})
+        rows = {tool_config_key(*address): values for address, values in settings.items()}
+        config.main.update({**rows, 'canvas_layout': snapshot})
     else:
         config.main['canvas_layout'] = snapshot
     notify_layout_changed(session_id)
@@ -599,13 +612,14 @@ def _can_apply_personal_layout() -> bool:
     return canvas_replacement_allowed()
 
 
-def _apply_personal_layout(layout: CanvasSnapshot, requester: str, settings: dict | None = None) -> None:
+def _apply_personal_layout(
+    layout: CanvasSnapshot, requester: str, settings: _DraftConfigUpdates | None = None,
+) -> None:
     from api.config import stop_removed_cards
     old_cards = _store_layout(layout, requester, settings)
     asyncio.get_running_loop().create_task(stop_removed_cards(old_cards, layout.cards))
-    for key, values in (settings or {}).items():
-        mcp_id, tool_name, *instance = key.removeprefix(_TOOL_CONFIG_PREFIX).split(':', 2)
-        apply_tool_config(mcp_id, tool_name, values, instance[0] if instance else '')
+    for (mcp_id, tool_name, instance_id), values in (settings or {}).items():
+        apply_tool_config(mcp_id, tool_name, values, instance_id)
 
 
 # ── Per-tool config CRUD ─────────────────────────────────────────────────────
