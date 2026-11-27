@@ -13,6 +13,7 @@
 
 import { showToast } from './toast.js';
 import { canvasDrafts, openCanvasDrafts } from './canvas-drafts.js';
+import { openCanvasDraftEditor } from './canvas-draft-editor.js';
 
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
@@ -3403,9 +3404,12 @@ async function _loadDraftStore() {
   }
 }
 
+function _newDraftId() {
+  return `${_sessionId}:copy:${Date.now()}:${_draftCopySequence++}`;
+}
+
 function _saveCanvasDraft(layout = _layoutSnapshot(), { initial = false, copy = false } = {}) {
-  const draftId = _activeDraftId();
-  const id = copy ? `${draftId}:copy:${Date.now()}:${_draftCopySequence++}` : draftId;
+  const id = copy ? _newDraftId() : _activeDraftId();
   try {
     if (_draftStore) {
       _draftStore.save(id, layout, initial);
@@ -3433,7 +3437,7 @@ async function _showCanvasDrafts() {
       _showToast('草稿存储暂不可用，请稍后重试');
       return;
     }
-    if (document.querySelector('.canvas-drafts-dialog')) return;
+    if (document.querySelector('.canvas-drafts-dialog, .canvas-drafts-editor')) return;
     openCanvasDrafts({
       drafts: _draftStore.list(),
       activeId: _isEditor ? _activeDraftId() : null,
@@ -3441,6 +3445,7 @@ async function _showCanvasDrafts() {
       blockedReason: _takeover ? '请先处理当前接管申请。' : _projectEditLockReason(),
       canCopy: _isEditor,
       onApply: _useCanvasDraft,
+      onEdit: _editLocalDraft,
       onCopy: () => {
         if (_isEditor && _saveCanvasDraft(_layoutSnapshot(), { copy: true })) _showToast('已另存草稿');
       },
@@ -3449,6 +3454,25 @@ async function _showCanvasDrafts() {
     console.warn('Could not open canvas drafts', error);
     _showToast('无法读取草稿，请检查浏览器存储');
   }
+}
+
+function _editLocalDraft(layout) {
+  const id = _newDraftId();
+  openCanvasDraftEditor({
+    layout,
+    mcps: _allMcps,
+    onSave: draft => {
+      try {
+        _draftStore.save(id, draft);
+        return true;
+      } catch (error) {
+        console.warn('Could not save local canvas draft', error);
+        return false;
+      }
+    },
+    onClose: _showCanvasDrafts,
+    onApply: _useCanvasDraft,
+  });
 }
 
 async function _useCanvasDraft(layout) {
@@ -3671,8 +3695,8 @@ const _KEEP_ALIVE_MS = 15000;
 let _lastPingAt = 0;
 let _pingTimer = null;
 
-function _pingEdit() {
-  if (!_isEditor) return;
+function _pingEdit(event) {
+  if (!_isEditor || event?.target?.closest?.('.canvas-drafts-dialog, .canvas-drafts-editor')) return;
   const wait = _KEEP_ALIVE_MS - (Date.now() - _lastPingAt);
   if (wait <= 0) { _sendPing(); return; }
   if (!_pingTimer) {

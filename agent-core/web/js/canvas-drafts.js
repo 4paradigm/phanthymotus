@@ -37,7 +37,7 @@ function parseDraft(raw, legacy = false) {
   }
 }
 
-export function openCanvasDrafts({ drafts, activeId, applyLabel, blockedReason, canCopy, onApply, onCopy }) {
+export function openCanvasDrafts({ drafts, activeId, applyLabel, blockedReason, canCopy, onApply, onEdit, onCopy }) {
   const dialog = document.createElement('dialog');
   dialog.className = 'canvas-drafts-dialog';
   dialog.setAttribute('aria-labelledby', 'canvas-drafts-heading');
@@ -51,7 +51,7 @@ export function openCanvasDrafts({ drafts, activeId, applyLabel, blockedReason, 
   header.append(heading, close);
 
   const explanation = document.createElement('p');
-  explanation.textContent = '编辑时自动保存卡片和连线。草稿只保存在当前浏览器。';
+  explanation.textContent = '草稿可独立编辑，应用时才会写入共享画布。';
   dialog.append(header, explanation);
 
   const items = document.createElement('div');
@@ -69,12 +69,14 @@ export function openCanvasDrafts({ drafts, activeId, applyLabel, blockedReason, 
       : '空画布';
     const button = action(applyLabel, () => { dialog.close(); onApply(layout); });
     button.disabled = !!blockedReason;
-    row.append(title, cards, button);
+    row.append(title, cards);
+    if (onEdit) row.append(action('编辑草稿', () => { dialog.close(); onEdit(layout); }));
+    row.append(button);
     items.append(row);
   }
   if (!drafts.length) {
     const empty = document.createElement('p');
-    empty.textContent = '还没有草稿。开始编辑后会自动保存。';
+    empty.textContent = '还没有草稿。可以新建草稿，或编辑共享画布自动保存。';
     items.append(empty);
   }
   dialog.append(items);
@@ -83,6 +85,7 @@ export function openCanvasDrafts({ drafts, activeId, applyLabel, blockedReason, 
     reason.textContent = blockedReason;
     dialog.append(reason);
   }
+  if (onEdit) dialog.append(action('新建草稿', () => { dialog.close(); onEdit(null); }));
   if (canCopy) {
     const copy = action('另存当前为草稿', () => { dialog.close(); onCopy(); });
     dialog.append(copy);

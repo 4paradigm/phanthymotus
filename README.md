@@ -539,8 +539,9 @@ or decline. After 15 seconds without a response, the requester receives edit acc
 and loads the requested layout.
 
 Open **My drafts** to view the cards and connections automatically saved in this
-browser for each editing session. You can keep editing the shared canvas after
-a takeover, or request access with a selected draft. If you already have edit
+browser for each editing session. Open or create a draft to arrange cards and
+connections locally while another person edits the shared canvas. Applying a draft
+requests edit access if the shared canvas is occupied. If you already have edit
 access, restore a draft directly. Your earlier drafts stay available after
 another session changes the shared canvas. Restoring a draft requires
 intelligent control to be stopped.
