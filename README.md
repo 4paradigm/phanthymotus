@@ -538,10 +538,12 @@ over the latest saved layout, save the current layout and hand it over in one st
 or decline. After 15 seconds without a response, the requester receives edit access
 and loads the requested layout.
 
-When requesting a takeover, choose the current canvas or your own saved cards.
-Use **Save my cards** while editing to save the cards and connections in the
-current browser for that robot. A personal layout can replace the shared layout
-once edit access is granted and intelligent control has stopped.
+Open **My drafts** to view the cards and connections automatically saved in this
+browser for each editing session. You can keep editing the shared canvas after
+a takeover, or request access with a selected draft. If you already have edit
+access, restore a draft directly. Your earlier drafts stay available after
+another session changes the shared canvas. Restoring a draft requires
+intelligent control to be stopped.
 
 ### Real-Time Monitoring
 

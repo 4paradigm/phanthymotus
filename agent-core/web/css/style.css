@@ -1424,10 +1424,54 @@ html, body {
   opacity: .55;
 }
 @media (pointer: coarse) {
-  .canvas-editor-bar .editor-btn {
+  .canvas-editor-bar .editor-btn,
+  .canvas-drafts-dialog button {
     min-height: 44px;
   }
 }
+
+.canvas-drafts-dialog {
+  margin: auto;
+  width: min(480px, calc(100% - 24px));
+  max-height: min(80vh, 620px);
+  padding: 18px;
+  overflow: auto;
+  color: var(--text);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+}
+.canvas-drafts-dialog::backdrop { background: rgba(0, 0, 0, .38); }
+.canvas-drafts-dialog header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.canvas-drafts-dialog h2 { font-size: 17px; }
+.canvas-drafts-dialog h3 { font-size: 14px; }
+.canvas-drafts-dialog p {
+  margin: 8px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.canvas-drafts-list article {
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+.canvas-drafts-dialog button {
+  border: 1px solid var(--border-med);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.canvas-drafts-dialog button:hover:enabled { background: var(--bg-hover); }
+.canvas-drafts-dialog button:disabled { opacity: .55; cursor: not-allowed; }
 
 .canvas-controls {
   position: absolute;

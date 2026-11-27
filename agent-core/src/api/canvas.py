@@ -116,9 +116,9 @@ def _broadcast_editor(reason: str) -> None:
     _broadcast({'type': 'canvas_editor', 'payload': _editor_state()})
 
 
-def _set_editor(session_id: str | None, reason: str) -> None:
+def _set_editor(session_id: str | None, reason: str, *, renew: bool = False) -> None:
     global _editor_session, _editor_last_seen, _editor_generation
-    if session_id != _editor_session:
+    if renew or session_id != _editor_session:
         _editor_generation += 1
     _editor_session = session_id
     _editor_last_seen = time.monotonic() if session_id else 0.0
@@ -526,6 +526,23 @@ async def save_layout(layout: CanvasLayout):
     from api.config import stop_removed_cards
     await stop_removed_cards(old_cards, layout.cards)
     return {'code': 200}
+
+
+@router.post('/restore-draft')
+async def restore_draft(layout: CanvasLayout):
+    """Replace the live layout from a browser draft under the current edit lease."""
+    _check_editor_expired()
+    session_id = layout.session_id
+    if not _holds_editor(session_id, layout.editor_generation, layout.editor_instance):
+        return _editor_conflict('Not the current editor.', 403)
+    if _takeover:
+        return _editor_conflict('Resolve the current takeover request before restoring a draft.')
+    if not _can_apply_personal_layout():
+        return _editor_conflict('Stop intelligent control before restoring a draft.')
+    _apply_personal_layout(layout, session_id)
+    # A save sent before restoring the draft must not overwrite it afterwards.
+    _set_editor(session_id, 'draft_restored', renew=True)
+    return {'code': 200, **_editor_state()}
 
 
 def _store_layout(layout: CanvasSnapshot, session_id: str) -> list:
