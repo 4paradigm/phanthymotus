@@ -1300,6 +1300,7 @@ def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypat
         return None
 
     replans = []
+    monkeypatch.setattr(policy, "_detour_still_locked", lambda *args: True)
     monkeypatch.setattr(policy, "_dwa_detour", blocked)
     monkeypatch.setattr(policy, "projected_forward_clearance", lambda *args: None if side_only else 1.)
     monkeypatch.setattr(policy, "_start_detour_segment", lambda *args, **kwargs: replans.append(args))
@@ -1335,6 +1336,99 @@ def test_expired_person_detour_stops_translation_and_keeps_the_original_track(mo
     assert state.committed_route is None
     assert state.reacquire_generation == original.generation
     assert state.tracker.track is original
+
+
+@pytest.mark.parametrize("new_blocker", [False, True])
+@pytest.mark.parametrize("side_exit", [False, True])
+def test_straight_handoff_from_committed_lateral_detour_uses_forward_clearance(monkeypatch, new_blocker, side_exit):
+    from dataclasses import replace
+
+    from plugins.navi import policy
+
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    original = card._state.committed_route
+    assert original is not None and original.locks_detour
+    if side_exit:
+        original = replace(original, passage_exit=((.9, -.9), (1., -.10)))
+        card._state.committed_route = original
+        work = card._scheduled_command
+        work.dwa_origin = replace(work.dwa_origin, acceptance=original)
+    monkeypatch.setattr(policy, "_detour_still_locked", lambda *args: False)
+
+    advance_snapshot(snapshot, clock, 1100, vx=0.)
+    objects, depth, odom, _ = snapshot[0]
+    depth["map"].fill(5.)
+    snapshot[0] = dict(objects, timestamp=1.1), depth, odom, 1100
+    message = card.next_command()
+    assert message["values"][0] > 0.
+    assert message["values"][1:] == [0.] * 5
+    assert card._last_decision.dwa_acceptance is None
+    assert card._state.committed_route is original
+
+    if new_blocker:
+        advance_snapshot(snapshot, clock, 1110, vx=0., obstacle=True)
+    count = len(packets)
+    card._stage_command(message, card._output_epoch)
+    if new_blocker:
+        assert all(not any(packet["values"]) for packet in packets[count:])
+        assert card._state.committed_route is original
+    else:
+        assert len(packets) == count + 1
+        assert packets[-1]["values"] == message["values"]
+        assert card._state.committed_route is None
+        advance_snapshot(snapshot, clock, 1200, vx=message["values"][0])
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = dict(objects, timestamp=1.2), depth, odom, 1200
+        renewed = card.next_command()
+        assert renewed["values"][0] > 0.
+        assert renewed["values"][1:] == [0.] * 5
+        assert card._staged_forward_check[1].straight_handoff is original
+        assert card._stage_command(renewed, card._output_epoch)
+        clock[0] = 1210
+        card._cancel_scheduled_motion(stop=(1210, "等待新深度", True))
+        advance_snapshot(snapshot, clock, 1300, vx=0.)
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = dict(objects, timestamp=1.3), depth, odom, 1300
+        resumed = card.next_command()
+        assert resumed["values"][0] > 0.
+        assert resumed["values"][1:] == [0.] * 5
+        assert card._staged_forward_check[1].straight_handoff is original
+
+
+def test_detour_only_locks_an_inbound_first_half():
+    from plugins.navi import dwa, local_path, policy
+    from test_navi_dwa_integration import observation_case
+
+    config, _, _, _ = observation_case(body=False)
+    for points, expected in (
+        (((0., 0.), (1., 0.), (2., .5)), True),
+        (((0., 0.), (1., .8), (2., .5)), False),
+        (((-2., 0.), (0., 0.), (1., 0.)), False),
+    ):
+        route = local_path.Detour(None, points, config.local_geometry)
+        assert policy._detour_still_locked(route, dwa.remaining_route_length(points), 4., 0.) == expected
+
+
+def test_straight_handoff_slowing_uses_depth_source_and_control_times(monkeypatch):
+    from plugins.navi import policy
+
+    config = policy.Config()
+    monkeypatch.setattr(policy, "_clearance", lambda *_: (config.obstacle_stop_m + .3, 1.))
+    depth = {"frame_id": 1000, "map": object(), "control_ms": 1000}
+    stopped = (0., 0., 0.)
+    fresh = policy.straight_handoff_speed(depth, config, 2., stopped, stopped)
+    delayed = policy.straight_handoff_speed(
+        dict(depth, obstacle_driver_ms=800), config, 2., stopped, stopped)
+    older = policy.straight_handoff_speed(
+        dict(depth, obstacle_driver_ms=800, control_ms=1100), config, 2., stopped, stopped)
+    assert 0. < older < delayed < fresh
+    slowing = policy.straight_handoff_speed(
+        dict(depth, obstacle_driver_ms=800, control_ms=1100), config, 2., stopped, (delayed, 0., 0.))
+    assert 0. < slowing < older
+    assert policy.straight_handoff_speed(depth, config, 2., stopped, (1., 0., 0.)) == 0.
 
 
 def test_target_loss_in_parking_range_cannot_start_a_search_turn(monkeypatch):

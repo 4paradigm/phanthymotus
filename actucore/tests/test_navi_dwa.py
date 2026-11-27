@@ -33,6 +33,17 @@ def _run(route, *, grid=None, measured=(.1, 0., 0.), previous=(.1, 0., 0.), late
     return dwa.select(**options)
 
 
+def test_delayed_depth_keeps_an_obstacle_that_enters_the_current_corridor():
+    _, occupied = _grid(obstacles=[(.70, .35)])
+    config = policy.Config(half_width_m=.20)
+    view = local_path.GridTransform(-.12, -.13)
+    receipt, registered = policy.dwa_depth_layers(
+        {"obstacle_driver_ms": 700}, occupied, 1000, view,
+        lambda *_: local_path.GridTransform(), config)
+    assert receipt.centers[0] == pytest.approx((.70, .35))
+    assert registered.centers[0] == pytest.approx((.58, .22))
+
+
 def test_non_lateral_never_issues_vy():
     choice = _run(((0.,0.),(.2,.2),(.6,.4)), lateral=False)
     assert choice is not None

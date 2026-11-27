@@ -1470,7 +1470,7 @@ def _measured_passage_cost(occupied, half_width):
     return opening, np.where(opening, 8. * np.square(midline_error / half_width), 0.)
 
 
-def _detour_shape_cost(cost, free, occupied, blockers, geometry, half_width, body_half_width, start, target):
+def _detour_shape_cost(cost, free, occupied, blockers, geometry, half_width, body_half_width, start, target, allow_lateral):
     """Weight the measured corridor midpoint or the tangents of a compact blocker."""
     opening, midline_cost = _measured_passage_cost(occupied, half_width)
     cost = np.where(opening, midline_cost, cost)
@@ -1527,6 +1527,9 @@ def _detour_shape_cost(cost, free, occupied, blockers, geometry, half_width, bod
     heading = np.arctan2(r, f)
     error = np.minimum.reduce([np.square(heading - angle) for angle in tangents])
     entry_length = max(.45, geometry.front + geometry.rear)
+    if allow_lateral and geometry.front == 0.:
+        # Keep the tangent influential during the approach in the camera frame.
+        entry_length = max(entry_length, 2 * (forward - span[0] / 2 - radius))
     weight = np.clip((entry_length + RESOLUTION - travel) / RESOLUTION, 0., 1.)
     cost = np.where(opening, cost, (1. - weight) * cost + weight * 8. * error)
 
@@ -1587,7 +1590,7 @@ def _round_grid_route(points, allowed, origin):
 
 
 def clearance_route(grid, geometry, half_width, target, stop, approach_origin, previous=(), *,
-                    body_half_width=None):
+                    body_half_width=None, allow_lateral=False):
     """Find a clearance-weighted reference about the body pivot, on either side of the goal line."""
     free, occupied = grid
     if not free.any() or not occupied.any() or target is None:
@@ -1636,7 +1639,7 @@ def clearance_route(grid, geometry, half_width, target, stop, approach_origin, p
     lateral = abs((FORWARD-target[0])*dy - (RIGHT-target[1])*dx) / length
     cost += .5 * lateral / max(.15, half_width)
     cost, tangent_goal, blocker_exit = _detour_shape_cost(cost, free, occupied, blockers, geometry, half_width,
-                                                         body_half_width or half_width, start, target)
+                                                         body_half_width or half_width, start, target, allow_lateral)
     if tangent_goal is not None:
         # Keep charging for nearby cells along a compact obstacle's tangents.
         cost += 2. * _clearance_shortfall(gap, .30)

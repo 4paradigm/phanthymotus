@@ -740,7 +740,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             diag["physical_evaluations"] += 1
             check = context.evaluate(prediction)
             if not check.accepted:
-                swept_into_obstacle |= bool(command[2] and check.reason == "footprint_collision")
+                swept_into_obstacle |= bool(command[2] and check.reason in ("footprint_collision", "remembered_obstacle"))
                 rejected[check.reason] = rejected.get(check.reason, 0) + 1
                 continue
             poses = prediction.camera_poses if footprint_mode == "camera_approx" else prediction.body_poses

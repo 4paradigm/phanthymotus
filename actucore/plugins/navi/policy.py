@@ -765,6 +765,7 @@ class State:
     dwa_selected: bool = False
     dwa_proposal: DwaProposal | DwaTurn | None = None
     published_dwa_route: DwaAcceptance | None = None
+    published_straight_handoff: DwaAcceptance | None = None
     published_camera_passage: CameraPassage | None = None
     committed_route: DwaAcceptance | None = None
     parking_hold_generation: int | None = None
@@ -1455,7 +1456,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
         state.commanded_vx = vx
     anchor, scan = state.goal_anchor, state.active_scan
     geometry = config.scan_geometry or config.local_geometry
-    if (anchor is not None and decision.values is not None and any(decision.values)
+    straight_handoff = state.dwa_trace.get("straight_handoff")
+    if (anchor is not None and decision.values is not None and any(decision.values) and not straight_handoff
             and not state.dwa_selected and not state.camera_arc_selected
             and not scan.active and not state.checked_prefix and state.executing_leg is None
             and geometry is not None and scan.current_frame and scan.views):
@@ -1467,7 +1469,7 @@ def step(*, detections, depth, odom, config: Config, state: State,
                                              (motion, state.commanded, twist)):
             decision = Decision(_twist(0., 0., 0.), AVOIDING, "前往记忆目标的扫掠区有障碍",
                                 distance_m=decision.distance_m, bearing=decision.bearing)
-    if (not state.dwa_selected and decision.values is not None and any(decision.values)
+    if (not state.dwa_selected and not straight_handoff and decision.values is not None and any(decision.values)
             and not scan.active and scan.near_hits is not None):
         twist = tuple(decision.values[i] for i in (0, 1, 5))
         searched = decision.status == SEARCHING and state.search_sweep_checked and not any(twist[:2])
@@ -1550,7 +1552,8 @@ def step(*, detections, depth, odom, config: Config, state: State,
                 followed_route=bool(trace.get("retained_route")),
                 passage_exit=proposal.reference.passage_exit if isinstance(proposal, DwaProposal) else None,
                 corridor_corner=(isinstance(proposal, DwaProposal) and proposal.reference.corridor_corner),
-                locks_detour=(isinstance(proposal, DwaProposal) and proposal.branch in ("route", "reachable_prefix")),
+                locks_detour=(isinstance(proposal, DwaProposal) and proposal.branch in ("route", "reachable_prefix")
+                              and not trace.get("unlocked_detour")),
                 blocker_exit=proposal.reference.blocker_exit if isinstance(proposal, DwaProposal) else None)
             trace.update(controller_used="dwa", accepted_twist=proposal.command, fallback_reason=None)
         else:
@@ -1637,6 +1640,7 @@ def _ego_twist(odom, state: State, *, command_fraction=1.):
 
 MAX_PREDICTED_DETOUR_TRAVEL_M = 3.
 NO_LOCAL_ROUTE = "局部规划未找到可执行的避让路线；停下"
+NO_ROUTE_CONTINUATION = "绕行：保留原路线，等待安全续发"
 
 
 def lateral_camera_detour(config, geometry, route):
@@ -2211,6 +2215,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 state.reacquire_source = observation_source(detections)
             state.goal_anchor = state.dwa_guidance = None
             state.committed_route = state.published_dwa_route = published = None
+        handoff = state.published_straight_handoff
+        if handoff is not None and depth is not None and geometry is not None and not corner and not scan.active:
+            straight = _straight_handoff(depth, config, state, handoff, None)
+            if straight is not None:
+                vx, vy, wz, status, reason = straight
+                return Decision(_twist(vx, vy, wz), status, reason, distance_m=track.range_m)
         if published is not None and published.locks_detour and published is state.committed_route:
             measured = track.measured_range_m if track is not None else None
             same_target = track is not None and track.generation == published.motion_guard.generation
@@ -2239,8 +2249,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 if arc is not None:
                     vx, vy, wz, status, reason = arc
                     return Decision(_twist(vx, vy, wz), status, reason, distance_m=distance)
-                if state.committed_route is not None:
-                    return Decision(_twist(0., 0., 0.), AVOIDING, "绕行：保留原路线，等待安全续发")
+                if state.published_dwa_route is not None:
+                    return Decision(_twist(0., 0., 0.), AVOIDING, NO_ROUTE_CONTINUATION)
                 published = None
         if state.reacquire_generation is not None:
             if scan.active or scan.result_frame or state.detour_leg is not None:
@@ -3088,6 +3098,35 @@ def projected_forward_clearance(occupied, geometry, config):
             if hits.any() and transform[0, 2] > 0. else None)
 
 
+def straight_handoff_speed(depth, config, distance, measured, previous):
+    if (depth is None or depth.get("map") is None or depth.get("capture_invalid") or measured is None
+            or any(abs(vy) > STILL_LINEAR or abs(wz) > STILL_YAW
+                                for _, vy, wz in (measured, previous))):
+        return 0.
+    ahead, coverage = _clearance(depth, config)
+    if coverage < config.coverage_min:
+        return 0.
+    received = observation_ms(depth)
+    checked = depth.get("control_ms") or received
+    delay = max(0, checked - (depth.get("obstacle_driver_ms") or received)) / 1000
+    reaction = delay + (config.watchdog_ms + 50) / 1000
+    depth_window = config.depth_age_limit_ms / 1000
+    hold = reaction + depth_window
+    room = distance - config.stop_distance_m
+    if ahead is not None:
+        room = min(room, ahead - config.obstacle_stop_m)
+    if room <= 0.:
+        return 0.
+    braking = config.motion_braking[0]
+    # Solve v * hold + v² / (2 * braking) <= room for forward speed.
+    cap = 2 * room / (hold + math.sqrt(hold ** 2 + 2 * room / braking))
+    outgoing = max(0., measured[0], previous[0])
+    # Reserve the old speed during the reaction window and its braking
+    # distance. The remaining depth window can still admit a slower packet.
+    brake_room = room - outgoing * reaction - outgoing ** 2 / (2 * braking)
+    return max(0., min(cap, brake_room / depth_window))
+
+
 def _may_strafe(towards_right: bool, depth, config: Config) -> bool:
     """Check measured obstacles in the destination corridor before strafing."""
     floor, limit = _local_velocity_limits(config, 1. if towards_right else -1.)[1]
@@ -3683,8 +3722,10 @@ def dwa_depth_layers(depth, cells, received_ms, view, registration, config):
     speed = config.vx_max
     stopping_reach = speed * dwa_hold(config, 0.) + speed**2 / (2 * config.motion_braking[0])
     reach = max(config.approach_check_distance_m, stopping_reach + math.hypot(view.forward, view.right))
-    ahead = (cells & (FORWARD >= 0.) & (FORWARD <= reach)
-             & (abs(RIGHT) <= _keepout_m(config) + local_path.RESOLUTION))
+    width = _keepout_m(config) + local_path.RESOLUTION
+    ahead = cells & (FORWARD >= 0.) & (FORWARD <= reach) & (abs(RIGHT) <= width)
+    forward, right = view.points(np.column_stack((FORWARD[cells], RIGHT[cells]))).T
+    ahead[cells] |= (forward >= 0.) & (forward <= reach) & (abs(right) <= width)
     return (receipt, view.squares(ahead)) if ahead.any() else (receipt,)
 
 
@@ -4052,6 +4093,49 @@ def _use_dwa(state, proposal, side):
     return (*proposal.command, AVOIDING, "局部规划：DWA沿已验证绕行轨迹运动")
 
 
+def _straight_handoff(depth, config, state, route, approach_speed):
+    track = state.tracker.track
+    if (track is None or not track.observed or not track.navigation_range_known
+            or track.generation != route.motion_guard.generation
+            or abs(track.bearing_rad) > config.align_tol * config.half_fov_rad):
+        return None
+    distance = track.measured_range_m
+    if distance is None and track.front_fix is not None:
+        distance = math.hypot(*track.front_fix)
+    if distance is None or distance <= config.arrival_distance_m:
+        return None
+    (floor, limit), _ = _local_velocity_limits(config, 1.)
+    if approach_speed is None:
+        approach_speed = config.k_fwd * (distance - config.stop_distance_m)
+    cap = straight_handoff_speed(depth, config, distance, state.active_scan.motion, state.commanded)
+    vx = min(approach_speed, limit, cap)
+    if vx > 0. and vx >= floor:
+        state.dwa_trace["straight_handoff"] = distance
+        return vx, 0., 0., APPROACHING, "绕行结束，沿目标方向直行"
+    return None
+
+
+def _detour_still_locked(route, remaining, distance, bearing):
+    if local_path.passage_ahead(route.passage_exit) or route.corridor_corner:
+        return True
+    segments = dwa._route_segments(route.points)
+    if not segments:
+        return False
+    length = segments[-1].walked + segments[-1].length
+    if remaining * 2 <= length:
+        return False
+    if distance is None or bearing is None:
+        return True
+    upcoming = min(length, length - remaining + route.geometry.half_length)
+    segment = next(s for s in segments if s.walked + s.length >= upcoming)
+    future = tuple(p + (upcoming - segment.walked) * v for p, v in zip(segment.start, segment.tangent))
+    start_f, start_r = route.points[0]
+    df, dr = distance * math.cos(bearing) - start_f, distance * math.sin(bearing) - start_r
+    current_offset = abs(start_f * dr - start_r * df)
+    future_offset = abs((future[0] - start_f) * dr - (future[1] - start_r) * df)
+    return future_offset <= current_offset + local_path.RESOLUTION * math.hypot(df, dr)
+
+
 def _follow_published_route(depth, config, state, geometry, distance, bearing, *,
                             foreground, corner_only=False, approach_speed=None):
     previous = state.published_dwa_route
@@ -4089,6 +4173,10 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
                    passage_exit=exit_line, corridor_corner=previous.corridor_corner,
                    blocker_exit=blocker_exit)
     remaining = dwa.remaining_route_length(route.points)
+    camera_detour = (config.use_lateral and geometry.front == 0. and not config.use_obstacle_history
+                     and previous is state.committed_route)
+    may_yield = (camera_detour
+                 and not _detour_still_locked(route, remaining, distance, bearing))
     if locked and not local_path.passage_ahead(exit_line):
         at_end = remaining <= 2 * local_path.RESOLUTION
         clear_tail = (remaining <= 3 * local_path.RESOLUTION and distance is not None and bearing is not None
@@ -4097,6 +4185,17 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
         if at_end or clear_tail:
             state.committed_route = state.published_dwa_route = None
             return None
+    # An opening guides the straight handoff only if the centerline crosses it.
+    # The live corridor check below still covers the full chassis width.
+    crossing_straight = (local_path.passage_ahead(exit_line)
+                         and min(right for _, right in exit_line) <= 0. <= max(right for _, right in exit_line))
+    if (camera_detour
+            and not corner_only and not route.corridor_corner and not crossing_straight
+            and not local_path.passage_ahead(blocker_exit)
+            and (may_yield or exit_line is not None or blocker_exit is not None)):
+        straight = _straight_handoff(depth, config, state, previous, approach_speed)
+        if straight is not None:
+            return straight
     # Once the target enters the full-speed stopping envelope, carry the
     # normal approach speed into the route and its publisher-side pursuit.
     speed_limit = None
@@ -4187,8 +4286,13 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
         if (remaining > 2 * local_path.RESOLUTION
                 and state.dwa_trace.get("fallback_reason") == "search_deadline"):
             state.dwa_trace["wait_for_committed_route"] = True
+        elif may_yield:
+            # Let this tick plan against the current scene. The last sent
+            # route remains available until a replacement reaches the wire.
+            state.published_dwa_route = None
+            state.dwa_guidance = None
         return None
-    state.dwa_trace["retained_route"] = True
+    state.dwa_trace.update(retained_route=True, unlocked_detour=may_yield)
     return _use_dwa(state, proposal, state.escape_side)
 
 
@@ -4292,7 +4396,8 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             reference_start = c*(origin[0]-f) + s*(origin[1]-r), -s*(origin[0]-f) + c*(origin[1]-r)
             previous = tuple((c*(x-f) + s*(y-r), -s*(x-f) + c*(y-r)) for x, y in saved.waypoints)
         guidance = local_path.clearance_route(grid, geometry, keep, target, config.stop_distance_m,
-                                              reference_start, previous, body_half_width=config.half_width_m)
+                                              reference_start, previous, body_half_width=config.half_width_m,
+                                              allow_lateral=config.use_lateral)
         if guidance is not None:
             points = guidance.points
             visible = local_path.visible_prefix(points, shadow) if shadow is not None else len(points)
@@ -4806,7 +4911,8 @@ def _camera_detour(depth, config, state, geometry, vx, distance, bearing, *,
                                            state.command_tail, admission, occupied=occupied, require_turn=False)
         if command is None:
             route = local_path.clearance_route(grid, geometry, width, target, config.stop_distance_m,
-                                               (0., 0.), body_half_width=config.half_width_m)
+                                               (0., 0.), body_half_width=config.half_width_m,
+                                               allow_lateral=config.use_lateral)
             if route is not None:
                 command = camera_route_command(route, config, target, vx, state.commanded,
                                                state.command_tail, admission, occupied=occupied, require_turn=True)

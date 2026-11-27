@@ -311,6 +311,7 @@ class _ForwardCheck:
     bearing_only: bool = False
     camera_passage: policy_mod.CameraPassage | None = None
     target_source_ms: int | None = None
+    straight_handoff: policy_mod.DwaAcceptance | None = None
 
     def matches_target_receipt(self, receipt_ms):
         return (self.planning_guard.association is None or self.target_source is not None
@@ -2218,6 +2219,8 @@ class NaviPlugin:
         """Copy the inputs needed to recheck a command without running the planner."""
         config, state = self._config, self._state
         scan, route = state.active_scan, state.view_detour
+        straight_distance = state.dwa_trace.get("straight_handoff")
+        straight_handoff = (state.committed_route or state.published_straight_handoff) if straight_distance else None
         angle_controlled = decision.dwa_acceptance is not None and decision.dwa_acceptance.angle_controlled
         guard = decision.dwa_acceptance.motion_guard if decision.dwa_acceptance else None
         probe = guard is not None and guard.probe_region
@@ -2273,7 +2276,7 @@ class NaviPlugin:
                 geometry is config.local_geometry and scan.views[-1][0] == depth["frame_id"]
                 and scan.matches_route_view(depth)):
             occupied = scan.views[-1][3]
-        if probe or (motion_guard is not None and target_source is None):
+        if straight_handoff is not None or probe or (motion_guard is not None and target_source is None):
             renewable = False
         depth_ms = depth_mod.observation_ms(depth)
         if motion_guard is not None and scan.current_frame:
@@ -2318,7 +2321,8 @@ class NaviPlugin:
                 passage = policy_mod.CameraPassage(state.view_detour, occupied, capture,
                                                     track.generation if track else None, state.view_detour.corridor_corner)
         return _ForwardCheck(geometry, depth["frame_id"], depth.get("source_frame_id"),
-                             objects_ms, decision.distance_m, previous_twist, mount_frame,
+                             objects_ms, straight_distance if straight_handoff is not None else decision.distance_m,
+                             previous_twist, mount_frame,
                              (odom or {}).get("source_sample_id"), (odom or {}).get("received_ms"),
                              remembered, memory_ms, occupied, squares,
                              decision.dwa_acceptance.guard_horizon_s if decision.dwa_acceptance else 0.,
@@ -2332,7 +2336,8 @@ class NaviPlugin:
                                  fix is not None and input_revision and motion_guard is not None
                                  and motion_guard.association is not None and target_source is not None
                                  and target_source == motion_guard.association.source) else None,
-                             direct_association, camera_passage=passage, target_source_ms=fix.capture_ms if fix else None)
+                             direct_association, camera_passage=passage, target_source_ms=fix.capture_ms if fix else None,
+                             straight_handoff=straight_handoff)
 
     def _registered_dwa_scene(self, check, depth, odom, now_ms, depth_ms, geometry, twists, *, scan, sources,
                               anchor_changed):
@@ -3151,6 +3156,11 @@ class NaviPlugin:
             self._state.published_dwa_route = None
             self._state.published_camera_passage = None
             if (outgoing_arc is not None and outgoing_arc.sent and tick < outgoing_arc.expires_at
+                    and outgoing_arc.forward_check is not None and self._wire_moving
+                    and outgoing_arc.forward_check.straight_handoff is not None):
+                # Remember the handoff for this target even through a brief stop.
+                self._state.published_straight_handoff = outgoing_arc.forward_check.straight_handoff
+            if (outgoing_arc is not None and outgoing_arc.sent and tick < outgoing_arc.expires_at
                     and outgoing_arc.camera_arc_end_ms is not None and outgoing_arc.forward_check is not None):
                 self._state.published_camera_passage = outgoing_arc.forward_check.camera_passage
             if (outgoing_arc is not None and outgoing_arc.sent and tick < outgoing_arc.expires_at
@@ -3339,16 +3349,22 @@ class NaviPlugin:
         target_observed = (origin.acceptance.target_observed if origin is not None else
                            objects is not None and not corner_only)
         visual_probe = guard is not None and guard.probe_region
+        straight_handoff = self._state.dwa_trace.get("straight_handoff")
         forward_check = (self._forward_check(decision, previous_twist, depth, odom,
                                              objects_ms if target_observed or visual_probe else 0,
                                              renewable=target_observed and bounded_age, input_revision=input_revision,
                                              target_source=observation_source(objects))
-                         if (origin is not None or camera_arc or (bounded_age and (objects is not None or corner_only)))
+                         if (origin is not None or camera_arc or straight_handoff
+                             or (bounded_age and (objects is not None or corner_only)))
                          and values == decision.values else None)
+        if straight_handoff and forward_check is None and any(values):
+            values = decision.values = [0.] * ACTION_DIM
+            decision.status, decision.reason = policy_mod.AVOIDING, "直行缺少有效观测，保留原路线"
+            obs_ms = now_ms
         if camera_arc and forward_check is not None:
             forward_check = replace(forward_check, target_receipt_ms=objects_ms)
         selected_arc = camera_arc or (origin is not None and bool(origin.acceptance.route_points))
-        if camera_arc and any(values):
+        if (camera_arc or straight_handoff) and any(values):
             prefix_deadline = planning_ms + admission_ms
             if forward_check is not None and forward_check.target_capture_ms is not None:
                 prefix_deadline = min(prefix_deadline, forward_check.target_capture_ms + self._config.depth_age_limit_ms)
@@ -3418,7 +3434,7 @@ class NaviPlugin:
                 if continue_camera:
                     camera_arc = self._state.camera_arc_selected = True
                     decision.reason = "局部规划：沿已执行的曲率接续下一段"
-        if (self._state.checked_prefix or camera_arc) and any(values) and not stale and recheck_deadline is None:
+        if (self._state.checked_prefix or camera_arc or straight_handoff) and any(values) and not stale and recheck_deadline is None:
             recheck_deadline = prefix_deadline
             if recheck_deadline is None or now_ms >= recheck_deadline:
                 values = decision.values = [0.] * ACTION_DIM
@@ -4483,7 +4499,8 @@ class NaviPlugin:
                                          and self._last_decision.status == policy_mod.BLIND)):
                     self._scheduled_command = None
                     return True
-                no_route = self._last_decision is not None and self._last_decision.reason == policy_mod.NO_LOCAL_ROUTE
+                no_route = (self._last_decision is not None and
+                            self._last_decision.reason in (policy_mod.NO_LOCAL_ROUTE, policy_mod.NO_ROUTE_CONTINUATION))
                 if (active is not None and active.sent and active.dwa_origin is not None
                         and self._last_decision is not None
                         and self._last_decision.reason in (policy_mod.FEEDBACK_STALE, policy_mod.FEEDBACK_SWITCH)):
@@ -5446,6 +5463,7 @@ class NaviPlugin:
         if (prediction is not None and origin is None
                 and (message["values"] != prediction.work.message["values"] or not self._prediction_inputs_current(prediction))):
             return self._wire_moving
+        straight_handoff = None
         if origin is None and prediction is None and any(message["values"][:2]):
             work = self._scheduled_command
             staged = self._staged_forward_check
@@ -5456,11 +5474,16 @@ class NaviPlugin:
                 check = staged[1]
             if check is not None:
                 now_ms = int(time.time() * 1000)
-                if self._outgoing_person_standoff(check, message["values"], now_ms,
+                snapshot = self._observation_snapshot(with_capture_timing=True)
+                straight_handoff = check.straight_handoff
+                front_blocked = straight_handoff is not None and message["values"][0] > policy_mod.straight_handoff_speed(
+                        snapshot[1], self._config, check.distance_m,
+                        odom_mod.planar_feedback(snapshot[2]), self._wire_twist or check.previous_twist)
+                if front_blocked or self._outgoing_person_standoff(check, message["values"], now_ms,
                                                   message["stamp_ms"] + message["ttl_ms"],
-                                                  self._observation_snapshot(with_capture_timing=True)):
+                                                  snapshot):
                     self._scheduled_command = None
-                    stop_reason = "target_standoff"
+                    stop_reason = "forward_obstacle" if front_blocked else "target_standoff"
                     message = dict(message, values=[0.] * ACTION_DIM, stamp_ms=now_ms,
                                    obs_stamp_ms=now_ms, ttl_ms=self._ttl_ms)
         if origin is not None and any(message["values"]):
@@ -5687,6 +5710,8 @@ class NaviPlugin:
             elif work is not None and work.leg is not None:
                 state.route_in_view = None
             else:
+                if straight_handoff is not None and state.committed_route is straight_handoff:
+                    state.goal_anchor = state.dwa_guidance = None
                 state.committed_route = state.route_in_view = None
         totals = self._state.dwa_totals
         if origin is not None and moving:
