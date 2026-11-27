@@ -532,6 +532,16 @@ Add sensors and actuators you need onto the canvas, connect them to the core Age
 
 ![Canvas](docs/images/home.png)
 
+One browser session edits the shared canvas at a time. When asked to hand over,
+the editor can save current changes and hand over in one click, or decline.
+With no reply, edit access passes to the requester after 15 seconds.
+
+**My draft** opens the same canvas editor with your browser's saved draft.
+Card positions, links and non-sensitive settings autosave locally. **Apply draft**
+writes them to the shared canvas when it is available and intelligent control is
+stopped. The draft toolbar shows the shared canvas status and lets you release
+your shared edit access while you stay in the draft.
+
 ### Real-Time Monitoring
 
 Live sensor data visualization — audio waveforms, battery status, 3D skeleton/point cloud, and more.

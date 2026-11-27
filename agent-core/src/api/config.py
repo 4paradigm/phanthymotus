@@ -1242,6 +1242,11 @@ def teardown_running() -> bool:
     return task is not None and not task.done()
 
 
+def canvas_replacement_allowed() -> bool:
+    starting = _start_project_task is not None and not _start_project_task.done()
+    return not (config.main.get('core', {}).get('project_running') or starting or teardown_running())
+
+
 async def _do_stop_project():
     """停止智能控制。**两段，保证不同。**
 

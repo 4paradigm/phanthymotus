@@ -493,12 +493,12 @@ class ConfigDB:
         return json.loads(row[0])
 
     def __setitem__(self, key: str, value):
+        self.update({key: value})
+
+    def update(self, values: dict) -> None:
+        rows = [(key, json.dumps(value)) for key, value in values.items()]
         with _get_conn() as conn:
-            conn.execute(
-                'INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
-                (key, json.dumps(value))
-            )
-            conn.commit()
+            conn.executemany('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', rows)
 
     def __contains__(self, key: str) -> bool:
         with _get_conn() as conn:

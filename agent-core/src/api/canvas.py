@@ -7,12 +7,19 @@ configuration in the SQLite config table.
 Includes editor lock: only one session can edit at a time.
 """
 
+from __future__ import annotations
+
 import asyncio
+from dataclasses import dataclass
 import json
+import math
 import time
-import fastapi
-from pydantic import BaseModel
 from typing import Any, Optional
+from uuid import uuid4
+
+import fastapi
+from jsonschema.validators import validator_for
+from pydantic import BaseModel
 
 import config
 
@@ -41,16 +48,31 @@ _editor_last_seen: float = 0.0          # monotonic timestamp of last real actio
 _EDITOR_TIMEOUT = 60.0                  # idle seconds before the lock auto-releases
 
 _live_sessions: dict[str, int] = {}     # session_id → open /ws/motus count
+_disconnect_tasks: dict[str, asyncio.Task] = {}
 _DISCONNECT_GRACE = 8.0                 # seconds to tolerate a WS reconnect flap
 
 _SWEEP_INTERVAL = 10.0                  # background expiry check cadence
+_TAKEOVER_TIMEOUT = 15.0
 
-# Why the lock was last freed. Mirrored into /edit-status so a client that missed
-# the canvas_editor push (WS down — the very case the poll exists for) can still
-# tell "you idled out" from "someone released it".
-_last_release_reason = ''
+# Keep the latest transition available to clients that missed the WebSocket push.
+_editor_reason = ''
+_editor_revision = 0
+_editor_generation = 0
+_editor_instance = uuid4().hex
 
 _layout_rev = 0                         # bumped on every canvas_layout write
+
+
+@dataclass(frozen=True)
+class _Takeover:
+    id: str
+    requester: str
+    deadline: float
+    layout: CanvasSnapshot | None = None
+
+
+_takeover: _Takeover | None = None
+_takeover_result: dict | None = None
 
 
 def _broadcast(event: dict) -> None:
@@ -61,21 +83,84 @@ def _broadcast(event: dict) -> None:
     broadcast degrades cross-tab freshness, not correctness, since clients also
     poll /canvas/edit-status.
     """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
     from api.motus_stream import push_event
 
-    try:
-        asyncio.create_task(push_event(event))
-    except RuntimeError:
-        pass
+    loop.create_task(push_event(event))
+
+
+def _editor_state() -> dict:
+    request = _takeover
+    return {
+        'editor': _editor_session,
+        'reason': _editor_reason,
+        'editor_instance': _editor_instance,
+        'editor_revision': _editor_revision,
+        'editor_generation': _editor_generation,
+        'takeover': ({
+            'id': request.id, 'requester': request.requester,
+            'layout_source': 'personal' if request.layout is not None else 'shared',
+            'remaining_seconds': max(0, math.ceil(request.deadline - time.monotonic())),
+        } if request else None),
+        'takeover_result': _takeover_result,
+    }
 
 
 def _broadcast_editor(reason: str) -> None:
-    """Tell every client who holds the lock now (None = free)."""
-    global _last_release_reason
-    if _editor_session is None:
-        _last_release_reason = reason
-    _broadcast({'type': 'canvas_editor',
-                'payload': {'editor': _editor_session, 'reason': reason}})
+    """Publish the lock and takeover together so they cannot disagree in clients."""
+    global _editor_reason, _editor_revision
+    _editor_reason = reason
+    _editor_revision += 1
+    _broadcast({'type': 'canvas_editor', 'payload': _editor_state()})
+
+
+def _set_editor(session_id: str | None, reason: str, *, renew: bool = False) -> None:
+    global _editor_session, _editor_last_seen, _editor_generation
+    if renew or session_id != _editor_session:
+        _editor_generation += 1
+    _editor_session = session_id
+    _editor_last_seen = time.monotonic() if session_id else 0.0
+    _broadcast_editor(reason)
+
+
+def _requester_present(request: _Takeover) -> bool:
+    return request.requester not in _disconnect_tasks
+
+
+def _settle_takeover(outcome: str, *, grant: bool = False, release_reason: str = '') -> None:
+    global _takeover, _takeover_result
+    request = _takeover
+    if request is None:
+        return
+    if grant and request.layout is not None:
+        if _can_apply_personal_layout():
+            _apply_personal_layout(request.layout, request.requester)
+        else:
+            grant = False
+            outcome = 'takeover_layout_locked'
+    _takeover = None
+    _takeover_result = {
+        'id': request.id, 'requester': request.requester, 'outcome': outcome,
+        'layout_source': 'personal' if request.layout is not None else 'shared',
+    }
+    if grant:
+        _set_editor(request.requester, outcome)
+    elif release_reason:
+        _set_editor(None, release_reason)
+    else:
+        _broadcast_editor(outcome)
+
+
+def _release_editor(reason: str) -> None:
+    if _takeover is None:
+        _set_editor(None, reason)
+    elif _requester_present(_takeover):
+        _settle_takeover('takeover_released', grant=True, release_reason=reason)
+    else:
+        _settle_takeover('takeover_cancelled', release_reason=reason)
 
 
 def notify_layout_changed(session_id: str = '') -> None:
@@ -97,13 +182,24 @@ def _check_editor_expired():
     editor, and letting a live WS veto expiry is exactly what made the lock
     un-releasable. Only real actions push _editor_last_seen forward.
     """
-    global _editor_session, _editor_last_seen
     if not _editor_session:
         return
-    if (time.monotonic() - _editor_last_seen) > _EDITOR_TIMEOUT:
-        _editor_session = None
-        _editor_last_seen = 0.0
-        _broadcast_editor('idle')
+    now = time.monotonic()
+    if _takeover and now >= _takeover.deadline:
+        if _requester_present(_takeover):
+            _settle_takeover('takeover_timeout', grant=True)
+            return
+        _settle_takeover('takeover_cancelled')
+    if (now - _editor_last_seen) > _EDITOR_TIMEOUT:
+        _release_editor('idle')
+
+
+def _takeover_timeout(request_id: str) -> None:
+    if _takeover and _takeover.id == request_id:
+        if (remaining := _takeover.deadline - time.monotonic()) > 0:
+            asyncio.get_running_loop().call_later(remaining, _takeover_timeout, request_id)
+        else:
+            _check_editor_expired()
 
 
 async def _editor_sweeper() -> None:
@@ -115,24 +211,20 @@ async def _editor_sweeper() -> None:
     """
     while True:
         await asyncio.sleep(_SWEEP_INTERVAL)
-        try:
-            _check_editor_expired()
-        except Exception:
-            pass                        # a sweep failure must not kill the loop
+        _check_editor_expired()
 
 
 def start_editor_sweeper() -> None:
     """Launch the sweeper; called from start.py's lifespan."""
-    try:
-        asyncio.create_task(_editor_sweeper())
-    except RuntimeError:
-        pass                            # no loop (tests, import-time) — lazy checks still apply
+    asyncio.get_running_loop().create_task(_editor_sweeper())
 
 
 def session_connected(session_id: str) -> None:
     """A /ws/motus connection opened for this session."""
     if not session_id:
         return
+    if pending := _disconnect_tasks.pop(session_id, None):
+        pending.cancel()
     _live_sessions[session_id] = _live_sessions.get(session_id, 0) + 1
 
 
@@ -150,23 +242,21 @@ def session_disconnected(session_id: str) -> None:
         _live_sessions[session_id] = remaining
         return
     _live_sessions.pop(session_id, None)
-    try:
-        asyncio.create_task(_grace_release(session_id))
-    except RuntimeError:
-        pass
+    if pending := _disconnect_tasks.get(session_id):
+        pending.cancel()
+    _disconnect_tasks[session_id] = asyncio.get_running_loop().create_task(_grace_release(session_id))
 
 
 async def _grace_release(session_id: str) -> None:
     """Release `session_id`'s lock unless it reconnects within the grace period."""
-    global _editor_session, _editor_last_seen
     await asyncio.sleep(_DISCONNECT_GRACE)
+    _disconnect_tasks.pop(session_id, None)
     if _live_sessions.get(session_id):
         return                          # reconnected — keep editing
-    if _editor_session != session_id:
-        return
-    _editor_session = None
-    _editor_last_seen = 0.0
-    _broadcast_editor('disconnect')
+    if _takeover and _takeover.requester == session_id:
+        _settle_takeover('takeover_cancelled')
+    if _editor_session == session_id:
+        _release_editor('disconnect')
 
 
 def current_editor() -> Optional[str]:
@@ -236,12 +326,45 @@ def tool_config_key(mcp_id: str, tool_name: str, instance_id: str = '') -> str:
 
 
 
-class CanvasLayout(BaseModel):
+class CanvasSnapshot(BaseModel):
     cards:           list  = []
     connections:     list  = []
     execConnections: list  = []
     transform:       dict  = {}
+
+
+class DraftConfig(BaseModel):
+    mcp_id: str
+    tool_name: str
+    instance_id: str = ''
+    values: dict[str, Any]
+
+
+class CanvasLayout(CanvasSnapshot):
+    draft_configs: list[DraftConfig] = []
     session_id:      Optional[str] = None
+    editor_generation: int | None = None
+    editor_instance: str | None = None
+
+
+class TakeoverRequest(BaseModel):
+    session_id: str
+    layout: CanvasSnapshot | None = None
+
+
+class TakeoverResponse(BaseModel):
+    session_id: str
+    request_id: str
+    action: str
+    layout: CanvasLayout | None = None
+
+
+def _matches_editor_lease(generation: int | None, instance: str | None) -> bool:
+    return generation == _editor_generation and instance == _editor_instance
+
+
+def _holds_editor(session_id: str | None, generation: int | None, instance: str | None) -> bool:
+    return bool(session_id and session_id == _editor_session and _matches_editor_lease(generation, instance))
 
 
 # ── Editor Lock Endpoints ────────────────────────────────────────────────────
@@ -249,23 +372,91 @@ class CanvasLayout(BaseModel):
 @router.post('/claim-edit')
 async def claim_edit(body: dict = fastapi.Body(...)):
     """Request edit permission. Returns 423 if someone else is editing."""
-    global _editor_session, _editor_last_seen
     _check_editor_expired()
 
     session_id = body.get('session_id', '')
-    if not session_id:
+    if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 128:
         return fastapi.responses.JSONResponse(
             status_code=400, content={'code': 400, 'message': 'session_id required'})
 
     if _editor_session and _editor_session != session_id:
-        return fastapi.responses.JSONResponse(
-            status_code=423, content={'code': 423, 'message': 'Canvas is locked by another editor',
-                                      'editor': _editor_session})
+        return _editor_conflict('Canvas is locked by another editor.', 423)
 
-    _editor_session = session_id
-    _editor_last_seen = time.monotonic()
-    _broadcast_editor('claim')
-    return {'code': 200, 'editor': session_id}
+    _set_editor(session_id, 'claim')
+    return {'code': 200, **_editor_state()}
+
+
+def _editor_conflict(message: str, code: int = 409):
+    return fastapi.responses.JSONResponse(
+        status_code=code, content={'code': code, 'message': message, **_editor_state()},
+    )
+
+
+@router.post('/request-takeover')
+async def request_takeover(body: TakeoverRequest):
+    global _takeover, _takeover_result
+    _check_editor_expired()
+    session = body.session_id.strip()
+    if not session or len(session) > 128:
+        return _editor_conflict('Invalid canvas session.', 400)
+    if _editor_session == session:
+        return {'code': 200, **_editor_state()}
+    if body.layout is not None and not _can_apply_personal_layout():
+        return _editor_conflict('Stop intelligent control before applying a personal layout.')
+    if _editor_session is None:
+        if body.layout is not None:
+            _apply_personal_layout(body.layout, session)
+        _set_editor(session, 'takeover_personal' if body.layout is not None else 'claim')
+        return {'code': 200, **_editor_state()}
+    if _takeover:
+        if _takeover.requester == session:
+            return {'code': 200, **_editor_state()}
+        return _editor_conflict('Another takeover request is pending.')
+    _takeover = _Takeover(uuid4().hex, session, time.monotonic() + _TAKEOVER_TIMEOUT, body.layout)
+    _takeover_result = None
+    asyncio.get_running_loop().call_later(_TAKEOVER_TIMEOUT, _takeover_timeout, _takeover.id)
+    _broadcast_editor('takeover_requested')
+    return {'code': 200, **_editor_state()}
+
+
+@router.post('/respond-takeover')
+async def respond_takeover(body: TakeoverResponse):
+    _check_editor_expired()
+    old_cards = None
+    request = _takeover
+    if not request or request.id != body.request_id:
+        return _editor_conflict('This takeover request has already closed.')
+    if body.action == 'cancel':
+        if body.session_id != request.requester:
+            return _editor_conflict('Only the requester can cancel.', 403)
+        _settle_takeover('takeover_cancelled')
+    elif body.action in ('approve', 'deny'):
+        if body.session_id != _editor_session:
+            return _editor_conflict('Only the current editor can respond.', 403)
+        if body.action == 'approve':
+            if not _requester_present(request):
+                _settle_takeover('takeover_cancelled')
+                return _editor_conflict('The requester closed the canvas.')
+            if body.layout is not None:
+                layout = body.layout
+                if layout.session_id != body.session_id or not _holds_editor(
+                    layout.session_id, layout.editor_generation, layout.editor_instance,
+                ):
+                    return _editor_conflict('Not the current editor.', 403)
+                if request.layout is None:
+                    old_cards = _store_layout(layout, body.session_id)
+            _settle_takeover('takeover_approved', grant=True)
+            if _editor_session != request.requester:
+                return _editor_conflict('Stop intelligent control before applying a personal layout.')
+        else:
+            _settle_takeover('takeover_denied')
+    else:
+        return _editor_conflict('Unknown takeover response.', 400)
+    result = {'code': 200, **_editor_state()}
+    if old_cards is not None:
+        from api.config import stop_removed_cards
+        await stop_removed_cards(old_cards, body.layout.cards)
+    return result
 
 
 @router.post('/release-edit')
@@ -277,24 +468,20 @@ async def release_edit(request: fastapi.Request):
     JSON-decodes an `application/*json` body, so a declared dict param 422'd and
     the lock was never released.
     """
-    global _editor_session, _editor_last_seen
-    _check_editor_expired()
-
     try:
         body = json.loads(await request.body() or b'{}')
     except (ValueError, TypeError):
         body = {}
-    session_id = body.get('session_id', '') if isinstance(body, dict) else ''
+    if not isinstance(body, dict):
+        body = {}
+    session_id = body.get('session_id', '')
+    _check_editor_expired()
 
-    if not session_id or _editor_session != session_id:
-        return fastapi.responses.JSONResponse(
-            status_code=409, content={'code': 409, 'message': 'Not the current editor',
-                                      'editor': _editor_session})
+    if not _holds_editor(session_id, body.get('editor_generation'), body.get('editor_instance')):
+        return _editor_conflict('Not the current editor.')
 
-    _editor_session = None
-    _editor_last_seen = 0.0
-    _broadcast_editor('release')
-    return {'code': 200}
+    _release_editor('release')
+    return {'code': 200, **_editor_state()}
 
 
 @router.post('/keep-edit')
@@ -308,23 +495,20 @@ async def keep_edit(body: dict = fastapi.Body(...)):
     _check_editor_expired()
 
     session_id = body.get('session_id', '')
-    if not session_id or _editor_session != session_id:
+    if not _holds_editor(session_id, body.get('editor_generation'), body.get('editor_instance')):
         # Already expired or taken — a ping cannot resurrect it, the client has to
         # re-claim. Returning the real holder lets it fix its local state in place.
-        return fastapi.responses.JSONResponse(
-            status_code=409, content={'code': 409, 'message': 'Not the current editor',
-                                      'editor': _editor_session})
+        return _editor_conflict('Not the current editor.')
 
     _editor_last_seen = time.monotonic()
-    return {'code': 200, 'editor': _editor_session}
+    return {'code': 200, **_editor_state()}
 
 
 @router.get('/edit-status')
 async def edit_status(session_id: str = ''):
     """Check who is currently editing. Pure query — does not renew the TTL."""
     _check_editor_expired()
-    return {'code': 200, 'editor': _editor_session,
-            'reason': '' if _editor_session else _last_release_reason}
+    return {'code': 200, **_editor_state()}
 
 
 # ── Layout Endpoints ─────────────────────────────────────────────────────────
@@ -334,33 +518,108 @@ async def get_layout():
     """Return the saved canvas layout + current editor info."""
     _check_editor_expired()
     data = config.main.get('canvas_layout', {'cards': []})
-    return {'code': 200, 'data': data, 'editor': _editor_session, 'rev': _layout_rev}
+    return {'code': 200, 'data': data, 'rev': _layout_rev, **_editor_state()}
 
 
 @router.post('/layout')
 async def save_layout(layout: CanvasLayout):
     """Persist the canvas layout. Only the current editor can save."""
-    global _editor_session, _editor_last_seen
+    global _editor_last_seen
     _check_editor_expired()
 
     session_id = layout.session_id
-    if session_id != _editor_session:
-        return fastapi.responses.JSONResponse(
-            status_code=403, content={'code': 403, 'message': 'Not the current editor',
-                                      'editor': _editor_session})
+    if not _holds_editor(session_id, layout.editor_generation, layout.editor_instance):
+        return _editor_conflict('Not the current editor.', 403)
 
     _editor_last_seen = time.monotonic()
 
-    save_data = layout.dict()
-    save_data.pop('session_id', None)
-    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = save_data
-    # A card that leaves the layout is unreachable afterwards — stop-project only
-    # walks the saved cards — so its plugin instance would keep running forever.
+    old_cards = _store_layout(layout, session_id)
+    # An instance removed from the saved layout won't be found by stop-project.
     from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, save_data.get('cards', []))
-    notify_layout_changed(session_id or '')
+    await stop_removed_cards(old_cards, layout.cards)
     return {'code': 200}
+
+
+@router.post('/restore-draft')
+async def restore_draft(layout: CanvasLayout):
+    """Replace the live layout from a browser draft under the current edit lease."""
+    _check_editor_expired()
+    session_id = layout.session_id
+    if not session_id or len(session_id) > 128 or not session_id.strip():
+        return _editor_conflict('Invalid canvas session.', 400)
+    if _editor_session and _editor_session != session_id:
+        return _editor_conflict('Canvas is locked by another editor.', 423)
+    if not _matches_editor_lease(layout.editor_generation, layout.editor_instance):
+        return _editor_conflict('Canvas edit state changed. Try again.', 409)
+    if _takeover:
+        return _editor_conflict('Resolve the current takeover request before restoring a draft.')
+    if not _can_apply_personal_layout():
+        return _editor_conflict('Stop intelligent control before restoring a draft.')
+    try:
+        settings = _draft_config_updates(layout)
+    except ValueError as error:
+        return _editor_conflict(str(error), 422)
+    _apply_personal_layout(layout, session_id, settings)
+    # A save sent before restoring the draft must not overwrite it afterwards.
+    _set_editor(session_id, 'draft_restored', renew=True)
+    return {'code': 200, **_editor_state()}
+
+
+_DraftConfigUpdates = dict[tuple[str, str, str], dict[str, Any]]
+
+
+def _draft_config_updates(layout: CanvasLayout) -> _DraftConfigUpdates:
+    from tool_config import find_tool
+    cards = {(card.get('mcpId'), card.get('toolName'), card.get('id')) for card in layout.cards}
+    tools = {(mcp_id, tool_name) for mcp_id, tool_name, _ in cards}
+    updates: _DraftConfigUpdates = {}
+    for entry in layout.draft_configs:
+        tool = (entry.mcp_id, entry.tool_name)
+        address = (*tool, entry.instance_id)
+        if not entry.values or tool not in tools or (entry.instance_id and address not in cards):
+            continue
+        schema = find_tool(*tool).get('configSchema') or {}
+        props = schema.get('properties') or {}
+        validator = validator_for(schema)(schema)
+        for name, value in entry.values.items():
+            field = props.get(name)
+            if (field is None or field.get('x-sensitive', field.get('format') == 'password')
+                    or (field.get('scope') == 'instance') != bool(entry.instance_id)
+                    or next(validator.descend(value, field), None) is not None):
+                raise ValueError(f'Invalid draft setting {entry.tool_name}.{name}. Refresh the card settings.')
+        if address not in updates:
+            updates[address] = dict(config.main.get(tool_config_key(*address)) or {})
+        updates[address].update(entry.values)
+    return updates
+
+
+def _store_layout(
+    layout: CanvasSnapshot, session_id: str, settings: _DraftConfigUpdates | None = None,
+) -> list:
+    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
+    snapshot = layout.model_dump(include=set(CanvasSnapshot.model_fields))
+    if settings:
+        rows = {tool_config_key(*address): values for address, values in settings.items()}
+        config.main.update({**rows, 'canvas_layout': snapshot})
+    else:
+        config.main['canvas_layout'] = snapshot
+    notify_layout_changed(session_id)
+    return old_cards
+
+
+def _can_apply_personal_layout() -> bool:
+    from api.config import canvas_replacement_allowed
+    return canvas_replacement_allowed()
+
+
+def _apply_personal_layout(
+    layout: CanvasSnapshot, requester: str, settings: _DraftConfigUpdates | None = None,
+) -> None:
+    from api.config import stop_removed_cards
+    old_cards = _store_layout(layout, requester, settings)
+    asyncio.get_running_loop().create_task(stop_removed_cards(old_cards, layout.cards))
+    for (mcp_id, tool_name, instance_id), values in (settings or {}).items():
+        apply_tool_config(mcp_id, tool_name, values, instance_id)
 
 
 # ── Per-tool config CRUD ─────────────────────────────────────────────────────
