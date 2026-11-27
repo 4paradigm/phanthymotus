@@ -246,12 +246,14 @@ class PluginTests(unittest.TestCase):
         play_by_id alias and any saved canvas call keep working.
         """
         self.plugin.dispatch('phanthy_music', {'action': 'start'})
-        reply = self.plugin.dispatch('phanthy_music',
-                                     {'action': 'play_by_id', 'track_id': 'fictional-1'})
-        # mock catalogue has no audio, so it reaches the player and is refused
-        # there — the point is that it got that far rather than being ignored.
-        self.assertIn('error', reply)
-        self.assertIn(reply['error']['code'], ('not_playable', 'not_found'))
+        missing = {'error': {'code': 'not_found'}}
+        with patch.object(self.plugin, '_query', return_value=missing) as query:
+            reply = self.plugin.dispatch(
+                'phanthy_music', {'action': 'play_by_id', 'track_id': 'fictional-1'}
+            )
+        query.assert_called_once()
+        self.assertEqual(query.call_args.kwargs['track_id'], 'fictional-1')
+        self.assertEqual(reply, missing)
 
     def test_the_card_has_nothing_to_configure(self):
         """四项设置没有一项经得起「谁比默认值更有资格回答」的追问：连接内置在卡里，

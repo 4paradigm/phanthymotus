@@ -3215,8 +3215,9 @@ Camera-stream detections include an integer `track_id`, scoped to the running
 VOP instance. Tracking uses ByteTrack's two-stage association with Kalman
 prediction. Detections below the configured confidence, down to 0.1, can
 maintain an active track internally but are omitted from the output. A strong
-detection can recover a lost track within one second. Only observed boxes are
-published. One-shot photo and URL results keep their existing fields.
+detection can recover a lost track within one second. The JSON stream and
+preview publish only observed boxes with an assigned ID that pass the configured
+output confidence. Creating a track requires a score of at least 0.30. One-shot photo and URL results keep their existing fields.
 
 Enable `publish_overlay` on a VOP instance to watch the tracked boxes and
 `class #ID` labels on the same video frame. The second output

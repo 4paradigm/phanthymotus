@@ -559,10 +559,10 @@ class _VOPNode(Node):
                 keep = self._distinct_boxes(boxes, scores, classes)
                 boxes, scores, classes = boxes[keep], scores[keep], classes[keep]
                 tracks = self._tracker.update(boxes, scores, classes, frame_time, confidence)
-                visible = np.flatnonzero(scores >= confidence)
+                visible = sorted(tracks)
                 objects = self._extract_objects(boxes[visible], scores[visible], classes[visible], frame)
                 for obj, index in zip(objects, visible):
-                    obj["track_id"] = tracks.get(int(index))
+                    obj["track_id"] = tracks[index]
                 self._publish_objects(objects, started)
                 if self._pub_overlay is not None:
                     self._publish_overlay_frame(frame, boxes[visible], objects, image_msg.header)
@@ -586,9 +586,9 @@ class _VOPNode(Node):
         for box, obj in zip(boxes, objects):
             left, top, right, bottom = (int(round(value)) for value in box)
             track_id = obj["track_id"]
-            color = palette[(track_id - 1) % len(palette)] if track_id is not None else (180, 180, 180)
+            color = palette[(track_id - 1) % len(palette)]
             cv2.rectangle(frame, (left, top), (right, bottom), color, stroke)
-            label = obj["name"] if track_id is None else f"{obj['name']} #{track_id}"
+            label = f"{obj['name']} #{track_id}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             (text_width, text_height), baseline = cv2.getTextSize(label, font, scale, stroke)
             x = max(0, min(left, width - text_width - 8))

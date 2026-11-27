@@ -451,6 +451,25 @@ def test_low_output_threshold_does_not_create_weak_tracks():
     assert tracker.update(boxes, np.array([0.70, 0.70]), classes, 0.3, 0.1) == {0: 1, 1: 2}
 
 
+def test_stream_omits_untracked_boxes_from_json_and_preview(monkeypatch):
+    model = _FakeModel(rows=[
+        [10, 10, 30, 30, 0.08, 0],
+        [40, 10, 60, 30, 0.18, 0],
+        [70, 10, 90, 30, 0.7, 0],
+    ])
+    plugin, executor = _plugin({"confidence": 0.05, "publish_overlay": True}, model)
+    node = _node_with(plugin, executor)
+    preview = []
+    monkeypatch.setattr(node, "_publish_overlay_frame",
+                        lambda frame, boxes, objects, header: preview.append((boxes.tolist(), objects)))
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    assert _wait_until(lambda: bool(preview))
+    boxes, objects = preview[0]
+    assert boxes == [[70.0, 10.0, 90.0, 30.0]]
+    assert json.loads(node.publishers[0].messages[0])["objects"] == objects
+    assert [obj["track_id"] for obj in objects] == [1]
+
+
 def test_low_confidence_detections_are_dropped():
     plugin, executor = _plugin(
         model=_FakeModel(rows=[[10.0, 10.0, 20.0, 20.0, 0.05, 0]])
