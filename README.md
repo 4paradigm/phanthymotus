@@ -533,9 +533,10 @@ Add sensors and actuators you need onto the canvas, connect them to the core Age
 ![Canvas](docs/images/home.png)
 
 One browser session edits a canvas at a time. If someone is already editing,
-another session can request a takeover from the canvas toolbar. The editor can
-save and hand over the canvas or decline. After 15 seconds without a response,
-the requester receives edit access and loads the latest saved layout.
+another session can request a takeover from the canvas toolbar. The editor can hand
+over the latest saved layout, save the current layout and hand it over in one step,
+or decline. After 15 seconds without a response, the requester receives edit access
+and loads the latest saved layout.
 
 ### Real-Time Monitoring
 

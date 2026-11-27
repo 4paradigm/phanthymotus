@@ -330,6 +330,7 @@ class TakeoverResponse(BaseModel):
     session_id: str
     request_id: str
     action: str
+    layout: CanvasLayout | None = None
 
 
 def _holds_editor(session_id: str | None, generation: int | None, instance: str | None) -> bool:
@@ -388,6 +389,7 @@ async def request_takeover(body: TakeoverRequest):
 @router.post('/respond-takeover')
 async def respond_takeover(body: TakeoverResponse):
     _check_editor_expired()
+    old_cards = None
     request = _takeover
     if not request or request.id != body.request_id:
         return _editor_conflict('This takeover request has already closed.')
@@ -402,12 +404,23 @@ async def respond_takeover(body: TakeoverResponse):
             if not _requester_present(request):
                 _settle_takeover('takeover_cancelled')
                 return _editor_conflict('The requester closed the canvas.')
+            if body.layout is not None:
+                layout = body.layout
+                if layout.session_id != body.session_id or not _holds_editor(
+                    layout.session_id, layout.editor_generation, layout.editor_instance,
+                ):
+                    return _editor_conflict('Not the current editor.', 403)
+                old_cards = _store_layout(layout)
             _settle_takeover('takeover_approved', grant=True)
         else:
             _settle_takeover('takeover_denied')
     else:
         return _editor_conflict('Unknown takeover response.', 400)
-    return {'code': 200, **_editor_state()}
+    result = {'code': 200, **_editor_state()}
+    if old_cards is not None:
+        from api.config import stop_removed_cards
+        await stop_removed_cards(old_cards, body.layout.cards)
+    return result
 
 
 @router.post('/release-edit')
@@ -484,15 +497,20 @@ async def save_layout(layout: CanvasLayout):
 
     _editor_last_seen = time.monotonic()
 
-    save_data = layout.model_dump(exclude={'session_id', 'editor_generation', 'editor_instance'})
-    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
-    config.main['canvas_layout'] = save_data
-    notify_layout_changed(session_id)
-    # A card that leaves the layout is unreachable afterwards — stop-project only
-    # walks the saved cards — so its plugin instance would keep running forever.
+    old_cards = _store_layout(layout)
+    # An instance removed from the saved layout won't be found by stop-project.
     from api.config import stop_removed_cards
-    await stop_removed_cards(old_cards, save_data.get('cards', []))
+    await stop_removed_cards(old_cards, layout.cards)
     return {'code': 200}
+
+
+def _store_layout(layout: CanvasLayout) -> list:
+    old_cards = (config.main.get('canvas_layout', {}) or {}).get('cards', [])
+    config.main['canvas_layout'] = layout.model_dump(
+        exclude={'session_id', 'editor_generation', 'editor_instance'},
+    )
+    notify_layout_changed(layout.session_id or '')
+    return old_cards
 
 
 # ── Per-tool config CRUD ─────────────────────────────────────────────────────

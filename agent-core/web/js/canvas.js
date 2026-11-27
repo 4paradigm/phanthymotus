@@ -3213,7 +3213,11 @@ function _saveLayout(options) {
     _saveDeferred = true;
     return Promise.resolve(false);
   }
-  const cards = _cards.map(c => ({
+  return _writeLayout(_layoutCards(), _connections, _execConnections, options);
+}
+
+function _layoutCards() {
+  return _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
     toolName:   c.toolName,
@@ -3224,11 +3228,14 @@ function _saveLayout(options) {
     topicOut:   c.topicOut || [],
     topicOutFrom: c.topicOutFrom,
   }));
-  return _writeLayout(cards, _connections, _execConnections, options);
+}
+
+function _layoutPayload(cards, connections, execConnections) {
+  return { cards, connections, execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, ..._editorLease() };
 }
 
 function _writeLayout(cards, connections, execConnections, { timeout = 0 } = {}) {
-  const lease = _editorLease();
+  const layout = _layoutPayload(cards, connections, execConnections);
   const pending = (async () => {
     const controller = timeout ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), timeout) : null;
@@ -3236,8 +3243,7 @@ function _writeLayout(cards, connections, execConnections, { timeout = 0 } = {})
       const resp = await fetch('/api/canvas/layout', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ cards, connections, execConnections,
-          transform: { zoom: _zoom, tx: _tx, ty: _ty }, ...lease }),
+        body:    JSON.stringify(layout),
         signal: controller?.signal,
       });
       if (resp.status === 403) {
@@ -3298,8 +3304,10 @@ function _updateEditorUI() {
       bar.innerHTML = _SVG_PEN + '<span class="editor-label" role="status">正在加载已保存的画布…</span>';
     } else if (_isEditor && _takeover) {
       bar.innerHTML = `${_SVG_PEN}<span class="editor-label" role="status">有人申请接管 ${countdown}</span>
-        <button class="editor-btn editor-btn--claim" id="canvas-approve-takeover">保存并交接</button>
+        <button class="editor-btn editor-btn--claim" id="canvas-handoff-takeover">直接交接</button>
+        <button class="editor-btn" id="canvas-approve-takeover">保存并交接</button>
         <button class="editor-btn" id="canvas-deny-takeover">拒绝</button>`;
+      bar.querySelector('#canvas-handoff-takeover').onclick = () => _respondTakeover('handoff');
       bar.querySelector('#canvas-approve-takeover').onclick = () => _respondTakeover('approve');
       bar.querySelector('#canvas-deny-takeover').onclick = () => _respondTakeover('deny');
     } else if (_isEditor) {
@@ -3383,21 +3391,31 @@ async function _flushBeforeRelease() {
 async function _respondTakeover(action) {
   if (_takeoverBusy || !_takeover) return;
   const requestId = _takeover.id;
+  const direct = action === 'handoff';
+  const pausedSave = direct && _saveTimer !== null;
+  if (pausedSave) {
+    clearTimeout(_saveTimer);
+    _saveTimer = null;
+  }
   _takeoverBusy = true;
   _updateEditorUI();
   try {
-    if (action === 'approve' && !(await _flushBeforeRelease())) {
-      if (_takeover?.id === requestId) _showToast('画布尚未保存，请重试');
-      return;
+    const response = { request_id: requestId, action: direct ? 'approve' : action };
+    if (action === 'approve') {
+      if (!_isEditor || _clearing) {
+        _showToast('画布当前无法保存，请重试');
+        return;
+      }
+      response.layout = _layoutPayload(_layoutCards(), _connections, _execConnections);
     }
-    if (_takeover?.id === requestId &&
-        !(await _editorPost('respond-takeover', { request_id: requestId, action }))) {
-      _showToast('接管请求状态已变化');
+    if (!(await _editorPost('respond-takeover', response)) && _takeover?.id === requestId) {
+      _showToast('未能交接画布，请检查状态后重试');
     }
   } catch {
-    _showToast('回应未送达，请检查网络');
+    _showToast('回应未确认，请检查网络');
   } finally {
     _takeoverBusy = false;
+    if (pausedSave && _isEditor) _debouncedSave();
     _updateEditorUI();
   }
 }
@@ -3572,10 +3590,26 @@ async function _reloadLayout() {
     _resolveAllTopics();
     _scheduleRedraw();
     _syncEmptyState();
-    // Update editor info
+    if (_editorSyncing && layoutJson.editor === _sessionId) _revealHandoffCards();
     _applyEditorState(layoutJson, { layoutLoaded: true });
     return true;
   } catch { return false; }
+}
+
+function _revealHandoffCards() {
+  const cards = _cards.filter(({ el }) => !el.hidden);
+  if (!cards.length) return;
+  const viewport = _canvasEl.getBoundingClientRect();
+  if (!viewport.width || !viewport.height) return;
+  const visible = cards.some(({ el }) => {
+    const card = el.getBoundingClientRect();
+    return card.left < viewport.right && card.right > viewport.left
+      && card.top < viewport.bottom && card.bottom > viewport.top;
+  });
+  if (!visible) {
+    _fitToViewport();
+    _saveViewport();
+  }
 }
 
 // Release on page close — a fast path only: correctness comes from the backend
