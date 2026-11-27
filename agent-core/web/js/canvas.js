@@ -3365,8 +3365,12 @@ function _updateEditorUI() {
   bar.classList.toggle('canvas-editor-bar--locked', !_draftEditing && !_isEditor && !!_currentEditor);
 
   const variant = _draftEditing ? 'draft' : _editorSyncing ? 'syncing' : _isEditor ? 'editor' : _currentEditor ? 'reader' : 'free';
-  const applyBlocked = _draftEditing && (_projectEditLockReason() || (_currentEditor && !_isEditor ? '共享画布空闲后可应用' : '') || (_takeover ? '请先处理接管申请' : ''));
-  const template = JSON.stringify([variant, _takeover?.id, _takeoverBusy, _editorInstance, applyBlocked]);
+  const ownsShared = _currentEditor === _sessionId;
+  const sharedStatus = ownsShared ? '你持有编辑权' : _currentEditor ? '他人编辑中' : '空闲';
+  const applyHint = _draftEditing && (_projectEditLockReason() || (_takeover ? '请先处理接管申请' : ''));
+  const applyBlocked = _draftEditing && (applyHint || (_currentEditor && !ownsShared));
+  const template = JSON.stringify([variant, _takeover?.id, _takeoverBusy, _editorInstance, applyHint,
+    _draftEditing && sharedStatus]);
   if (bar.dataset.state !== template) {
     bar.dataset.state = template;
     const countdown = '<span class="editor-countdown" aria-hidden="true"></span>';
@@ -3374,9 +3378,19 @@ function _updateEditorUI() {
       bar.innerHTML = `<button class="editor-btn" id="canvas-back-shared">共享画布</button>
         <span class="editor-label editor-label--active" aria-current="true">我的草稿</span>
         <button class="editor-btn editor-btn--claim" id="canvas-apply-draft">应用草稿</button>
-        ${applyBlocked ? `<span class="editor-label">${applyBlocked}</span>` : ''}`;
+        <span class="editor-label" role="status">共享画布 · ${sharedStatus}</span>
+        ${ownsShared ? '<button class="editor-btn" id="canvas-release-btn">释放共享编辑权</button>' : ''}
+        ${!_currentEditor ? '<button class="editor-btn" id="canvas-edit-shared">编辑共享画布</button>' : ''}
+        ${applyHint ? `<span class="editor-label">${applyHint}</span>` : ''}`;
       bar.querySelector('#canvas-back-shared').onclick = async () => {
         if (!(await _leaveDraftCanvas())) _showToast('暂时无法返回共享画布，请检查网络');
+      };
+      const release = bar.querySelector('#canvas-release-btn');
+      if (release) release.onclick = _releaseEdit;
+      const editShared = bar.querySelector('#canvas-edit-shared');
+      if (editShared) editShared.onclick = async () => {
+        if (await _leaveDraftCanvas()) await _ensureEdit();
+        else _showToast('暂时无法切换到共享画布，请检查网络');
       };
       bar.querySelector('#canvas-apply-draft').onclick = _applyWorkingDraft;
     } else if (_editorSyncing) {
@@ -3555,7 +3569,7 @@ async function _leaveDraftCanvas() {
 
 async function _applyWorkingDraft() {
   if (!_draftEditing || _switchingCanvas || _takeoverBusy || _takeover || _projectEditLockReason()) return;
-  if ((_currentEditor && !_isEditor) || !_saveWorkingDraft()) return;
+  if ((_currentEditor && _currentEditor !== _sessionId) || !_saveWorkingDraft()) return;
   _takeoverBusy = true;
   _updateEditorUI();
   try {
@@ -3595,7 +3609,9 @@ async function _requestTakeover() {
 }
 
 async function _flushBeforeRelease() {
-  if (!_isEditor || _clearing) return false;
+  const fromDraft = !!_draftEditing;
+  const ownsEdit = () => fromDraft ? _currentEditor === _sessionId : _isEditor;
+  if (!ownsEdit() || _clearing) return false;
   clearTimeout(_saveTimer);
   _saveTimer = null;
   let timer;
@@ -3604,7 +3620,7 @@ async function _flushBeforeRelease() {
     new Promise(resolve => { timer = setTimeout(() => resolve(false), EDITOR_SAVE_TIMEOUT_MS); }),
   ]);
   clearTimeout(timer);
-  return settled && _isEditor && await _saveLayout({ timeout: EDITOR_SAVE_TIMEOUT_MS });
+  return settled && ownsEdit() && (fromDraft || await _saveLayout({ timeout: EDITOR_SAVE_TIMEOUT_MS }));
 }
 
 async function _respondTakeover(action) {
@@ -3643,12 +3659,18 @@ function _setCanvasReadonly(readonly) {
 }
 
 async function _releaseEdit() {
-  if (!_isEditor || _takeoverBusy) return;
+  const fromDraft = !!_draftEditing;
+  if (!(fromDraft ? _currentEditor === _sessionId : _isEditor) || _takeoverBusy) return;
+  const lease = _editorLease();
   _takeoverBusy = true;
   _updateEditorUI();
   try {
-    if (!(await _flushBeforeRelease())) { if (_isEditor) _showToast('画布尚未保存，请重试'); return; }
-    await _editorPost('release-edit', _editorLease());
+    if (!(await _flushBeforeRelease())) {
+      if (_currentEditor === _sessionId) _showToast('共享画布尚未保存，请重试');
+      return;
+    }
+    const released = await _editorPost('release-edit', lease);
+    if (fromDraft && released) _showToast('已释放共享编辑权');
   } catch {
     _showToast('释放未送达，请检查网络');
   } finally {
@@ -3702,7 +3724,7 @@ function _applyEditorState(data, { layoutLoaded = false, announce = true } = {})
     _saveTimer = _pingTimer = null;
     _saveDeferred = false;
     if (!layoutLoaded && !_editorSyncing) _scheduleReload(true);
-    if (announce && !_editorSyncing) _showToast(reason === 'idle' ? '超过 1 分钟无操作，编辑权已自动释放'
+    if (announce && !_editorSyncing && !_draftEditing) _showToast(reason === 'idle' ? '超过 1 分钟无操作，编辑权已自动释放'
       : takeover ? '编辑权已交接，画布转为只读' : '编辑权已释放，画布转为只读');
   } else if (!editor && previousEditor && !layoutLoaded) {
     _scheduleReload(true);
