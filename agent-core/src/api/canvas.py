@@ -49,7 +49,7 @@ _disconnect_tasks: dict[str, asyncio.Task] = {}
 _DISCONNECT_GRACE = 8.0                 # seconds to tolerate a WS reconnect flap
 
 _SWEEP_INTERVAL = 10.0                  # background expiry check cadence
-_TAKEOVER_TIMEOUT = 30.0
+_TAKEOVER_TIMEOUT = 15.0
 
 # Keep the latest transition available to clients that missed the WebSocket push.
 _editor_reason = ''
