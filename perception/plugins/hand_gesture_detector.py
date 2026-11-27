@@ -378,6 +378,37 @@ def _decode_gesture_dets(
     return out
 
 
+def _copy_hand_fields(fields: dict, allowed_set: Optional[set] = None) -> dict:
+    """Return a fresh copy of detector hand fields, optionally filtered by `allowed_set`."""
+    raw_boxes = fields.get("hand_bboxes") or {}
+    raw_gests = fields.get("hand_gestures") or {}
+    raw_scores = fields.get("hand_gesture_scores") or {}
+    raw_pts = fields.get("hands_detected") or {}
+    boxes = {side: list(raw_boxes.get(side) or []) for side in ("left", "right")}
+    gests: Dict[str, Optional[str]] = {}
+    scores: Dict[str, Optional[float]] = {}
+    for side in ("left", "right"):
+        lbl = raw_gests.get(side)
+        if lbl is not None and allowed_set is not None and lbl not in allowed_set:
+            gests[side] = None
+            scores[side] = None
+        else:
+            gests[side] = lbl
+            scores[side] = raw_scores.get(side) if lbl is not None else None
+    pts = {
+        side: [list(pt) for pt in pts_list]
+        for side, pts_list in raw_pts.items()
+        if pts_list
+    }
+    return {
+        "hand_bboxes": boxes,
+        "hand_gestures": gests,
+        "hand_gesture_scores": scores,
+        "hands_detected": pts,
+        "hands": {side: [list(pt) for pt in pts_list] for side, pts_list in pts.items()},
+    }
+
+
 class HandGestureDetectorChannel:
     """Runs YOLOv10n hand + gesture detection and attaches left/right results to persons."""
 
@@ -392,6 +423,7 @@ class HandGestureDetectorChannel:
         kpt_conf: float = DEFAULT_KPT_CONF,
         adaptive_zoom: bool = True,
         interval_s: float = 0.0,
+        hold_s: float = 0.5,
     ):
         self._gesture_session = gesture_session
         self._hand_session = hand_session
@@ -400,9 +432,11 @@ class HandGestureDetectorChannel:
         self._two_hand_conf = float(two_hand_conf)
         self._kpt_conf = float(kpt_conf)
         self._adaptive_zoom = bool(adaptive_zoom)
-        self._interval_s = float(interval_s)
+        self._interval_s = max(0.0, float(interval_s))
+        self._hold_s = max(0.0, float(hold_s))
         self._last_t: float = -1e9
-        self._last_result: Optional[dict] = None
+        self._last_by_person: Dict[Any, dict] = {}
+        self._last_synthetic: Optional[dict] = None
         self.ran: int = 0
         self.skipped: Dict[str, int] = {"throttled": 0}
         self.last_error: Optional[str] = None
@@ -415,7 +449,62 @@ class HandGestureDetectorChannel:
     def reset(self) -> None:
         """Clear throttle/cache state when the owning stream node stops."""
         self._last_t = -1e9
-        self._last_result = None
+        self._last_by_person.clear()
+        self._last_synthetic = None
+
+    def _reapply_held(
+        self,
+        persons: List[dict],
+        now: float,
+        *,
+        allowed_set: Optional[set],
+        synthesize_person: bool,
+    ) -> int:
+        """Reapply the most recent per-person detector result during a throttle interval."""
+        hold_window = max(self._hold_s, self._interval_s) if self._hold_s > 0.0 else 0.0
+        found = 0
+        if persons:
+            for p in persons:
+                pid = p.get("id")
+                entry = self._last_by_person.get(pid) if pid is not None else None
+                if (
+                    entry is not None
+                    and hold_window > 0.0
+                    and 0.0 <= (now - entry["seen"]) <= hold_window
+                ):
+                    fields = _copy_hand_fields(entry["fields"], allowed_set)
+                    p.update(fields)
+                    found += sum(
+                        1 for side in ("left", "right")
+                        if fields["hand_bboxes"][side] or fields["hand_gestures"][side]
+                    )
+                else:
+                    p.update(_empty_hand_fields())
+            return found
+
+        if (
+            synthesize_person
+            and self._last_synthetic is not None
+            and hold_window > 0.0
+            and 0.0 <= (now - self._last_synthetic["seen"]) <= hold_window
+        ):
+            src = self._last_synthetic["person"]
+            fields = _copy_hand_fields(self._last_synthetic["fields"], allowed_set)
+            person = {
+                "id": src["id"],
+                "score": src["score"],
+                "box": list(src["box"]),
+                "keypoints": src["keypoints"].copy(),
+                "position": list(src["position"]),
+                "verdict": dict(src["verdict"]),
+                **fields,
+            }
+            persons.append(person)
+            found = sum(
+                1 for side in ("left", "right")
+                if fields["hand_bboxes"][side] or fields["hand_gestures"][side]
+            )
+        return found
 
     def _run_hands(self, frame: np.ndarray, ox: float = 0.0, oy: float = 0.0) -> List[dict]:
         if self._hand_session is None:
@@ -448,18 +537,31 @@ class HandGestureDetectorChannel:
         Returns a diagnostic note dict (`{"ok": True, "found": ..., "ran": ..., ...}`).
         """
         height, width = frame.shape[:2]
-        if self._interval_s > 0.0 and (now - self._last_t) < self._interval_s:
+        allowed_set = set(allowed) if allowed is not None else None
+        if self._interval_s > 0.0 and 0.0 <= (now - self._last_t) < self._interval_s:
             self.skipped["throttled"] += 1
-            for p in persons:
-                for k, v in _empty_hand_fields().items():
-                    p.setdefault(k, v)
-            return {"ok": True, "throttled": True, "ran": self.ran}
+            held_found = self._reapply_held(
+                persons,
+                now,
+                allowed_set=allowed_set,
+                synthesize_person=synthesize_person,
+            )
+            return {
+                "ok": True,
+                "backend": "detector",
+                "throttled": True,
+                "found": held_found,
+                "ran": self.ran,
+            }
 
         try:
             hand_dets = self._run_hands(frame)
             gest_dets = self._run_gestures(frame)
         except Exception as error:  # noqa: BLE001 — never crash body pose on hand failure
             self.last_error = f"{type(error).__name__}: {error}"
+            self._last_t = now
+            self._last_by_person.clear()
+            self._last_synthetic = None
             log.warning("[pose] hand gesture detector failed: %s", error)
             for p in persons:
                 p.update(_empty_hand_fields())
@@ -468,6 +570,8 @@ class HandGestureDetectorChannel:
         self.ran += 1
         self._last_t = now
         self.last_error = None
+        self._last_by_person.clear()
+        self._last_synthetic = None
 
         # Initialise empty hand fields on all persons first.
         for p in persons:
@@ -477,9 +581,10 @@ class HandGestureDetectorChannel:
         # full-frame pass missed both hands and gestures.
         if not hand_dets and not gest_dets:
             if not (self._adaptive_zoom and persons):
-                return {"ok": True, "found": 0, "ran": self.ran, "zoomed": False}
+                return {"ok": True, "backend": "detector", "found": 0, "ran": self.ran, "zoomed": False}
 
         # Pick or synthesize the target person owning these hands.
+        synthesized = False
         if persons:
             p_idx = (
                 pick_primary_person_index(persons, hand_dets or gest_dets)
@@ -488,12 +593,15 @@ class HandGestureDetectorChannel:
             )
             if p_idx != 0:
                 # Place the gesturing person first so single-subject callers
-                # reading persons[0] always receive the active person.
+                # reading persons[0] always receive the active person. Keep
+                # PoseTracker track ids intact on stream frames.
                 persons.insert(0, persons.pop(p_idx))
-                for rank, p in enumerate(persons, start=1):
-                    p["id"] = rank
+                if all("track" not in p for p in persons):
+                    for rank, p in enumerate(persons, start=1):
+                        p["id"] = rank
             person = persons[0]
         elif synthesize_person:
+            synthesized = True
             all_boxes = [d["box"] for d in (hand_dets or gest_dets)]
             ux1 = min(b[0] for b in all_boxes)
             uy1 = min(b[1] for b in all_boxes)
@@ -513,7 +621,7 @@ class HandGestureDetectorChannel:
             }
             persons.append(person)
         else:
-            return {"ok": True, "found": 0, "ran": self.ran, "zoomed": False}
+            return {"ok": True, "backend": "detector", "found": 0, "ran": self.ran, "zoomed": False}
 
         # Adaptive person-crop zoom when the hand is tiny, missed, or borderline.
         zoomed = False
@@ -547,7 +655,7 @@ class HandGestureDetectorChannel:
                         log.debug("[pose] adaptive gesture zoom skipped: %s", error)
 
         if not hand_dets and not gest_dets:
-            return {"ok": True, "found": 0, "ran": self.ran, "zoomed": zoomed}
+            return {"ok": True, "backend": "detector", "found": 0, "ran": self.ran, "zoomed": zoomed}
 
         # Assign individual single-hand boxes to person's left/right.
         box_source = (
@@ -564,8 +672,6 @@ class HandGestureDetectorChannel:
         pred_gestures: Dict[str, Optional[str]] = {"left": None, "right": None}
         pred_scores: Dict[str, Optional[float]] = {"left": None, "right": None}
         pred_hands_pts: Dict[str, List[List[float]]] = {}
-
-        allowed_set = set(allowed) if allowed is not None else None
 
         def _accept(label: Optional[str]) -> Optional[str]:
             if label is None:
@@ -646,6 +752,30 @@ class HandGestureDetectorChannel:
         person["hands"] = pred_hands_pts
 
         found = sum(1 for side in ("left", "right") if pred_boxes[side])
+        has_any = found > 0 or any(pred_gestures[side] is not None for side in ("left", "right"))
+        if has_any:
+            cached_fields = _copy_hand_fields(person)
+            if synthesized:
+                self._last_synthetic = {
+                    "person": {
+                        "id": person["id"],
+                        "score": person["score"],
+                        "box": list(person["box"]),
+                        "keypoints": person["keypoints"].copy(),
+                        "position": list(person["position"]),
+                        "verdict": dict(person["verdict"]),
+                    },
+                    "fields": cached_fields,
+                    "seen": now,
+                }
+            else:
+                pid = person.get("id")
+                if pid is not None:
+                    self._last_by_person[pid] = {
+                        "fields": cached_fields,
+                        "seen": now,
+                    }
+
         return {
             "ok": True,
             "backend": "detector",

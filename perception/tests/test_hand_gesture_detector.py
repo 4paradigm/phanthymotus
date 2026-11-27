@@ -225,6 +225,100 @@ class TestHandGestureDetector(unittest.TestCase):
         self.assertFalse(n3.get("throttled", False))
         self.assertEqual(channel.ran, 2)
 
+    def test_throttled_stream_frames_retain_detector_result_and_fire_gesture_event(self):
+        from plugins.gesture_events import GestureEventTracker
+        from plugins.pose import PoseTracker, _PoseNode, build_backend
+
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        # 3 inference passes see a left-hand "victory" (HaGRID class 21 = peace -> victory),
+        # then the 4th inference pass sees no hands (hand lowered).
+        hand_rows = [[330, 180, 400, 260, 0.94, 0]]
+        gest_rows = [[330, 180, 400, 260, 0.95, 21]]
+        hand_sess = _FakeVisionSession([hand_rows, hand_rows, hand_rows, []])
+        gest_sess = _FakeVisionSession([gest_rows, gest_rows, gest_rows, []])
+        channel = HandGestureDetectorChannel(
+            gest_sess, hand_sess, adaptive_zoom=False, interval_s=0.25
+        )
+        tracker = GestureEventTracker(
+            ("victory",), hold_s=0.5, release_s=0.3, cooldown_s=1.0
+        )
+
+        node = object.__new__(_PoseNode)
+        node._max_persons = 5
+        node._tracker = PoseTracker()
+        node._activity_interval_s = 0.0
+        node._classifier = build_backend("rules")
+        node._last_prediction = {}
+        node._hand_channel = channel
+        node._hand_gestures = None
+        node._last_actions = {}
+        node._publish_bbox = True
+        node._publish_keypoints = "off"
+        node._publish_hand_keypoints = "off"
+
+        base_person = _make_person(l_wrist=(360, 240), r_wrist=(280, 240))
+        boxes = [np.asarray(base_person["box"], dtype=np.float32)]
+        scores = [0.95]
+        kpts_list = [base_person["keypoints"]]
+
+        events = []
+        # Drive 10 frames at ~12.5 fps (dt=0.08s) over [10.00, 10.72] -> 3 inferences, 7 throttled.
+        for step in range(10):
+            now = 10.0 + step * 0.08
+            persons = node._describe(boxes, scores, kpts_list, frame, now_wall=now)
+            self.assertEqual(len(persons), 1)
+            lean = node._lean_record(persons[0])
+            self.assertEqual(
+                lean["hand_gestures"],
+                {"left": "victory", "right": None},
+                f"frame step={step} (t={now:.2f}) flickered empty during throttle",
+            )
+            self.assertEqual(lean["hands_seen"], ["left"])
+            self.assertEqual(lean["hand_bboxes"]["left"], [330.0, 180.0, 400.0, 260.0])
+            events.extend(tracker.update(persons, now))
+
+        self.assertGreater(channel.skipped["throttled"], 0)
+        self.assertEqual(channel.ran, 3)
+        start_events = [e for e in events if e["event"] == "gesture_start"]
+        self.assertEqual(len(start_events), 1)
+        self.assertEqual(start_events[0]["gesture"], "victory")
+        self.assertEqual(start_events[0]["hand"], "left")
+
+        # An unrelated person arriving on a throttled frame must NOT inherit person 1's gesture.
+        stranger = _make_person(l_wrist=(160, 240), r_wrist=(100, 240))
+        stranger["id"] = 99
+        throttled_note = channel.update([stranger], frame, now=10.76)
+        self.assertTrue(throttled_note.get("throttled"))
+        self.assertEqual(stranger["hand_gestures"], {"left": None, "right": None})
+        self.assertEqual(stranger["hand_bboxes"], {"left": [], "right": []})
+
+        # Next fresh inference (t=10.90 >= 10.56 + 0.25) sees hand lowered -> clears cache.
+        persons_after = node._describe(boxes, scores, kpts_list, frame, now_wall=10.90)
+        self.assertEqual(channel.ran, 4)
+        lean_after = node._lean_record(persons_after[0])
+        self.assertEqual(lean_after["hand_gestures"], {"left": None, "right": None})
+        self.assertEqual(lean_after["hands_seen"], [])
+
+        # Synthetic close-up person must also persist across throttled frames and clear on reset().
+        syn_hand = _FakeVisionSession([[[420, 180, 500, 290, 0.92, 0]]])
+        syn_gest = _FakeVisionSession([[[420, 180, 500, 290, 0.91, 18]]])  # ok
+        syn_ch = HandGestureDetectorChannel(
+            syn_gest, syn_hand, adaptive_zoom=False, interval_s=0.5
+        )
+        p_first = []
+        syn_ch.update(p_first, frame, now=1.0, synthesize_person=True)
+        self.assertEqual(len(p_first), 1)
+        self.assertEqual(p_first[0]["hand_gestures"], {"left": "ok", "right": None})
+
+        p_throttled = []
+        syn_ch.update(p_throttled, frame, now=1.1, synthesize_person=True)
+        self.assertEqual(len(p_throttled), 1)
+        self.assertEqual(p_throttled[0]["hand_gestures"], {"left": "ok", "right": None})
+
+        syn_ch.reset()
+        self.assertEqual(syn_ch._last_by_person, {})
+        self.assertIsNone(syn_ch._last_synthetic)
+
     def test_pose_plugin_recognize_by_photo_detector_contract(self):
         from plugins.pose import PosePerceptionPlugin
 

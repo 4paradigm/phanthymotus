@@ -1391,6 +1391,7 @@ class PosePerceptionPlugin:
                 kpt_conf=merged["kpt_confidence"],
                 adaptive_zoom=merged["hand_adaptive_zoom"],
                 interval_s=merged["hand_interval_s"],
+                hold_s=merged["hand_hold_s"],
             )
         try:
             session = self._ensure_hand_model()
@@ -1729,6 +1730,7 @@ class PosePerceptionPlugin:
                 kpt_conf=merged["kpt_confidence"],
                 adaptive_zoom=merged["hand_adaptive_zoom"],
                 interval_s=0.0,
+                hold_s=0.0,
             )
             note = channel.update(persons, frame, 0.0, synthesize_person=True)
             return note, []
