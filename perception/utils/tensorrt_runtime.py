@@ -19,17 +19,39 @@ lazily so importing this module on a non-Jetson host is harmless.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
 import json
 import logging
 import math
+import mmap
+import os
 import threading
 from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+# Process-wide device scratch pool shared across engines that opt in via
+# `shared_scratch=True`. Serializing execution across sharers lets co-resident
+# models reuse one activation buffer instead of holding separate allocations.
+_SHARED_SCRATCH_LOCK = threading.Lock()
+_SHARED_SCRATCH_BUFFERS: dict[int, tuple[int, int]] = {}
+
+
+def _ensure_shared_scratch(cuda: "CudaRuntime", device_id: int, required: int) -> int:
+    required = max(1, int(required))
+    pointer, capacity = _SHARED_SCRATCH_BUFFERS.get(device_id, (0, 0))
+    if pointer and required <= capacity:
+        return pointer
+    if pointer:
+        cuda.free(pointer)
+        _SHARED_SCRATCH_BUFFERS.pop(device_id, None)
+    pointer = cuda.malloc(required)
+    _SHARED_SCRATCH_BUFFERS[device_id] = (pointer, required)
+    return pointer
 
 __all__ = [
     "TensorRTError",
@@ -197,6 +219,38 @@ def _make_logger(trt):
     return _FilteredLogger()
 
 
+def _parse_engine_header(serialized: bytes | memoryview) -> tuple[dict, bytes | memoryview]:
+    if len(serialized) < 8:
+        return {}, serialized
+    metadata_size = int.from_bytes(serialized[:4], "little", signed=True)
+    if metadata_size <= 0 or metadata_size > min(len(serialized) - 4, 1 << 20):
+        return {}, serialized
+    try:
+        header_bytes = (
+            bytes(serialized[4 : 4 + metadata_size])
+            if isinstance(serialized, memoryview)
+            else serialized[4 : 4 + metadata_size]
+        )
+        metadata = json.loads(header_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}, serialized
+    if not isinstance(metadata, dict) or "task" not in metadata:
+        return {}, serialized
+    return metadata, serialized[4 + metadata_size :]
+
+
+def _drop_file_page_cache(fd: int) -> None:
+    """Advise the kernel to drop clean page-cache pages for a loaded engine."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if not callable(fadvise) or dontneed is None:
+        return
+    try:
+        fadvise(fd, 0, 0, dontneed)
+    except OSError:
+        pass
+
+
 def read_engine_file(path: str | Path) -> tuple[dict, bytes]:
     """Read a serialized engine, stripping an optional JSON metadata header.
 
@@ -207,18 +261,51 @@ def read_engine_file(path: str | Path) -> tuple[dict, bytes]:
         serialized = Path(path).read_bytes()
     except OSError as error:
         raise TensorRTError(f"TensorRT engine could not be read: {path}") from error
-    if len(serialized) < 8:
-        return {}, serialized
-    metadata_size = int.from_bytes(serialized[:4], "little", signed=True)
-    if metadata_size <= 0 or metadata_size > min(len(serialized) - 4, 1 << 20):
-        return {}, serialized
+    metadata, payload = _parse_engine_header(serialized)
+    return metadata, bytes(payload) if isinstance(payload, memoryview) else payload
+
+
+@contextlib.contextmanager
+def _open_engine_buffer(path: str | Path):
+    """Map an engine file read-only for zero-copy deserialization, then drop cache.
+
+    Avoids allocating a second full anonymous copy of the engine in RAM while
+    multiple containers deserialize engines concurrently on an 8 GB Jetson.
+    """
     try:
-        metadata = json.loads(serialized[4 : 4 + metadata_size].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return {}, serialized
-    if not isinstance(metadata, dict) or "task" not in metadata:
-        return {}, serialized
-    return metadata, serialized[4 + metadata_size :]
+        file_obj = open(path, "rb")
+    except OSError as error:
+        raise TensorRTError(f"TensorRT engine could not be read: {path}") from error
+    with file_obj:
+        fd = file_obj.fileno()
+        try:
+            size = os.fstat(fd).st_size
+        except OSError as error:
+            raise TensorRTError(f"TensorRT engine could not be read: {path}") from error
+        if size <= 0:
+            yield {}, b""
+            return
+        try:
+            mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+        except (OSError, ValueError):
+            # Fallback for non-mmapable streams/files.
+            try:
+                raw = file_obj.read()
+            except OSError as error:
+                raise TensorRTError(f"TensorRT engine could not be read: {path}") from error
+            yield _parse_engine_header(raw)
+            return
+        view = memoryview(mm)
+        payload = None
+        try:
+            metadata, payload = _parse_engine_header(view)
+            yield metadata, payload
+        finally:
+            if payload is not None and payload is not view and isinstance(payload, memoryview):
+                payload.release()
+            view.release()
+            mm.close()
+            _drop_file_page_cache(fd)
 
 
 # ── CUDA runtime ─────────────────────────────────────────────────────────────
@@ -360,11 +447,16 @@ class TensorRTEngine:
     """
 
     def __init__(self, path: str | Path, *, device_id: int = 0,
-                 primary_input: str | None = None):
+                 primary_input: str | None = None,
+                 shared_scratch: bool = False):
         import tensorrt as trt
 
         self.path = str(path)
         self._trt = trt
+        self._device_id = int(device_id)
+        self._shared_scratch = bool(shared_scratch)
+        self._uses_shared_scratch = False
+        self._scratch_required = 0
         self._lock = threading.Lock()
         self._cuda: CudaRuntime | None = None
         self._runtime = None
@@ -375,7 +467,7 @@ class TensorRTEngine:
         self._active_profile = 0
         self._active_shape: tuple[int, ...] | None = None
 
-        self.metadata, serialized = read_engine_file(self.path)
+        self.metadata = {}
         try:
             self._cuda = CudaRuntime(device_id)
             # Kept on the instance, not passed inline: TensorRT holds a bare
@@ -383,8 +475,9 @@ class TensorRTEngine:
             # segfaults the process at a random later inference.
             self._logger = _make_logger(trt)
             self._runtime = trt.Runtime(self._logger)
-            self._engine = self._runtime.deserialize_cuda_engine(serialized)
-            del serialized
+            with _open_engine_buffer(self.path) as (metadata, serialized):
+                self.metadata = metadata
+                self._engine = self._runtime.deserialize_cuda_engine(serialized)
             if self._engine is None:
                 # Overwhelmingly this is a version mismatch: an engine plan is
                 # tied to the exact TensorRT that built it, and the reason it
@@ -401,7 +494,22 @@ class TensorRTEngine:
                     f"(see the preceding [TRT] [E] line for the version it "
                     f"expects)."
                 )
-            self._context = self._engine.create_execution_context()
+            if (
+                self._shared_scratch
+                and hasattr(trt, "ExecutionContextAllocationStrategy")
+                and hasattr(trt.ExecutionContextAllocationStrategy, "USER_MANAGED")
+                and hasattr(self._engine, "device_memory_size_v2")
+            ):
+                try:
+                    self._context = self._engine.create_execution_context(
+                        trt.ExecutionContextAllocationStrategy.USER_MANAGED
+                    )
+                    if self._context is not None:
+                        self._uses_shared_scratch = True
+                except (AttributeError, TypeError):
+                    self._context = None
+            if self._context is None:
+                self._context = self._engine.create_execution_context()
             if self._context is None:
                 raise TensorRTError(f"failed to create TensorRT context: {self.path}")
 
@@ -516,7 +624,12 @@ class TensorRTEngine:
                     f"auxiliary input {name} shape {value.shape} must be {self.auxiliary_shapes[name]}"
                 )
             auxiliary[name] = value
-        with self._lock:
+        shared_guard = (
+            _SHARED_SCRATCH_LOCK
+            if self._uses_shared_scratch
+            else contextlib.nullcontext()
+        )
+        with self._lock, shared_guard:
             if self._context is None or self._cuda is None:
                 raise TensorRTError(f"TensorRT engine is closed ({self.path})")
             cuda = self._cuda
@@ -532,6 +645,15 @@ class TensorRTEngine:
                 for name, value in auxiliary.items():
                     if not context.set_input_shape(name, value.shape):
                         raise TensorRTShapeError(f"TensorRT rejected auxiliary shape {name}: {value.shape}")
+                if self._uses_shared_scratch:
+                    update_scratch = getattr(
+                        context, "update_device_memory_size_for_shapes", None
+                    )
+                    dynamic_req = int(update_scratch()) if callable(update_scratch) else 0
+                    engine_req = int(getattr(self._engine, "device_memory_size_v2", 0) or 0)
+                    # The context reports the requirement for the shapes just set;
+                    # the engine-level value covers the maximum permitted shapes.
+                    self._scratch_required = dynamic_req if dynamic_req > 0 else engine_req
                 self._active_shape = shape
 
             outputs: list[np.ndarray] = []
@@ -553,6 +675,11 @@ class TensorRTEngine:
                 pointer = self._ensure_capacity(name, value.nbytes)
                 context.set_tensor_address(name, pointer)
                 cuda.copy_host_to_device(pointer, value)
+            if self._uses_shared_scratch and self._scratch_required > 0:
+                scratch_pointer = _ensure_shared_scratch(
+                    cuda, self._device_id, self._scratch_required
+                )
+                context.set_device_memory(scratch_pointer, self._scratch_required)
             if not context.execute_async_v3(cuda.stream_handle):
                 raise TensorRTError(f"TensorRT execute_async_v3 failed ({self.path})")
             for name, output in zip(self.output_names, outputs):
@@ -598,6 +725,8 @@ class TensorRTEngine:
             self._device_buffers = {}
             self._device_capacity = {}
             self._active_shape = None
+            self._scratch_required = 0
+            self._uses_shared_scratch = False
             self._context = None
             self._engine = None
             self._runtime = None

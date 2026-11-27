@@ -732,3 +732,145 @@ def test_motion_is_measured_on_the_tensor_that_would_be_sent():
     moving = still.copy()
     moving[0, 0, :, 0, 0] = np.linspace(0.0, 0.5, 10)
     assert SkeletonActionBackend.clip_motion(moving) == pytest.approx(0.5)
+
+
+# ── 126-class vocabulary & bone / jb modalities ──────────────────────────────
+
+class _FakeEngine126:
+    def __init__(self, scores=None, *, in_channels=3, window_frames=DEFAULT_WINDOW_FRAMES):
+        self.input_shape = (1, NUM_PERSON_SLOTS, window_frames, N_KEYPOINTS, in_channels)
+        self.output_shape = (1, 126)
+        self.calls = []
+        values = np.zeros(126, dtype=np.float32)
+        for index, value in (scores or {}).items():
+            values[index] = value
+        self._outputs = [values[None]]
+
+    def infer(self, blob):
+        self.calls.append(np.asarray(blob).copy())
+        return self._outputs
+
+
+def test_126_class_engine_preserves_exact_byte_spellings():
+    """Every byte-trap class id (make OK sign, Attention, Rally with U+FF0F,
+    MoveInReverse, none) must emerge verbatim from SkeletonActionBackend."""
+    from plugins.action_vocab import OFFICIAL_126_CLASSES
+
+    for cid in (33, 38, 68, 87, 96, 114, 115, 116, 117, 124):
+        engine = _FakeEngine126({cid - 1: 12.0})
+        backend = SkeletonActionBackend(
+            engine=engine, prenorm_mode="fix", min_motion=0.0, min_score=0.05
+        )
+        verdict = backend.classify(_frames(_standing, n=12, static=True))
+        zh, en = OFFICIAL_126_CLASSES[cid]
+        assert verdict["activity"]["name"] == en
+        assert verdict["activity"]["name_zh"] == zh
+        assert verdict["activity"]["action_id"] == cid
+
+
+def test_bone_and_jb_modalities_produce_expected_shapes():
+    from plugins.pose_stgcn import COCO_BONE_PAIRS, compute_bones
+
+    engine_b = _FakeEngine126({0: 10.0}, in_channels=3)
+    backend_b = SkeletonActionBackend(
+        engine=engine_b, modality="b", prenorm_mode="fix", min_motion=0.0
+    )
+    backend_b.classify(_frames(_standing, n=15))
+    assert engine_b.calls[0].shape == (1, 2, DEFAULT_WINDOW_FRAMES, N_KEYPOINTS, 3)
+    # Root joint 0 has parent 0, so bone (0, 0) xy displacement is identically 0.
+    assert COCO_BONE_PAIRS[0] == (0, 0)
+    assert np.allclose(engine_b.calls[0][0, 0, :, 0, :2], 0.0)
+
+    engine_jb = _FakeEngine126({0: 10.0}, in_channels=6)
+    backend_jb = SkeletonActionBackend(
+        engine=engine_jb, modality="auto", prenorm_mode="fix", min_motion=0.0
+    )
+    backend_jb.classify(_frames(_standing, n=15))
+    blob_jb = engine_jb.calls[0]
+    assert blob_jb.shape == (1, 2, DEFAULT_WINDOW_FRAMES, N_KEYPOINTS, 6)
+    expected_b = compute_bones(blob_jb[0, 0, :, :, :3])
+    assert np.allclose(blob_jb[0, 0, :, :, 3:], expected_b, atol=1e-5)
+
+
+def test_hybrid_126_never_leaks_non_vocab_rule_labels_even_when_throttled():
+    """On a 126-class engine, geometry provides posture only; neither a low-score
+    frame nor a throttled (`want_activity=False`) frame may inject rule-only
+    names such as `raising hand` or veto `falling down`."""
+    # Pointing arm pose triggers a rule activity in geometry (`pointing`).
+    joints = _body()
+    shoulder = (CX - 0.10 * H, TOP + 0.18 * H)
+    wrist = (CX - 0.40 * H, TOP + 0.19 * H)
+    joints.update({"left_shoulder": shoulder, "left_wrist": wrist,
+                   "left_elbow": ((shoulder[0] + wrist[0]) / 2,
+                                  (shoulder[1] + wrist[1]) / 2)})
+    box = (CX - 0.45 * H, TOP, CX + 0.15 * H, TOP + H)
+    clip = _frames(lambda _t: joints, n=20, box=box)
+
+    # Below threshold -> activity must be None, NOT geometry's "pointing".
+    low_engine = _FakeEngine126({})
+    hybrid_low = HybridActionBackend(
+        engine=low_engine, min_score=0.5, min_motion=0.0, strict_vocabulary=True
+    )
+    assert hybrid_low.classify(clip, want_activity=True)["activity"] is None
+    assert hybrid_low.classify(clip, want_activity=False)["activity"] is None
+
+    # Falling down class 119 (index 118) is NOT vetoed when body is still upright mid-fall.
+    fall_engine = _FakeEngine126({118: 12.0})
+    hybrid_fall = HybridActionBackend(
+        engine=fall_engine, min_score=0.1, min_motion=0.0, strict_vocabulary=True
+    )
+    res = hybrid_fall.classify(_frames(_standing, n=20), want_activity=True)
+    assert res["activity"]["name"] == "falling down"
+    assert res["activity"]["name_zh"] == "跌倒"
+
+
+def test_min_window_frames_abstains_until_enough_frames_arrive():
+    engine = _FakeEngine126({0: 12.0})
+    backend = SkeletonActionBackend(
+        engine=engine,
+        prenorm_mode="fix",
+        min_motion=0.0,
+        min_window_frames=4,
+    )
+    too_short = backend.predict(_frames(_standing, n=3, fps=10.0))
+    assert too_short["abstained"] == "clip holds too few frames"
+    assert too_short["scores"] == []
+    assert too_short["frames_used"] == 3
+    assert len(engine.calls) == 0
+
+    enough = backend.predict(_frames(_standing, n=4, fps=10.0))
+    assert "abstained" not in enough
+    assert enough["frames_used"] == 4
+    assert len(engine.calls) == 1
+
+
+def test_window_maturity_scales_short_spans_and_reaches_full_weight():
+    unscaled = SkeletonActionBackend(
+        engine=_FakeEngine126({0: 8.0}),
+        prenorm_mode="fix",
+        min_motion=0.0,
+        window_s=5.0,
+        window_maturity_s=0.0,
+    )
+    scaled = SkeletonActionBackend(
+        engine=_FakeEngine126({0: 8.0}),
+        prenorm_mode="fix",
+        min_motion=0.0,
+        window_s=5.0,
+        window_maturity_s=2.8,
+    )
+    raw_score = unscaled.predict(_frames(_standing, n=5, fps=10.0))["scores"][0]["score"]
+
+    # span = 0.4s -> (0.4 / 2.8) ** 1.5 < 0.12 -> clamped at 0.12
+    short_pred = scaled.predict(_frames(_standing, n=5, fps=10.0))
+    assert short_pred["scores"][0]["score"] == pytest.approx(round(raw_score * 0.12, 3), abs=0.002)
+
+    # span = 1.4s -> (1.4 / 2.8) ** 1.5 = 0.5 ** 1.5
+    mid_pred = scaled.predict(_frames(_standing, n=15, fps=10.0))
+    assert mid_pred["scores"][0]["score"] == pytest.approx(
+        round(raw_score * (0.5 ** 1.5), 3), abs=0.002
+    )
+
+    # span = 2.9s >= 2.8s -> full unscaled score
+    mature_pred = scaled.predict(_frames(_standing, n=30, fps=10.0))
+    assert mature_pred["scores"][0]["score"] == pytest.approx(raw_score, abs=0.001)

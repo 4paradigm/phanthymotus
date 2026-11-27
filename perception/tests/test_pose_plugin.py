@@ -203,6 +203,28 @@ def test_keypoint_payload_levels_match_the_implementation():
     assert pose_plugin.TOOLS[0]["configSchema"]["properties"]["publish_keypoints"]["default"] == "off"
 
 
+def test_action_config_schema_defaults_match_plugin_fallbacks(monkeypatch):
+    """Schema defaults and PosePerceptionPlugin fallbacks must stay aligned so
+    existing rolling-mode cards keep main's exact behavior across upgrades."""
+    monkeypatch.delenv("POSE_ACTIVITY_MODE", raising=False)
+    properties = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    plugin, _ = _plugin({})
+    merged = plugin._merged_config("_default")
+    for key in (
+        "action_backend",
+        "action_window_s",
+        "activity_interval_s",
+        "activity_idle_flush_s",
+        "activity_segment_pause_s",
+        "activity_stall_backfill_s",
+        "activity_mode",
+        "label_hold",
+        "action_min_score",
+    ):
+        assert merged[key] == properties[key]["default"], key
+    assert merged["activity_mode"] == "rolling"
+
+
 # ── topic derivation ─────────────────────────────────────────────────────────
 
 def test_topics_are_derived_in_one_place():
@@ -1563,3 +1585,133 @@ def test_a_global_config_call_keeps_the_fall_thresholds():
     assert merged["fall_settle_s"] == 2.5
     assert merged["fall_drop_ratio"] == 0.4
     assert merged["fall_drop_window_s"] == 1.5
+
+
+def test_none_class_38_does_not_collide_with_absent_activity_sentinel():
+    """Class 38 in OFFICIAL_126_CLASSES is ("无动作", "none"). Passing literal
+    `"none"` to `activity_stabiliser` when `activity is None` previously treated
+    absence and class 38 as the same token."""
+    class _NoneClassClassifier:
+        history_s = 3.0
+        last_error = None
+
+        def __init__(self):
+            self.emit_none_class = False
+
+        def classify(self, frames, want_activity=True):
+            act = (
+                {"name": "none", "name_zh": "无动作", "score": 0.88,
+                 "ntu_class": 38, "action_id": 38, "source": "stgcn"}
+                if self.emit_none_class
+                else None
+            )
+            return {"posture": "standing", "posture_confidence": 0.9,
+                    "activity": act, "evidence": {}}
+
+    plugin, _ = _plugin({"label_hold": 2, "activity_interval_s": 0.0})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = plugin._nodes["/cam/rgb"]
+    clf = _NoneClassClassifier()
+    node._classifier = clf
+
+    lean = _publisher(node, "/cam/rgb/poses")
+
+    def push_one():
+        before = len(lean.messages)
+        node._last_inference_time -= 0.25
+        node.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(FRAME_W, FRAME_H)))
+        _wait_until(lambda: len(lean.messages) > before, timeout=3.0)
+        return json.loads(lean.messages[-1])["persons"][0]
+
+    # Frame 1: absent activity (None) primes stabiliser with "__absent__", NOT "none".
+    assert "activity" not in push_one()
+
+    # Frame 2: model emits class 38 ("none") — with hold=2 it must still be held back
+    # for 1 frame rather than matching the absent sentinel immediately!
+    clf.emit_none_class = True
+    assert "activity" not in push_one()
+
+    # Frame 3: second consecutive "none" satisfies hold=2 and publishes "none" / "无动作".
+    third = push_one()
+    assert third["activity"] == "none"
+    assert third["activity_zh"] == "无动作"
+
+
+def test_action_engine_is_shared_across_stop_and_start_cycles(monkeypatch):
+    """Retiring and restarting a topic must reuse the resident ST-GCN++ engine
+    rather than re-deserializing a fresh TensorRTEngine on every start."""
+    import plugins.pose_stgcn as pose_stgcn
+
+    load_calls = []
+
+    class _FakeActionEngine:
+        input_shape = (1, 2, 100, 17, 6)
+        output_shape = (1, 126)
+
+        def infer(self, blob):
+            logits = np.full((1, 126), -10.0, dtype=np.float32)
+            logits[0, 0] = 8.0
+            return [logits]
+
+    def _fake_load(model_dir=None):
+        load_calls.append(model_dir)
+        return _FakeActionEngine()
+
+    monkeypatch.setattr(pose_stgcn, "load_action_engine", _fake_load)
+    plugin, _ = _plugin({
+        "action_backend": "hybrid",
+        "action_modality": "jb",
+        "prenorm_mode": "fix",
+        "min_motion": 0.0,
+        "strict_vocabulary": True,
+        "action_min_score": 0.08,
+        "activity_interval_s": 0.0,
+        "label_hold": 1,
+    })
+
+    for _ in range(3):
+        plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+        node = _feed(plugin, "/cam/rgb", frames=2)
+        last = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])
+        assert last["persons"][0]["activity"] == "drink water"
+        plugin.dispatch("pose", {"action": "stop", "input_topic": "/cam/rgb"})
+
+    assert len(load_calls) == 1
+
+
+def test_max_fps_caps_instance_fps_only_when_positive():
+    capped, _ = _plugin({"fps": 15, "max_fps": 20})
+    capped.dispatch("pose", {"action": "config", "instance_id": "high", "fps": 30})
+    capped.dispatch("pose", {"action": "config", "instance_id": "low", "fps": 10})
+    assert capped._merged_config("high")["fps"] == 20
+    assert capped._merged_config("low")["fps"] == 10
+    assert capped._merged_config("default")["fps"] == 15
+
+    uncapped, _ = _plugin({"fps": 15})
+    uncapped.dispatch("pose", {"action": "config", "instance_id": "high", "fps": 30})
+    assert uncapped._merged_config("high")["fps"] == 30
+
+
+def test_skeleton_publish_skips_unsubscribed_real_publisher_and_keeps_subscribed():
+    plugin, _ = _plugin({"activity_interval_s": 0.0})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = plugin._nodes["/cam/rgb"]
+    lean = _publisher(node, "/cam/rgb/poses")
+    skeleton = _publisher(node, "/cam/rgb/poses/skeleton")
+    assert skeleton is not None
+
+    skeleton.subscription_count = 0
+    node.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(FRAME_W, FRAME_H)))
+    _wait_until(lambda: len(lean.messages) >= 1, timeout=3.0)
+    assert len(lean.messages) == 1
+    assert len(skeleton.messages) == 0
+
+    skeleton.subscription_count = 1
+    node._last_inference_time -= 0.25
+    node.subscriptions[0].callback(_FakeCompressedImage(frame_bytes(FRAME_W, FRAME_H)))
+    _wait_until(
+        lambda: len(lean.messages) >= 2 and len(skeleton.messages) >= 1,
+        timeout=3.0,
+    )
+    assert len(lean.messages) == 2
+    assert len(skeleton.messages) == 1

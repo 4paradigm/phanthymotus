@@ -1207,7 +1207,7 @@ class PoseTracker:
     def __init__(self, history_s: float = 3.0, iou_min: float = 0.2,
                  timeout_s: float = 1.0, min_conf: float = 0.3,
                  centroid_max_travel: float = 1.0,
-                 label_hold: int = 3):
+                 label_hold: int = 3, frame_factory=None):
         self.history_s = float(history_s)
         self.iou_min = float(iou_min)
         self.timeout_s = float(timeout_s)
@@ -1233,6 +1233,9 @@ class PoseTracker:
         # re-identification, so it has no identity to protect.
         self.centroid_max_travel = float(centroid_max_travel)
         self.label_hold = max(1, int(label_hold))
+        # Association only reads t/box/keypoints/height. Segment-only callers
+        # can omit posture geometry; normal live histories keep PoseFrame.
+        self._frame_factory = frame_factory
         self._tracks: list = []
         self._next_id = 1
 
@@ -1318,9 +1321,9 @@ class PoseTracker:
                 track = PoseTrack(self._next_id, self.label_hold)
                 self._next_id += 1
                 self._tracks.append(track)
-            frame = PoseFrame(now, box, np.asarray(keypoints[d_index],
-                                                   dtype=np.float32),
-                              self.min_conf, image_size=image_size)
+            frame = (self._frame_factory or PoseFrame)(
+                now, box, np.asarray(keypoints[d_index], dtype=np.float32),
+                self.min_conf, image_size=image_size)
             track.history.append(frame)
             track.last_seen = now
             self._trim(track, now)

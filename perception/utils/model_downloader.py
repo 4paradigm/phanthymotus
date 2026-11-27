@@ -1601,6 +1601,84 @@ def ensure_action_model(model_dir: str, family: str | None = None,
                                  progress_cb=progress_cb)
 
 
+# Opt-in segment-level action recognition bundle (126-class dual-stream:
+# 6-channel joint+bone ST-GCN++ + MobileNetV2 single-view RGB feature engine
+# with 4-frame global context residual head and calibrated PoE router).
+# Fetched lazily ONLY when the pose card's `activity_mode` is set to `segment`;
+# default `rolling` mode and the NTU-60 `ACTION_MODEL_BUNDLES` above are
+# untouched. Every pin below was verified by anonymous re-download from the
+# immutable 40-char ModelScope revision.
+#
+# Licensing note: skeleton/action training data includes NTU RGB+D (academic /
+# research terms); check dataset terms before commercial redistribution.
+SEGMENT_ACTION_MODEL_BASE = os.environ.get(
+    "SEGMENT_ACTION_MODEL_BASE_URL",
+    "https://modelscope.cn/models/Flame4pd/"
+    "pose-action126-segment-v4/resolve/"
+    "8d27796843e78b7984c0c0893ed456ddd34ba5aa/v4-ctx4-ntu200",
+).rstrip("/")
+_SEGMENT_ACTION_HEAD = {
+    "size": 5018382,
+    "sha256": "9df6c2285b59dd97536290da320fc912278e6b4b233f590678de746729e6ff19",
+}
+_SEGMENT_ACTION_MANIFEST = {
+    "size": 329,
+    "sha256": "f841f9a25a0653eceb6da67df90eced451a230ac4659d3c0a9d269971eec98f1",
+}
+SEGMENT_ACTION_MODEL_BUNDLES = {
+    # Built in the jp6.1 perception image (TensorRT 10.4.0, FP16).
+    "jp61": {
+        "base_url": f"{SEGMENT_ACTION_MODEL_BASE}/jp61",
+        "files": {
+            "stgcnpp-action126-v4-ntu200-y26s.engine": {
+                "size": 4419748,
+                "sha256": "a37b321cc0d7c3b32d25a2abc83f0ef836c9e4acc5514de2952017af7fa8115a",
+            },
+            "mnv2-sv16f-crope-ctx4-v4-feat.engine": {
+                "size": 8673452,
+                "sha256": "e7e61bb21e651b1f965febe62752e734c9a0fa0d1bad8ef7ec66f836b3a3fcba",
+            },
+            "mnv2-sv16f-crope-ctx4-v4-head.npz": _SEGMENT_ACTION_HEAD,
+            "models.json": _SEGMENT_ACTION_MANIFEST,
+        },
+    },
+    # Built from the same ONNX graphs in the jp5.11 perception image
+    # (TensorRT 8.5.2.2, FP16); parity-verified against ORT before upload.
+    "jp511": {
+        "base_url": f"{SEGMENT_ACTION_MODEL_BASE}/jp511",
+        "files": {
+            "stgcnpp-action126-v4-ntu200-y26s.engine": {
+                "size": 4475176,
+                "sha256": "d8f17b14238986515938e6489e9c655524bcd191d5b1d399f44a07bdf634b529",
+            },
+            "mnv2-sv16f-crope-ctx4-v4-feat.engine": {
+                "size": 8618998,
+                "sha256": "4f59087e359cddede17052b7f95d18bbbe7cc68ff191e6828a561004a37c2980",
+            },
+            "mnv2-sv16f-crope-ctx4-v4-head.npz": _SEGMENT_ACTION_HEAD,
+            "models.json": _SEGMENT_ACTION_MANIFEST,
+        },
+    },
+}
+
+
+def ensure_segment_action_model(
+    model_dir: str = "/models/action-segment", family: str | None = None,
+    progress_cb=None,
+) -> dict[str, str]:
+    """Ensure the opt-in segment action bundle matching runtime TensorRT is present.
+
+    Isolated per JetPack family (`<model_dir>/<jp511|jp61>`) so a host sharing
+    `/models` across JP5.11 and JP6.1 containers never overwrites one line's
+    TensorRT engine with the other's.
+    """
+    key = select_bundle_family(SEGMENT_ACTION_MODEL_BUNDLES, family)
+    return _ensure_vision_bundle(
+        "action-segment", SEGMENT_ACTION_MODEL_BUNDLES,
+        os.path.join(model_dir, key), key, progress_cb=progress_cb,
+    )
+
+
 def ensure_hand_model(model_dir: str, family: str | None = None,
                       progress_cb=None) -> dict[str, str]:
     """Ensure the 21-keypoint hand engine matching the runtime TensorRT is present.
