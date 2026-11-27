@@ -1423,6 +1423,49 @@ HAND_ONNX_BASE = os.environ.get(
     "HAND_ONNX_BASE_URL", f"{VISION_MODEL_BASE}/rtmpose-m-hand5/onnx")
 
 
+# Opt-in lightweight single- and two-hand gesture detector engines for
+# `pose` (`hand_backend: detector`): YOLOv10n_hands (~2.27M) and
+# YOLOv10n_gestures (~2.27M, 30 canonical gestures + no_gesture), FP16
+# TensorRT engines compiled for Orin JP5.1.1 (TRT 8.5) and JP6.1 (TRT 10.4).
+# Upstream weights: HaGRIDv2 (CC BY-SA 4.0), direct format conversion only
+# (weights_changed: false).
+HAND_DETECTOR_MODEL_REVISION = "1ca2dd288ef1b882c91a1307473a5ce25a76a662"
+HAND_DETECTOR_MODEL_BASE = os.environ.get(
+    "HAND_DETECTOR_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    f"pose-hand-gesture-detector-trt/resolve/{HAND_DETECTOR_MODEL_REVISION}",
+)
+
+HAND_DETECTOR_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{HAND_DETECTOR_MODEL_BASE}/tensorrt-jp61-trt10.4-orin-640",
+        "files": {
+            "yolov10n_hands_640.engine": {
+                "size": 7809020,
+                "sha256": "b7033ab0d78c18be73c57e0497469a9dddda19a104f5196f67823bbd65fb2353",
+            },
+            "yolov10n_gestures_640.engine": {
+                "size": 7719668,
+                "sha256": "456c9a40670cfc5fef2d929439198e426392b4af21c893d023ecd67869fc250e",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": f"{HAND_DETECTOR_MODEL_BASE}/tensorrt-jp511-trt8.5-orin-640",
+        "files": {
+            "yolov10n_hands_640.engine": {
+                "size": 6618579,
+                "sha256": "d4245dd4313c07db860ec3c49e337c61cdeab938550579a0cb9466d839be8c24",
+            },
+            "yolov10n_gestures_640.engine": {
+                "size": 6881191,
+                "sha256": "3bbf0f47a38a735d1f64500eec90e43a234d8d5c26b6b15adc1bfb085328402a",
+            },
+        },
+    },
+}
+
+
 # Skeleton-action recognition for the pose card: ST-GCN++, joint stream,
 # NTU60-XSub, 2D 17-keypoint input. 1.39 M params and 1.95 GFLOPs at 100 frames,
 # top-1 89.3% — the smallest of the options with a published 2D-COCO17
@@ -1612,6 +1655,19 @@ def ensure_hand_model(model_dir: str, family: str | None = None,
     """
     return _ensure_vision_bundle("hand", HAND_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
+
+
+def ensure_hand_detector_models(model_dir: str, family: str | None = None,
+                                progress_cb=None) -> dict[str, str]:
+    """Ensure the opt-in YOLOv10n hand + 30-class gesture detector engines."""
+    key = select_bundle_family(HAND_DETECTOR_MODEL_BUNDLES, family)
+    return _ensure_vision_bundle(
+        "hand_detector",
+        HAND_DETECTOR_MODEL_BUNDLES,
+        os.path.join(model_dir, key),
+        key,
+        progress_cb=progress_cb,
+    )
 
 
 def ensure_hand_onnx(model_dir: str, progress_cb=None) -> dict[str, str]:
