@@ -532,9 +532,9 @@ Add sensors and actuators you need onto the canvas, connect them to the core Age
 
 ![Canvas](docs/images/home.png)
 
-One browser session edits the shared canvas at a time. An editor can hand over the
-last saved version, save current changes and hand over, or decline. With no reply,
-the requester receives the last saved version after 15 seconds.
+One browser session edits the shared canvas at a time. When asked to hand over,
+the editor can save current changes and hand over in one click, or decline.
+With no reply, edit access passes to the requester after 15 seconds.
 
 **My draft** opens the same canvas editor with your browser's saved draft.
 Card positions, links and non-sensitive settings autosave locally. **Apply draft**

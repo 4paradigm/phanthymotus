@@ -3384,13 +3384,9 @@ function _updateEditorUI() {
     } else if (_isEditor && _takeover) {
       const personal = _takeover.layout_source === 'personal';
       const request = personal ? '对方申请使用自己的草稿' : '对方申请接手共享画布';
-      const direct = personal ? '交接编辑权' : '用已保存版本交接';
-      const save = personal ? '保留我的修改并交接' : '保存当前修改并交接';
       bar.innerHTML = `${_SVG_PEN}<span class="editor-label" role="status">${request} ${countdown}</span>
-        <button class="editor-btn editor-btn--claim" id="canvas-handoff-takeover">${direct}</button>
-        <button class="editor-btn" id="canvas-approve-takeover">${save}</button>
+        <button class="editor-btn editor-btn--claim" id="canvas-approve-takeover">交接画布</button>
         <button class="editor-btn" id="canvas-deny-takeover">拒绝</button>`;
-      bar.querySelector('#canvas-handoff-takeover').onclick = () => _respondTakeover('handoff');
       bar.querySelector('#canvas-approve-takeover').onclick = () => _respondTakeover('approve');
       bar.querySelector('#canvas-deny-takeover').onclick = () => _respondTakeover('deny');
     } else if (_isEditor) {
@@ -3614,16 +3610,10 @@ async function _flushBeforeRelease() {
 async function _respondTakeover(action) {
   if (_takeoverBusy || !_takeover) return;
   const requestId = _takeover.id;
-  const direct = action === 'handoff';
-  const pausedSave = direct && _saveTimer !== null;
-  if (pausedSave) {
-    clearTimeout(_saveTimer);
-    _saveTimer = null;
-  }
   _takeoverBusy = true;
   _updateEditorUI();
   try {
-    const response = { request_id: requestId, action: direct ? 'approve' : action };
+    const response = { request_id: requestId, action };
     if (action === 'approve') {
       if (!_isEditor || _clearing) {
         _showToast('画布当前无法保存，请重试');
@@ -3640,7 +3630,6 @@ async function _respondTakeover(action) {
     _showToast('回应未确认，请检查网络');
   } finally {
     _takeoverBusy = false;
-    if (pausedSave && _isEditor) _debouncedSave();
     _updateEditorUI();
   }
 }
