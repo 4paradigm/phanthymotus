@@ -62,6 +62,7 @@ def _plugin(cfg=None, model=None):
     ("yolov8s-world", "yoloe-26s-seg"),
     ("yoloe-26s", "yoloe-26s-seg"),
     ("yoloe-26s-seg", "yoloe-26s-seg"),
+    ("ovdeim-m-768", "ovdeim-m-768"),
     ("", "yoloe-26s-seg"),
 ])
 def test_legacy_model_names_still_resolve(configured, expected):
@@ -69,9 +70,140 @@ def test_legacy_model_names_still_resolve(configured, expected):
     assert vop_plugin.canonical_model_name(configured) == expected
 
 
-def test_unknown_model_name_is_left_alone():
-    """An explicit engine path is a dev-box escape hatch, not an alias miss."""
-    assert vop_plugin.canonical_model_name("/models/custom.engine") == "/models/custom"
+def test_explicit_engine_path_keeps_its_suffix():
+    """An explicit engine path is a dev-box escape hatch, not an alias miss.
+
+    `_resolve_engine` only takes the configured-file branch while the name still
+    ends in `.engine`, so stripping the suffix would make every such config
+    quietly miss the local file branch.
+    """
+    assert vop_plugin.canonical_model_name("/models/custom.engine") == "/models/custom.engine"
+
+
+# ── model registry and switching ─────────────────────────────────────────────
+
+def test_every_bundled_model_is_offered_on_the_card():
+    """The card's choice and the downloader's rows are one list."""
+    from utils.model_downloader import VOP_MODEL_BUNDLES
+
+    schema = vop_plugin.TOOLS[0]["configSchema"]["properties"]["model"]
+    assert schema["enum"] == list(VOP_MODEL_BUNDLES)
+    assert {"yoloe-26s-seg", "ovdeim-m-768"} <= set(schema["enum"])
+    assert schema["default"] == vop_plugin.DEFAULT_MODEL == "yoloe-26s-seg"
+    assert schema["scope"] == "shared"
+
+
+def test_each_model_downloads_into_its_own_directory(monkeypatch):
+    """Every bundle ships a vocab.json; sharing a directory would make two
+    models overwrite each other's on every switch."""
+    import utils.model_downloader as md
+
+    seen = []
+    monkeypatch.setattr(md, "ensure_verified_bundle",
+                        lambda name, model_dir, base_url, files, progress_cb=None:
+                        seen.append((model_dir, base_url, files)) or {})
+    monkeypatch.setattr(md, "require_models_subpath", lambda path: path)
+    for model in md.VOP_MODEL_BUNDLES:
+        for family in ("jp61", "jp511"):
+            md.ensure_vop_model("/models/vop", model=model, family=family)
+    assert len(seen) == 2 * len(md.VOP_MODEL_BUNDLES)
+    for model_dir, base_url, files in seen:
+        model = model_dir.rsplit("/", 1)[1]
+        assert model_dir == f"/models/vop/{model}"
+        assert base_url.startswith("https://")
+        assert "vocab.json" in files
+        assert any(name.endswith(".engine") for name in files)
+        for meta in files.values():
+            assert int(meta["size"]) > 0
+            assert len(meta["sha256"]) == 64
+
+
+def test_an_unknown_model_is_refused_by_the_downloader():
+    import utils.model_downloader as md
+
+    with pytest.raises(ValueError, match="Unknown vop model"):
+        md.ensure_vop_model("/models/vop", model="nonexistent-detector")
+
+
+def test_config_switches_the_model_and_stops_running_instances():
+    plugin, executor = _plugin(model=_FakeModel())
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    assert len(executor.nodes) == 1
+
+    reply = plugin.dispatch("vop", {"action": "config", "model": "ovdeim-m-768"})
+
+    assert reply["status"] == "configured"
+    assert reply["model"] == "ovdeim-m-768"
+    assert reply["stopped_instances"] == ["/cam/rgb"]
+    assert "model" not in reply["config"]
+    assert executor.nodes == [] and plugin._nodes == {}
+    # The old engine is dropped, so the next start loads the new one.
+    assert plugin._model is None
+    assert plugin._model_name == "ovdeim-m-768"
+    assert plugin._vocabulary == []
+
+
+def test_config_with_an_instance_id_still_switches_the_shared_model():
+    plugin, _ = _plugin(model=_FakeModel())
+    reply = plugin.dispatch("vop", {"action": "config", "instance_id": "cam",
+                                    "model": "ovdeim-m-768", "fps": 3})
+    assert plugin._model_name == "ovdeim-m-768"
+    assert plugin._instance_configs["cam"] == {"fps": 3}
+    assert reply["model"] == "ovdeim-m-768"
+
+
+def test_config_to_the_current_model_keeps_the_engine():
+    model = _FakeModel()
+    plugin, executor = _plugin(model=model)
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("vop", {"action": "config", "model": "yoloe-26s-seg"})
+    assert plugin._model is model
+    assert len(executor.nodes) == 1
+    plugin.dispatch("vop", {"action": "stop"})
+
+
+def test_an_unknown_model_in_config_changes_nothing():
+    model = _FakeModel()
+    plugin, _ = _plugin(model=model)
+    reply = plugin.dispatch("vop", {"action": "config", "model": "nonexistent-detector",
+                                    "fps": 2})
+    assert reply["status"] == "error"
+    assert "ovdeim-m-768" in reply["message"]
+    assert plugin._model is model
+    assert plugin._model_name == "yoloe-26s-seg"
+    assert plugin._fps != 2
+
+
+def test_a_switch_during_a_load_is_refused():
+    plugin, _ = _plugin()
+    plugin._model_loading = True
+    reply = plugin.dispatch("vop", {"action": "config", "model": "ovdeim-m-768"})
+    assert reply["status"] == "error"
+    assert plugin._model_name == "yoloe-26s-seg"
+
+
+def test_prefetch_vocabulary_ignores_stale_result_after_model_switch(monkeypatch, tmp_path):
+    """A slow vocab download started for the old model must not overwrite
+    the vocabulary slot after a switch to another model."""
+    import utils.model_downloader as md
+
+    old_vocab = tmp_path / "vocab.json"
+    old_vocab.write_text(json.dumps({"classes": ["old_only"]}), encoding="utf-8")
+
+    plugin, _ = _plugin()
+    plugin._vocabulary = []
+
+    def fake_ensure(name, model_dir, base_url, files, progress_cb=None):
+        # Simulate model switch happening while the download was in flight.
+        plugin._model_name = "ovdeim-m-768"
+        return {"vocab.json": str(old_vocab)}
+
+    monkeypatch.setattr(md, "ensure_verified_bundle", fake_ensure)
+    monkeypatch.setattr(md, "require_models_subpath", lambda path: path)
+    monkeypatch.setattr(md, "select_bundle_family", lambda bundles, family=None: "jp61")
+
+    plugin._prefetch_vocabulary()
+    assert plugin._vocabulary == []
 
 
 # ── frozen vocabulary ────────────────────────────────────────────────────────
