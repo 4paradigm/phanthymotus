@@ -206,6 +206,24 @@ def test_prefetch_vocabulary_ignores_stale_result_after_model_switch(monkeypatch
     assert plugin._vocabulary == []
 
 
+def test_info_while_loading_surfaces_download_progress():
+    """Card polling via info() must show live download progress instead of a fixed string."""
+    plugin, _ = _plugin()
+    plugin._model = None
+    plugin._model_name = "ovdeim-m-768"
+    plugin._model_loading = True
+    plugin._model_load_status = "Downloading ovdeim-m-768: 42% (19 / 45 MB)"
+    info = plugin.dispatch("vop", {"action": "info"})
+    assert info["state"] == "loading"
+    assert "42%" in info["desc"]
+    assert "ovdeim-m-768" in info["desc"]
+
+    plugin._model_load_status = None
+    fallback = plugin.dispatch("vop", {"action": "info"})
+    assert fallback["state"] == "loading"
+    assert "ovdeim-m-768" in fallback["desc"]
+
+
 # ── frozen vocabulary ────────────────────────────────────────────────────────
 
 def test_set_classes_is_refused_with_the_vocabulary_named():

@@ -1071,7 +1071,7 @@ class VideoObjectPerceptionPlugin:
                 return {
                     "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
                     "state": "loading",
-                    "desc": "Loading YOLO model...",
+                    "desc": self._model_load_status or f"Loading {self._model_name} model...",
                     # **The declaration does not wait for the engine.**
                     #
                     # This reply used to drop it, and agent-core records
