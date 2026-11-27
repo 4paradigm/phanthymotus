@@ -1687,6 +1687,27 @@ def test_physical_memory_requires_three_views_and_complete_free_support():
     assert not memory.has_occupied
 
 
+def test_floorless_view_keeps_only_vertically_supported_hits_in_near_memory():
+    horizontal = HorizontalIntrinsics(640, 420., 320.)
+    geometry = camera_square(horizontal, (480, 420., 240.), .25, at_front=True)
+    image = np.zeros((480, 640))
+    image[445:475, 280:320] = .8
+    image[240:420, 340:380] = .8
+    active = scan.ActiveScan(receipt_only=True, keep_physical_views=True)
+
+    for stamp in (1000, 1100, 1200):
+        depth = dict(map=image, frame_id=stamp, source_frame_id=stamp, capture_ms=stamp)
+        odom = dict(_odom(stamp), received_ms=stamp, source_sample_id=stamp)
+        assert active.update(depth, odom, geometry, receipt_only=True) is None
+        active.update_near_obstacles(depth, geometry, None, .3, 1.5, approaching=True)
+
+    _, observed = active.observed_grid()
+    assert (observed & (scan.RIGHT < 0.)).any()
+    assert (observed & (scan.RIGHT > 0.)).any()
+    assert not (active.near_hits & (scan.RIGHT < 0.)).any()
+    assert (active.near_hits & (scan.RIGHT > 0.)).any()
+
+
 @pytest.mark.parametrize("capture_time", [True, False])
 def test_retained_receipt_view_requires_a_registered_exposure(capture_time):
     look = scan.ActiveScan(receipt_only=True, keep_physical_views=True)

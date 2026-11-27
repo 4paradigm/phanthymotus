@@ -6,6 +6,48 @@ from plugins.navi import policy
 from test_navi_dwa_publish import advance_snapshot, observation_card
 
 
+def test_detour_remembers_the_last_associated_image_side(monkeypatch):
+    card, _, _, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    state = card._state
+    objects, depth, odom, receipt = snapshot[0]
+    person = dict(objects["objects"][0], position=[-.05, -.6])
+    snapshot[0] = dict(objects, objects=[person]), depth, odom, receipt
+
+    card.next_command()
+
+    assert state.tracker.track.accepted_detection
+    assert state.dwa_trace["branch"] in ("route", "reachable_prefix")
+    assert state.last_seen_side == -1.
+
+
+def test_recovery_turn_does_not_switch_to_the_clearer_side(monkeypatch):
+    config = policy.Config(local_planning=True, lost_frames=1)
+    state = policy.State(target="person", last_seen_side=1., reacquire_generation=1)
+    monkeypatch.setattr(policy, "_clearance", lambda _d, _c, lateral_offset_m=0.: (
+        2. if lateral_offset_m < 0. else .8, 1.))
+
+    decision = policy._search_for_target({"map": np.ones((4, 4))}, config, state, .1, None)
+
+    assert decision.values[:5] == [0.] * 5
+    assert decision.values[5] < 0.
+
+
+def test_blocked_recovery_turn_only_retries_toward_original_target(monkeypatch):
+    config = policy.Config(local_planning=True, lost_frames=1, floor_wz=0.)
+    state = policy.State(target="person", last_seen_side=1., reacquire_generation=1)
+
+    def check(_depth, _config, _state, *, requested_yaw=None):
+        if requested_yaw is None or requested_yaw < 0.:
+            return "原地搜索：转身扫掠范围有障碍，停车"
+        return None
+
+    monkeypatch.setattr(policy, "_search_turn_stop", check)
+    decision = policy._search_for_target({}, config, state, .1, None)
+
+    assert decision.values == [0.] * 6
+    assert state.last_seen_side == 1.
+
+
 def test_fresh_depth_on_the_last_seen_person_can_start_a_checked_approach(monkeypatch):
     from plugins.navi.depth import ground_mask
     from test_navi_dwa_integration import card_for_case, observation_case

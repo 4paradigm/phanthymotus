@@ -44,6 +44,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
+from statistics import median
 
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
@@ -571,6 +572,8 @@ class NaviPlugin:
         self._depth_source_ms = None
         self._depth_source_ns = None
         self._depth_vendor = {}
+        self._lateral_depth_reference = None
+        self._lateral_pose_bias = 0.
         self._mounts = {}
         self._obstacle_poses = deque(maxlen=32)
         self._odom = None
@@ -883,6 +886,8 @@ class NaviPlugin:
             self._depth_source_ms = None
             self._depth_source_ns = None
             self._depth_vendor = {}
+            self._lateral_depth_reference = None
+            self._lateral_pose_bias = 0.
             self._mounts.clear()
             self._obstacle_poses.clear()
             self._odom = None
@@ -1978,6 +1983,7 @@ class NaviPlugin:
                               for axis in ("vx", "vy", "wz")}
                 stamp = payload.get("stamp_ms")
                 self._odom_received_ms = now
+                previous_source = self._odom_source_ms
                 self._odom_source_ms = (int(stamp) if isinstance(stamp, (int, float))
                                         and not isinstance(stamp, bool)
                                         and math.isfinite(stamp) and stamp > 0 else None)
@@ -1987,6 +1993,10 @@ class NaviPlugin:
                     pose = sample[1]
                 else:
                     pose = odom_mod.planar_pose(payload, self._odom_source_ms)
+                if (pose is not None or payload.get("valid") is False or (previous_source is not None
+                        and (self._odom_source_ms is None or self._odom_source_ms < previous_source))):
+                    self._lateral_depth_reference = None
+                    self._lateral_pose_bias = 0.
                 previous = self._motion_pose
                 if pose is None or pose != previous:
                     feedback = (pose.feedback_since(previous, policy_mod.ODOM_GAP_MS)
@@ -2049,6 +2059,44 @@ class NaviPlugin:
             self._image_jpeg = bytes(message.data)
             self._image_ms = int(time.time() * 1000)
 
+    def _observe_lateral_pose_bias(self, frame, source, received_ms):
+        config = self._config
+        geometry = config.local_geometry
+        if (self._state.target or self._wire_moving or self._motion_pose is not None or not source
+                or config.local_controller != "dwa" or not config.use_lateral or config.scan_geometry is not None
+                or geometry is None or geometry.horizontal is None or geometry.vertical is None):
+            self._lateral_depth_reference = None
+            return
+        reference = self._lateral_depth_reference
+        if reference is None or not 0 < received_ms - reference[0] <= 900 or source <= reference[1]:
+            self._lateral_depth_reference = received_ms, source, frame
+            return
+        before_ms, _, before = reference
+        elapsed = (received_ms - before_ms) / 1000
+        if elapsed < .5:
+            return
+        self._lateral_depth_reference = received_ms, source, frame
+        samples = [(stamp, identity, motion) for stamp, identity, motion in self._velocity_history
+                   if before_ms <= stamp <= received_ms]
+        gap = config.max_feedback_gap_ms
+        if (len(samples) < 3 or samples[0][0] - before_ms > gap or received_ms - samples[-1][0] > gap
+                or any(identity is None or motion is None for _, identity, motion in samples)
+                or any(not (0 < b[1] - a[1] <= gap and 0 < b[0] - a[0] <= gap)
+                       for a, b in zip(samples, samples[1:]))):
+            return
+        if any(abs(vx) > .01 or abs(wz) > .01 or abs(vy) > policy_mod.STILL_LINEAR
+               for _, _, (vx, vy, wz) in samples):
+            return
+        speeds = [motion[1] for _, _, motion in samples]
+        reported = median(speeds)
+        if abs(reported) < .015 or max(speeds) - min(speeds) > .01:
+            return
+        fx, cx, _, cy = local_path.intrinsics_for(geometry, *frame.shape)
+        displacement = depth_mod.opening_lateral_shift(before, frame, fx, cx, cy)
+        if displacement is not None:
+            bias = reported - displacement / elapsed
+            self._lateral_pose_bias = bias if .015 <= abs(bias) <= policy_mod.STILL_LINEAR else 0.
+
     def _set_depth_map(self, depth, *, capture_ms=None, source_stamp_ns=None, source_frame=None,
                        received_ms=None):
         received_ms = int(time.time() * 1000) if received_ms is None else received_ms
@@ -2074,6 +2122,7 @@ class NaviPlugin:
             if source and source == self._depth_source_ns:
                 # A repeated exposure is still the same observation.
                 return
+            self._observe_lateral_pose_bias(projection.frame, source, received_ms)
             self._depth_map = projection.frame
             self._depth_ground = projection.ground
             self._depth_projection = projection
@@ -2210,6 +2259,8 @@ class NaviPlugin:
                         odom["source_sample_id"] = self._odom_source_ms
                     if self._velocity_history:
                         odom["velocity_history"] = tuple(self._velocity_history)
+                    if self._lateral_pose_bias and pose is None:
+                        odom["lateral_pose_bias"] = self._lateral_pose_bias
                 if self._odom_stamp_verified and odom_age <= policy_mod.ODOM_GAP_MS:
                     odom = {**odom, "stamp_ms": self._odom_ms}
         depth, odom = policy_mod.camera_odometry_inputs(self._config, self._state, depth, odom)
@@ -2832,7 +2883,9 @@ class NaviPlugin:
         result = motion.evaluate_motion(
             prediction, terminal_boundary=boundary, footprint=guard.footprint,
             occupied=occupied, remembered=remembered,
-            supported_region=local_path.SUPPORTED_REGION, original_goal=None, stop_distance_m=0.)
+            supported_region=local_path.SUPPORTED_REGION,
+            original_goal=goal if guard.cached_goal_standoff_m else None,
+            stop_distance_m=(guard.cached_goal_standoff_m + goal_error) if guard.cached_goal_standoff_m else 0.)
         # A newly measured front can veto a translating packet even when
         # this check only confirms the original admission window.
         new_front = live_point is not None or (
@@ -3172,8 +3225,11 @@ class NaviPlugin:
                 if accepted.route_points and accepted.motion_guard.pose is not None:
                     self._state.published_dwa_route = accepted
             committed = self._state.committed_route
+            track = self._state.tracker.track
             if (self._state.published_dwa_route is None and committed is not None
-                    and (committed.locks_detour or self._state.dwa_trace.get("wait_for_committed_route"))):
+                    and (committed.locks_detour or self._state.dwa_trace.get("wait_for_committed_route")
+                         or (self._state.target == "person" and track is not None and not track.observed
+                             and committed.motion_guard is not None and track.generation == committed.motion_guard.generation))):
                 self._state.published_dwa_route = committed
             if self._config.local_controller == "dwa" and self._wire_twist is not None:
                 # A preview or an expired candidate did not change the chassis
@@ -4150,7 +4206,10 @@ class NaviPlugin:
                 return None
         observation_ms = depth_ms if target_pending else min(depth_ms, objects_ms)
         period_ms = math.ceil(1000 / self._rate_hz)
-        deadline_ms = int(min(now_ms + min(self._ttl_ms, 2 * period_ms),
+        # Cover another depth interval on straight, non-lateral motion. The
+        # braking sweep below includes the entire extended command window.
+        hold_periods = 3 if not config.use_lateral and not command[2] else 2
+        deadline_ms = int(min(now_ms + min(self._ttl_ms, hold_periods * period_ms),
                               depth_ms + config.depth_age_limit_ms, observation_ms + max_age,
                               coast_end_ms if target_pending else objects_ms + config.max_obs_age_ms))
         if now_ms >= deadline_ms:
@@ -4716,14 +4775,15 @@ class NaviPlugin:
         best_cost = math.inf
         swept_into_obstacle = False
         lateral_floor, _ = policy_mod._local_velocity_limits(cfg, 1.)[1]
-        for steering, scale in dwa.pursuit_options(yaw_limit, cfg.use_lateral):
+        for steering, scale in dwa.pursuit_options(yaw_limit, cfg.use_lateral or cfg.floor_wz_moving > 0.):
             if steering != yaw_limit and (best is not None or not swept_into_obstacle):
                 break
             tracked = dwa.track_route(
                 points, nominal * scale, original.prediction_horizon_s, steering,
                 body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral,
                 yaw_floor=cfg.floor_wz_moving, lateral_floor=lateral_floor, view_bearing=view_bearing,
-                steering_horizon=cfg.dwa_horizon_s if camera_detour and check.geometry.front == 0. else None)
+                steering_horizon=cfg.dwa_horizon_s if camera_detour and check.geometry.front == 0. else None,
+                hold_heading=steering != yaw_limit)
             if tracked is None:
                 break
             (vx, vy, wz), room = tracked

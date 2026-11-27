@@ -1318,8 +1318,9 @@ def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypat
         assert points[1][0] > 0. and points[1][1] == 0.
 
 
-def test_expired_person_detour_stops_translation_and_keeps_the_original_track(monkeypatch):
-    card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+@pytest.mark.parametrize("clear", [True, False], ids=["clear-route", "new-obstacle"])
+def test_expired_person_track_keeps_the_committed_detour(monkeypatch, clear):
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
     card._config.use_lateral = True
     card._config.use_obstacle_history = False
     assert card._stage_command(card.next_command(), card._output_epoch)
@@ -1328,14 +1329,45 @@ def test_expired_person_detour_stops_translation_and_keeps_the_original_track(mo
     assert state.committed_route.locks_detour
     card._config.max_coast_s = .12
     for stamp in (1100, 1200, 1300):
+        advance_snapshot(snapshot, clock, stamp, obstacle=not clear, vx=0.)
+        _, depth, odom, _ = snapshot[0]
+        snapshot[0] = {"timestamp": stamp / 1000, "objects": []}, depth, odom, stamp
+        packet = card.next_command()
+    assert any(packet["values"][:2]) == clear
+    assert state.committed_route is not None
+    assert state.reacquire_generation == original.generation
+    assert state.tracker.track is original
+    if clear:
+        assert card._last_decision.dwa_acceptance.followed_route
+        assert card._stage_command(packet, card._output_epoch)
+        assert any(packets[-1]["values"][:2])
+
+
+def test_search_can_take_over_when_committed_person_detour_cannot_continue(monkeypatch):
+    from plugins.navi import policy
+
+    card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    state = card._state
+    route = state.committed_route
+    assert route.locks_detour
+    card._config.max_coast_s = .12
+    attempts = []
+    monkeypatch.setattr(policy, "_follow_published_route", lambda *args, **kwargs: attempts.append(args))
+
+    for stamp in (1100, 1200, 1300):
+        attempts.clear()
         advance_snapshot(snapshot, clock, stamp, vx=0.)
         _, depth, odom, _ = snapshot[0]
         snapshot[0] = {"timestamp": stamp / 1000, "objects": []}, depth, odom, stamp
         packet = card.next_command()
-    assert not any(packet["values"][:2])
-    assert state.committed_route is None
-    assert state.reacquire_generation == original.generation
-    assert state.tracker.track is original
+
+    assert len(attempts) == 1
+    assert packet["values"][:5] == [0.] * 5
+    assert packet["values"][5] < 0.
+    assert state.committed_route is route
 
 
 @pytest.mark.parametrize("new_blocker", [False, True])
@@ -1410,6 +1442,40 @@ def test_detour_only_locks_an_inbound_first_half():
     ):
         route = local_path.Detour(None, points, config.local_geometry)
         assert policy._detour_still_locked(route, dwa.remaining_route_length(points), 4., 0.) == expected
+
+
+@pytest.mark.parametrize("blocked", [False, True], ids=["side-face", "blocked-ahead"])
+def test_near_side_face_can_be_passed_without_turning_into_it(monkeypatch, blocked):
+    import numpy as np
+
+    from plugins.navi import local_path, policy
+    from plugins.navi.active_scan import NearProjection
+
+    card, _, _, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    config, state = card._config, card._state
+    config.use_lateral = True
+    config.use_obstacle_history = False
+    card.next_command()
+    scan = state.active_scan
+    state.goal_anchor = None
+    objects, depth, odom, receipt = snapshot[0]
+    pose = policy.dwa_grid_pose(scan, config.local_geometry, receipt, odom)
+    points = [(-.20, -.34)]
+    if blocked:
+        points.append((.08, 0.))
+    cells = local_path.ObstacleSquares(np.array(points), 0.)
+    occupied = np.zeros(local_path.SHAPE, dtype=bool)
+    scan.near_projection = NearProjection(occupied, cells, pose, receipt)
+    monkeypatch.setattr(policy, "_decide", lambda *args, **kwargs: policy.Decision(
+        policy._twist(.2, 0., .5), policy.APPROACHING, "approaching", distance_m=2.))
+
+    decision = policy.step(detections=objects, depth=depth, odom=odom, config=config,
+                           state=state, dt=.1, objects_ms=receipt, dwa_admission_ms=100)
+
+    assert not any(decision.values[1:])
+    assert bool(decision.values[0]) is not blocked
+    if not blocked:
+        assert decision.dwa_acceptance.motion_guard.check.accepted
 
 
 def test_straight_handoff_publishes_slower_speed_when_clearance_shrinks(monkeypatch):

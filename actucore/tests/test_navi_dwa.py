@@ -146,6 +146,17 @@ def test_retained_short_route_creeps_through_a_bend():
     assert 0. < choice.command[0] < .25 and choice.command[2] < 0.
 
 
+def test_retained_non_lateral_route_can_advance_when_turn_sweep_is_blocked():
+    diagnostics = {}
+    choice = _run(((0., 0.), (.4, .27), (1.2, .4)), grid=_grid(obstacles=[(.05, -.35)]),
+                  lateral=False, follow_published=True, target=None, diagnostics=diagnostics,
+                  floors=(.08, 0., .5, .5))
+
+    assert diagnostics["rejected"]["footprint_collision"] > 0
+    assert choice is not None and choice.check.accepted
+    assert choice.command[0] > 0. and choice.command[1:] == (0., 0.)
+
+
 def test_retained_route_prefers_a_slower_arc_with_more_braking_clearance():
     choice = _run(((0., 0.), (1.6, .25)), grid=_grid(obstacles=[(.4, .4)]),
                   follow_published=True, target=None, measured=(.35, 0., -.1), previous=(.35, 0., -.1))

@@ -434,7 +434,7 @@ def view_yaw_limits(limits, bearing, half_fov, horizon, *, protect_person_view=F
 
 
 def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None, yaw_floor=0.,
-                lateral_floor=0., view_bearing=None, steering_horizon=None):
+                lateral_floor=0., view_bearing=None, steering_horizon=None, hold_heading=False):
     """Track the finite visible polyline in the current forward/right grid."""
     segments = _route_segments(points)
     remaining = remaining_route_length(points, segments=segments)
@@ -450,7 +450,7 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
     if f <= 0. and (not lateral or abs(r) <= abs(f)):
         return None
     speed = min(nominal, remaining / horizon)
-    if not lateral and r:
+    if not lateral and r and not hold_heading:
         # Preserve the requested curvature at a tight bend when yaw saturates.
         yaw_cap = -yaw_limit[0] if r > 0. else yaw_limit[1]
         speed = min(speed, yaw_cap * (f * f + r * r) / (2. * abs(r)))
@@ -490,8 +490,8 @@ def pursuit_cost(command, previous, nominal_speed, yaw_limit, check, *, lateral_
     return change + .75 * (1. - speed_fraction) + _obstacle_score(check) * clearance_weight
 
 
-def pursuit_options(yaw_limit, lateral, scales=ROUTE_SPEED_SCALES):
-    headings = (yaw_limit, (0., 0.)) if lateral and any(yaw_limit) else (yaw_limit,)
+def pursuit_options(yaw_limit, can_hold_heading, scales=ROUTE_SPEED_SCALES):
+    headings = (yaw_limit, (0., 0.)) if can_hold_heading and any(yaw_limit) else (yaw_limit,)
     return product(headings, scales)
 
 
@@ -718,7 +718,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         best_rank = None
         swept_into_obstacle = False
         scales = ROUTE_SPEED_SCALES[:len(ROUTE_SPEED_SCALES) - int(transition_slot)]
-        for steering, scale in pursuit_options(yaw_limit, bool(y_speed), scales):
+        for steering, scale in pursuit_options(yaw_limit, bool(y_speed) or floors[3] > 0., scales):
             if budget.expired() or diag["sampled_candidates"] >= slots:
                 break
             if steering != yaw_limit and (best is not None or not swept_into_obstacle):
@@ -726,7 +726,8 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
             tracked = track_route(points, x_speed * scale, horizon, steering,
                                   body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
                                   yaw_floor=floors[3], lateral_floor=floors[1],
-                                  view_bearing=view_bearing, steering_horizon=steering_horizon)
+                                  view_bearing=view_bearing, steering_horizon=steering_horizon,
+                                  hold_heading=steering != yaw_limit)
             if tracked is None:
                 break
             command, room = tracked

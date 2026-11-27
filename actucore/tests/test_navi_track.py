@@ -511,6 +511,47 @@ def test_first_matching_return_revives_a_coasted_track():
     assert track is original and track.observed and track.accepted_detection
 
 
+@pytest.mark.parametrize("stamped", [True, False])
+def test_new_depth_can_associate_a_person_on_the_same_recovery_detection(stamped):
+    config = _cfg(local_controller="dwa", max_coast_s=.2)
+    tracker = T.Tracker()
+    person = _obj("person", bearing=.15)
+
+    def observe(receipt, depth, dt=.1):
+        frame = _detections(person)
+        if stamped:
+            frame["timestamp"] = receipt / 1000
+        return tracker.step(detections=frame, depth=depth, target="person", config=config,
+                            ego=STILL, dt=dt, receipt_ms=receipt, retain_identity=True)
+
+    original = observe(1000, dict(_depth(), frame_id=1000))
+    foreground = dict(_depth(.6), frame_id=1300)
+    assert observe(1300, foreground, dt=.3) is None
+    assert observe(1300, dict(_depth(), frame_id=1200)) is None
+    assert observe(1300, foreground) is None
+    recovered = observe(1300, dict(_depth(), frame_id=1400))
+    assert recovered is original and recovered.observed and recovered.accepted_detection
+    assert observe(1300, dict(_depth(), frame_id=1500)) is recovered
+    assert not recovered.accepted_detection
+
+
+def test_expired_person_associates_against_last_measured_front_after_prediction_drifts():
+    config = _cfg(local_controller="dwa", max_coast_s=.2)
+    tracker = T.Tracker()
+    person = _obj("person")
+    original = _feed(tracker, _stamped(1., person), config=config, target="person")
+    original.front_reference = np.array([3., 0.])
+    original.mean[:2] = [7., 0.]
+
+    def recover(stamp, distance, dt):
+        return tracker.step(detections=_stamped(stamp, person), depth=_depth(distance), target="person",
+                            config=config, ego=STILL, dt=dt, retain_identity=True)
+
+    assert recover(1.3, 7., .3) is None
+    assert recover(1.4, 3., .1) is original
+    assert original.measured_range_m == pytest.approx(3.)
+
+
 def test_reacquiring_a_static_target_after_ego_motion_preserves_zero_velocity():
     config = _cfg()
     tracker = T.Tracker()

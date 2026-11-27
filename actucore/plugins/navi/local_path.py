@@ -315,10 +315,11 @@ def _vertical_face_evidence(frame, heights, pixels, intrinsics, optical_normal):
 class DepthGrid(tuple):
     """Planning visibility and occupancy, with stronger evidence for clearing memory."""
 
-    def __new__(cls, free, occupied, confirmed_free, ignored_low_pixels=None):
+    def __new__(cls, free, occupied, confirmed_free, ignored_low_pixels=None, rememberable=None):
         grid = super().__new__(cls, (free, occupied))
         grid.confirmed_free = confirmed_free
         grid.ignored_low_pixels = ignored_low_pixels
+        grid.rememberable = rememberable
         return grid
 
 
@@ -340,8 +341,10 @@ def frozen_grid(grid):
     clear = confirmed_free(grid)
     frozen_free = frozen_mask(free)
     ignored = getattr(grid, "ignored_low_pixels", None)
+    rememberable = getattr(grid, "rememberable", None)
     return DepthGrid(frozen_free, frozen_mask(occupied), frozen_free if clear is free else frozen_mask(clear),
-                     frozen_mask(ignored) if ignored is not None else None)
+                     frozen_mask(ignored) if ignored is not None else None,
+                     frozen_mask(rememberable) if rememberable is not None else None)
 
 
 def observe(frame, geometry, right, forward, resolution, ground, *, max_hit_depth=None,
@@ -477,6 +480,15 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
 
     # Dropping a possible obstacle only changes current occupancy. A fitted
     # floor needs local support, and floorless clearance needs denser returns.
+    rememberable = None
+    if heights is None and occupied.any():
+        # Floorless pixels can block the current view. A blind-spot cell
+        # needs vertical extent, which a shallow patch of carpet can lack.
+        height = (x * transform[2, 0] + y * transform[2, 1] + z * transform[2, 2])[in_cols][raised]
+        lower, upper = np.full(right.size, np.inf), np.full(right.size, -np.inf)
+        np.minimum.at(lower, cell_ids[raised], height)
+        np.maximum.at(upper, cell_ids[raised], height)
+        rememberable = occupied & ((upper - lower).reshape(right.shape) >= MIN_OBSTACLE_HEIGHT_M)
     if floor_samples is None:
         clear_samples, minimum_clear_samples = ~possible_hits, 8
     else:
@@ -486,7 +498,7 @@ def _project_observed(geometry, right, forward, resolution, x, y, z, hits, *,
     if ignored_low_pixels is not None:
         possible_hits |= ignored_low_pixels[pixel_samples][in_grid]
     clear[cells[0][possible_hits], cells[1][possible_hits]] = False
-    return DepthGrid(free, occupied, clear, ignored_low_pixels)
+    return DepthGrid(free, occupied, clear, ignored_low_pixels, rememberable)
 
 
 @dataclass(frozen=True)

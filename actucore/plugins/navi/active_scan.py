@@ -539,6 +539,7 @@ class ActiveScan:
         # Receipt-time turns and checked legs share this velocity history
         # with the publisher. Pose deltas only supply its missing axes.
         body_pose = None if receipt_only and history else odom.get("motion_pose")
+        lateral_bias = odom.get("lateral_pose_bias", 0.) if body_pose is None else 0.
         self.buffered_odom = bool(history)
         if self.poses and ((body_pose is None) != (self.pose_origin is None)
                            or (body_pose is not None and body_pose.frame != self.pose_origin.frame)):
@@ -551,7 +552,7 @@ class ActiveScan:
                                        or (self.keep_physical_views and not self.use_obstacle_history))
                     and body_pose is None and stamp > previous and history):
                 hold = self._integrate_receipt_motion(
-                    history, stamp, source, motion, gap_speed_bounds=gap_speed_bounds
+                    history, stamp, source, motion, lateral_bias=lateral_bias, gap_speed_bounds=gap_speed_bounds
                     if self.keep_physical_views and not (odom.get("motion_pose") or odom.get("obstacle_pose"))
                     and self.pose_registration is None else None)
                 if hold is not None:
@@ -570,7 +571,7 @@ class ActiveScan:
                         return self._hold_for_feedback_gap()
                     self.invalidate()
                 elif stamp > previous and body_pose is None:
-                    self._integrate_motion(motion, (stamp - previous) / 1000)
+                    self._integrate_motion(motion, (stamp - previous) / 1000, lateral_bias)
         if body_pose is not None:
             self.pose_origin = self.pose_origin or body_pose
             forward, left, yaw = body_pose.relative_to(self.pose_origin)
@@ -638,15 +639,16 @@ class ActiveScan:
             self.views.clear()
         self.views.append(self._source_view(capture, pose, grid, depth, geometry))
 
-    def _integrate_motion(self, motion, dt):
+    def _integrate_motion(self, motion, dt, lateral_bias=0.):
         vx, vy, wz = motion
+        vy -= lateral_bias
         forward, right, heading = self.pose
         mid = heading - .5 * wz * dt
         self.pose = (forward + dt * (vx * math.cos(mid) + vy * math.sin(mid)),
                      right + dt * (vx * math.sin(mid) - vy * math.cos(mid)),
                      heading - dt * wz)
 
-    def _integrate_receipt_motion(self, history, stamp, source, motion, *, gap_speed_bounds=None):
+    def _integrate_receipt_motion(self, history, stamp, source, motion, *, lateral_bias=0., gap_speed_bounds=None):
         # The control timer may run late while odometry is still arriving.
         # Validate the entire sample sequence before integrating any of it.
         previous = self.poses[-1][0]
@@ -684,7 +686,7 @@ class ActiveScan:
         for received, velocity, dt in intervals:
             # Two newer producer samples can share a millisecond of receipt.
             if dt:
-                self._integrate_motion(velocity, dt)
+                self._integrate_motion(velocity, dt, lateral_bias)
                 self.poses.append((received, self.pose, velocity[2]))
         if intervals:
             self.odom_source, self.motion = last_source, last_motion
@@ -945,6 +947,8 @@ class ActiveScan:
                     # outside the straight corridor, with the existing clear rule.
                     nearby = occupied & (FORWARD**2 + RIGHT**2 <= CAMERA_OCCUPANCY_MEMORY_RANGE_M**2)
                     selected = nearby if selected is None else selected | nearby
+                if selected is not None and len(evidence) > 2 and evidence[2] is not None:
+                    selected = selected & evidence[2]
                 memory.remember_view(capture, free, occupied, remember_occupied=selected,
                                      rolling_range=CAMERA_OCCUPANCY_MEMORY_RANGE_M, clear=clear,
                                      physical_support=self.keep_physical_views,
@@ -1051,7 +1055,7 @@ class ActiveScan:
                             f, left, yaw = source.relative_to(baseline)
                             capture = self._body_pose_at(capture_ms, (f, -left, -yaw), anchor)
         origin = self._footprint_origin(capture, geometry) if capture is not None else None
-        return stamp, coords, free, occupied, clear, (capture_ms, origin)
+        return stamp, coords, free, occupied, clear, (capture_ms, origin), grid.rememberable
 
     def _body_pose_at(self, stamp, coords, origin):
         if origin is None:

@@ -868,6 +868,7 @@ class DwaMotionGuard(DwaMotionInputs):
     probe_region: tuple | None = None
     corner_only: bool = False
     route_error: float = 0.
+    cached_goal_standoff_m: float = 0.
 
 
 @dataclass(frozen=True)
@@ -1474,7 +1475,25 @@ def step(*, detections, depth, odom, config: Config, state: State,
         twist = tuple(decision.values[i] for i in (0, 1, 5))
         searched = decision.status == SEARCHING and state.search_sweep_checked and not any(twist[:2])
         if not searched and _near_sweep_hits(config, scan, odom, state, twist).any():
-            decision = Decision(_twist(0., 0., 0.), AVOIDING, "当前运动的扫掠区有盲区内已观测障碍")
+            track = state.tracker.track
+            checked = None
+            if (config.local_controller == "dwa" and geometry is not None and scan.near_squares is not None
+                    and track is not None and track.observed and track.navigation_range_known
+                    and decision.distance_m is not None):
+                room = decision.distance_m * math.cos(track.bearing_rad) - config.stop_distance_m
+                if room >= local_path.RESOLUTION:
+                    # Keep the side obstacle in the sweep while clearing it at the current heading.
+                    forward = min(geometry.rear + .25, room)
+                    straight = Detour(None, ((0., 0.), (forward, 0.)), geometry)
+                    checked = _dwa_detour(depth, config, state, straight, decision.distance_m, track.bearing_rad,
+                                          branch="direct", speed_limit=forward / dwa_hold(config, 0.),
+                                          recovery=True, follow_published=True)
+            if checked is None:
+                decision = Decision(_twist(0., 0., 0.), AVOIDING, "当前运动的扫掠区有盲区内已观测障碍")
+            else:
+                vx, vy, wz, _, _ = _use_dwa(state, checked, state.escape_side)
+                decision = Decision(_twist(vx, vy, wz), AVOIDING, "沿当前朝向通过车身侧方障碍",
+                                    distance_m=decision.distance_m)
     if (decision.reason == NO_LOCAL_ROUTE and scan.exhausted and scan.current_frame
             and anchor is not None and anchor.verified_range_m is not None
             and anchor.verified_range_m > config.arrival_distance_m
@@ -1797,7 +1816,7 @@ def _search_for_target(depth, config, state, dt, odom):
         return replace(_search(config, state, dt, odom), target_pending=True)
     if "扫掠范围有障碍" in reason:
         yaw = -state.last_seen_side * config.search_rate
-        for rate in _search_yaw_candidates(config, yaw, True, (.5, .25)):
+        for rate in _search_yaw_candidates(config, yaw, state.reacquire_generation is None, (.5, .25)):
             if _search_turn_stop(depth, config, state, requested_yaw=rate) is None:
                 if state.missing_frames + 1 < config.lost_frames:
                     return replace(_search(config, state, dt, odom), target_pending=True)
@@ -1920,18 +1939,22 @@ def _decide(detections, depth, odom, config: Config, state: State,
         detections = None
     committed = state.committed_route
     current_track = state.tracker.track
-    # The measured parking target outlives the detour that brought us to it.
+    # A committed detour, reacquisition, and parking keep the same person.
     retained_target = (current_track is not None and state.target == "person" and config.local_controller == "dwa"
                        and (current_track.generation == state.parking_target_generation
-                            or (config.use_lateral and config.scan_geometry is None
-                                and current_track.generation == state.reacquire_generation)
-                            or (committed is not None and committed.locks_detour and committed.motion_guard is not None
+                            or current_track.generation == state.reacquire_generation
+                            or (committed is not None and committed.motion_guard is not None
                                 and current_track.generation == committed.motion_guard.generation)))
     track = state.tracker.step(detections=detections, depth=depth,
                                target=state.target, config=config,
                                ego=ego, ego_measured=ego_measured, dt=dt,
                                receipt_ms=objects_ms if recovering and state.target == "person" else 0,
                                retain_identity=retained_target)
+    person_dwa = state.target == "person" and config.local_controller == "dwa"
+    if person_dwa and isinstance(track, Track) and track.accepted_detection and track.image_region:
+        bearing = track.image_region[0][0] if track.image_region[0] else track.bearing_rad
+        if bearing:
+            state.last_seen_side = math.copysign(1., bearing)
     if parking_target_unobserved(config, state):
         return Decision(_twist(0., 0., 0.), AVOIDING, "近距目标暂不可见，保持停车等待同一目标")
     if (config.use_lateral and config.scan_geometry is None and state.parking_target_generation is not None
@@ -1964,14 +1987,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if fresh_recovery:
         state.reacquire_receipt_ms, state.reacquire_source = objects_ms, detection_source
         state.reacquire_candidate = detections if matched_person else None
+    elif recovering and matched_person and track is not None and track.accepted_detection:
+        state.reacquire_candidate = detections
     # One associated detector receipt can span multiple ticks while its
     # depth arrives on a separate stream.
     pending_person = (recovering and detections is not None and state.reacquire_candidate is detections
                       and objects_ms == state.reacquire_receipt_ms and state.tracker.track is not None)
     if track is not None and track.observed and (
             fresh_recovery and track.accepted_detection or pending_person and track.measured_range_m is not None):
-        if matched_person and track.image_region and track.image_region[0]:
-            state.last_seen_side = 1. if track.image_region[0][0] >= 0. else -1.
         # A confirmed replacement owns a new goal; it cannot inherit the old detour.
         if anchor is not None and (track.generation != anchor.generation or visual_only):
             _reset_detour_route(state)
@@ -2209,25 +2232,20 @@ def _decide(detections, depth, odom, config: Config, state: State,
             return Decision(_twist(0., 0., 0.), AVOIDING,
                             update.reason if update is not None else "主动观察：反馈恢复，停车等待旧视图到期")
         lost = state.tracker.track
-        if (state.target == "person" and published is state.committed_route
-                and lateral_camera_detour(config, geometry, published)
-                and lost is not None and lost.state == LOST and lost.generation == published.motion_guard.generation):
-            # The old route was checked for obstacles, but advancing it after
-            # the person leaves view can take the robot away from that person.
-            state.last_seen_side = math.copysign(1., lost.bearing_rad)
-            if state.reacquire_generation != lost.generation:
-                state.reacquire_generation = lost.generation
-                state.reacquire_receipt_ms = objects_ms
-                state.reacquire_source = observation_source(detections)
-            state.goal_anchor = state.dwa_guidance = None
-            state.committed_route = state.published_dwa_route = published = None
+        if (person_dwa and committed is not None and committed.motion_guard is not None
+                and lost is not None and lost.state == LOST and lost.generation == committed.motion_guard.generation
+                and state.reacquire_generation != lost.generation):
+            state.reacquire_generation = lost.generation
+            state.reacquire_receipt_ms = objects_ms
+            state.reacquire_source = observation_source(detections)
         handoff = state.published_straight_handoff
         if handoff is not None and depth is not None and geometry is not None and not corner and not scan.active:
             straight = _straight_handoff(depth, config, state, handoff, None)
             if straight is not None:
                 vx, vy, wz, status, reason = straight
                 return Decision(_twist(vx, vy, wz), status, reason, distance_m=track.range_m)
-        if published is not None and published.locks_detour and published is state.committed_route:
+        if (published is not None and published is committed
+                and (published.locks_detour or (person_dwa and lost is not None and not lost.observed))):
             measured = track.measured_range_m if track is not None else None
             same_target = track is not None and track.generation == published.motion_guard.generation
             seen_target = track is not None and track.observed and track.navigation_range_known
@@ -2255,7 +2273,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 if arc is not None:
                     vx, vy, wz, status, reason = arc
                     return Decision(_twist(vx, vy, wz), status, reason, distance_m=distance)
-                if state.published_dwa_route is not None:
+                recovering_detour = (lost is not None and lost.state == LOST
+                                     and lost.generation == state.reacquire_generation)
+                if (state.published_dwa_route is not None
+                        and (state.dwa_trace.get("wait_for_committed_route")
+                             or not (recovering_detour or reobserved_target))):
                     return Decision(_twist(0., 0., 0.), AVOIDING, NO_ROUTE_CONTINUATION)
                 published = None
         if state.reacquire_generation is not None:
@@ -2418,7 +2440,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
     bearing_rad = (route_fix[1] if route_fix is not None else
                    math.atan2(-anchor.y, anchor.x) if anchor is not None else track.bearing_rad)
     bearing = _clamp(bearing_rad / max(1e-6, config.half_fov_rad), 1.0)
-    if not missing_person:
+    if not (person_dwa or missing_person):
         state.last_seen_side = 1.0 if bearing >= 0 else -1.0
     distance = (route_fix[0] if route_fix is not None else
                 math.hypot(anchor.x, anchor.y) if anchor is not None else
@@ -3248,7 +3270,7 @@ def _search_turn_stop(depth, config: Config, state: State, *, requested_yaw=None
             return "原地搜索：等待可用深度"
     if can_plan:
         direction = state.last_seen_side if requested_yaw is None else -math.copysign(1., requested_yaw)
-        if (requested_yaw is None and not state.searching_for_s
+        if (requested_yaw is None and state.reacquire_generation is None and not state.searching_for_s
                 and ahead is not None and ahead < config.approach_check_distance_m
                 and depth.get("map") is not None):
             keep = _keepout_m(config)
@@ -3420,7 +3442,7 @@ def dwa_scene_sources(scan, now_ms, odom=None):
                   and now_ms - (v[5][0] if len(v) > 5 else v[0]) <= MAP_AGE_MS)
     history = scan.historical_layers
     view_keys = tuple((v[0], v[1], local_path.array_revision(v[3]),
-                       local_path.array_revision(v[4] if len(v) > 4 else v[2]), v[5:]) for v in views)
+                       local_path.array_revision(v[4] if len(v) > 4 else v[2]), v[5:6]) for v in views)
     reference = scan.pose_registration
     revision = (frame, origin, poses, gap, pose, stamp, current, receipt, near.stamp_ms, near.origin,
                 _cell_revision(near.squares if near.squares is not None else near.hits),
@@ -3449,6 +3471,7 @@ class DwaFrameMismatch(ValueError):
 def _advance_dwa_pose(pose, stamp, odom, max_gap):
     """Integrate the contiguous measured prefix after this pose, up to stamp."""
     last_source = None
+    lateral_bias = odom.get("lateral_pose_bias", 0.)
     for received, source, twist in odom.get("velocity_history", ()):
         if received <= pose.stamp_ms:
             last_source = source
@@ -3462,6 +3485,7 @@ def _advance_dwa_pose(pose, stamp, odom, max_gap):
                 break
         dt = (received - pose.stamp_ms) / 1000
         vx, vy, wz = twist
+        vy -= lateral_bias
         mid = pose.yaw + .5 * wz * dt
         pose = PlanarPose(received, pose.frame,
                           pose.x + dt * (vx * math.cos(mid) - vy * math.sin(mid)),
@@ -4018,6 +4042,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
                 and (closer or measured_range <= config.arrival_min_distance_m)) else None)
     spacing = config.arrival_min_distance_m
     preferred_spacing = None
+    cached_goal_standoff = (config.stop_distance_m if follow_published and target is not None
+                            and track is not None and track.state == LOST else 0.)
     if (follow_published and measured is None and measured_range is not None and target_distance is not None
             and state.target == "person" and inputs.measured_target is not None
             and track.measured_point.standoff_point is not None):
@@ -4036,7 +4062,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         y_limit=(0., 0.) if branch == "direct" else (-right_vy, left_vy),
         yaw_limit=yaw_limit,
         floors=(floor_x, floor_y, config.floor_wz, config.floor_wz_moving),
-        target=target, measured_target=measured, measured_standoff_m=spacing, preferred_standoff_m=preferred_spacing,
+        target=target, stop_distance=cached_goal_standoff, measured_target=measured,
+        measured_standoff_m=spacing, preferred_standoff_m=preferred_spacing,
         view_bearing=view_bearing,
         acceleration=config.motion_acceleration, braking=config.motion_braking,
         horizon=inputs.prediction_horizon_s, max_candidates=limit,
@@ -4068,7 +4095,8 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     guard = DwaMotionGuard(**vars(inputs), trace=proposed.trace, check=proposed.check,
                            visibility_required=shadow is not None,
                            probe_region=state.tracker.track.image_region if visual else None,
-                           corner_only=corner_only, route_error=route_error if route.corridor_corner else 0.)
+                           corner_only=corner_only, route_error=route_error if route.corridor_corner else 0.,
+                           cached_goal_standoff_m=cached_goal_standoff)
     return DwaProposal(proposed, routes[proposed.reference_index], branch, guard)
 
 

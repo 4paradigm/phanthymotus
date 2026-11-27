@@ -68,6 +68,35 @@ def advance_snapshot(snapshot, clock, stamp, *, obstacle=False, vx=.1):
                    dict(odom, vx=vx, received_ms=stamp, source_sample_id=stamp), target_ms)
 
 
+@pytest.mark.parametrize("scene", ["still", "real-slip", "flat", "repeated"])
+def test_stationary_depth_can_calibrate_lateral_pose_without_changing_speed(monkeypatch, scene):
+    card, _, clock, _ = observation_card(monkeypatch, body=False)
+    card._state.target = ""
+    card._config.use_lateral = True
+    intrinsics = card._config.local_geometry.horizontal
+    card._config.depth_intrinsics = intrinsics
+    image = np.full((480, 640), 1.)
+    if scene != "flat":
+        image[:, 180:460] = 3.
+    fx, _ = intrinsics.for_width(image.shape[1])
+    speed = .0355
+    for ms in range(1000, 1601, 50):
+        clock[0] = ms
+        payload = {"schema": "motus.odom/1", "stamp_ms": ms, "frame": "body",
+                   "twist": [0., speed, None, None, None, 0.], "pose": None,
+                   "units": {"linear": "m/s", "angular": "rad/s", "length": "m"}}
+        card._on_string("odom", SimpleNamespace(data=json.dumps(payload)))
+        if (ms - 1000) % 300 == 0:
+            shift = round(fx * speed * (ms - 1000) / 1000) if scene == "real-slip" else 0
+            source = 1000 if scene == "repeated" else ms
+            card._set_depth_map(np.roll(image, shift, axis=1), capture_ms=source)
+
+    _, _, odom, _ = plugin.NaviPlugin._observation_snapshot(card, with_capture_timing=True)
+    assert odom["vy"] == speed
+    assert odom["velocity_history"][-1][2][1] == speed
+    assert odom.get("lateral_pose_bias", 0.) == pytest.approx(speed if scene == "still" else 0.)
+
+
 @pytest.mark.parametrize("first,last,yaw,settled", [
     (1005, 1010, 0., True), (995, 1010, 0., False),
     (1005, 1005, 0., False), (1005, 1010, .4, False)])

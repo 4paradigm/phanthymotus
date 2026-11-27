@@ -72,6 +72,35 @@ def observation_ms(depth, fallback=None):
     return depth.get("capture_ms") or (depth.get("frame_id") if fallback is None else fallback)
 
 
+def opening_lateral_shift(before, after, fx, cx, cy):
+    """Measure lateral displacement from two unambiguous, level doorway edges."""
+    row = round(cy)
+    if before.shape != after.shape or not 0 <= row < before.shape[0]:
+        return None
+    edges = []
+    for frame in (before, after):
+        band = max(1, frame.shape[0] // 40)
+        line = np.median(frame[max(0, row - band):row + band + 1], axis=0)
+        with np.errstate(invalid="ignore"):
+            jump = np.diff(line)
+        near = np.minimum(line[:-1], line[1:])
+        candidates = np.flatnonzero(np.isfinite(jump) & (near > 0.) & (abs(jump) >= .25))
+        candidates = candidates[np.argsort(near[candidates])]
+        if len(candidates) < 2 or (len(candidates) > 2 and near[candidates[2]] - near[candidates[1]] < .15):
+            return None
+        left, right = sorted(candidates[:2])
+        ranges = near[[left, right]]
+        if jump[left] <= 0. or jump[right] >= 0. or abs(ranges[0] - ranges[1]) > .08:
+            return None
+        edges.append((ranges, (np.array([left, right]) + .5 - cx) * ranges / fx))
+    (first_range, first), (last_range, last) = edges
+    delta = last - first
+    # Both edges must support the same lateral motion without changing depth.
+    if np.max(abs(last_range - first_range)) > .02 or abs(delta[0] - delta[1]) > .01:
+        return None
+    return float(delta.mean())
+
+
 def decode(payload: bytes) -> np.ndarray:
     """A `image/depth-zlib` buffer as a 640x480 float array of metres.
 

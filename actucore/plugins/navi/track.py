@@ -608,6 +608,7 @@ class Tracker:
         self.matched_detections = None
         # Keep recent stamps across blind ticks and out-of-order delivery.
         self._detection_stamps = deque(maxlen=64)
+        self._unmatched_recovery = None
         self._range_frames = deque(maxlen=64)
         # Expose why a target was lost or recovered in info().
         self.last_reason = ""
@@ -654,21 +655,37 @@ class Tracker:
         stamp = (detections or {}).get("timestamp")
         if stamp is None and detections is not None and receipt_ms:
             stamp = ("receipt", receipt_ms)
+        depth_frame = None
+        if depth is not None and depth.get("map") is not None and not depth.get("capture_invalid"):
+            depth_frame = depth.get("source_frame_id") or depth.get("frame_id")
         if stamp is not None:
             # A late, previously unseen detector frame cannot refresh a DWA
             # motion origin. Its producer clock is used only for ordering.
             older = (config.local_controller == "dwa" and self.track is not None
                      and isinstance(stamp, (int, float)) and self.track.latest_source is not None
                      and stamp < self.track.latest_source)
-            if older or stamp in self._detection_stamps:
-                if stamp == self._detection_stamps[-1] and self.track is not None:
+            repeated = stamp in self._detection_stamps
+            last = repeated and stamp == self._detection_stamps[-1]
+            pending = self._unmatched_recovery
+            # A rejected detector sample can be associated once a newer depth frame arrives.
+            retry = (last and expired and self.track is not None and pending is not None
+                     and pending[0] == stamp and type(depth_frame) is int
+                     and depth_frame > (pending[1] or 0))
+            if older or (repeated and not retry):
+                if last and self.track is not None:
                     self._update_front(depth, config, dt)
                 return self.track if (self.track and self.track.drivable) else None
-            self._detection_stamps.append(stamp)
+            if not repeated:
+                self._detection_stamps.append(stamp)
 
         track = self.track
         position = track.position if track is not None else None
+        if expired and track is not None and target == "person" and track.front_reference is not None:
+            # Keep the measured front, transported by ego motion, as the
+            # association reference after the velocity prediction expires.
+            position = track.front_reference
         candidates = _candidates(detections, depth, target, config, position)
+        pending_recovery = bool(expired and track is not None and target == "person" and receipt_ms and candidates)
         association_age = track.since_obs_s if track is not None else 0.
         if expired and track is not None:
             # A fresh metric match can account for one observation window
@@ -682,6 +699,8 @@ class Tracker:
             association_age = min(association_age, config.max_obs_age_ms / 1000)
         matched = (_associate(candidates, config, position, track.cov, association_age, track.hue)
                    if track is not None else _associate(candidates, config, None))
+        if stamp is not None:
+            self._unmatched_recovery = (stamp, depth_frame) if matched is None and pending_recovery else None
 
         self.matched_detections = detections if matched is not None else None
         if matched is not None:
