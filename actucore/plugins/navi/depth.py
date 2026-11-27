@@ -145,6 +145,11 @@ def _box_slices(shape, bbox_norm):
     return slice(top, bottom), slice(left, right)
 
 
+def box_median_agrees(depth_m, bbox_norm, expected, tolerance):
+    valid = _valid(depth_m[_box_slices(depth_m.shape, bbox_norm)])
+    return bool(valid.size and abs(float(np.median(valid)) - expected) <= tolerance)
+
+
 def sample_box(depth_m: np.ndarray, bbox_norm) -> float | None:
     """Representative optical depth in a normalized detection box."""
     valid = _valid(depth_m[_box_slices(depth_m.shape, bbox_norm)])

@@ -67,7 +67,6 @@ _DEPTH_NEAR_SHARE = 0.72
 
 _NO_READING = (70, 70, 70)
 _CORRIDOR = (255, 255, 255)
-_EXECUTING_ROUTE = (115, 230, 105)
 _TARGET = (80, 220, 255)
 _ARROW = (120, 255, 120)
 _WARN = (80, 120, 255)
@@ -305,14 +304,14 @@ def _line(frame, start, end, colour, thickness: int = 2):
     cv2.line(frame, start, end, colour, thickness, cv2.LINE_AA)
 
 
-def _route_stroke(frame, polylines, colour):
+def _route_stroke(frame, polylines):
     import cv2
 
     cv2.polylines(frame, polylines, False, _CASING, 6, cv2.LINE_AA)
-    cv2.polylines(frame, polylines, False, colour, 3, cv2.LINE_AA)
+    cv2.polylines(frame, polylines, False, _CORRIDOR, 3, cv2.LINE_AA)
 
 
-def _schematic_route(route, width, height, *, keep=0.):
+def _schematic_route(route, width, height, *, keep):
     """Draw the robot-relative route in the corridor area without a floor pose."""
     if route is None or len(route.points) < 2:
         return []
@@ -320,7 +319,7 @@ def _schematic_route(route, width, height, *, keep=0.):
     scale = 1. / (1. + np.maximum(forward, 0.))
     rows = height * (.60 + .31 * scale)
     paths = []
-    for side in ((-keep, keep) if keep else (0.,)):
+    for side in (-keep, keep):
         columns = width * (.5 + .5 * (right + side) * scale)
         paths.append(np.rint(np.column_stack((columns, rows))).astype(np.int32))
     return paths
@@ -385,33 +384,18 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
                                interpolation=cv2.INTER_NEAREST)
 
     keep = getattr(config, "half_width_m", 0.35) + config.clearance_margin_m
-    if executing is not None:
-        detour = None
-    lines = (route_lines(depth_m, ground, detour.geometry, detour.points, None, keep,
+    route, project = (executing, project_executing) if executing is not None else (detour, project_detour)
+    lines = (route_lines(depth_m, ground, route.geometry, route.points, None, keep,
                          width, height, stop_distance_m=config.stop_distance_m)
-             if detour is not None and project_detour else ())
+             if route is not None and project else ())
     projected = []
     for a, b, _ in lines:
         visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
         if visible:
             projected.append(np.asarray((a, b), dtype=np.int32))
-    execution_visible = False
-    if executing is not None:
-        execution_lines = (route_lines(depth_m, ground, executing.geometry, executing.points, None,
-                                       0., width, height, stop_distance_m=config.stop_distance_m)
-                           if project_executing else ())
-        for a, b, _ in execution_lines:
-            visible, a, b = cv2.clipLine((0, 0, width, height), a, b)
-            if visible:
-                _line(frame, a, b, _EXECUTING_ROUTE, thickness=3)
-                execution_visible = True
-        if not execution_visible:
-            executing_path = _schematic_route(executing, width, height)
-            if executing_path:
-                _route_stroke(frame, executing_path, _EXECUTING_ROUTE)
-    schematic = _schematic_route(detour, width, height, keep=keep) if not projected else []
+    schematic = _schematic_route(route, width, height, keep=keep) if not projected else []
     if projected or schematic:
-        _route_stroke(frame, projected or schematic, _CORRIDOR)
+        _route_stroke(frame, projected or schematic)
 
     # ── the corridor, at the distance it currently clears to ─────────────────
     #
@@ -421,7 +405,7 @@ def render(*, depth_m, decision, track, box, clearance, coverage, config,
     edges = corridor_edges(clearance, config, width)
     if edges:
         colour = _WARN if clearance <= config.obstacle_stop_m else _CORRIDOR
-        if detour is None and executing is None:
+        if route is None:
             for far, near in zip(edges, corridor_edges(clearance * .5, config, width)):
                 visible, a, b = cv2.clipLine((0, 0, width, height),
                                             (far, int(height * .62)), (near, height - 1))

@@ -378,7 +378,8 @@ def test_the_fallback_corridor_uses_dashed_guides_without_a_dimension_bar():
 
 
 @needs_cv2
-def test_a_planned_route_is_drawn_with_two_white_corridor_edges():
+@pytest.mark.parametrize("route_kind", ["detour", "executing"])
+def test_route_is_drawn_with_two_white_corridor_edges(route_kind):
     from plugins.navi.camera import HorizontalIntrinsics
     from plugins.navi.local_path import Detour, camera_square
 
@@ -389,7 +390,7 @@ def test_a_planned_route_is_drawn_with_two_white_corridor_edges():
     depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
     ground = np.broadcast_to(tangent[:, None] > .05, depth.shape)
     route = Detour(None, ((.8, 0.), (1.05, 0.), (1.3, .2), (1.8, .2)), geometry)
-    frame = _render(depth_m=depth, ground=ground, detour=route, clearance=None, config=config)
+    frame = _render(depth_m=depth, ground=ground, clearance=None, config=config, **{route_kind: route})
     route_color = (frame == (255, 255, 255)).all(axis=2)
     # The horizontal focal length is twice the vertical focal length times
     # the floor height, so each row projects twice the half-width in pixels.
@@ -403,20 +404,21 @@ def test_a_planned_route_is_drawn_with_two_white_corridor_edges():
 
 
 @needs_cv2
-@pytest.mark.parametrize("project_detour", [True, False], ids=["no-ground", "new-depth"])
-def test_unprojectable_route_stays_centered_in_the_main_view(project_detour):
+@pytest.mark.parametrize("route_kind", ["detour", "executing"])
+@pytest.mark.parametrize("project", [True, False], ids=["no-ground", "new-depth"])
+def test_unprojectable_route_stays_centered_in_the_main_view(route_kind, project):
     from plugins.navi.camera import HorizontalIntrinsics
     from plugins.navi.local_path import Detour, camera_square
 
     geometry = camera_square(HorizontalIntrinsics(640, 320, 320), (480, 400, 240), .21)
     tangent = (np.arange(480) - 240) / 400
     depth = np.broadcast_to(.4 / np.maximum(tangent[:, None], .01), (480, 640))
-    ground = None if project_detour else np.broadcast_to(tangent[:, None] > .05, depth.shape)
+    ground = None if project else np.broadcast_to(tangent[:, None] > .05, depth.shape)
     route = Detour(None, ((0., 0.), (.25, 0.), (.8, .3), (1.2, .24)), geometry)
     config = P.Config(half_width_m=.25)
     keep = config.half_width_m + config.clearance_margin_m
-    frame = _render(depth_m=depth, ground=ground, detour=route, clearance=1.,
-                    project_detour=project_detour, config=config)
+    frame = _render(depth_m=depth, ground=ground, clearance=1., config=config,
+                    **{route_kind: route, f"project_{route_kind}": project})
     baseline = _render(depth_m=depth, ground=ground, clearance=1.)
 
     white = (frame == (255, 255, 255)).all(axis=2)
@@ -488,7 +490,7 @@ def test_a_corrupt_jpeg_falls_back_to_the_depth_map():
 
 
 @needs_cv2
-def test_executing_segment_is_visibly_distinct_from_candidate():
+def test_executing_segment_takes_precedence_over_candidate():
     from plugins.navi.camera import HorizontalIntrinsics
     from plugins.navi.local_path import Detour, camera_square
 
@@ -501,8 +503,7 @@ def test_executing_segment_is_visibly_distinct_from_candidate():
     preview = _render(depth_m=depth, ground=ground, detour=candidate)
     executing = _render(depth_m=depth, ground=ground, detour=candidate, executing=active)
     published_only = _render(depth_m=depth, ground=ground, executing=active)
-    assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
-    assert (executing == V._EXECUTING_ROUTE).all(axis=2).any()
+    assert not np.array_equal(executing, preview)
     assert np.array_equal(executing, published_only)
 
 
@@ -518,9 +519,7 @@ def test_route_monitor_draws_selected_and_executing_routes_without_ground():
     preview = _render(ground=None, clearance=None, detour=candidate)
     executing = _render(ground=None, clearance=None, detour=candidate, executing=active)
     assert not np.array_equal(preview, baseline)
-    assert not (preview == V._EXECUTING_ROUTE).all(axis=2).any()
-    green = (executing == V._EXECUTING_ROUTE).all(axis=2)
-    assert green[350:440, 230:320].any()
+    assert np.array_equal(executing, _render(ground=None, clearance=None, detour=active))
     assert np.array_equal(executing[:145, 500:], baseline[:145, 500:])
 
 

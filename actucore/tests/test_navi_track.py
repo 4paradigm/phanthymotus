@@ -278,6 +278,64 @@ def test_hue_is_a_tie_break_not_a_gate():
     assert cost_same < cost_other
 
 
+@pytest.mark.parametrize("check_publication", [False, True], ids=["track", "publication"])
+def test_person_next_to_target_cannot_supply_the_targets_depth(check_publication):
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    config = _cfg(local_controller="dwa", half_fov_rad=.79,
+                  depth_intrinsics=HorizontalIntrinsics(640, 315., 337.))
+    tracker = T.Tracker()
+    first = dict(_obj("person", bearing=.085, colour="medium muted teal"),
+                 bbox_norm=(.476, .01, .609, .6))
+    target = dict(_obj("person", bearing=-.091, colour="medium vivid cyan"),
+                  bbox_norm=(.374, .0, .534, .61))
+    neighbour = dict(_obj("person", bearing=.179, colour="dark muted yellow"),
+                     bbox_norm=(.535, .0, .645, .70))
+    robot = dict(_obj("person", bearing=.4, colour="medium muted green"),
+                 bbox_norm=(.65, .05, .75, .50))
+    observation = _stamped(1.2, target, neighbour, robot)
+    original = _feed(tracker, _stamped(1., first), target="person", config=config,
+                     depth=dict(_depth(2.19), frame_id=1000))
+
+    # During the turn, the original is still visible. Sampling its new box
+    # on the delayed depth image reads the background instead.
+    delayed = dict(_depth(2.145), frame_id=1200)
+    delayed["map"][:, :342] = 3.037
+    if check_publication:
+        assert T.match_observation(original.snapshot(1000), observation, delayed,
+                                   ego_motion=(0., 0., .08), elapsed_s=.2, target="person",
+                                   config=config) is None
+    else:
+        track = _feed(tracker, observation, target="person", config=config, depth=delayed,
+                      ego=(0., 0., .4), dt=.2)
+        assert track is original and track.state == T.COASTING
+        assert track.front_box == first["bbox_norm"]
+        assert track.measured_range_m is None
+        recovered = _feed(tracker, _stamped(1.4, target, neighbour), target="person",
+                          config=config, depth=dict(_depth(2.19), frame_id=1400), dt=.2)
+        assert recovered is original and recovered.observed
+        assert recovered.front_box == target["bbox_norm"]
+
+
+def test_low_confidence_colour_match_does_not_replace_the_confirmed_person():
+    from plugins.navi.camera import HorizontalIntrinsics
+
+    config = _cfg(local_controller="dwa", depth_intrinsics=HorizontalIntrinsics(640, 315., 337.))
+    tracker = T.Tracker()
+    person = dict(_obj("person", bearing=0., colour="medium muted teal"), confidence=.95,
+                  bbox_norm=(.40, .10, .54, .60))
+    track = _feed(tracker, _stamped(1., person), target="person", config=config,
+                  depth=dict(_depth(2.), frame_id=1000))
+    same_person = dict(person, color="medium muted azure")
+    neighbour = dict(_obj("person", bearing=.17, colour="medium muted green"), confidence=.20,
+                     bbox_norm=(.55, .10, .68, .59))
+    updated = _feed(tracker, _stamped(1.1, same_person, neighbour), target="person", config=config,
+                    depth=dict(_depth(2.), frame_id=1100))
+
+    assert updated is track and updated.observed
+    assert updated.front_box == same_person["bbox_norm"]
+
+
 # ── depth it never had ───────────────────────────────────────────────────────
 
 def test_a_target_with_no_depth_reading_is_tracked_but_reports_no_range():

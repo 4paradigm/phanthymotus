@@ -1776,6 +1776,12 @@ def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allo
         entry = plane - geometry.front - RESOLUTION
         align = (allow_detour and entry > RESOLUTION
                  and hi - lo - RESOLUTION < 2 * (half_width + geometry.half_length))
+        if (align and geometry.front == 0. and (lo + half_width > 0. or hi - half_width < 0.)
+                and travel_limits is not None and not any(travel_limits[1])):
+            # Finish steering before the near jamb enters the camera's blind area.
+            entry = max(2 * RESOLUTION, entry - geometry.half_length)
+            available = (hi - lo - RESOLUTION) / 2 - half_width
+            middle += math.copysign(available, middle)
         points = tuple((forward, middle * min(1., forward / entry) if align else forward * middle / plane)
                        for forward in np.arange(0., end + 1e-9, RESOLUTION))
         exit_line = ((points[-1][0], lo), (points[-1][0], hi))
@@ -1783,11 +1789,12 @@ def _opening_at_plane(frame, occupied, geometry, half_width, plane, target, allo
     return None
 
 
-def extend_passage(opening, grid, half_width, target, stop):
+def extend_passage(opening, grid, half_width, target, stop, *, finish_offset=False):
     """Join a visible exit corridor to a measured opening and preserve its entry."""
     geometry = opening.geometry
     forward, right = opening.points[-1]
-    if abs(target[1] - right) <= max(half_width, target[0] - forward) or target[0] < forward - RESOLUTION:
+    if (target[0] < forward - RESOLUTION
+            or (not finish_offset and abs(target[1] - right) <= max(half_width, target[0] - forward))):
         return opening
     row = START[0] + round(forward / RESOLUTION)
     col = START[1] + round(right / RESOLUTION)

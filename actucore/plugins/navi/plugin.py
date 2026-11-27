@@ -46,6 +46,8 @@ import uuid
 from dataclasses import dataclass, replace
 from statistics import median
 
+import numpy as np
+
 from ..control_stream import build as build_message
 from ..control_stream import negotiate
 from . import dwa
@@ -438,7 +440,7 @@ def _policy_config(settings: dict) -> policy_mod.Config:
     return policy_mod.Config(_clearance_margin_override_m=margin, **{
         k: v for k, v in settings.items()
         if (k in policy_mod.Config.__dataclass_fields__
-            and k not in ("stop_tolerance_m", "motion_acceleration", "motion_braking",
+            and k not in ("stop_tolerance_m", "motion_acceleration", "motion_braking", "lateral_step",
                           "_clearance_margin_override_m"))
     })
 
@@ -2234,7 +2236,15 @@ class NaviPlugin:
                             and self._depth_vendor.get("timestamp_source") == "driver_receive"):
                         depth["obstacle_driver_ms"] = ns // 10**6
                         depth["obstacle_driver_pose"] = odom_mod.obstacle_pose_at(self._obstacle_poses, ns)
-                    pose = odom_mod.obstacle_pose_at(self._obstacle_poses, self._depth_ms * 10**6)
+                    pose = None
+                    if (ns is not None and depth.get("body_from_optical") is not None
+                            and 0 <= self._depth_ms - ns // 10**6 < depth_age):
+                        # This mount was matched on the declared capture clock.
+                        pose = odom_mod.obstacle_pose_at(self._obstacle_poses, ns)
+                        if pose is not None:
+                            depth["capture_ms"] = ns // 10**6
+                    if pose is None:
+                        pose = odom_mod.obstacle_pose_at(self._obstacle_poses, self._depth_ms * 10**6)
                     if pose is not None:
                         depth["obstacle_capture_pose"] = pose
                 if self._depth_source_ms is not None:
@@ -2608,7 +2618,7 @@ class NaviPlugin:
     def _recheck_dwa_motion(self, check, values, max_age, now_ms, snapshot, *, renew, diagnostics,
                             handoff_deadline_ms=None, scan=None, route_room=None,
                             packet_deadline_ms=None, check_outgoing=False, cover_slower_feedback=False,
-                            target_refresh=False, corner_route=None):
+                            target_refresh=False, corner_route=None, keep_detour=False):
         """Reuse the selected physical proof within its window or rebuild a complete stop."""
         config, state = self._config, self._state
         scan = state.active_scan if scan is None else scan
@@ -2754,7 +2764,17 @@ class NaviPlugin:
                     return reject("target_missing")
                 target_pending = True
             elif match.point is None:
-                if route_room is not None and match.image_region and match.image_region[0]:
+                anchor = state.goal_anchor
+                if (keep_detour and match.image_region and anchor is not None
+                        and anchor.generation == guard.generation == match.generation):
+                    # Keep the checked route and its original target deadline.
+                    # A bearing without a range cannot redirect this detour.
+                    refresh_target = False
+                    obs_ms = min(obs_ms, check.target_ms or guard.checked_ms)
+                    deadline = min(deadline, guard.deadline_ms, obs_ms + max_age)
+                    if now_ms >= deadline:
+                        return reject("publish_expired")
+                elif route_room is not None and match.image_region and match.image_region[0]:
                     bearing = float(match.image_region[0][0])
                     dx, dy, _ = command
                     yaw_limit = policy_mod._scan_yaw_rate(config, math.copysign(1., bearing))
@@ -3228,7 +3248,8 @@ class NaviPlugin:
             track = self._state.tracker.track
             if (self._state.published_dwa_route is None and committed is not None
                     and (committed.locks_detour or self._state.dwa_trace.get("wait_for_committed_route")
-                         or (self._state.target == "person" and track is not None and not track.observed
+                         or (self._state.target == "person" and track is not None
+                             and (not track.observed or not track.navigation_range_known)
                              and committed.motion_guard is not None and track.generation == committed.motion_guard.generation))):
                 self._state.published_dwa_route = committed
             if self._config.local_controller == "dwa" and self._wire_twist is not None:
@@ -4773,26 +4794,42 @@ class NaviPlugin:
         previous = self._wire_twist or original.previous
         best = None
         best_cost = math.inf
-        swept_into_obstacle = False
-        lateral_floor, _ = policy_mod._local_velocity_limits(cfg, 1.)[1]
-        for steering, scale in dwa.pursuit_options(yaw_limit, cfg.use_lateral or cfg.floor_wz_moving > 0.):
-            if steering != yaw_limit and (best is not None or not swept_into_obstacle):
+        swept_into_obstacle = skip_turn_samples = False
+        keep_detour = self._state.committed_route is origin.acceptance
+        (forward_floor, _), (lateral_floor, _) = policy_mod._local_velocity_limits(cfg, 1.)
+        ramping_lateral = previous[1] if abs(measured[1]) < lateral_floor else 0.
+        yaw_step = min(cfg.motion_acceleration[2], cfg.motion_braking[2]) / self._rate_hz
+        try_sidestep = (cfg.use_lateral and yaw_step < cfg.floor_wz_moving and view_bearing is None
+                        and (previous[2] != 0. or abs(measured[2]) > policy_mod.STILL_YAW))
+        crawl = cfg.use_lateral and cfg.floor_wz_moving > 0. and forward_floor <= nominal * dwa.ROUTE_CRAWL_SCALE
+        for steering, scale in dwa.pursuit_options(yaw_limit, cfg.use_lateral or cfg.floor_wz_moving > 0.,
+                                                  fallback_scales=(dwa.ROUTE_CRAWL_SCALE,) if crawl else ()):
+            if scale == dwa.ROUTE_CRAWL_SCALE and (best is not None or not swept_into_obstacle):
                 break
+            hold_heading = steering != yaw_limit
+            if hold_heading and not (try_sidestep or (best is None and swept_into_obstacle)):
+                break
+            if skip_turn_samples and not hold_heading:
+                continue
             tracked = dwa.track_route(
                 points, nominal * scale, original.prediction_horizon_s, steering,
                 body_origin=original.trace.body_poses[0][:2], lateral=cfg.use_lateral,
                 yaw_floor=cfg.floor_wz_moving, lateral_floor=lateral_floor, view_bearing=view_bearing,
                 steering_horizon=cfg.dwa_horizon_s if camera_detour and check.geometry.front == 0. else None,
-                hold_heading=steering != yaw_limit)
+                hold_heading=hold_heading, ramping_lateral=ramping_lateral, lateral_step=cfg.lateral_step,
+                previous_yaw=previous[2], measured_yaw=measured[2], yaw_step=yaw_step)
             if tracked is None:
                 break
             (vx, vy, wz), room = tracked
             (_, max_x), (_, max_y) = policy_mod._local_velocity_limits(cfg, -1. if vy > 0 else 1.)
+            if max_y < lateral_floor:
+                vy = 0.
             candidate = [min(vx, max_x), math.copysign(min(abs(vy), max_y), vy), 0., 0., 0., wz]
             candidate = policy_mod.apply_deadband(candidate, self._deadband_for(candidate))
-            if not any(candidate[:2]) or room <= route_error:
+            if room <= route_error:
                 break
-            if candidate == previous_values:
+            if (not any(candidate[:2]) or candidate == previous_values
+                    or (hold_heading and not candidate[1] and not swept_into_obstacle)):
                 continue
             previous_values = candidate
             diagnostics.pop("reason", None)
@@ -4800,7 +4837,7 @@ class NaviPlugin:
                 check, candidate, max_age, now_ms, snapshot, renew=renew, diagnostics=diagnostics, scan=scan,
                 route_room=room - route_error, packet_deadline_ms=packet_deadline_ms,
                 cover_slower_feedback=(cover_slower_feedback or target_refresh or self._goal_beyond_local_grid(origin)),
-                target_refresh=target_refresh)
+                target_refresh=target_refresh, keep_detour=keep_detour)
             values = diagnostics.pop("visual_command", candidate)
             if checked is not None and checked[2]:
                 result = checked[3].motion_guard.check
@@ -4809,14 +4846,18 @@ class NaviPlugin:
                 if cost < best_cost:
                     best_cost = cost
                     best = checked, values, diagnostics.copy()
-                if scale == 1. and result.min_clearance_m >= dwa.PREFERRED_CLEARANCE_M and values[5] * previous[2] >= 0.:
-                    break
+                if (scale == 1. and result.min_clearance_m >= dwa.PREFERRED_CLEARANCE_M
+                        and values[5] * previous[2] >= 0.):
+                    if not try_sidestep:
+                        break
+                    skip_turn_samples = True
             else:
                 reason = diagnostics.get("reason")
-                swept_into_obstacle |= bool(wz and reason == "footprint_collision")
+                swept_into_obstacle |= bool(reason == "footprint_collision" and (wz or previous[2]))
                 if (checked is None or reason not in
                         ("insufficient_room", "outside_grid", "footprint_collision", "occluded_prefix", "target_standoff")
-                        or (not wz and steering == yaw_limit and reason not in ("insufficient_room", "target_standoff"))):
+                        or (not (wz or previous[2] or try_sidestep) and not hold_heading
+                            and reason not in ("insufficient_room", "target_standoff"))):
                     break
             if int(time.time() * 1000) >= packet_deadline_ms:
                 break
@@ -5542,9 +5583,12 @@ class NaviPlugin:
                 straight_handoff = check.straight_handoff
                 front_blocked = False
                 if check.straight_forward:
+                    near_hits = (self._state.active_scan.near_hits
+                                 if check.mount_frame is None and check.geometry.front == 0. else None)
                     cap = policy_mod.straight_handoff_speed(
                         snapshot[1], self._config, check.distance_m,
-                        odom_mod.planar_feedback(snapshot[2]), self._wire_twist or check.previous_twist)
+                        odom_mod.planar_feedback(snapshot[2]), self._wire_twist or check.previous_twist,
+                        near_hits=near_hits)
                     if cap < message["values"][0]:
                         values = [cap, *message["values"][1:]]
                         front_blocked = cap <= 0. or policy_mod.apply_deadband(values, self._deadband_for(values)) != values

@@ -71,7 +71,7 @@ from .active_scan import (ANGLE, ANGLE_TOLERANCE, ActiveScan, CAMERA_OCCUPANCY_M
                           DEFAULT_FEEDBACK_GAP_MS, MAP_AGE_MS, ODOM_GAP_MS,
                           NearProjection, SCAN_ODOM_LINEAR_TOLERANCE_MPS, STILL_LINEAR, STILL_YAW,
                           TURN_SPEED_REDUCTION, confirmed_square_coverage, relative_pose_at)
-from .depth import has_valid_returns, observation_ms
+from .depth import box_median_agrees, has_valid_returns, observation_ms
 from .track import LOST, AssociationSnapshot, ObservationFrame, Track, Tracker, observation_source, observation_transform, target_objects
 from . import local_path
 from . import dwa
@@ -342,6 +342,7 @@ class Config:
     # copy is a copy that goes stale. See `adopt_limits`.
     floor_vx: float = 0.0
     floor_vy: float = 0.0
+    lateral_step: float = 0.0
     floor_vx_moving: float | None = None
     floor_vy_moving: float | None = None
     left_vy_limit: float | None = None
@@ -814,6 +815,7 @@ class State:
     command_tail: tuple = (0., 0., 0.)
     command_tail_s: float = 0.
     reacquire_generation: int | None = None
+    reacquire_pause_until_ms: int | None = None
     reacquire_receipt_ms: int = 0
     reacquire_source: float | None = None
     reacquire_candidate: dict | None = None
@@ -1144,6 +1146,7 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
     # The command sink limits velocity changes per accepted packet. Model
     # its nominal ramp at the producer cadence declared by the sink.
     deltas = limits.get("max_delta_per_step") or ()
+    config.lateral_step = 0.
     hz = rate.get("expected_hz")
     nominal_ramp = [None] * 3
     if isinstance(deltas, (list, tuple)) and type(hz) in (int, float) and 0 < hz < math.inf:
@@ -1153,6 +1156,8 @@ def adopt_limits(config: Config, descriptor: dict) -> list[str]:
             step = deltas[index]
             if type(step) in (int, float) and 0 < step < math.inf and math.isfinite(step * hz):
                 nominal_ramp[axis] = step * hz
+                if index == 1:
+                    config.lateral_step = step
     config.motion_acceleration = tuple(rate or fallback for rate, fallback in
                                        zip(nominal_ramp, motion_model._DEFAULT_ACCELERATION))
     config.motion_braking = tuple(rate or fallback for rate, fallback in
@@ -1984,6 +1989,9 @@ def _decide(detections, depth, odom, config: Config, state: State,
                        and track.front_fix is None)
     matched_person = (state.target == "person" and detections is not None
                       and state.tracker.track is not None and state.tracker.matched_detections is detections)
+    keep_unranged_detour = (visual_only and config.local_controller == "dwa" and anchor is not None
+                          and committed is not None and committed.motion_guard is not None
+                          and committed.motion_guard.generation == anchor.generation == track.generation)
     if fresh_recovery:
         state.reacquire_receipt_ms, state.reacquire_source = objects_ms, detection_source
         state.reacquire_candidate = detections if matched_person else None
@@ -1996,15 +2004,16 @@ def _decide(detections, depth, odom, config: Config, state: State,
     if track is not None and track.observed and (
             fresh_recovery and track.accepted_detection or pending_person and track.measured_range_m is not None):
         # A confirmed replacement owns a new goal; it cannot inherit the old detour.
-        if anchor is not None and (track.generation != anchor.generation or visual_only):
+        if anchor is not None and (track.generation != anchor.generation or (visual_only and not keep_unranged_detour)):
             _reset_detour_route(state)
             state.goal_anchor = anchor = None
         if track.measured_range_m is not None or visual_only:
             state.reacquire_generation = None
+            state.reacquire_pause_until_ms = None
             state.reacquire_candidate = None
             state.missing_frames = 0
             state.searching_for_s = state.searched_rad = 0.
-    needs_probe = visual_only and (anchor is None or config.local_controller == "dwa")
+    needs_probe = visual_only and not keep_unranged_detour and (anchor is None or config.local_controller == "dwa")
     if needs_probe:
         if anchor is not None and depth is not None:
             _reset_detour_route(state)
@@ -2031,7 +2040,7 @@ def _decide(detections, depth, odom, config: Config, state: State,
         anchor.advance(odom, ego, dt, geometry=geometry, now_ms=now_ms, approach_command=(
             approach_command if state.active_scan.exhausted and any(approach_command) else None))
         target_fix = _fresh_detour_fix(anchor, track, config, depth)
-        if track is None or not track.observed or (freeze_goal and track.generation != anchor.generation):
+        if visual_only or track is None or not track.observed or (freeze_goal and track.generation != anchor.generation):
             anchor.target_missing = True
         if target_fix is not None:
             reobserved_target = anchor.target_missing
@@ -2205,8 +2214,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 vantage = scan.views[-1][1]
                 if not scan._already_observed(vantage, 0.):
                     scan.observed_vantages.append(vantage)
-        if ((config.use_obstacle_history or config.local_controller == "dwa") and config.scan_geometry is None
-                and geometry is not None and geometry.horizontal is not None):
+        paired_depth = ((depth or {}).get("body_mount_required") and depth.get("capture_ms") is not None)
+        keep_near = (config.use_obstacle_history or config.local_controller == "dwa"
+                     if config.scan_geometry is None else
+                     paired_depth and config.local_controller == "dwa" and not config.use_obstacle_history)
+        if keep_near and geometry is not None and geometry.horizontal is not None:
             target_range = (track.range_m if track is not None and track.range_known else math.inf)
             if anchor is not None:
                 target_range = min(target_range, math.hypot(anchor.x, anchor.y))
@@ -2245,11 +2257,21 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 vx, vy, wz, status, reason = straight
                 return Decision(_twist(vx, vy, wz), status, reason, distance_m=track.range_m)
         if (published is not None and published is committed
-                and (published.locks_detour or (person_dwa and lost is not None and not lost.observed))):
+                and (published.locks_detour or keep_unranged_detour
+                     or (person_dwa and lost is not None and not lost.observed))):
             measured = track.measured_range_m if track is not None else None
             same_target = track is not None and track.generation == published.motion_guard.generation
             seen_target = track is not None and track.observed and track.navigation_range_known
             if (same_target or seen_target) and measured is not None and measured <= config.arrival_distance_m + 1e-6:
+                if (same_target and anchor is not None and anchor.generation == track.generation
+                        and anchor.x > config.arrival_distance_m + config.stop_tolerance_m
+                        and config.scan_geometry is None and depth is not None
+                        and depth.get("map") is not None and track.front_box is not None):
+                    x0, y0, x1, y1 = track.front_box
+                    top = (x0, y0, x1, y0 + (y1 - y0) / 4)
+                    if box_median_agrees(depth["map"], top, anchor.x, 3 * config.range_std_m):
+                        return Decision(_twist(0., 0., 0.), AVOIDING, "近距测量与保留目标位置不一致，停车等待复测",
+                                        distance_m=measured, target_pending=True)
                 state.committed_route = state.published_dwa_route = published = None
             elif depth is None or geometry is None or not scan.current_frame:
                 return Decision(_twist(0., 0., 0.), BLIND, "绕行：保留原路线，等待可用深度")
@@ -2273,6 +2295,11 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 if arc is not None:
                     vx, vy, wz, status, reason = arc
                     return Decision(_twist(vx, vy, wz), status, reason, distance_m=distance)
+                # Give the last checked detour fresh views before a brief
+                # range loss can replace it with a search turn.
+                if (person_dwa and not seen_target and state.committed_route is published and now_ms is not None
+                        and 0 <= now_ms - published.motion_guard.checked_ms < config.depth_age_limit_ms):
+                    return Decision(_twist(0., 0., 0.), AVOIDING, NO_ROUTE_CONTINUATION)
                 recovering_detour = (lost is not None and lost.state == LOST
                                      and lost.generation == state.reacquire_generation)
                 if (state.published_dwa_route is not None
@@ -2287,6 +2314,12 @@ def _decide(detections, depth, odom, config: Config, state: State,
                 return Decision(_twist(0., 0., 0.), BLIND, "原地搜索：等待可用深度")
             if matched_person:
                 return Decision(_twist(0., 0., 0.), ALIGNING, "已关联到人，停车等待有效测距", target_pending=True)
+            if (now_ms is not None and state.searching_for_s
+                    and state.reacquire_pause_until_ms is None and state.tracker.reentry_visible):
+                state.reacquire_pause_until_ms = now_ms + config.depth_age_limit_ms
+            if (now_ms is not None and state.reacquire_pause_until_ms is not None
+                    and now_ms < state.reacquire_pause_until_ms):
+                return Decision(_twist(0., 0., 0.), ALIGNING, "候选目标重新入画，等待有效测距", target_pending=True)
             state.missing_frames = max(state.missing_frames, config.lost_frames)
             return _search_for_target(depth, config, state, dt, odom)
         if config.local_controller == "dwa" and depth is not None and geometry is not None:
@@ -2490,6 +2523,14 @@ def _decide(detections, depth, odom, config: Config, state: State,
             within = within or track.observed
         elif not same_target or not near_ring or not within:
             state.parking_hold_generation = None
+    if (within and person_approach and config.use_lateral and config.scan_geometry is None
+            and abs(bearing) > config.arrive_align_tol and track is not None and track.observed
+            and track.navigation_range_known and state.parking_target_generation != track.generation
+            and track.measured_range_m is None and track.measured_point is not None
+            and math.hypot(*track.measured_point.point) > config.arrival_distance_m + 1e-6):
+        # A projected range can enter the ring one tick before the measured
+        # range. Keep the checked approach until the first parking turn is due.
+        within = False
     if within:
         if missing_person and not last_seen_target:
             return _search_for_target(depth, config, state, dt, odom)
@@ -3127,7 +3168,7 @@ def projected_forward_clearance(occupied, geometry, config):
             if hits.any() and transform[0, 2] > 0. else None)
 
 
-def straight_handoff_speed(depth, config, distance, measured, previous):
+def straight_handoff_speed(depth, config, distance, measured, previous, *, near_hits=None):
     if (depth is None or depth.get("map") is None or depth.get("capture_invalid") or measured is None
             or any(abs(vy) > STILL_LINEAR or abs(wz) > STILL_YAW
                                 for _, vy, wz in (measured, previous))):
@@ -3135,6 +3176,14 @@ def straight_handoff_speed(depth, config, distance, measured, previous):
     ahead, coverage = _clearance(depth, config)
     if coverage < config.coverage_min:
         return 0.
+    # Both jambs can leave the front camera's field of view before the
+    # chassis reaches a measured opening that is too narrow.
+    if near_hits is not None and config.scan_geometry is None:
+        corridor = near_hits & (FORWARD >= 0.) & (abs(RIGHT) <= _keepout_m(config))
+        paired = (corridor & (RIGHT < 0.)).any(axis=1) & (corridor & (RIGHT > 0.)).any(axis=1)
+        if paired.any():
+            jambs = float(FORWARD[paired, 0].min())
+            ahead = jambs if ahead is None else min(ahead, jambs)
     received = observation_ms(depth)
     checked = depth.get("control_ms") or received
     delay = max(0, checked - (depth.get("obstacle_driver_ms") or received)) / 1000
@@ -4044,16 +4093,13 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     preferred_spacing = None
     cached_goal_standoff = (config.stop_distance_m if follow_published and target is not None
                             and track is not None and track.state == LOST else 0.)
-    if (follow_published and measured is None and measured_range is not None and target_distance is not None
-            and state.target == "person" and inputs.measured_target is not None
-            and track.measured_point.standoff_point is not None):
-        # A person's near surface can be closer than the representative box range.
-        # Score the candidates against the same surface spacing as the wire recheck.
-        camera = local_path.target_in_grid(geometry, 0., 0.)
-        if math.dist(camera, inputs.measured_target[0]) + config.stop_tolerance_m < target_distance:
-            measured = inputs.measured_target
-            spacing = config.stop_distance_m
-            preferred_spacing = spacing + config.stop_tolerance_m
+    if (follow_published and measured_range is not None and state.target == "person"
+            and inputs.measured_target is not None and track.measured_point.standoff_point is not None):
+        # Use the same coherent surface and spacing as the publisher, even
+        # when the surface agrees with the range used to steer toward the goal.
+        measured = inputs.measured_target
+        spacing = config.stop_distance_m
+        preferred_spacing = spacing + config.stop_tolerance_m
     proposed = dwa.select(
         route=route.points, grid=grid, geometry=geometry, footprint=inputs.footprint,
         occupied=inputs.observed, remembered=inputs.remembered, supported_region=local_path.SUPPORTED_REGION,
@@ -4072,6 +4118,7 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
         candidate_budget=state.dwa_budget, motion_frame=(scan.motion_frame, inputs.pose), guidance=guidance,
         follow_published=follow_published, route_error=route_error,
         steering_horizon=config.dwa_horizon_s if camera_detour else None,
+        lateral_step=config.lateral_step,
         handoff_yaw_step=state.dwa_handoff_yaw_step if not visual else 0.,
         retry_from_rest=(recovery and scan.dwa_failures > 0 and not any(inputs.previous)
                          and math.hypot(*inputs.measured[:2]) <= config.scan_odom_linear_tolerance_mps))
@@ -4142,7 +4189,8 @@ def _straight_handoff(depth, config, state, route, approach_speed):
     (floor, limit), _ = _local_velocity_limits(config, 1.)
     if approach_speed is None:
         approach_speed = config.k_fwd * (distance - config.stop_distance_m)
-    cap = straight_handoff_speed(depth, config, distance, state.active_scan.motion, state.commanded)
+    cap = straight_handoff_speed(depth, config, distance, state.active_scan.motion, state.commanded,
+                                 near_hits=state.active_scan.near_hits)
     vx = min(approach_speed, limit, cap)
     if vx > 0. and vx >= floor:
         state.dwa_trace["straight_handoff"] = distance
@@ -4184,9 +4232,13 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
     locked = previous.locks_detour and previous is state.committed_route
     generation_matches = (corner_only or guard.generation == (track.generation if track is not None else None)
                           or (locked and (track is None or (track.observed and track.navigation_range_known))))
+    if (guard.footprint.front, guard.footprint.rear) != (geometry.front, geometry.rear):
+        if locked:
+            # A route from the body frame cannot be continued in the camera frame.
+            state.committed_route = state.published_dwa_route = None
+        return None
     if (guard.target_name != state.target or not generation_matches
-            or current is None or not 0 <= now - current.stamp_ms < config.max_feedback_gap_ms
-            or (guard.footprint.front, guard.footprint.rear) != (geometry.front, geometry.rear)):
+            or current is None or not 0 <= now - current.stamp_ms < config.max_feedback_gap_ms):
         return None
     try:
         transform = dwa_registration(guard.pose, current, guard.checked_ms, now, geometry,
@@ -4290,6 +4342,22 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
     if proposal is None:
         reason = state.dwa_trace.get("fallback_reason")
         blocked = state.dwa_trace.get("rejected", {}).keys() & {"footprint_collision", "remembered_obstacle"}
+        if (locked and not config.use_lateral and not config.use_obstacle_history and geometry.front == 0.
+                and exit_line is None and not route.corridor_corner and not corner_only
+                and "remembered_obstacle" in blocked and scan.near_hits is not None):
+            # Changing speed keeps the blocked curvature. Try a short
+            # continuation away from the remembered flank with the same sweep.
+            near = scan.near_hits & (FORWARD >= -geometry.rear) & (FORWARD <= geometry.half_length)
+            if near.any():
+                across = RIGHT[near]
+                flank = across[np.argmin(abs(across))]
+                length = geometry.half_length + local_path.RESOLUTION
+                point = (length / 2, -math.copysign(length * math.sqrt(3) / 2, flank))
+                tangent = Detour(None, ((0., 0.), point), geometry)
+                proposal = _dwa_detour(depth, config, state, tangent, distance, bearing,
+                                       branch="reachable_prefix", follow_published=True, recovery=True)
+                if proposal is not None:
+                    return _use_dwa(state, proposal, state.escape_side)
         if (locked and config.use_lateral and not config.use_obstacle_history and geometry.front == 0.
                 and exit_line is None and not route.corridor_corner and not corner_only
                 and reason in ("no_admissible_candidates", "initial_remembered_overlap") and blocked
@@ -4409,7 +4477,11 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
     detour_opening = (local_path.opening_route(depth["map"], occupied, geometry, keep, plane, target, True, travel_limits, state.commanded)
                       if config.local_controller == "dwa" and (not closest or dwa_only) else None)
     if detour_opening is not None:
-        joined = local_path.extend_passage(detour_opening, grid, keep, target, config.stop_distance_m)
+        (_, lo), (_, hi) = detour_opening.passage_exit
+        finish_offset = (geometry.front == 0. and not config.use_lateral
+                         and (lo + keep > 0. or hi - keep < 0.))
+        joined = local_path.extend_passage(detour_opening, grid, keep, target, config.stop_distance_m,
+                                           finish_offset=finish_offset)
         if joined is not detour_opening:
             visible = local_path.visible_prefix(joined.points, shadow) if shadow is not None else len(joined.points)
             if visible > len(detour_opening.points):

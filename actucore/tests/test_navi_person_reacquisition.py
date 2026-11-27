@@ -188,3 +188,104 @@ def test_out_of_order_detection_cannot_restore_tracking(monkeypatch, stale_stamp
             assert not card._state.tracker.track.observed
     assert card._state.reacquire_generation is None
     assert command["values"][0] > 0.
+
+
+@pytest.mark.parametrize("view", ["same_box", "ambiguous", "empty"])
+def test_lost_person_can_pause_once_for_matching_depth(monkeypatch, view):
+    from test_navi_dwa_target_evidence import coasting_person_case
+
+    card, packets, clock, snapshot, _ = coasting_person_case(monkeypatch, False)
+    state, cfg = card._state, card._config
+    track = state.tracker.track
+    track.hue = "blue"
+    track.since_obs_s = cfg.max_coast_s + .1
+    state.goal_anchor = None
+    state.reacquire_generation = track.generation
+    state.reacquire_receipt_ms, state.reacquire_source = 1000, 1.
+    state.searching_for_s = .2
+    person = {"name": "person", "color": "blue", "position": [0., -.6], "confidence": .95,
+              "bbox_norm": [.45, .1, .55, .3]}
+    people = [] if view == "empty" else [person]
+    if view == "ambiguous":
+        people += [dict(person, position=[.4, -.6], bbox_norm=[.65, .1, .75, .3])]
+
+    def observe(stamp, distance):
+        advance_snapshot(snapshot, clock, stamp, vx=0.)
+        _, depth, odom, _ = snapshot[0]
+        image = depth["map"].copy()
+        image[:150] = distance
+        snapshot[0] = {"timestamp": stamp / 1000, "objects": people}, dict(depth, map=image), odom, stamp
+        return card.next_command()
+
+    message = observe(1050, 12.)
+    assert state.tracker.track is track and not track.observed
+    assert track.measured_range_m is None
+    if view != "same_box":
+        assert state.reacquire_pause_until_ms is None
+        return
+    assert message["values"] == [0.] * 6
+    card._publish_command(message)
+    assert packets[-1]["values"] == [0.] * 6
+    deadline = state.reacquire_pause_until_ms
+    assert deadline == 1050 + cfg.depth_age_limit_ms
+    assert observe(1100, 12.)["values"] == [0.] * 6
+    assert state.reacquire_pause_until_ms == deadline
+    observe(deadline + 1, 12.)
+    assert state.reacquire_pause_until_ms == deadline
+    assert state.tracker.track is track and not track.observed
+    assert "候选目标重新入画" not in card._last_decision.reason
+
+
+@pytest.mark.parametrize("mixed", [True, False], ids=["mixed-depth", "uniform-near"])
+def test_near_depth_does_not_release_committed_person_route_with_far_upper_support(monkeypatch, mixed):
+    from dataclasses import replace
+    from plugins.navi.depth import _box_slices
+    from test_navi_dwa_target_evidence import coasting_person_case
+
+    card, packets, clock, snapshot, message = coasting_person_case(monkeypatch, False)
+    state = card._state
+    track = state.tracker.track
+    assert card._stage_command(message, card._output_epoch)
+    commitment = state.committed_route
+    assert commitment is not None
+    commitment = replace(commitment, locks_detour=True)
+    state.committed_route = commitment
+    card._scheduled_command = None
+
+    # The person was associated three metres away. Delay-induced foreground
+    # range has contaminated the live filter but never changed the frozen goal.
+    state.goal_anchor = anchor = policy.DetourGoal(3., 0., generation=track.generation)
+    track.mean[:2] = (.85, 0.)
+    track.mean[2:] = 0.
+    track.front_reference = np.array([.85, 0.])
+    track.front_fix = np.array([.85, 0.])
+
+    stamp = 1100
+    advance_snapshot(snapshot, clock, stamp, vx=0.)
+    _, depth, odom, _ = snapshot[0]
+    image = depth["map"].copy()
+    box = [.45, .10, .55, .30]
+    crop = image[_box_slices(image.shape, box)]
+    crop[:] = .744
+    if mixed:
+        # Foreground spans 40% of the crop, including the upper edge.
+        # A background layer agrees with the original target farther away.
+        crop[:, int(crop.shape[1] * .4):] = 3.
+    person = {"name": "person", "position": [0., -.6], "bbox_norm": box, "confidence": .95}
+    snapshot[0] = {"timestamp": stamp / 1000, "objects": [person]}, dict(depth, map=image), odom, stamp
+
+    next_packet = card.next_command()
+
+    assert state.tracker.track is track
+    assert track.measured_range_m == pytest.approx(.744)
+    assert next_packet["values"][:2] == [0., 0.]
+    if mixed:
+        assert next_packet["values"] == [0.] * 6
+        card._publish_command(next_packet)
+        assert packets[-1]["values"] == [0.] * 6
+        assert state.committed_route is commitment
+        assert state.goal_anchor is anchor
+        assert state.parking_target_generation is None
+    else:
+        assert state.committed_route is None
+        assert state.parking_target_generation == track.generation

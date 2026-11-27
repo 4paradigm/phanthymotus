@@ -18,12 +18,14 @@ from typing import Literal
 import numpy as np
 
 from . import local_path
+from .active_scan import STILL_YAW
 from .motion import (FootprintSpec, MotionCheck, MotionTrace, Pose, Twist, _DEFAULT_ACCELERATION, _DEFAULT_BRAKING,
                      evaluate_motion, minimum_target_distance, predict_motion, stopping_horizon)
 
 
 MAX_SEARCH_CANDIDATES = 64
 ROUTE_SPEED_SCALES = (1., .75, .5, .25)
+ROUTE_CRAWL_SCALE = .125
 PREFERRED_CLEARANCE_M = .30
 
 
@@ -434,7 +436,8 @@ def view_yaw_limits(limits, bearing, half_fov, horizon, *, protect_person_view=F
 
 
 def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lookahead_m=None, yaw_floor=0.,
-                lateral_floor=0., view_bearing=None, steering_horizon=None, hold_heading=False):
+                lateral_floor=0., view_bearing=None, steering_horizon=None, hold_heading=False,
+                ramping_lateral=0., lateral_step=0., previous_yaw=0., measured_yaw=0., yaw_step=0.):
     """Track the finite visible polyline in the current forward/right grid."""
     segments = _route_segments(points)
     remaining = remaining_route_length(points, segments=segments)
@@ -457,8 +460,11 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
     turn_horizon = horizon if steering_horizon is None else steering_horizon
     vx, vy, wz = _preferred_command(((0., 0.), (f, r)), speed, turn_horizon, yaw_limit, differential=not lateral)
     if 0. < abs(vy) < lateral_floor:
-        # Keep the planned steering without asking for an unusable sidestep.
-        vy = 0.
+        # A small pursuit change should not reset a started same-side Driver ramp.
+        # The caller still sweeps the resulting floor-speed command.
+        keep_ramp = ramping_lateral * vy > 0. and lateral_floor - abs(vy) <= lateral_step
+        sidestep = hold_heading and abs(vy) >= lateral_floor / 2
+        vy = math.copysign(lateral_floor, vy) if keep_ramp or sidestep else 0.
     if 0. < abs(wz) < yaw_floor:
         # A lateral offset resolved by the grid needs steering, even at low speed.
         minimum = math.copysign(yaw_floor, wz)
@@ -470,6 +476,14 @@ def track_route(points, nominal, horizon, yaw_limit, *, body_origin, lateral, lo
         correction = -math.copysign(max(yaw_floor, abs(view_bearing) / (2. * turn_horizon)), view_bearing)
         if yaw_limit[0] <= correction <= yaw_limit[1]:
             wz = correction
+    if wz * previous_yaw < 0.:
+        # Brake toward zero before requesting the other direction. If the
+        # Driver has a yaw deadband, zero is the next executable request.
+        braking_yaw = math.copysign(max(0., abs(previous_yaw) - yaw_step), previous_yaw)
+        wz = (braking_yaw if yaw_step > 0. and yaw_limit[0] <= braking_yaw <= yaw_limit[1]
+              and abs(braking_yaw) >= yaw_floor else 0.)
+    elif not previous_yaw and wz * measured_yaw < -STILL_YAW * abs(wz):
+        wz = 0.
     return (vx, vy, wz), remaining
 
 
@@ -490,9 +504,10 @@ def pursuit_cost(command, previous, nominal_speed, yaw_limit, check, *, lateral_
     return change + .75 * (1. - speed_fraction) + _obstacle_score(check) * clearance_weight
 
 
-def pursuit_options(yaw_limit, can_hold_heading, scales=ROUTE_SPEED_SCALES):
+def pursuit_options(yaw_limit, can_hold_heading, scales=ROUTE_SPEED_SCALES, *, fallback_scales=()):
     headings = (yaw_limit, (0., 0.)) if can_hold_heading and any(yaw_limit) else (yaw_limit,)
-    return product(headings, scales)
+    yield from product(headings, scales)
+    yield from product(((0., 0.),), fallback_scales)
 
 
 def score_candidate(command, trace, check, reference, previous, *, half_width, limits,
@@ -560,7 +575,7 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
            candidate_budget: CandidateBudget | None = None, motion_frame=(), measured_target=None,
            measured_standoff_m=None, preferred_standoff_m=None, view_bearing=None,
            guidance=False, follow_published=False, route_error=0., handoff_yaw_step=0., retry_from_rest=False,
-           steering_horizon=None) -> Choice | None:
+           steering_horizon=None, lateral_step=0.) -> Choice | None:
     """Select a legal target velocity whose complete predicted stop is admissible.
 
     Routes, occupied cells and targets share the current grid frame. Each
@@ -642,8 +657,10 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
     slots = min(budget.remaining, max_candidates)
     # Only reserve work for an abrupt release of an ongoing turn. Smaller
     # tracking corrections already use the regular route score and Driver ramp.
-    transition_slot = bool(slots > 1 and handoff_yaw_step > 0. and any(previous[:2])
-                           and abs(previous[2]) > 2 * handoff_yaw_step)
+    transition_yaw = previous[2] - math.copysign(handoff_yaw_step, previous[2])
+    ongoing_turn = bool(slots > 1 and handoff_yaw_step > 0. and any(previous[:2])
+                        and abs(previous[2]) > 2 * handoff_yaw_step)
+    transition_slot = ongoing_turn and (not follow_published or _valid_axis(transition_yaw, *yaw_limit, floors[3]))
     entry_slot = (slots > 1 and guidance and not follow_published and target is not None
                   and any(yaw_limit) and any(abs(r - ref[0][1]) >= local_path.RESOLUTION / 2
                                              for ref in routes for _, r in ref[1:]))
@@ -716,22 +733,42 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         segments = _route_segments(points)
         best = None
         best_rank = None
-        swept_into_obstacle = False
-        scales = ROUTE_SPEED_SCALES[:len(ROUTE_SPEED_SCALES) - int(transition_slot)]
-        for steering, scale in pursuit_options(yaw_limit, bool(y_speed) or floors[3] > 0., scales):
+        swept_into_obstacle = skip_turn_samples = False
+        try_sidestep = (bool(y_speed) and 0. < handoff_yaw_step < floors[3] and view_bearing is None
+                        and (previous[2] != 0. or abs(measured[2]) > STILL_YAW))
+        ramping_lateral = previous[1] if abs(measured[1]) < floors[1] else 0.
+        scales = ROUTE_SPEED_SCALES[:len(ROUTE_SPEED_SCALES) - int(ongoing_turn)]
+        fallback_scales = ()
+        if y_speed and floors[3] > 0.:
+            # Keep the normal pursuit ranking. Try the freed slot and a
+            # lower forward speed only when the turn sweep left no successor.
+            if ongoing_turn and not transition_slot:
+                fallback_scales = ROUTE_SPEED_SCALES[-1:]
+            if floors[0] <= x_speed * ROUTE_CRAWL_SCALE:
+                fallback_scales += (ROUTE_CRAWL_SCALE,)
+        for steering, scale in pursuit_options(yaw_limit, bool(y_speed) or floors[3] > 0., scales,
+                                              fallback_scales=fallback_scales):
             if budget.expired() or diag["sampled_candidates"] >= slots:
                 break
-            if steering != yaw_limit and (best is not None or not swept_into_obstacle):
+            if scale in fallback_scales and (best is not None or not swept_into_obstacle):
                 break
+            hold_heading = steering != yaw_limit
+            if hold_heading and not (try_sidestep or (best is None and swept_into_obstacle)):
+                break
+            if skip_turn_samples and not hold_heading:
+                continue
             tracked = track_route(points, x_speed * scale, horizon, steering,
                                   body_origin=body_origin, lateral=bool(y_speed), lookahead_m=lookahead,
                                   yaw_floor=floors[3], lateral_floor=floors[1],
                                   view_bearing=view_bearing, steering_horizon=steering_horizon,
-                                  hold_heading=steering != yaw_limit)
+                                  hold_heading=hold_heading,
+                                  ramping_lateral=ramping_lateral, lateral_step=lateral_step,
+                                  previous_yaw=previous[2], measured_yaw=measured[2], yaw_step=handoff_yaw_step)
             if tracked is None:
                 break
             command, room = tracked
-            if not any(command[:2]) or not _legal_command(command, limits, floors):
+            if (not any(command[:2]) or not _legal_command(command, limits, floors)
+                    or (hold_heading and not command[1] and not swept_into_obstacle)):
                 continue
             budget.remaining -= 1
             diag["sampled_candidates"] += 1
@@ -775,7 +812,9 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
                 best_room = room - route_error
             if (scale == 1. and not near_limit and check.min_clearance_m >= PREFERRED_CLEARANCE_M
                     and command[2] * previous[2] >= 0.):
-                break
+                if not try_sidestep:
+                    break
+                skip_turn_samples = True
         if best is not None:
             diag.update(reference_scores=diag["admissible_candidates"],
                         scores_by_reference=[diag["admissible_candidates"]], reason=None)

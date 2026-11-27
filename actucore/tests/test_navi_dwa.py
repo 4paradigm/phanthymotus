@@ -79,6 +79,22 @@ def test_route_pursuit_steers_when_its_sideways_component_is_below_the_floor(rig
     assert vx > 0. and vy == 0. and yaw * right < 0.
 
 
+@pytest.mark.parametrize("side", [-1., 1.], ids=["right", "left"])
+@pytest.mark.parametrize("previous,measured,expected", [
+    (.12, .03, .12),
+    (0., 0., 0.),
+    (-.12, -.03, 0.),
+    (.12, .12, 0.),
+])
+def test_pursuit_keeps_a_started_lateral_ramp_for_one_driver_step(side, previous, measured, expected):
+    choice = _run(((0., 0.), (1.6, -.32 * side)), lateral=True, follow_published=True,
+                  previous=(.5, previous * side, 0.), measured=(.5, measured * side, 0.),
+                  floors=(.08, .12, .5, .04), lateral_step=.03)
+
+    assert choice is not None and choice.check.accepted
+    assert choice.command[1] == pytest.approx(expected * side)
+
+
 @pytest.mark.parametrize("bearing", [-.44, .44])
 def test_lateral_detour_reserves_view_before_turning_away_from_person(bearing):
     lower, upper = dwa.view_yaw_limits((-.6, .6), bearing, .8, 2.4, protect_person_view=True)
@@ -155,6 +171,28 @@ def test_retained_non_lateral_route_can_advance_when_turn_sweep_is_blocked():
     assert diagnostics["rejected"]["footprint_collision"] > 0
     assert choice is not None and choice.check.accepted
     assert choice.command[0] > 0. and choice.command[1:] == (0., 0.)
+
+
+@pytest.mark.parametrize("horizon, obstacle, max_safe_speed", [
+    (1.5, .45, .075),
+    (2., .45, .0375),
+    (2., .30, None),
+])
+def test_retained_route_checks_low_speeds_when_an_intermediate_turn_is_unavailable(
+        horizon, obstacle, max_safe_speed):
+    choice = _run(((0., 0.), (1.6, -.24)), grid=_grid(obstacles=[(obstacle, 0.)]),
+                  lateral=True, follow_published=True, target=None,
+                  previous=(.18, 0., .8), measured=(.08, 0., .08), x_limit=(0., .3),
+                  floors=(0., .12, .8, .8), handoff_yaw_step=.155, yaw_limits=(-1., 1.),
+                  horizon=horizon)
+
+    if max_safe_speed is None:
+        assert choice is None
+    else:
+        assert choice is not None and choice.check.accepted and choice.trace.stopped
+        assert 0. < choice.command[0] <= max_safe_speed
+        assert choice.command[1:] == (0., 0.)
+        assert choice.progress > 0.
 
 
 def test_retained_route_prefers_a_slower_arc_with_more_braking_clearance():
@@ -343,6 +381,33 @@ def test_moving_arc_handoff_sweeps_interpolated_yaw(follow_published, allow_tran
     assert -.4 in checked
     assert choice.command[2] == pytest.approx(-.4 if allow_transition else 0.)
     assert budget.remaining >= 0
+
+
+@pytest.mark.parametrize("turn_floor, previous_yaw, measured_yaw, expected", [
+    (.8, .8, .6, 0.),
+    (.8, 0., .3, 0.),
+    (.8, 0., .02, -.8),
+    (.04, .5, .3, .4),
+])
+def test_retained_route_brakes_opposite_yaw_while_translating(turn_floor, previous_yaw, measured_yaw, expected):
+    choice = _run(((0., 0.), (1.6, .55)), lateral=True, follow_published=True,
+                  target=None, yaw_limits=(-1., 1.), floors=(0., .12, turn_floor, turn_floor),
+                  previous=(.22, -.12, previous_yaw), measured=(.2, -.12, measured_yaw),
+                  handoff_yaw_step=.1, view_bearing=.5)
+    assert choice is not None and choice.check.accepted
+    assert choice.command[0] > 0.
+    assert choice.command[1] <= 0.
+    assert choice.command[2] == pytest.approx(expected)
+
+
+def test_retained_lateral_route_can_translate_at_the_driver_floor_and_hold_heading():
+    choice = _run(((0., 0.), (1.4, .42)), lateral=True, follow_published=True,
+                  target=None, yaw_limits=(-1., 1.), x_limit=(0., .3),
+                  previous=(.28, -.12, .8), measured=(.28, -.12, .02),
+                  floors=(0., .12, .8, .8), handoff_yaw_step=.155)
+    assert choice is not None and choice.check.accepted
+    assert choice.command[0] > 0.
+    assert choice.command[1:] == pytest.approx((-.12, 0.))
 
 
 def test_guard_rejects_fast_candidate_but_accepts_slow_candidate():

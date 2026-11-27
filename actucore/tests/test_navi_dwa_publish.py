@@ -3164,11 +3164,16 @@ def test_route_controller_checks_the_outgoing_packet_when_front_range_is_missing
         assert work.expires_ms == cutoff
 
 
-def test_route_controller_follows_an_associated_image_bearing_without_a_range(monkeypatch):
+@pytest.mark.parametrize("committed", [False, True])
+def test_route_controller_checks_an_associated_image_bearing_without_a_range(monkeypatch, committed):
     from plugins.navi.track import TargetMatch
 
     card, packets, _, snapshot, feed = tracked_route_card(monkeypatch)
     cutoff = card._scheduled_command.expires_ms
+    assert card._state.committed_route is card._wire_dwa_origin.acceptance
+    assert card._state.goal_anchor is not None
+    if not committed:
+        card._state.committed_route = None
     feed(1100, .1, frame=snapshot[0][1]["map"])
     objects, depth, odom, _ = snapshot[0]
     snapshot[0] = dict(objects, timestamp=1.1), depth, odom, 1100
@@ -3179,9 +3184,15 @@ def test_route_controller_follows_an_associated_image_bearing_without_a_range(mo
     card._dispatch_command()
     assert len(packets) == 2
     packet = packets[-1]
-    assert packet["values"][0] > 0 and packet["values"][5] < 0
+    assert packet["values"][0] > 0
     proof = card._wire_dwa_origin.forward_check
-    assert proof.bearing_only and proof.target_ms == 1100 and proof.target_capture_ms == 1000
+    assert proof.bearing_only and proof.target_capture_ms == 1000
+    if committed:
+        assert packet["values"][5] == 0.
+        assert proof.target_ms == 1000
+        assert proof.motion_guard.check.accepted and proof.motion_guard.trace.stopped
+    else:
+        assert packet["values"][5] < 0 and proof.target_ms == 1100
     assert packet["stamp_ms"] + packet["ttl_ms"] <= cutoff
 
 
@@ -3979,6 +3990,47 @@ def test_duplicate_detection_keeps_evidence_for_an_association_miss(monkeypatch)
     assert card._scheduled_command is work
     assert packets[-1]["seq"] > retained["seq"]
     assert packets[-1]["values"] == retained["values"]
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_detour_target_dropout_checks_the_original_mount(monkeypatch, changed):
+    card, packets, _, snapshot, feed = tracked_route_card(monkeypatch, latest_depth_only=True)
+    work = card._scheduled_command
+    previous, = packets
+    feed(1180, previous["values"][0], frame=snapshot[0][1]["map"].copy())
+    _, depth, odom, _ = snapshot[0]
+    frame = ("odom", "base_link")
+    work.forward_check = replace(work.forward_check, mount_frame=frame)
+    mount = work.forward_check.geometry.base_from_optical.copy()
+    mount[0, 3] += .05 if changed else 0.
+    depth = dict(depth, body_from_optical=mount, obstacle_capture_pose=policy.PlanarPose(1180, frame, 0., 0., 0.))
+    snapshot[0] = {"timestamp": 1.18, "objects": []}, depth, odom, 1180
+
+    assert card._continue_without_target(work, 1180) is not changed
+    assert len(packets) == (1 if changed else 2)
+
+
+@pytest.mark.parametrize("paired", [False, True])
+def test_mounted_depth_is_paired_to_its_exposure_pose(monkeypatch, paired):
+    config, _, view, _ = observation_case()
+    card = plugin.NaviPlugin({}, executor=None)
+    card._config = config
+    card._binding = {"body_mount": "/test/mount"}
+    card._depth_map, card._depth_ms = view["map"], 1300
+    card._depth_source_ns = 1000 * 10**6
+    card._mounts[card._depth_source_ns] = (config.scan_geometry.base_from_optical, True)
+    frame = ("odom", "base_link")
+    for stamp, x in ((975, .0), (1025, .02), (1300, .12)) if paired else ((1300, .12),):
+        card._obstacle_poses.append((stamp * 10**6, policy.PlanarPose(stamp, frame, x, 0., 0.)))
+    monkeypatch.setattr(plugin.time, "time", lambda: 1.30)
+
+    _, depth, _, _ = card._observation_snapshot(with_capture_timing=True)
+
+    assert depth["frame_id"] == 1300
+    assert depth.get("capture_ms") == (1000 if paired else None)
+    pose = depth["obstacle_capture_pose"]
+    assert pose.stamp_ms == (1000 if paired else 1300)
+    assert pose.x == pytest.approx(.01 if paired else .12)
 
 
 @pytest.mark.parametrize("scene", ["clear", "blocked", "newer_depth", "newer_blocked"])

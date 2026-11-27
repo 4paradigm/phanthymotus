@@ -329,6 +329,24 @@ def test_missing_range_may_continue_a_route_that_reaches_the_exit(monkeypatch, c
         assert state.dwa_trace["fallback_reason"] == "no_reference"
 
 
+def test_retained_route_checks_the_measured_person_surface_even_when_ranges_agree(monkeypatch):
+    config, state, depth, _ = prepared_reference_case()
+    measured = .92
+    track = state.tracker.track = Track(np.array([measured, 0., 0., 0.]), np.eye(4), range_known=True)
+    track.record_range(measured, (measured, 0.), depth, standoff_point=(.91, 0.))
+    state.goal_anchor.generation = track.generation
+    route = local_path.Detour(None, ((0., 0.), (1., 0.)), config.local_geometry)
+    calls = observe_selector(monkeypatch)
+
+    proposal = policy._dwa_detour(depth, config, state, route, measured, 0., follow_published=True)
+
+    options, choice = calls[0]
+    assert options["measured_standoff_m"] == config.stop_distance_m
+    point, error = options["measured_target"]
+    assert proposal is not None and choice.check.accepted
+    assert dwa.minimum_target_distance(choice.trace, point) >= config.stop_distance_m + error - 1e-10
+
+
 @pytest.mark.parametrize("reason", ["footprint_collision", "remembered_obstacle", "occluded_prefix",
                                     "target_standoff"])
 def test_candidate_rejections_preserve_the_actual_constraint(monkeypatch, reason):
@@ -1028,3 +1046,84 @@ def test_exhausted_detour_tail_hands_off_only_to_a_clear_target_corridor(restric
     assert policy._target_corridor_clear(depth, config, scan, 3., 0.) == (restriction != "obstacle")
     retained = route if restriction is not None else None
     assert state.committed_route is state.published_dwa_route is retained
+
+
+@pytest.mark.parametrize("change", ["frame", "missing_depth", "missing_target"])
+def test_committed_body_route_is_only_released_when_the_footprint_changes(change):
+    config, state, depth, odom = advance_case(body=True)
+    scan, geometry = state.active_scan, config.scan_geometry
+    scan.retire_motion()
+    state.dwa_odom = odom
+    state.goal_anchor = policy.DetourGoal(3., 0., generation=1)
+    anchor = state.goal_anchor
+    state.tracker.track = Track(np.array([3., 0., 0., 0.]), np.eye(4), range_known=True, generation=1)
+    target = state.tracker.track
+    assert scan.update(depth, odom, geometry, receipt_only=True) is None
+    reference = local_path.Detour(None, ((0., 0.), (1., .12), (1.5, 0.)), geometry)
+    selected = policy._dwa_detour(depth, config, state, reference, 3., 0.)
+    assert selected is not None and selected.guard.check.accepted
+
+    published = policy.DwaAcceptance(1, selected.command, motion_guard=selected.guard,
+                                     route_points=reference.points, locks_detour=True)
+    state.committed_route = state.published_dwa_route = published
+    if change == "frame":
+        geometry = local_path.camera_square(geometry.horizontal, geometry.vertical, config.half_width_m,
+                                            half_length=geometry.half_length, at_front=True)
+        config.local_geometry, config.scan_geometry = geometry, None
+    elif change == "missing_depth":
+        depth = None
+    else:
+        state.tracker.track = None
+    state.dwa_budget = None
+
+    result = policy._follow_published_route(depth, config, state, geometry, 3., 0., foreground=True)
+
+    if change == "frame":
+        assert result is None
+        assert state.published_dwa_route is state.committed_route is None
+        assert state.tracker.track is target
+    else:
+        assert state.published_dwa_route is state.committed_route is published
+    assert state.goal_anchor is anchor
+
+
+@pytest.mark.parametrize("side", [-1., 1.])
+@pytest.mark.parametrize("blocked", [False, True])
+def test_differential_route_can_continue_away_from_a_remembered_flank(side, blocked):
+    config, state, depth, odom = advance_case(body=False)
+    camera = config.local_geometry
+    geometry = local_path.camera_square(camera.horizontal, camera.vertical, .30, half_length=.30, at_front=True)
+    config.local_geometry, config.half_width_m = geometry, .30
+    config.vx_max, config.max_depth_age_ms, config.watchdog_ms = .50, 1200, 500
+    config.motion_acceleration = (.30, .30, 1.)
+    scan = state.active_scan
+    scan.retire_motion()
+    scan.use_obstacle_history = config.use_obstacle_history = False
+    state.dwa_odom = odom
+    state.dwa_admission_ms = 200
+    assert scan.update(depth, odom, geometry, receipt_only=True) is None
+    route = local_path.Detour(None, ((0., 0.), (.45, side * .10), (1.45, side * .48)), geometry)
+    selected = policy._dwa_detour(depth, config, state, route, 2., side * .27)
+    assert selected is not None
+    old = policy.DwaAcceptance(1, selected.command, motion_guard=selected.guard,
+                               route_points=route.points, locks_detour=True)
+    state.committed_route = state.published_dwa_route = old
+    hits = np.isclose(local_path.FORWARD, .15) & np.isclose(local_path.RIGHT, side * .35)
+    cells = [[.15, side * .36]]
+    if blocked:
+        cells.append([.15, -side * .31])
+    squares = local_path.ObstacleSquares(np.array(cells), 0.)
+    scan.near_projection = NearProjection(hits, squares, selected.guard.pose, 1100)
+    state.dwa_budget = None
+    state.dwa_trace.clear()
+
+    result = policy._follow_published_route(depth, config, state, geometry, 2., side * .27, foreground=True)
+
+    assert state.dwa_trace["attempts"][0]["rejected"] == {"remembered_obstacle": 4}
+    if blocked:
+        assert result is None and state.dwa_proposal is None
+    else:
+        assert result is not None and result[0] > 0. and result[2] * side > 0.
+        assert state.dwa_proposal.guard.check.accepted
+    assert scan.near_squares is squares
+    assert state.committed_route is old

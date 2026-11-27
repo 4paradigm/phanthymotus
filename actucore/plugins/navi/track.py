@@ -80,6 +80,11 @@ CONFIRMED = "confirmed"
 COASTING = "coasting"      # not seen this tick; position is predicted
 LOST = "lost"
 
+# VOP's chromatic bins are circular. Adjacent bins can describe the same
+# appearance after a small shift in the detector box or lighting.
+_HUE_WHEEL = ("red", "orange", "yellow", "lime", "green", "teal", "cyan",
+              "azure", "blue", "violet", "magenta", "pink")
+
 
 # Body frame throughout: x forward, y **left**, metres. Same convention as
 # motus.control/1's twist and motus.odom/1, so `vx`/`vy`/`wz` mean here exactly
@@ -426,7 +431,7 @@ def _candidates(detections, depth, target: str, config, position) -> list:
     return out
 
 
-def _associate(candidates, config, position, cov=None, since_obs_s=0., hue=""):
+def _associate(candidates, config, position, cov=None, since_obs_s=0., hue="", *, person_box=None):
     """Pick the candidate this track is looking at, or None.
 
     ByteTrack's two stages, collapsed to one track: high-confidence
@@ -445,6 +450,28 @@ def _associate(candidates, config, position, cov=None, since_obs_s=0., hue=""):
         if not confident:
             return None
         return max(confident, key=lambda c: c["confidence"])
+
+    if person_box and config.local_controller == "dwa" and hue in _HUE_WHEEL and len(candidates) > 1:
+        index = _HUE_WHEEL.index(hue)
+        similar_hues = {_HUE_WHEEL[(index + delta) % len(_HUE_WHEEL)] for delta in (-1, 0, 1)}
+        similar = [c for c in candidates if c["confidence"] >= config.min_confidence
+                   and c["hue"] in similar_hues and c["obj"].get("bbox_norm")]
+        if similar and len(similar) < len(candidates):
+            # A delayed depth image can sample the background inside the
+            # current person's box. If the image still supports the original
+            # identity, let a bad range coast instead of following a neighbour.
+            predicted_range, predicted_bearing = polar_of(position)
+            # Vertical extent gives continuity even while yaw sweeps both boxes
+            # across the frame and the predicted bearing lags the detector.
+            visual = min(similar, key=lambda c: (
+                abs(c["obj"]["bbox_norm"][1] - person_box[1])
+                + abs(c["obj"]["bbox_norm"][3] - person_box[3]),
+                abs(polar_of(c["point"])[1] - predicted_bearing),
+            ))
+            visual_ray = dict(visual, range_m=predicted_range,
+                              point=point_of(predicted_range, polar_of(visual["point"])[1]))
+            if _gate_cost(position, cov, since_obs_s, hue, visual_ray, config) is not None:
+                candidates = [c for c in similar if c["hue"] == visual["hue"]]
 
     high = [c for c in candidates if c["confidence"] >= config.min_confidence]
     low = [c for c in candidates if c["confidence"] < config.min_confidence]
@@ -571,7 +598,9 @@ def match_observation(snapshot, detections, depth, *, ego_motion, elapsed_s, tar
     if original_frame and snapshot.image_region is not None:
         # A reused detector frame still refers to its original image region.
         candidates = [c for c in candidates if _image_region(c["obj"]) == snapshot.image_region]
-    candidate = _associate(candidates, config, mean[:2], cov, snapshot.since_obs_s + elapsed_s, snapshot.hue)
+    person_box = snapshot.image_region[1] if snapshot.front_required and snapshot.image_region else None
+    candidate = _associate(candidates, config, mean[:2], cov, snapshot.since_obs_s + elapsed_s, snapshot.hue,
+                           person_box=person_box)
     if candidate is None or not candidate["range_measured"]:
         return None
     point = candidate["point"]
@@ -606,6 +635,7 @@ class Tracker:
         self.track: Track | None = None
         self._generation = 0
         self.matched_detections = None
+        self.reentry_visible = False
         # Keep recent stamps across blind ticks and out-of-order delivery.
         self._detection_stamps = deque(maxlen=64)
         self._unmatched_recovery = None
@@ -625,6 +655,7 @@ class Tracker:
         `detections` may be None (no fresh payload), which counts as a miss
         rather than as nothing happening.
         """
+        self.reentry_visible = False
         expired = False
         if self.track is not None:
             self._predict(ego, dt, config, ego_measured)
@@ -685,6 +716,7 @@ class Tracker:
             # association reference after the velocity prediction expires.
             position = track.front_reference
         candidates = _candidates(detections, depth, target, config, position)
+        all_candidates = candidates
         pending_recovery = bool(expired and track is not None and target == "person" and receipt_ms and candidates)
         association_age = track.since_obs_s if track is not None else 0.
         if expired and track is not None:
@@ -697,8 +729,19 @@ class Tracker:
             candidates = [candidate for candidate in candidates if candidate["range_measured"]
                           and abs(polar_of(candidate["point"])[1] - reentry) <= half_fov]
             association_age = min(association_age, config.max_obs_age_ms / 1000)
-        matched = (_associate(candidates, config, position, track.cov, association_age, track.hue)
+        matched = (_associate(candidates, config, position, track.cov, association_age, track.hue,
+                              person_box=track.front_box)
                    if track is not None else _associate(candidates, config, None))
+        if matched is None and pending_recovery and len(all_candidates) == 1 and not repeated:
+            candidate = all_candidates[0]
+            if (candidate["confidence"] >= config.min_confidence
+                    and candidate["hue"] and candidate["hue"] == track.hue
+                    and candidate["obj"].get("bbox_norm") and track.front_box):
+                prior_range, _ = polar_of(position)
+                beam = dict(candidate, range_m=prior_range,
+                            point=point_of(prior_range, polar_of(candidate["point"])[1]))
+                self.reentry_visible = _gate_cost(
+                    position, track.cov, association_age, track.hue, beam, config) is not None
         if stamp is not None:
             self._unmatched_recovery = (stamp, depth_frame) if matched is None and pending_recovery else None
 

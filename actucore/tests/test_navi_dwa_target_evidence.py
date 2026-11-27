@@ -1343,7 +1343,38 @@ def test_expired_person_track_keeps_the_committed_detour(monkeypatch, clear):
         assert any(packets[-1]["values"][:2])
 
 
-def test_search_can_take_over_when_committed_person_detour_cannot_continue(monkeypatch):
+@pytest.mark.parametrize("obstacle", [False, True])
+def test_committed_detour_keeps_its_target_when_visible_box_loses_range(monkeypatch, obstacle):
+    from plugins.navi import track
+
+    card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    state = card._state
+    route, anchor = state.committed_route, state.goal_anchor
+    assert route.locks_detour and anchor.generation == state.tracker.track.generation
+
+    card._config.depth_intrinsics = card._config.local_geometry.horizontal
+    advance_snapshot(snapshot, clock, 1100, obstacle=obstacle)
+    objects, depth, odom, _ = snapshot[0]
+    person = dict(objects["objects"][0], bbox_norm=[.45, .10, .55, .30])
+    snapshot[0] = dict(objects, timestamp=1.1, objects=[person]), depth, odom, 1100
+    monkeypatch.setattr(track, "_front_point", lambda *args: None)
+    message = card.next_command()
+
+    assert state.tracker.track.observed and state.tracker.track.front_required
+    assert state.tracker.track.front_fix is None
+    assert state.goal_anchor is anchor and state.committed_route is route
+    assert state.dwa_trace.get("branch") != "visual_probe"
+    if obstacle:
+        assert not any(message["values"])
+    else:
+        assert any(message["values"][:2])
+        assert card._last_decision.dwa_acceptance.followed_route
+
+
+def test_search_waits_for_committed_person_detour_to_lose_freshness(monkeypatch):
     from plugins.navi import policy
 
     card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
@@ -1357,12 +1388,16 @@ def test_search_can_take_over_when_committed_person_detour_cannot_continue(monke
     attempts = []
     monkeypatch.setattr(policy, "_follow_published_route", lambda *args, **kwargs: attempts.append(args))
 
-    for stamp in (1100, 1200, 1300):
+    expires = route.motion_guard.checked_ms + card._config.depth_age_limit_ms
+    for stamp in range(1100, expires + 100, 100):
         attempts.clear()
         advance_snapshot(snapshot, clock, stamp, vx=0.)
         _, depth, odom, _ = snapshot[0]
         snapshot[0] = {"timestamp": stamp / 1000, "objects": []}, depth, odom, stamp
         packet = card.next_command()
+        if stamp < expires:
+            assert not any(packet["values"])
+            assert state.committed_route is route
 
     assert len(attempts) == 1
     assert packet["values"][:5] == [0.] * 5
@@ -1506,6 +1541,39 @@ def test_straight_handoff_publishes_slower_speed_when_clearance_shrinks(monkeypa
     assert card._state.committed_route is None
 
 
+@pytest.mark.parametrize("opening", ["too_narrow", "fits", "one_jamb"])
+def test_straight_handoff_keeps_a_measured_narrow_opening_in_the_braking_distance(monkeypatch, opening):
+    import numpy as np
+
+    from plugins.navi import local_path, policy
+    from plugins.navi.active_scan import NearProjection
+
+    card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    monkeypatch.setattr(policy, "_detour_still_locked", lambda *args: False)
+    advance_snapshot(snapshot, clock, 1100, vx=0.)
+    objects, depth, odom, _ = snapshot[0]
+    depth["map"].fill(5.)
+    snapshot[0] = dict(objects, timestamp=1.1), depth, odom, 1100
+    message = card.next_command()
+    assert message["values"][0] > 0.
+
+    # The latest camera view is clear even though previously seen jambs
+    # are already beside the camera and still ahead of the chassis.
+    span = .30 if opening == "fits" else .20
+    right = np.isclose(local_path.RIGHT, span)
+    if opening != "one_jamb":
+        right |= np.isclose(local_path.RIGHT, -span)
+    hits = right & np.isclose(local_path.FORWARD, .20)
+    card._state.active_scan.near_projection = NearProjection(hits=hits, stamp_ms=1100)
+
+    assert card._stage_command(message, card._output_epoch)
+    assert bool(packets[-1]["values"][0]) is (opening != "too_narrow")
+    assert packets[-1]["values"][1:] == [0.] * 5
+
+
 @pytest.mark.parametrize("blocked", [False, True])
 def test_only_a_clear_forward_corridor_can_bypass_unregistered_near_memory(monkeypatch, blocked):
     card, packets, _, snapshot = observation_card(monkeypatch, body=False, live_target=True)
@@ -1575,3 +1643,32 @@ def test_target_loss_in_parking_range_cannot_start_a_search_turn(monkeypatch):
         card._tick()
         assert all(not any(packet["values"]) for packet in packets[count:])
     assert state.tracker.track.generation == generation
+
+
+def test_retained_target_does_not_start_parking_turn_on_a_predicted_range(monkeypatch):
+    from plugins.navi.track import point_of
+
+    card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    card._config.use_lateral = True
+    card._config.use_obstacle_history = False
+    state = card._state
+    state.goal_anchor = None
+    state.fwd_gate.on = True
+    track = state.tracker.track
+    advance_snapshot(snapshot, clock, 1100, vx=.02)
+    _, depth, _, _ = snapshot[0]
+    depth["map"].fill(5.)
+    arrival = card._config.arrival_distance_m
+    bearing = -.4 * card._config.half_fov_rad
+    track.record_range(arrival + .003, point_of(arrival + .003, bearing), depth)
+    track.front_required = True
+    track.front_fix = point_of(arrival - .003, bearing)
+    track.measured_range_m = None
+    monkeypatch.setattr(state.tracker, "step", lambda **_: track)
+
+    packet = card.next_command()
+
+    assert packet["values"][0] > 0.
+    assert packet["values"][5] == 0.
+    assert card._last_decision.dwa_acceptance is not None
+    assert card._last_decision.dwa_acceptance.motion_guard.check.accepted

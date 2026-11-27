@@ -135,6 +135,23 @@ def test_offset_opening_reference_is_centred_while_body_overlaps_jambs():
     assert max(crossing) - min(crossing) < 1e-8
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+def test_differential_front_camera_centres_early_for_an_opening_outside_its_corridor(side):
+    bounds = (.10, .70) if side > 0. else (-.70, -.10)
+    frame, geometry, plane, (_, occupied) = _scene(body=False, opening=bounds)
+    keep = .22
+    limits = ((0., .30), (0., 0.), (-.6, .6))
+    route = local_path.opening_route(frame, occupied, geometry, keep, plane, (3., 0.), True,
+                                    travel_limits=limits)
+    assert route is not None
+    (_, lo), (_, hi) = route.passage_exit
+    end_side = route.points[-1][1]
+    earlier = plane - geometry.half_length - local_path.RESOLUTION
+    entry = min(route.points, key=lambda point: abs(point[0] - earlier))
+    assert entry[1] == pytest.approx(end_side)
+    assert lo + keep + local_path.RESOLUTION / 2 <= end_side <= hi - keep - local_path.RESOLUTION / 2
+
+
 def test_equal_distance_openings_rank_by_incoming_angular_velocity():
     frame, geometry, plane, _ = _scene(body=False)
     frame.fill(5.)
