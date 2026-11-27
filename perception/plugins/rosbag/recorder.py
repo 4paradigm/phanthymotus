@@ -16,12 +16,15 @@ import time
 import uuid
 from pathlib import Path
 
+from .store import BagStore
+
 
 class Recorder:
     """Own at most one recording; output paths are generated under ``root``."""
 
     def __init__(self, root, ros2_executable="ros2"):
         self._root = Path(root).expanduser().resolve()
+        self._store = BagStore(self._root)
         self._executable = ros2_executable
         self._lock = threading.RLock()
         self._process = None
@@ -41,6 +44,7 @@ class Recorder:
                     if self._started is not None else self._duration)
         return {
             "state": self._state,
+            "process_active": self._process is not None,
             "message": self._message,
             "path": str(self._path) if self._path else None,
             "topics": list(self._topics),
@@ -119,6 +123,17 @@ class Recorder:
             self._state = "error"
             self._reason = "unexpected_exit"
             self._message = f"Recorder exited unexpectedly (code {code}); bag may be incomplete"
+            self._remember_topics()
+
+    def _remember_topics(self):
+        if not self._path or not self._topics:
+            return
+        try:
+            self._store.remember_expected(self._path.name, self._topics)
+        except (OSError, ValueError):
+            # An incomplete bag may not have a directory to write into.
+            # The results view reports that the original selection is unknown.
+            pass
 
     def _watch(self, process, stop_event):
         while not stop_event.wait(1.0):
@@ -175,6 +190,7 @@ class Recorder:
         # Never lose track of a still-running process on a failed stop.
         if process.poll() is not None:
             self._process = None
+            self._remember_topics()
         return self._snapshot()
 
     def stop(self):

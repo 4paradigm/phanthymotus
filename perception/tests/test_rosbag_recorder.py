@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -86,6 +87,8 @@ def test_records_requested_topics_and_closes_on_sigint(harness):
     assert stopped["state"] == "completed"
     assert stopped["stop_reason"] == "requested"
     assert stopped["duration_sec"] == 3
+    request = json.loads((Path(started["path"]) / "rosbag_card.json").read_text(encoding="utf-8"))
+    assert request["requested_topics"] == ["/camera/image", "/imu"]
 
 
 def test_missing_ros2_executable_is_reported(harness):

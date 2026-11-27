@@ -449,6 +449,61 @@ async def mcp_file_upload(
                 'data': None}
 
 
+@router.get('/{mcp_id}/rosbag/file')
+async def mcp_rosbag_file(mcp_id: str, bag: str, file: str):
+    """Stream one managed bag file from Perception through the authenticated API."""
+    import re
+    import auth
+    from fastapi.responses import StreamingResponse
+
+    if not re.fullmatch(r'bag_[0-9]{8}_[0-9]{6}_[0-9a-f]{12}', bag):
+        raise fastapi.HTTPException(status_code=400, detail='无效的录制编号')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', file):
+        raise fastapi.HTTPException(status_code=400, detail='无效的文件名')
+    target = next((m for m in _get_mcp_list() if m.get('id') == mcp_id), None)
+    if not target:
+        raise fastapi.HTTPException(status_code=404, detail='MCP 不存在')
+    if not any((t.get('name') if isinstance(t, dict) else t) == 'rosbag_recorder'
+               for t in target.get('tools', [])):
+        raise fastapi.HTTPException(status_code=404, detail='录制卡不可用')
+    endpoint = _file_intake_url(mcp_id).rsplit('/file/upload', 1)[0] + '/rosbag/file'
+    token = auth.get_token()
+    headers = {'X-Access-Token': token} if token else {}
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+        total=None, sock_connect=10, sock_read=60))
+    try:
+        upstream = await session.get(endpoint, params={'bag': bag, 'file': file},
+                                     headers=headers, allow_redirects=False)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        await session.close()
+        raise fastapi.HTTPException(status_code=502, detail=f'无法连接录制服务：{error}') from error
+    if upstream.status != 200:
+        try:
+            payload = await upstream.json(content_type=None)
+            message = payload.get('error', '无法读取录制文件') if isinstance(payload, dict) else '无法读取录制文件'
+        except (ValueError, aiohttp.ClientError):
+            message = '无法读取录制文件'
+        status = upstream.status if 400 <= upstream.status < 500 else 502
+        upstream.release()
+        await session.close()
+        raise fastapi.HTTPException(status_code=status, detail=message)
+
+    async def chunks():
+        try:
+            async for chunk in upstream.content.iter_chunked(1024 * 1024):
+                yield chunk
+        finally:
+            upstream.release()
+            await session.close()
+
+    response_headers = {'Content-Disposition': f'attachment; filename="{file}"',
+                        'Cache-Control': 'no-store'}
+    if upstream.headers.get('Content-Length'):
+        response_headers['Content-Length'] = upstream.headers['Content-Length']
+    return StreamingResponse(chunks(), media_type='application/octet-stream',
+                             headers=response_headers)
+
+
 @router.post('')
 async def mcp_add(req: MCPAddRequest):
     async with _mcp_write_lock:

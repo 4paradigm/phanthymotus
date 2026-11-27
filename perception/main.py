@@ -357,6 +357,13 @@ class PerceptionBundle:
                 except Exception:
                     log.exception("plugin shutdown failed: %s", plugin.PREFIX)
 
+    def open_rosbag_file(self, bag_id: str, filename: str):
+        """Open only files managed by the rosbag plugin."""
+        for plugin in self._plugins:
+            if plugin.PREFIX == "rosbag_recorder":
+                return plugin.open_recording_file(bag_id, filename)
+        raise FileNotFoundError("录制卡未启用")
+
 
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
@@ -382,6 +389,49 @@ def make_handler():
             self.wfile.write(encoded)
 
         def do_GET(self):
+            if self.path.split("?", 1)[0] == "/rosbag/file":
+                # The Perception HTTP service listens on the host network.
+                # Only the local Agent Core proxy may reach this data endpoint;
+                # browsers authenticate at Agent Core, not at this listener.
+                import hmac
+                import ipaddress
+                from urllib.parse import parse_qs, urlsplit
+                from utils.file_intake import access_token
+
+                address = ipaddress.ip_address(self.client_address[0])
+                if not (address.is_loopback or
+                        getattr(address, "ipv4_mapped", None) == ipaddress.ip_address("127.0.0.1")):
+                    self._send(403, '{"error":"本机访问专用"}')
+                    return
+                token = access_token()
+                provided = self.headers.get("X-Access-Token", "")
+                if token and not hmac.compare_digest(token, provided):
+                    self._send(401, '{"error":"认证失败"}')
+                    return
+                query = parse_qs(urlsplit(self.path).query)
+                bag_id = (query.get("bag") or [""])[0]
+                filename = (query.get("file") or [""])[0]
+                try:
+                    stream, size = _bundle.open_rosbag_file(bag_id, filename)
+                except (FileNotFoundError, ValueError, OSError) as error:
+                    self._send(404, json.dumps({"error": str(error)}, ensure_ascii=False))
+                    return
+                with stream:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(size))
+                    self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    try:
+                        while True:
+                            chunk = stream.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        log.info("rosbag file transfer interrupted")
+                return
             if self.path in ("/vad/test", "/tts/test"):
                 self._send(405, '{"error":"Use POST"}')
                 return

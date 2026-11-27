@@ -7,6 +7,7 @@ import re
 import threading
 
 from .recorder import Recorder
+from .store import BagStore
 
 
 class RosbagRecorderPlugin:
@@ -18,8 +19,10 @@ class RosbagRecorderPlugin:
         self._topics = cfg.get("topics", [])
         self._max_duration_sec = cfg.get("max_duration_sec", 3600)
         self._min_free_bytes = cfg.get("min_free_bytes", 1073741824)
+        root = cfg.get("output_root", "/bags")
+        self._store = BagStore(root)
         self._recorder = Recorder(
-            cfg.get("output_root", "/bags"),
+            root,
             ros2_executable=cfg.get("ros2_executable", "ros2"),
         )
 
@@ -33,6 +36,7 @@ class RosbagRecorderPlugin:
                 "type": "object",
                 "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "config"]}},
                 "required": ["action"],
+                "x-rosbag-manager": {"version": 1},
                 # Graceful SIGINT (15s) plus a bounded kill/reap (5s) can
                 # legitimately outlast the platform's normal stop deadline.
                 "x-stop": {"timeout_s": 25},
@@ -75,12 +79,59 @@ class RosbagRecorderPlugin:
                 except (ValueError, TypeError, OSError) as exc:
                     return self._error(str(exc))
             if action == "stop":
-                return self._recorder.stop()
+                return self._with_result(self._recorder.stop())
             if action == "info":
-                return self._recorder.info()
+                snapshot = self._recorder.info()
+                view = args.get("view") or "status"
+                active_id = self._active_id(snapshot)
+                try:
+                    if view == "list":
+                        return self._store.list_bags(active_id=active_id,
+                                                     offset=args.get("offset", 0))
+                    if view == "inspect":
+                        bag_id = args.get("bag_id")
+                        expected = snapshot.get("topics") if self._snapshot_id(snapshot) == bag_id else None
+                        return self._store.inspect(bag_id, expected_topics=expected,
+                                                   active=(bag_id == active_id))
+                    if view == "status":
+                        return self._with_result(snapshot)
+                    return self._error("不支持的查询")
+                except (OSError, ValueError) as exc:
+                    return self._error(str(exc))
             if action == "config":
                 return self._config(args)
         return None
+
+    @staticmethod
+    def _snapshot_id(snapshot):
+        path = snapshot.get("path")
+        if not path:
+            return None
+        from pathlib import Path
+        return Path(path).name
+
+    def _active_id(self, snapshot):
+        if snapshot.get("process_active", snapshot.get("state") in ("recording", "stopping")):
+            return self._snapshot_id(snapshot)
+        return None
+
+    def _with_result(self, snapshot):
+        bag_id = self._snapshot_id(snapshot)
+        if bag_id and not self._active_id(snapshot):
+            try:
+                snapshot["result_confirmation"] = self._store.inspect(
+                    bag_id, expected_topics=snapshot.get("topics"))
+            except (OSError, ValueError) as exc:
+                snapshot["result_confirmation"] = {
+                    "metadata_status": "unavailable", "warnings": [str(exc)]}
+        return snapshot
+
+    def open_recording_file(self, bag_id, filename):
+        """Open an existing bag file for the local Agent Core download proxy."""
+        with self._lock:
+            snapshot = self._recorder.info()
+            return self._store.open_file(bag_id, filename,
+                                         active=(bag_id == self._active_id(snapshot)))
 
     @staticmethod
     def _validate(topics, duration, min_free):

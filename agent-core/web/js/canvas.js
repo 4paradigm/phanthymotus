@@ -624,6 +624,11 @@ export function updateCanvasMcps(mcps) {
       const hasBtn = !!card.el.querySelector('.canvas-card-instance-cfg-btn');
       if (!!liveHasInstanceFields !== hasBtn) topicsChanged = true;
     }
+    if (!topicsChanged && toolObj && typeof toolObj === 'object') {
+      const hasManager = !!card.el.querySelector('.rosbag-manager-btn');
+      const liveHasManager = toolObj.inputSchema?.['x-rosbag-manager']?.version === 1;
+      if (hasManager !== liveHasManager) topicsChanged = true;
+    }
   }
   if (topicsChanged) {
     // Rebuild cards that have new port counts
@@ -1326,6 +1331,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     // processor||actuator for the same reason.
     const showViewBtn = (effectiveType === 'processor' || effectiveType === 'actuator')
       && topicOut.length > 0;
+    const showRosbagManager = schema?.['x-rosbag-manager']?.version === 1;
 
     const instanceCfgBtn = hasInstanceFields
       ? `<button class="canvas-card-instance-cfg-btn" title="实例配置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-1.42 3.42 2 2 0 0 1-1.42-.58l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-3.42-1.42 2 2 0 0 1 .58-1.42l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 1.42-3.42 2 2 0 0 1 1.42.58l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1.08 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 3.42 1.42 2 2 0 0 1-.58 1.42l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1.08z"/></svg></button>`
@@ -1347,6 +1353,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           ${hasUsableFields ? `<button class="canvas-exec-btn${_projectRunning ? '' : ' locked'}">▶ 执行</button>` : ''}
           ${hasUsableFields && showViewBtn ? '<hr class="canvas-footer-divider">' : ''}
           ${showViewBtn ? '<button class="canvas-view-btn">📡 查看数据流</button>' : ''}
+          ${showRosbagManager ? '<button class="canvas-view-btn rosbag-manager-btn">查看录制与文件</button>' : ''}
         </div>
       </div>
       <div class="canvas-port-col left">${inPortsHtml}</div>
@@ -1424,7 +1431,16 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       });
     }
 
-    const viewBtn = el.querySelector('.canvas-view-btn');
+    const rosbagManagerBtn = el.querySelector('.rosbag-manager-btn');
+    if (rosbagManagerBtn) {
+      rosbagManagerBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const { openRosbagManager } = await import('./rosbag-manager.js');
+        openRosbagManager({ mcpId, toolName });
+      });
+    }
+
+    const viewBtn = el.querySelector('.canvas-view-btn:not(.rosbag-manager-btn)');
     if (viewBtn) {
       viewBtn.addEventListener('click', (e) => {
         e.stopPropagation();

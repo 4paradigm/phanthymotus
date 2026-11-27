@@ -22,6 +22,27 @@ project. Project start begins recording; project stop ends it and waits for the
 recorder to finish writing. The Card reports recording status and errors. This
 Card does not play bags.
 
+Use **查看录制与文件** on the card to see its current state and select a
+recording, including after the project has stopped. The results panel reads the
+bag's `metadata.yaml` and shows recorded topics, counts, start time, duration,
+file sizes and warnings for an empty bag, missing requested topics, or missing
+metadata/files. It does not read or validate every message: metadata alone
+cannot establish payload correctness or prove that no messages were dropped.
+The card saves its selected topics in `rosbag_card.json` when a recording ends;
+older recordings and recordings interrupted before this is written may not
+contain it, in which case the original selection is reported as unknown.
+
+The panel lists up to 100 recordings per page. After recording has stopped,
+download each selected file from the panel and keep `metadata.yaml`, all data
+files, and `rosbag_card.json` (when present) together in the same directory. Downloads go
+through the Agent Core API (using the platform's existing authentication
+settings) and stream from Perception without buffering the bag in the service.
+Browsers supporting the File System Access
+API can save large files as a stream. For other browsers, the fallback is
+limited to 128 MiB per file; for larger files use a supported browser or copy
+them from the host's configured storage directory. This panel does not delete
+recordings.
+
 The default `plugins.rosbag_recorder.output_root` is `/models/rosbags`.
 The supplied deployment mounts `/opt/embodied/models` at `/models`, so bags
 are stored on the host under `/opt/embodied/models/rosbags`. Ensure this
