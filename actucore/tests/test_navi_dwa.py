@@ -173,6 +173,42 @@ def test_retained_non_lateral_route_can_advance_when_turn_sweep_is_blocked():
     assert choice.command[0] > 0. and choice.command[1:] == (0., 0.)
 
 
+@pytest.mark.parametrize("side", [-1., 1.])
+@pytest.mark.parametrize("front_blocked", [False, True])
+def test_retained_differential_route_checks_straight_after_blocked_turns(side, front_blocked):
+    obstacles = [(.35, side * .35)]
+    if front_blocked:
+        obstacles.append((.35, 0.))
+    diagnostics = {}
+    choice = _run(((0., 0.), (.4, side * .27), (1.2, side * .34)),
+                  grid=_grid(obstacles=obstacles), follow_published=True, target=None,
+                  floors=(.08, 0., .5, 0.), diagnostics=diagnostics)
+
+    assert diagnostics["rejected"]["footprint_collision"] > 0
+    if front_blocked:
+        assert choice is None
+    else:
+        assert choice is not None and choice.check.accepted and choice.trace.stopped
+        assert choice.command[0] > 0. and choice.command[1:] == (0., 0.)
+        assert choice.progress > 0.
+
+
+@pytest.mark.parametrize("obstacle, accepted", [(.15, True), (.10, False)])
+def test_front_camera_differential_route_checks_a_safe_crawl_after_blocked_turns(obstacle, accepted):
+    geometry = Geometry(None, None, np.eye(4), 0., .46, None)
+    footprint = dwa.FootprintSpec(0., .46, .21, .05, "camera_approx")
+    choice = _run(((0., 0.), (.5, .35), (1.6, .5)), grid=_grid(obstacles=[(obstacle, 0.)]),
+                  geometry=geometry, footprint=footprint, follow_published=True, target=None,
+                  previous=(.08, 0., 0.), measured=(.08, 0., 0.), x_limit=(0., .30),
+                  floors=(0., 0., .5, 0.), horizon=1.2)
+
+    if accepted:
+        assert choice is not None and choice.check.accepted and choice.trace.stopped
+        assert choice.command == (.30 * dwa.ROUTE_CRAWL_SCALE, 0., 0.)
+    else:
+        assert choice is None
+
+
 @pytest.mark.parametrize("horizon, obstacle, max_safe_speed", [
     (1.5, .45, .075),
     (2., .45, .0375),

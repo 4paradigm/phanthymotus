@@ -504,8 +504,8 @@ def pursuit_cost(command, previous, nominal_speed, yaw_limit, check, *, lateral_
     return change + .75 * (1. - speed_fraction) + _obstacle_score(check) * clearance_weight
 
 
-def pursuit_options(yaw_limit, can_hold_heading, scales=ROUTE_SPEED_SCALES, *, fallback_scales=()):
-    headings = (yaw_limit, (0., 0.)) if can_hold_heading and any(yaw_limit) else (yaw_limit,)
+def pursuit_options(yaw_limit, scales=ROUTE_SPEED_SCALES, *, fallback_scales=()):
+    headings = (yaw_limit, (0., 0.)) if any(yaw_limit) else (yaw_limit,)
     yield from product(headings, scales)
     yield from product(((0., 0.),), fallback_scales)
 
@@ -739,14 +739,14 @@ def select(*, route, grid, geometry, half_width=None, measured, previous,
         ramping_lateral = previous[1] if abs(measured[1]) < floors[1] else 0.
         scales = ROUTE_SPEED_SCALES[:len(ROUTE_SPEED_SCALES) - int(ongoing_turn)]
         fallback_scales = ()
-        if y_speed and floors[3] > 0.:
+        if (y_speed and floors[3] > 0.) or (not y_speed and footprint_mode == "camera_approx"):
             # Keep the normal pursuit ranking. Try the freed slot and a
             # lower forward speed only when the turn sweep left no successor.
             if ongoing_turn and not transition_slot:
                 fallback_scales = ROUTE_SPEED_SCALES[-1:]
             if floors[0] <= x_speed * ROUTE_CRAWL_SCALE:
                 fallback_scales += (ROUTE_CRAWL_SCALE,)
-        for steering, scale in pursuit_options(yaw_limit, bool(y_speed) or floors[3] > 0., scales,
+        for steering, scale in pursuit_options(yaw_limit, scales,
                                               fallback_scales=fallback_scales):
             if budget.expired() or diag["sampled_candidates"] >= slots:
                 break

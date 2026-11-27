@@ -4801,8 +4801,10 @@ class NaviPlugin:
         yaw_step = min(cfg.motion_acceleration[2], cfg.motion_braking[2]) / self._rate_hz
         try_sidestep = (cfg.use_lateral and yaw_step < cfg.floor_wz_moving and view_bearing is None
                         and (previous[2] != 0. or abs(measured[2]) > policy_mod.STILL_YAW))
-        crawl = cfg.use_lateral and cfg.floor_wz_moving > 0. and forward_floor <= nominal * dwa.ROUTE_CRAWL_SCALE
-        for steering, scale in dwa.pursuit_options(yaw_limit, cfg.use_lateral or cfg.floor_wz_moving > 0.,
+        can_crawl = ((cfg.use_lateral and cfg.floor_wz_moving > 0.)
+                     or (not cfg.use_lateral and check.geometry.front == 0.))
+        crawl = can_crawl and forward_floor <= nominal * dwa.ROUTE_CRAWL_SCALE
+        for steering, scale in dwa.pursuit_options(yaw_limit,
                                                   fallback_scales=(dwa.ROUTE_CRAWL_SCALE,) if crawl else ()):
             if scale == dwa.ROUTE_CRAWL_SCALE and (best is not None or not swept_into_obstacle):
                 break

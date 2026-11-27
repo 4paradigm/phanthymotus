@@ -2269,7 +2269,8 @@ def _decide(detections, depth, odom, config: Config, state: State,
                         and depth.get("map") is not None and track.front_box is not None):
                     x0, y0, x1, y1 = track.front_box
                     top = (x0, y0, x1, y0 + (y1 - y0) / 4)
-                    if box_median_agrees(depth["map"], top, anchor.x, 3 * config.range_std_m):
+                    if (box_median_agrees(depth["map"], top, anchor.x, 3 * config.range_std_m)
+                            and not box_median_agrees(depth["map"], top, measured, config.range_std_m)):
                         return Decision(_twist(0., 0., 0.), AVOIDING, "近距测量与保留目标位置不一致，停车等待复测",
                                         distance_m=measured, target_pending=True)
                 state.committed_route = state.published_dwa_route = published = None
@@ -4062,12 +4063,19 @@ def _dwa_detour(depth, config, state, route, target_distance, target_bearing, *,
     yaw_limit = (0., 0.) if branch == "direct" else (-_scan_yaw_rate(config, 1.), _scan_yaw_rate(config, -1.))
     track = state.tracker.track
     view_bearing = None
-    lateral_detour = (config.use_lateral and branch in ("route", "reachable_prefix")
-                      and not any(ref.corridor_corner or ref.passage_exit is not None for ref in routes))
+    open_detour = (branch in ("route", "reachable_prefix")
+                   and not any(ref.corridor_corner or ref.passage_exit is not None for ref in routes))
+    lateral_detour = config.use_lateral and open_detour
     camera_detour = lateral_detour and mode == "camera_approx"
-    if camera_detour and inputs.footprint.clearance_margin_m < local_path.RESOLUTION:
-        # Reserve a full cell around the estimated footprint during open detours.
-        # Measured openings keep the existing footprint and corridor checks.
+    use_detour_margin = lateral_detour
+    if mode == "camera_approx" and not config.use_obstacle_history and branch in ("route", "reachable_prefix", "prefix"):
+        # Apply the same turning-room threshold as the measured opening planner.
+        wide_opening = 2 * (_keepout_m(config) + geometry.half_length) + local_path.RESOLUTION
+        use_detour_margin = all(
+            not ref.corridor_corner if ref.passage_exit is None else math.dist(*ref.passage_exit) >= wide_opening
+            for ref in routes)
+    if mode == "camera_approx" and use_detour_margin and inputs.footprint.clearance_margin_m < local_path.RESOLUTION:
+        # Reserve a full cell around the estimated footprint in open space.
         inputs = replace(inputs, footprint=replace(inputs.footprint, clearance_margin_m=local_path.RESOLUTION))
     protect_view = (config.use_lateral and mode == "camera_approx" and branch in ("route", "reachable_prefix")
                     and state.target == "person" and track is not None
@@ -4261,9 +4269,9 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
                    passage_exit=exit_line, corridor_corner=previous.corridor_corner,
                    blocker_exit=blocker_exit)
     remaining = dwa.remaining_route_length(route.points)
-    camera_detour = (config.use_lateral and geometry.front == 0. and not config.use_obstacle_history
+    camera_detour = (geometry.front == 0. and not config.use_obstacle_history
                      and previous is state.committed_route)
-    may_yield = (camera_detour
+    may_yield = (camera_detour and config.use_lateral
                  and not _detour_still_locked(route, remaining, distance, bearing))
     if locked and not local_path.passage_ahead(exit_line):
         at_end = remaining <= 2 * local_path.RESOLUTION
@@ -4280,7 +4288,7 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
     if (camera_detour
             and not corner_only and not route.corridor_corner and not crossing_straight
             and not local_path.passage_ahead(blocker_exit)
-            and (may_yield or exit_line is not None or blocker_exit is not None)):
+            and (may_yield or blocker_exit is not None or (config.use_lateral and exit_line is not None))):
         straight = _straight_handoff(depth, config, state, previous, approach_speed)
         if straight is not None:
             return straight
@@ -4358,7 +4366,7 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
                                        branch="reachable_prefix", follow_published=True, recovery=True)
                 if proposal is not None:
                     return _use_dwa(state, proposal, state.escape_side)
-        if (locked and config.use_lateral and not config.use_obstacle_history and geometry.front == 0.
+        if (locked and not config.use_obstacle_history and geometry.front == 0.
                 and exit_line is None and not route.corridor_corner and not corner_only
                 and reason in ("no_admissible_candidates", "initial_remembered_overlap") and blocked
                 and distance is not None and bearing is not None and current_target_observed(state)
@@ -4375,7 +4383,8 @@ def _follow_published_route(depth, config, state, geometry, distance, bearing, *
                                                      distance, bearing, closest=True, dwa_only=True)
                     if isinstance(replanned, tuple):
                         return replanned
-                if ahead is None and "remembered_obstacle" in blocked and scan.near_hits is not None:
+                if (config.use_lateral and ahead is None
+                        and "remembered_obstacle" in blocked and scan.near_hits is not None):
                     forwards = FORWARD[scan.near_hits]
                     room = distance * math.cos(bearing) - config.stop_distance_m
                     length = min(geometry.rear + 3 * local_path.RESOLUTION, room)
@@ -4503,7 +4512,10 @@ def _start_detour_segment(depth, config, state, geometry, ahead, directions, tar
             origin = saved.approach_origin
             reference_start = c*(origin[0]-f) + s*(origin[1]-r), -s*(origin[0]-f) + c*(origin[1]-r)
             previous = tuple((c*(x-f) + s*(y-r), -s*(x-f) + c*(y-r)) for x, y in saved.waypoints)
-        guidance = local_path.clearance_route(grid, geometry, keep, target, config.stop_distance_m,
+        clearance_width = keep
+        if geometry.front == 0. and not config.use_obstacle_history:
+            clearance_width = max(keep, config.half_width_m + local_path.RESOLUTION)
+        guidance = local_path.clearance_route(grid, geometry, clearance_width, target, config.stop_distance_m,
                                               reference_start, previous, body_half_width=config.half_width_m,
                                               allow_lateral=config.use_lateral)
         if guidance is not None:

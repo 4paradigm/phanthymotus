@@ -53,9 +53,11 @@ def observe_selector(monkeypatch):
     return calls
 
 
-def test_lateral_camera_detour_checks_an_extra_footprint_margin(monkeypatch):
+@pytest.mark.parametrize("use_lateral", [False, True])
+def test_open_camera_detour_checks_an_extra_footprint_margin(monkeypatch, use_lateral):
     config, state, depth, odom = observation_case(body=False, attempted=False)
-    config.use_lateral = True
+    config.use_lateral = use_lateral
+    config.use_obstacle_history = False
     calls = observe_selector(monkeypatch)
     policy.step(detections=None, depth=depth, odom=odom, config=config, state=state, dt=.1)
     assert calls
@@ -167,6 +169,29 @@ def advance_case(*, body):
     scan.phase, scan.side_frame = "evaluate", scan.current_frame
     return config, state, dict(depth, frame_id=1100, control_ms=1100, source_frame_id=1100), dict(
         odom, received_ms=1100, source_sample_id=1100)
+
+
+@pytest.mark.parametrize("branch, passage_width, corner, margin", [
+    ("route", .80, False, .02),
+    ("route", 1.15, True, .05),
+    ("route", None, True, .02),
+    ("prefix", None, False, .05),
+], ids=["narrow-door", "wide-turn", "unmeasured-turn", "short-detour"])
+def test_single_view_differential_route_uses_larger_margin_where_it_fits(branch, passage_width, corner, margin):
+    config, state, depth, odom = advance_case(body=False)
+    scan, geometry = state.active_scan, config.local_geometry
+    scan.retire_motion()
+    scan.use_obstacle_history = config.use_obstacle_history = False
+    state.dwa_odom = odom
+    assert scan.update(depth, odom, geometry, receipt_only=True) is None
+    exit_line = None if passage_width is None else ((.8, -passage_width / 2), (.8, passage_width / 2))
+    route = local_path.Detour(None, ((0., 0.), (1., 0.)), geometry,
+                              passage_exit=exit_line, corridor_corner=corner)
+
+    proposal = policy._dwa_detour(depth, config, state, route, 3., 0., branch=branch)
+
+    assert proposal is not None and proposal.guard.check.accepted and proposal.guard.trace.stopped
+    assert proposal.guard.footprint.clearance_margin_m == pytest.approx(margin)
 
 
 @pytest.mark.parametrize("body", [True, False])
@@ -1036,8 +1061,13 @@ def test_exhausted_detour_tail_hands_off_only_to_a_clear_target_corridor(restric
     state.dwa_budget = None
     state.dwa_trace.clear()
 
-    assert policy._follow_published_route(depth, config, state, geometry, 3., 0.,
-                                          foreground=restriction == "obstacle") is None
+    result = policy._follow_published_route(depth, config, state, geometry, 3., 0.,
+                                            foreground=restriction == "obstacle")
+    if restriction == "footprint":
+        assert result is not None and result[0] > 0. and result[1:3] == (0., 0.)
+        assert state.dwa_motion_guard.check.accepted and state.dwa_motion_guard.trace.stopped
+    else:
+        assert result is None
 
     expected = {"insufficient_room"}
     if restriction == "footprint":
@@ -1088,8 +1118,10 @@ def test_committed_body_route_is_only_released_when_the_footprint_changes(change
 
 
 @pytest.mark.parametrize("side", [-1., 1.])
-@pytest.mark.parametrize("blocked", [False, True])
-def test_differential_route_can_continue_away_from_a_remembered_flank(side, blocked):
+@pytest.mark.parametrize("flank, opposite_blocked, accepted", [
+    (.38, False, True), (.36, False, False), (.38, True, False),
+], ids=["clear-margin", "inside-margin", "opposite-blocked"])
+def test_differential_route_keeps_clearance_from_remembered_flanks(side, flank, opposite_blocked, accepted):
     config, state, depth, odom = advance_case(body=False)
     camera = config.local_geometry
     geometry = local_path.camera_square(camera.horizontal, camera.vertical, .30, half_length=.30, at_front=True)
@@ -1109,8 +1141,8 @@ def test_differential_route_can_continue_away_from_a_remembered_flank(side, bloc
                                route_points=route.points, locks_detour=True)
     state.committed_route = state.published_dwa_route = old
     hits = np.isclose(local_path.FORWARD, .15) & np.isclose(local_path.RIGHT, side * .35)
-    cells = [[.15, side * .36]]
-    if blocked:
+    cells = [[.15, side * flank]]
+    if opposite_blocked:
         cells.append([.15, -side * .31])
     squares = local_path.ObstacleSquares(np.array(cells), 0.)
     scan.near_projection = NearProjection(hits, squares, selected.guard.pose, 1100)
@@ -1119,11 +1151,12 @@ def test_differential_route_can_continue_away_from_a_remembered_flank(side, bloc
 
     result = policy._follow_published_route(depth, config, state, geometry, 2., side * .27, foreground=True)
 
-    assert state.dwa_trace["attempts"][0]["rejected"] == {"remembered_obstacle": 4}
-    if blocked:
-        assert result is None and state.dwa_proposal is None
-    else:
-        assert result is not None and result[0] > 0. and result[2] * side > 0.
+    assert state.dwa_trace["attempts"][0]["rejected"]["remembered_obstacle"] > 0
+    if accepted:
+        assert result is not None and result[0] > 0. and result[1:3] == (0., 0.)
         assert state.dwa_proposal.guard.check.accepted
+        assert state.dwa_proposal.guard.footprint.clearance_margin_m == local_path.RESOLUTION
+    else:
+        assert result is None and state.dwa_proposal is None
     assert scan.near_squares is squares
     assert state.committed_route is old

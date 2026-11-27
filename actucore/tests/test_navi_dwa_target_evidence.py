@@ -1273,14 +1273,16 @@ def test_committed_detour_replans_when_old_odometry_frame_cannot_register(monkey
     assert guard.pose.frame != old_pose.frame and guard.check.accepted and guard.trace.stopped
 
 
-@pytest.mark.parametrize("side_only", [False, True], ids=["forward-blocker", "remembered-side-blocker"])
-def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypatch, side_only):
+@pytest.mark.parametrize("use_lateral, side_only", [
+    (True, False), (True, True), (False, False),
+], ids=["forward-blocker", "remembered-side-blocker", "differential-forward-blocker"])
+def test_blocked_camera_detour_replans_after_distinct_stationary_views(monkeypatch, use_lateral, side_only):
     import numpy as np
     from plugins.navi import policy
     from plugins.navi.active_scan import NearProjection
 
     card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
-    card._config.use_lateral = True
+    card._config.use_lateral = use_lateral
     card._config.use_obstacle_history = False
     assert card._stage_command(card.next_command(), card._output_epoch)
     state = card._state
@@ -1406,23 +1408,27 @@ def test_search_waits_for_committed_person_detour_to_lose_freshness(monkeypatch)
 
 
 @pytest.mark.parametrize("new_blocker", [False, True])
-@pytest.mark.parametrize("side_exit", [False, True])
-def test_straight_handoff_from_committed_lateral_detour_uses_forward_clearance(monkeypatch, new_blocker, side_exit):
+@pytest.mark.parametrize("use_lateral, side_exit", [
+    (True, False), (True, True), (False, False),
+], ids=["lateral", "lateral-side-exit", "differential-past-blocker"])
+def test_straight_handoff_from_committed_detour_uses_forward_clearance(monkeypatch, new_blocker, use_lateral, side_exit):
     from dataclasses import replace
 
     from plugins.navi import policy
 
     card, packets, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
-    card._config.use_lateral = True
+    card._config.use_lateral = use_lateral
     card._config.use_obstacle_history = False
     assert card._stage_command(card.next_command(), card._output_epoch)
     original = card._state.committed_route
     assert original is not None and original.locks_detour
     if side_exit:
         original = replace(original, passage_exit=((.9, -.9), (1., -.10)))
-        card._state.committed_route = original
-        work = card._scheduled_command
-        work.dwa_origin = replace(work.dwa_origin, acceptance=original)
+    elif not use_lateral:
+        original = replace(original, blocker_exit=((-.30, -.40), (-.30, .40)))
+    card._state.committed_route = original
+    work = card._scheduled_command
+    work.dwa_origin = replace(work.dwa_origin, acceptance=original)
     monkeypatch.setattr(policy, "_detour_still_locked", lambda *args: False)
 
     advance_snapshot(snapshot, clock, 1100, vx=0.)
@@ -1643,6 +1649,42 @@ def test_target_loss_in_parking_range_cannot_start_a_search_turn(monkeypatch):
         card._tick()
         assert all(not any(packet["values"]) for packet in packets[count:])
     assert state.tracker.track.generation == generation
+
+
+@pytest.mark.parametrize("top_range", [.73, 1.05], ids=["coherent-near-person", "far-top-occluder"])
+def test_committed_detour_checks_that_near_range_disagrees_with_box_top(monkeypatch, top_range):
+    from plugins.navi import policy
+
+    card, _, clock, snapshot = observation_card(monkeypatch, body=False, live_target=True)
+    config, state = card._config, card._state
+    config.use_obstacle_history = False
+    config.stop_distance_m = .70
+    assert card._stage_command(card.next_command(), card._output_epoch)
+    route, track = state.committed_route, state.tracker.track
+    assert route.locks_detour and state.goal_anchor.generation == track.generation
+    state.goal_anchor.x, state.goal_anchor.y = 1.05, 0.
+
+    advance_snapshot(snapshot, clock, 1100, vx=0.)
+    _, depth, _, _ = snapshot[0]
+    depth["map"].fill(.73)
+    rows = depth["map"].shape[0]
+    depth["map"][rows // 4:3 * rows // 8, :] = top_range
+    track.front_box = (.25, .25, .75, .75)
+    track.front_fix = (.73, 0.)
+    track.front_required = True
+    track.record_range(.73, track.front_fix, depth)
+    monkeypatch.setattr(state.tracker, "step", lambda **_: track)
+
+    message = card.next_command()
+
+    assert message["values"] == [0.] * 6
+    if top_range == .73:
+        assert state.committed_route is None
+        assert card._last_decision.status == policy.ARRIVED
+    else:
+        assert state.committed_route is route
+        assert card._last_decision.target_pending
+        assert card._last_decision.status == policy.AVOIDING
 
 
 def test_retained_target_does_not_start_parking_turn_on_a_predicted_range(monkeypatch):
