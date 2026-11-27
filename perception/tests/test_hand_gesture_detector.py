@@ -391,6 +391,109 @@ class TestHandGestureDetector(unittest.TestCase):
         self.assertFalse(plugin._hand_loading)
         self.assertIsNotNone(plugin._hand_load_error)
 
+    def test_concurrent_stop_during_hand_download_prevents_node_revival(self):
+        from plugins.pose import PosePerceptionPlugin
+
+        class _FakeExecutor:
+            def __init__(self):
+                self.added = []
+                self.removed = []
+
+            def add_node(self, node):
+                self.added.append(node)
+
+            def remove_node(self, node):
+                self.removed.append(node)
+
+        for cancel_args, expected_key, expected_val in (
+            ({"action": "stop", "instance_id": "/cam/rgb"}, "state", "idle"),
+            ({"action": "stop"}, "state", "idle"),
+            (
+                {
+                    "action": "config",
+                    "instance_id": "/cam/rgb",
+                    "hands": False,
+                },
+                "status",
+                "configured",
+            ),
+        ):
+            with self.subTest(cancel_args=cancel_args):
+                executor = _FakeExecutor()
+                plugin = PosePerceptionPlugin(
+                    {
+                        "hands": True,
+                        "hand_backend": "detector",
+                        "action_backend": "rules",
+                    },
+                    namespace="",
+                    executor=executor,
+                )
+                plugin._model = _FakePoseSession()
+
+                entered = threading.Event()
+                release = threading.Event()
+                start_reply = {}
+                errors = []
+
+                def fake_ensure_detector():
+                    entered.set()
+                    release.wait(timeout=5.0)
+                    return _FakeVisionSession([[]]), _FakeVisionSession([[]])
+
+                with mock.patch.object(
+                    plugin,
+                    "_ensure_hand_detector_models",
+                    side_effect=fake_ensure_detector,
+                ):
+                    def run_start():
+                        try:
+                            start_reply["value"] = plugin.dispatch(
+                                "pose",
+                                {
+                                    "action": "start",
+                                    "input_topic": "/cam/rgb",
+                                    "instance_id": "/cam/rgb",
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(exc)
+
+                    t = threading.Thread(target=run_start, daemon=True)
+                    t.start()
+                    self.assertTrue(entered.wait(timeout=5.0))
+                    try:
+                        cancel_reply = plugin.dispatch("pose", cancel_args)
+                    finally:
+                        release.set()
+                        t.join(timeout=5.0)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(cancel_reply[expected_key], expected_val)
+                self.assertEqual(start_reply["value"]["state"], "idle")
+                self.assertEqual(plugin._nodes, {})
+                self.assertEqual(executor.added, [])
+
+                # A fresh start after cancellation must succeed cleanly.
+                with mock.patch.object(
+                    plugin,
+                    "_ensure_hand_detector_models",
+                    return_value=(_FakeVisionSession([[]]), _FakeVisionSession([[]])),
+                ):
+                    restart_reply = plugin.dispatch(
+                        "pose",
+                        {
+                            "action": "start",
+                            "input_topic": "/cam/rgb",
+                            "instance_id": "/cam/rgb",
+                        },
+                    )
+                    try:
+                        self.assertEqual(restart_reply["state"], "running")
+                        self.assertIn("/cam/rgb", plugin._nodes)
+                    finally:
+                        plugin.dispatch("pose", {"action": "stop", "instance_id": "/cam/rgb"})
+
     def test_model_downloader_hand_detector_bundles_pinned_and_public(self):
         import ipaddress
         from urllib.parse import urlparse

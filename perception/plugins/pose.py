@@ -1163,6 +1163,11 @@ class PosePerceptionPlugin:
 
         self._nodes: dict[str, _PoseNode] = {}
         self._instance_configs: dict[str, dict] = {}
+        # Generation counters guarded by _nodes_lock so a stop() or instance
+        # config() arriving while _start_node / _bg_start prepares engines
+        # outside the lock cannot be superseded by a stale node registration.
+        self._stop_all_gen = 0
+        self._node_gen: dict[str, int] = {}
         # What the camera feeding each instance said about its optics. `position`
         # here is a normalised lateral offset, so without a field of view it is
         # dimensionless to everyone downstream; passing the declaration on is
@@ -1803,7 +1808,12 @@ class PosePerceptionPlugin:
 
     # ── node lifecycle ───────────────────────────────────────────────────
 
-    def _start_node(self, node_key: str, input_topic: str):
+    def _start_token(self, node_key: str) -> tuple:
+        """Current start generation for `node_key`. Caller must hold _nodes_lock."""
+        return (self._stop_all_gen, self._node_gen.get(node_key, 0))
+
+    def _start_node(self, node_key: str, input_topic: str,
+                    start_token: Optional[tuple] = None):
         """Create and start a _PoseNode for the given topic.
 
         Registers the node before starting it so a concurrent stop can always
@@ -1814,13 +1824,17 @@ class PosePerceptionPlugin:
         with self._nodes_lock:
             if node_key in self._nodes:
                 return
+            if start_token is None:
+                start_token = self._start_token(node_key)
+            elif self._start_token(node_key) != start_token:
+                return
             merged = self._merged_config(node_key)
         classifier = self._classifier_for(merged)
         gesture_tracker = self._gesture_tracker_for(merged)
         hand_channel = self._hand_channel_for(merged)
         suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
         with self._nodes_lock:
-            if node_key in self._nodes:
+            if node_key in self._nodes or self._start_token(node_key) != start_token:
                 return
             node = _PoseNode(
                 input_topic or None, self._model, merged["confidence"],
@@ -1847,6 +1861,7 @@ class PosePerceptionPlugin:
     def _retire_node(self, node_key: str) -> Optional[dict]:
         """Stop, unregister and destroy one node. Returns its stop() result."""
         with self._nodes_lock:
+            self._node_gen[node_key] = self._node_gen.get(node_key, 0) + 1
             node = self._nodes.pop(node_key, None)
             # Goes with the node: a re-wired card answering info() with the
             # optics of a camera it is no longer fed by is worse than answering
@@ -1907,6 +1922,7 @@ class PosePerceptionPlugin:
                 result = self._retire_node(instance_id)
                 return result if result is not None else {"state": "idle"}
             with self._nodes_lock:
+                self._stop_all_gen += 1
                 keys = list(self._nodes.keys())
             stopped = [key for key in keys if self._retire_node(key) is not None]
             return ({"state": "idle", "stopped_instances": stopped} if stopped
@@ -2264,6 +2280,9 @@ class PosePerceptionPlugin:
                 return {"state": "error",
                         "message": f"Engine failed to load: {self._model_load_error}"}
 
+            with self._nodes_lock:
+                start_token = self._start_token(node_key)
+
             def _bg_start():
                 self._model_loading = True
                 self._model_load_error = None
@@ -2272,7 +2291,8 @@ class PosePerceptionPlugin:
                     self._ensure_model()
                     self._model_loading = False
                     self._model_load_status = None
-                    self._start_node(node_key, input_topic)
+                    self._start_node(node_key, input_topic,
+                                     start_token=start_token)
                 except Exception as error:  # noqa: BLE001
                     self._model_loading = False
                     self._model_load_error = str(error)
@@ -2298,6 +2318,7 @@ class PosePerceptionPlugin:
         if instance_id:
             with self._nodes_lock:
                 self._instance_configs[instance_id] = cfg
+                self._node_gen[instance_id] = self._node_gen.get(instance_id, 0) + 1
                 running = instance_id in self._nodes
             # A running instance is retired; the next start picks the new config
             # up. Rebuilding thresholds under a live worker would change what
