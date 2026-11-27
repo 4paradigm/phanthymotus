@@ -365,6 +365,131 @@ class TestHandGestureDetector(unittest.TestCase):
             self.assertIn("left", p0["hands"])
             self.assertIn("right", p0["hands"])
 
+    def test_detector_respects_gesture_whitelist_in_photo_and_stream(self):
+        from plugins.gesture_events import GestureEventTracker
+        from plugins.pose import PosePerceptionPlugin, PoseTracker, _PoseNode, build_backend
+
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        # HaGRID class 8 = hand_heart (excluded by restrictive whitelist),
+        # HaGRID class 21 = peace -> victory (included by restrictive whitelist).
+        hand_rows = [
+            [330, 180, 400, 260, 0.94, 0],
+            [240, 180, 310, 260, 0.93, 0],
+        ]
+        excluded_gest_rows = [[240, 180, 400, 260, 0.96, 8]]
+        allowed_gest_rows = [[330, 180, 400, 260, 0.95, 21]]
+
+        # 1. Default detector whitelist includes all 30 detector gestures (e.g. hand_heart).
+        default_plugin = PosePerceptionPlugin(
+            {"hands": True, "hand_backend": "detector", "action_backend": "rules"},
+            namespace="",
+            executor=None,
+        )
+        default_wl = set(default_plugin._merged_config("/cam/rgb")["gesture_whitelist"])
+        self.assertTrue(set(ALL_DETECTOR_GESTURES).issubset(default_wl))
+
+        # Switching from default rtmpose -> detector via config() without an explicit
+        # gesture_whitelist automatically adopts the 30-class detector default.
+        switched_plugin = PosePerceptionPlugin(
+            {"action_backend": "rules"},
+            namespace="",
+            executor=None,
+        )
+        switched_plugin.dispatch(
+            "pose", {"action": "config", "hands": True, "hand_backend": "detector"}
+        )
+        switched_wl = set(switched_plugin._merged_config("/cam/rgb")["gesture_whitelist"])
+        self.assertTrue(set(ALL_DETECTOR_GESTURES).issubset(switched_wl))
+
+        # 2. Restrictive gesture_whitelist omits excluded labels in recognize_by_photo.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img_path = os.path.join(tmpdir, "sample.jpg")
+            cv2.imwrite(img_path, frame)
+
+            plugin = PosePerceptionPlugin(
+                {
+                    "hands": True,
+                    "hand_backend": "detector",
+                    "action_backend": "rules",
+                    "gesture_whitelist": ["victory", "ok"],
+                    "image_roots": [tmpdir],
+                },
+                namespace="",
+                executor=None,
+            )
+            plugin._model = _FakePoseSession()
+            plugin._gesture_det_model = _FakeVisionSession([excluded_gest_rows])
+            plugin._hand_det_model = _FakeVisionSession([hand_rows])
+
+            res_excluded = plugin.dispatch(
+                "pose",
+                {"action": "recognize_by_photo", "image_path": img_path},
+            )
+            self.assertTrue(res_excluded["ok"])
+            p0 = res_excluded["persons"][0]
+            self.assertEqual(p0["hand_gestures"], {"left": None, "right": None})
+            self.assertEqual(p0["hand_gesture_scores"], {"left": None, "right": None})
+            self.assertEqual(p0["hand_bboxes"]["left"], [330.0, 180.0, 400.0, 260.0])
+
+            # Allowed gesture still comes through on photo.
+            plugin._gesture_det_model = _FakeVisionSession([allowed_gest_rows])
+            plugin._hand_det_model = _FakeVisionSession([hand_rows])
+            res_allowed = plugin.dispatch(
+                "pose",
+                {"action": "recognize_by_photo", "image_path": img_path},
+            )
+            self.assertTrue(res_allowed["ok"])
+            self.assertEqual(
+                res_allowed["persons"][0]["hand_gestures"],
+                {"left": "victory", "right": None},
+            )
+
+        # 3. Restrictive gesture_whitelist omits excluded labels in stream payloads
+        #    (both fresh inference and throttled frames) while passing allowed labels.
+        channel = HandGestureDetectorChannel(
+            _FakeVisionSession([excluded_gest_rows, allowed_gest_rows]),
+            _FakeVisionSession([hand_rows, hand_rows]),
+            adaptive_zoom=False,
+            interval_s=0.25,
+        )
+        tracker = GestureEventTracker(("victory", "ok"), hold_s=0.2, release_s=0.3)
+
+        node = object.__new__(_PoseNode)
+        node._max_persons = 5
+        node._tracker = PoseTracker()
+        node._activity_interval_s = 0.0
+        node._classifier = build_backend("rules")
+        node._last_prediction = {}
+        node._hand_channel = channel
+        node._hand_gestures = ("victory", "ok")
+        node._last_actions = {}
+        node._publish_bbox = True
+        node._publish_keypoints = "off"
+        node._publish_hand_keypoints = "off"
+
+        base_person = _make_person(l_wrist=(360, 240), r_wrist=(280, 240))
+        boxes = [np.asarray(base_person["box"], dtype=np.float32)]
+        scores = [0.95]
+        kpts_list = [base_person["keypoints"]]
+
+        # Inference frame (t=1.0) + throttled frame (t=1.1): excluded hand_heart must be omitted.
+        for now in (1.0, 1.1):
+            persons = node._describe(boxes, scores, kpts_list, frame, now_wall=now)
+            lean = node._lean_record(persons[0])
+            self.assertEqual(lean["hand_gestures"], {"left": None, "right": None})
+            self.assertEqual(tracker.update(persons, now), [])
+
+        # Next inference frame (t=1.30) + throttled frames (t=1.40, 1.55): allowed victory emits.
+        events = []
+        for now in (1.30, 1.40, 1.55):
+            persons = node._describe(boxes, scores, kpts_list, frame, now_wall=now)
+            lean = node._lean_record(persons[0])
+            self.assertEqual(lean["hand_gestures"], {"left": "victory", "right": None})
+            events.extend(tracker.update(persons, now))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "gesture_start")
+        self.assertEqual(events[0]["gesture"], "victory")
+
     def test_stream_describe_synthesizes_person_and_preserves_two_hand_hands_seen(self):
         from plugins.pose import PoseTracker, _PoseNode, build_backend
 

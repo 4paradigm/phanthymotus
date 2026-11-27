@@ -77,6 +77,7 @@ from plugins.hand_gesture import (
     gesture_catalogue,
 )
 from plugins.hand_gesture_detector import (
+    ALL_DETECTOR_GESTURES,
     DEFAULT_GESTURE_DET_CONF,
     DEFAULT_HAND_DET_CONF,
     HandGestureDetectorChannel,
@@ -209,7 +210,13 @@ def gesture_topic_for(input_topic: Optional[str]) -> str:
     return f"{output_topic_for(input_topic)}/gesture"
 
 
-def _gesture_whitelist(value) -> tuple:
+def _default_gesture_whitelist(hand_backend: str = DEFAULT_HAND_BACKEND) -> tuple:
+    if hand_backend == "detector":
+        return tuple(DEFAULT_GESTURES) + tuple(ALL_DETECTOR_GESTURES)
+    return tuple(DEFAULT_GESTURES) + tuple(DEFAULT_HAND_GESTURES)
+
+
+def _gesture_whitelist(value, *, hand_backend: str = DEFAULT_HAND_BACKEND) -> tuple:
     """Normalise the configured gesture whitelist.
 
     A string is accepted as well as a list because the canvas's config forms
@@ -217,14 +224,15 @@ def _gesture_whitelist(value) -> tuple:
     string would become a whitelist of one long nonsense label that matches
     nothing — a silently empty gesture stream.
     """
+    default = _default_gesture_whitelist(hand_backend)
     if value is None or value == "":
-        return tuple(DEFAULT_GESTURES) + tuple(DEFAULT_HAND_GESTURES)
+        return default
     if isinstance(value, str):
         items = [part.strip() for part in value.split(",")]
     else:
         items = [str(part).strip() for part in value]
     kept = tuple(item for item in items if item)
-    return kept or (tuple(DEFAULT_GESTURES) + tuple(DEFAULT_HAND_GESTURES))
+    return kept or default
 
 
 def _hands_enabled(value) -> bool:
@@ -698,7 +706,11 @@ class _PoseNode(Node):
                     # Close-up hand frames can miss the body detector; synthesize
                     # a person record so stream mode matches photo mode.
                     self._hand_channel.update(
-                        persons, frame, now_wall, synthesize_person=True
+                        persons,
+                        frame,
+                        now_wall,
+                        allowed=self._hand_gestures,
+                        synthesize_person=True,
                     )
                 else:
                     self._hand_channel.update(persons, frame, now_wall)
@@ -1101,8 +1113,11 @@ class PosePerceptionPlugin:
         self._publish_overlay = bool(plugin_cfg.get("publish_overlay", False))
         self._publish_gesture_events = bool(
             plugin_cfg.get("publish_gesture_events", True))
+        self._hands = _hands_enabled(plugin_cfg.get("hands"))
+        self._hand_backend = _hand_backend_name(plugin_cfg.get("hand_backend"))
+        self._gesture_whitelist_raw = plugin_cfg.get("gesture_whitelist")
         self._gesture_whitelist = _gesture_whitelist(
-            plugin_cfg.get("gesture_whitelist"))
+            self._gesture_whitelist_raw, hand_backend=self._hand_backend)
         self._gesture_hold_s = float(plugin_cfg.get("gesture_hold_s",
                                                     DEFAULT_HOLD_S))
         self._gesture_release_s = float(plugin_cfg.get("gesture_release_s",
@@ -1110,8 +1125,6 @@ class PosePerceptionPlugin:
         self._gesture_cooldown_s = float(plugin_cfg.get("gesture_cooldown_s",
                                                         DEFAULT_COOLDOWN_S))
         self._gesture_min_score = float(plugin_cfg.get("gesture_min_score", 0.0))
-        self._hands = _hands_enabled(plugin_cfg.get("hands"))
-        self._hand_backend = _hand_backend_name(plugin_cfg.get("hand_backend"))
         self._hand_interval_s = float(plugin_cfg.get("hand_interval_s", 0.25))
         self._hand_max_rois = int(plugin_cfg.get("hand_max_rois", 2))
         self._hand_min_forearm_px = float(
@@ -1184,6 +1197,16 @@ class PosePerceptionPlugin:
 
     def _merged_config(self, node_key: str) -> dict:
         icfg = self._instance_configs.get(node_key, {})
+        hand_backend = (_hand_backend_name(icfg["hand_backend"])
+                        if "hand_backend" in icfg else self._hand_backend)
+        if "gesture_whitelist" in icfg:
+            gesture_whitelist = _gesture_whitelist(
+                icfg["gesture_whitelist"], hand_backend=hand_backend)
+        elif self._gesture_whitelist_raw is not None:
+            gesture_whitelist = _gesture_whitelist(
+                self._gesture_whitelist_raw, hand_backend=hand_backend)
+        else:
+            gesture_whitelist = _default_gesture_whitelist(hand_backend)
         merged = {
             "confidence": float(icfg.get("confidence", self._confidence)),
             "fps": int(icfg.get("fps", self._fps)),
@@ -1205,9 +1228,7 @@ class PosePerceptionPlugin:
                 "activity_interval_s", self._activity_interval_s)),
             "publish_gesture_events": bool(icfg.get(
                 "publish_gesture_events", self._publish_gesture_events)),
-            "gesture_whitelist": (_gesture_whitelist(icfg["gesture_whitelist"])
-                                  if "gesture_whitelist" in icfg
-                                  else self._gesture_whitelist),
+            "gesture_whitelist": gesture_whitelist,
             "gesture_hold_s": float(icfg.get("gesture_hold_s",
                                              self._gesture_hold_s)),
             "gesture_release_s": float(icfg.get("gesture_release_s",
@@ -1218,8 +1239,7 @@ class PosePerceptionPlugin:
                                                 self._gesture_min_score)),
             "hands": (_hands_enabled(icfg["hands"]) if "hands" in icfg
                       else self._hands),
-            "hand_backend": (_hand_backend_name(icfg["hand_backend"])
-                             if "hand_backend" in icfg else self._hand_backend),
+            "hand_backend": hand_backend,
             "hand_interval_s": float(icfg.get("hand_interval_s",
                                               self._hand_interval_s)),
             "hand_max_rois": int(icfg.get("hand_max_rois", self._hand_max_rois)),
@@ -1732,7 +1752,13 @@ class PosePerceptionPlugin:
                 interval_s=0.0,
                 hold_s=0.0,
             )
-            note = channel.update(persons, frame, 0.0, synthesize_person=True)
+            note = channel.update(
+                persons,
+                frame,
+                0.0,
+                allowed=merged["gesture_whitelist"],
+                synthesize_person=True,
+            )
             return note, []
         try:
             session = self._ensure_hand_model()
@@ -2354,7 +2380,7 @@ class PosePerceptionPlugin:
         if "publish_gesture_events" in cfg:
             self._publish_gesture_events = bool(cfg["publish_gesture_events"])
         if "gesture_whitelist" in cfg:
-            self._gesture_whitelist = _gesture_whitelist(cfg["gesture_whitelist"])
+            self._gesture_whitelist_raw = cfg["gesture_whitelist"]
         if "gesture_hold_s" in cfg:
             self._gesture_hold_s = float(cfg["gesture_hold_s"])
         if "gesture_release_s" in cfg:
@@ -2367,6 +2393,9 @@ class PosePerceptionPlugin:
             self._hands = _hands_enabled(cfg["hands"])
         if "hand_backend" in cfg:
             self._hand_backend = _hand_backend_name(cfg["hand_backend"])
+        if "hand_backend" in cfg or "gesture_whitelist" in cfg:
+            self._gesture_whitelist = _gesture_whitelist(
+                self._gesture_whitelist_raw, hand_backend=self._hand_backend)
         if "hand_det_confidence" in cfg:
             self._hand_det_confidence = float(cfg["hand_det_confidence"])
         if "gesture_det_confidence" in cfg:
