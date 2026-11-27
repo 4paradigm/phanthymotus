@@ -267,6 +267,53 @@ def test_stream_class_filter(class_filter, expected):
     assert len({obj["track_id"] for obj in objects}) == len(expected)
 
 
+def test_stream_suppresses_duplicate_geometry_and_overlapping_box_aliases():
+    plugin, executor = _plugin({"confidence": 0.2}, model=_FakeModel(rows=[
+        [11, 10, 61, 60, 0.26, 0],
+        [10, 10, 60, 60, 0.43, 1],
+        [10, 10, 60, 60, 0.25, 2],
+        [12, 10, 59, 60, 0.32, 2],
+        [100, 10, 150, 60, 0.65, 0],
+    ]))
+    plugin._vocabulary = ["box", "cardboard box", "book"]
+    node = _node_with(plugin, executor)
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+
+    json_pub = node.publishers[0]
+    assert _wait_until(lambda: bool(json_pub.messages))
+    objects = json.loads(json_pub.messages[0])["objects"]
+    assert [obj["name"] for obj in objects] == ["box", "book", "box"]
+    assert objects[0]["confidence"] == 0.43
+    assert len({obj["track_id"] for obj in objects}) == 3
+
+
+def test_box_whitelist_keeps_id_across_label_changes():
+    model = _FakeModel(rows=[[10, 10, 60, 60, 0.43, 1], [100, 10, 150, 60, 0.85, 2]])
+    plugin, executor = _plugin(model=model)
+    plugin._vocabulary = ["box", "cardboard box", "book"]
+    instance = {"instance_id": "test-card"}
+    plugin.dispatch("vop", {
+        **instance, "action": "config", "stream_class_filter": "box",
+        "confidence": 0.3, "fps": 10,
+    })
+    plugin.dispatch("vop", {**instance, "action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    messages = node.publishers[0].messages
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    assert _wait_until(lambda: len(messages) == 1)
+    first, = json.loads(messages[0])["objects"]
+    assert first["name"] == "box"
+    assert first["track_id"] == 1
+
+    model._output[0, 0, 5] = 0
+    time.sleep(0.11)
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+    assert _wait_until(lambda: len(messages) == 2)
+    second, = json.loads(messages[1])["objects"]
+    assert second["name"] == "box"
+    assert second["track_id"] == first["track_id"]
+
+
 def test_objects_are_published_with_center_relative_coordinates():
     # 200x100 frame, box centered at (150, 25) → x_norm=+0.5, y_norm=-0.5
     plugin, executor = _plugin(model=_FakeModel())
@@ -392,6 +439,16 @@ def test_vop_low_confidence_box_cannot_create_or_reactivate_a_track():
     assert tracker.update(box[:0], np.array([]), classes[:0], 0.4, 0.3) == {}
     assert tracker.update(box, np.array([0.2]), classes, 1.0, 0.3) == {}
     assert tracker.update(box, np.array([0.9]), classes, 1.4, 0.3) == {0: 2}
+
+
+def test_low_output_threshold_does_not_create_weak_tracks():
+    tracker = vop_plugin.VOPTracker()
+    boxes = np.array([[0, 0, 20, 20], [60, 0, 80, 20]])
+    classes = np.array([0, 0])
+    assert tracker.update(boxes, np.array([0.16, 0.27]), classes, 0.0, 0.1) == {}
+    assert tracker.update(boxes, np.array([0.70, 0.16]), classes, 0.1, 0.1) == {0: 1}
+    assert tracker.update(boxes, np.array([0.16, 0.16]), classes, 0.2, 0.1) == {0: 1}
+    assert tracker.update(boxes, np.array([0.70, 0.70]), classes, 0.3, 0.1) == {0: 1, 1: 2}
 
 
 def test_low_confidence_detections_are_dropped():

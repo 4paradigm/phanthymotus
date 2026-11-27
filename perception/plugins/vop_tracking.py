@@ -11,6 +11,8 @@ import numpy as np
 
 
 LOW_CONFIDENCE = 0.1
+STRONG_CONFIDENCE = 0.25
+NEW_TRACK_CONFIDENCE = 0.30
 
 
 class _Track:
@@ -107,8 +109,8 @@ class VOPTracker:
         for track in self._tracks.values():
             track.predict(now)
 
-        high = np.flatnonzero(scores >= confidence)
-        low = np.flatnonzero((scores < confidence) & (scores >= LOW_CONFIDENCE))
+        high = np.flatnonzero(scores >= STRONG_CONFIDENCE)
+        low = np.flatnonzero((scores < STRONG_CONFIDENCE) & (scores >= LOW_CONFIDENCE))
         strong = _associate(self._tracks, boxes, classes, high, min_iou=0.2)
         matched = set(strong.values())
         unmatched_active = {
@@ -121,10 +123,11 @@ class VOPTracker:
             track.active = track_id in matched
         for index, track_id in {**strong, **weak}.items():
             self._tracks[track_id].correct(boxes[index], now)
-        for index in high:
+        for index in np.flatnonzero(scores >= NEW_TRACK_CONFIDENCE):
             if index not in strong:
                 track_id = next(self._next_id)
                 self._tracks[track_id] = _Track(boxes[index], int(classes[index]), now)
                 strong[int(index)] = track_id
-        # Weak detections maintain IDs internally without changing VOP's output threshold.
-        return strong
+        # Return IDs only for detections that pass the caller's output threshold.
+        return {index: track_id for index, track_id in {**strong, **weak}.items()
+                if scores[index] >= confidence}

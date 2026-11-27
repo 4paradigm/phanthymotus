@@ -397,7 +397,19 @@ class _VOPNode(Node):
         self._output_topic = output_topic_for(input_topic)
         self._model = model
         self._vocabulary = list(vocabulary or [])
+        box_labels = {"box", "cardboard box", "carton", "shipping box"}
+        self._box_class_ids = [
+            i for i, name in enumerate(self._vocabulary) if name.casefold() in box_labels
+        ]
+        self._box_class_id = next(
+            (i for i in self._box_class_ids if self._vocabulary[i] == "box"), None
+        )
+        if self._box_class_ids and self._box_class_id is None:
+            self._box_class_id = len(self._vocabulary)
+            self._vocabulary.append("box")
         self._stream_class_filter = stream_class_filter.strip().casefold()
+        if self._stream_class_filter in box_labels:
+            self._stream_class_filter = "box"
         self._confidence = confidence
         self._fps = fps
         self._publish_bbox = bool(publish_bbox)
@@ -529,15 +541,28 @@ class _VOPNode(Node):
                 boxes, scores, classes = decode_detections(
                     outputs, meta, min(confidence, LOW_CONFIDENCE)
                 )
+                if self._box_class_id is not None:
+                    classes[np.isin(classes, self._box_class_ids)] = self._box_class_id
                 if self._stream_class_filter:
                     keep = [self._class_name(int(cls_id)).casefold() == self._stream_class_filter
                             for cls_id in classes]
                     boxes, scores, classes = boxes[keep], scores[keep], classes[keep]
+                # The detector may assign multiple labels to identical geometry.
+                best_by_box = {}
+                for i, box in enumerate(boxes):
+                    key = tuple(box)
+                    previous = best_by_box.get(key)
+                    if previous is None or scores[i] > scores[previous]:
+                        best_by_box[key] = i
+                unique = sorted(best_by_box.values())
+                boxes, scores, classes = boxes[unique], scores[unique], classes[unique]
+                keep = self._distinct_boxes(boxes, scores, classes)
+                boxes, scores, classes = boxes[keep], scores[keep], classes[keep]
                 tracks = self._tracker.update(boxes, scores, classes, frame_time, confidence)
                 visible = np.flatnonzero(scores >= confidence)
                 objects = self._extract_objects(boxes[visible], scores[visible], classes[visible], frame)
                 for obj, index in zip(objects, visible):
-                    obj["track_id"] = tracks[int(index)]
+                    obj["track_id"] = tracks.get(int(index))
                 self._publish_objects(objects, started)
                 if self._pub_overlay is not None:
                     self._publish_overlay_frame(frame, boxes[visible], objects, image_msg.header)
@@ -561,9 +586,9 @@ class _VOPNode(Node):
         for box, obj in zip(boxes, objects):
             left, top, right, bottom = (int(round(value)) for value in box)
             track_id = obj["track_id"]
-            color = palette[(track_id - 1) % len(palette)]
+            color = palette[(track_id - 1) % len(palette)] if track_id is not None else (180, 180, 180)
             cv2.rectangle(frame, (left, top), (right, bottom), color, stroke)
-            label = f"{obj['name']} #{track_id}"
+            label = obj["name"] if track_id is None else f"{obj['name']} #{track_id}"
             font = cv2.FONT_HERSHEY_SIMPLEX
             (text_width, text_height), baseline = cv2.getTextSize(label, font, scale, stroke)
             x = max(0, min(left, width - text_width - 8))
@@ -579,6 +604,29 @@ class _VOPNode(Node):
             message.format = "jpeg"
             message.data = encoded.tobytes()
             self._pub_overlay.publish(message)
+
+    def _distinct_boxes(self, boxes, scores, classes):
+        """Suppress nearly identical detections in the canonical box class."""
+        keep = np.ones(len(classes), dtype=bool)
+        if self._box_class_id is None:
+            return keep
+        candidates = np.flatnonzero(classes == self._box_class_id)
+        accepted = []
+        for i in sorted(candidates, key=lambda index: -scores[index]):
+            for j in accepted:
+                intersection_size = np.maximum(
+                    0, np.minimum(boxes[i, 2:], boxes[j, 2:])
+                    - np.maximum(boxes[i, :2], boxes[j, :2]),
+                )
+                intersection = np.prod(intersection_size)
+                union = (np.prod(boxes[i, 2:] - boxes[i, :2])
+                         + np.prod(boxes[j, 2:] - boxes[j, :2]) - intersection)
+                if union > 0 and intersection >= 0.9 * union:
+                    keep[i] = False
+                    break
+            if keep[i]:
+                accepted.append(i)
+        return keep
 
     def _class_name(self, cls_id: int) -> str:
         """Resolve a class id through the engine's frozen vocabulary.
