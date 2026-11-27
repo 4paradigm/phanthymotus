@@ -365,6 +365,7 @@ TOOLS = [
                 # caller who cannot see the frame has no other way to get the
                 # pixel box back.
                 "publish_bbox":  {"type": "boolean", "description": "在流式结果里带上像素框 [x1,y1,x2,y2]。关掉只剩中心点，下游想按目标区域采样另一张对齐的图（如深度图）就只能取一小块", "default": True, "scope": "instance"},
+                "stream_class_filter": {"type": "string", "title": "流式类别过滤", "description": "仅跟踪和输出指定类别，例如 box。留空保留全部类别。", "default": "", "scope": "instance"},
                 "publish_overlay": {"type": "boolean", "title": "跟踪预览", "description": "输出带检测框、类别和跟踪 ID 的视频。每帧额外编码一次 JPEG。", "default": False, "scope": "instance"},
                 "publish_color": {"type": "string", "enum": list(COLOR_LEVELS), "description": "流式结果里的颜色详略：name=三元组+亮度（默认），full=全部 16 个字段，off=不发。每个对象每帧的差别是 27 B 与 239 B", "default": "name", "scope": "instance"},
             },
@@ -386,7 +387,7 @@ class _VOPNode(Node):
     def __init__(self, input_topic: Optional[str], model, confidence: float, fps: float,
                  node_suffix: str, vocabulary: Optional[list] = None,
                  publish_bbox: bool = True, publish_color: str = "name",
-                 publish_overlay: bool = False):
+                 publish_overlay: bool = False, stream_class_filter: str = ""):
         super().__init__(f"vop_{node_suffix}" if node_suffix else "vop")
         # Topic-less is a supported mode, as in plugins/tts.py: a card driven
         # only by recognize_by_photo has no camera to subscribe to, but still
@@ -396,6 +397,7 @@ class _VOPNode(Node):
         self._output_topic = output_topic_for(input_topic)
         self._model = model
         self._vocabulary = list(vocabulary or [])
+        self._stream_class_filter = stream_class_filter.strip().casefold()
         self._confidence = confidence
         self._fps = fps
         self._publish_bbox = bool(publish_bbox)
@@ -527,6 +529,10 @@ class _VOPNode(Node):
                 boxes, scores, classes = decode_detections(
                     outputs, meta, min(confidence, LOW_CONFIDENCE)
                 )
+                if self._stream_class_filter:
+                    keep = [self._class_name(int(cls_id)).casefold() == self._stream_class_filter
+                            for cls_id in classes]
+                    boxes, scores, classes = boxes[keep], scores[keep], classes[keep]
                 tracks = self._tracker.update(boxes, scores, classes, frame_time, confidence)
                 visible = np.flatnonzero(scores >= confidence)
                 objects = self._extract_objects(boxes[visible], scores[visible], classes[visible], frame)
@@ -992,7 +998,8 @@ class VideoObjectPerceptionPlugin:
             node = _VOPNode(input_for_node, self._model, confidence, fps,
                             node_suffix=suffix, vocabulary=self._vocabulary,
                             publish_bbox=publish_bbox, publish_color=publish_color,
-                            publish_overlay=publish_overlay)
+                            publish_overlay=publish_overlay,
+                            stream_class_filter=icfg.get("stream_class_filter", ""))
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()

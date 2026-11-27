@@ -241,6 +241,32 @@ def _node_with(plugin, executor):
     return executor.nodes[0]
 
 
+@pytest.mark.parametrize("class_filter, expected", [
+    ("box", ["box"]),
+    ("", ["box", "person"]),
+])
+def test_stream_class_filter(class_filter, expected):
+    plugin, executor = _plugin(model=_FakeModel(rows=[
+        [10, 10, 60, 60, 0.9, 0],
+        [100, 10, 150, 60, 0.85, 1],
+    ]))
+    plugin._vocabulary = ["box", "person"]
+    instance = {"instance_id": "test-card"}
+    plugin.dispatch("vop", {
+        **instance, "action": "config", "stream_class_filter": class_filter,
+        "publish_overlay": True,
+    })
+    plugin.dispatch("vop", {**instance, "action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    json_pub, image_pub = node.publishers
+    node._image_cb(_FakeCompressedImage(frame_bytes(200, 100)))
+
+    assert _wait_until(lambda: bool(image_pub.messages))
+    objects = json.loads(json_pub.messages[0])["objects"]
+    assert [obj["name"] for obj in objects] == expected
+    assert len({obj["track_id"] for obj in objects}) == len(expected)
+
+
 def test_objects_are_published_with_center_relative_coordinates():
     # 200x100 frame, box centered at (150, 25) → x_norm=+0.5, y_norm=-0.5
     plugin, executor = _plugin(model=_FakeModel())
