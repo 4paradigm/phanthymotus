@@ -3463,13 +3463,14 @@ running vop, depth, OCR, ASR and TTS the binding constraint is memory, not GPU
 time, so an enabled-but-unwired card has to cost nothing.
 
 Action labels come from `plugins/pose_action.py` — pure numpy geometry over a
-window of keypoints. **No second model and no second inference runtime**, and
-that is not a shortcut: a second ONNX Runtime in this process shares one provider
-bridge with the first, which throws on jp6.1 and SIGSEGVs the whole of perception
-on jp5.11 (see `plugins/kokoro_worker.py`). A learned skeleton-action model
-(ST-GCN and friends) would replace `PoseActionClassifier` and nothing else —
-hence `action_backend`, and hence `classify()` taking plain `PoseFrame`s and
-returning a plain dict.
+window of keypoints, paired with ST-GCN++ when `action_backend: hybrid` (the
+default `rolling` mode) is used. **No second inference runtime** is introduced:
+all learned vision/action engines run through TensorRT (`utils.tensorrt_runtime`)
+because a second ONNX Runtime in this process shares one provider bridge with
+the first, which throws on jp6.1 and SIGSEGVs the whole of perception on jp5.11
+(see `plugins/kokoro_worker.py`). An opt-in `activity_mode: segment` mode is
+also available for clip-level recognition (see below); it stays completely
+unloaded in default `rolling` mode.
 
 ### Four output topics, and why it is not one
 
@@ -3928,6 +3929,38 @@ tensor layout, the normalisation arithmetic, the sampling, the logit/probability
 handling, the label mapping and every failure path — against a fake engine. They
 cannot establish that ST-GCN++ agrees with these labels on a robot. Read a green
 suite as "the plumbing is right".
+
+### Opt-in segment action mode (`activity_mode: segment`)
+
+Default pose cards remain in `activity_mode: rolling` and keep `main`'s exact
+defaults (`action_window_s: 1.5`, `activity_interval_s: 0.35`, `label_hold: 3`,
+NTU-60 `ACTION_MODEL_BUNDLES`). Setting `activity_mode: segment` (per card or
+per instance, or via `POSE_ACTIVITY_MODE=segment`) switches activity recognition
+to `plugins/pose_segment.py`, which buffers an incoming clip until an input
+pause (`activity_idle_flush_s` / `activity_segment_pause_s`, with optional
+bounded stall backfill via `activity_stall_backfill_s`, chunked at batch size
+`<= 2`) and evaluates the full clip once.
+
+- **Dual-stream TensorRT runtime**: combines a 6-channel joint+bone ST-GCN++
+  skeleton engine with a single-view MobileNetV2 RGB feature engine (person +
+  hand crops + 4-frame global context residual head `res_ctx`) and a calibrated
+  PoE router across the 126-class vocabulary (`plugins/action_vocab.py`). A
+  single-container background RGB worker (`_rgb_worker`) precomputes RGB
+  features during reception (early 6-frame trigger, 12-frame refresh, `>= 70%`
+  end-of-segment coverage reuse) and defers RGB warmup until first use
+  (`warmup(include_rgb=False)`).
+- **Memory footprint**: engines deserialize in place via read-only `mmap` with
+  `POSIX_FADV_DONTNEED` (`utils/tensorrt_runtime.py`) and share one opt-in
+  process-wide `USER_MANAGED` TensorRT activation scratch pool
+  (`shared_scratch=True`).
+- **Lazy pinned distribution**: on the first `start` in `segment` mode,
+  `ensure_segment_action_model` fetches the pinned ModelScope bundle for the
+  active JetPack family (`SEGMENT_ACTION_MODEL_BUNDLES`, isolated under
+  `/models/action-segment/<jp511|jp61>` with size + SHA256 verification) and
+  reports live download progress through `info()`. Set
+  `ACTION_SEGMENT_MODEL_DIR` to load a pre-provisioned local bundle without
+  network access. As with `ACTION_MODEL_BUNDLES`, skeleton/action training data
+  includes NTU RGB+D (academic-research dataset terms).
 
 ### Occlusion is `unknown`, and that is the point
 

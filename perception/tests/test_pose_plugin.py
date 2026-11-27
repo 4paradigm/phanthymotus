@@ -203,6 +203,28 @@ def test_keypoint_payload_levels_match_the_implementation():
     assert pose_plugin.TOOLS[0]["configSchema"]["properties"]["publish_keypoints"]["default"] == "off"
 
 
+def test_action_config_schema_defaults_match_plugin_fallbacks(monkeypatch):
+    """Schema defaults and PosePerceptionPlugin fallbacks must stay aligned so
+    existing rolling-mode cards keep main's exact behavior across upgrades."""
+    monkeypatch.delenv("POSE_ACTIVITY_MODE", raising=False)
+    properties = pose_plugin.TOOLS[0]["configSchema"]["properties"]
+    plugin, _ = _plugin({})
+    merged = plugin._merged_config("_default")
+    for key in (
+        "action_backend",
+        "action_window_s",
+        "activity_interval_s",
+        "activity_idle_flush_s",
+        "activity_segment_pause_s",
+        "activity_stall_backfill_s",
+        "activity_mode",
+        "label_hold",
+        "action_min_score",
+    ):
+        assert merged[key] == properties[key]["default"], key
+    assert merged["activity_mode"] == "rolling"
+
+
 # ── topic derivation ─────────────────────────────────────────────────────────
 
 def test_topics_are_derived_in_one_place():

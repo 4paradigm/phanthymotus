@@ -87,6 +87,7 @@ _BUNDLE_FRONT_DOORS = [
     ("ensure_face_model", {"model_dir": "/models/face/buffalo_sc"}),
     ("ensure_vop_model", {"model_dir": "/models/vop"}),
     ("ensure_depth_model", {"model_dir": "/models/depth"}),
+    ("ensure_segment_action_model", {"model_dir": "/models/action-segment"}),
     ("ensure_soundevent_model", {}),
 ]
 

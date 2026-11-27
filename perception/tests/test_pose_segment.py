@@ -1174,3 +1174,190 @@ def test_async_rgb_precompute_reuses_high_coverage_and_refreshes_low_coverage(mo
     node._flush_received_segment()
     assert node._last_prediction['rgb_precomputed'] is False
     assert rgb_stub.calls == 2  # Full-segment RGB refreshed!
+
+
+def test_segment_action_bundle_pins_and_jetpack_cache_isolation(monkeypatch):
+    import re
+    from utils import model_downloader as md
+
+    bundles = md.SEGMENT_ACTION_MODEL_BUNDLES
+    assert set(bundles) == {'jp511', 'jp61'}
+    expected_files = {
+        'stgcnpp-action126-v4-ntu200-y26s.engine',
+        'mnv2-sv16f-crope-ctx4-v4-feat.engine',
+        'mnv2-sv16f-crope-ctx4-v4-head.npz',
+        'models.json',
+    }
+    rev_re = re.compile(r'/resolve/[0-9a-f]{40}/')
+    for family, spec in bundles.items():
+        assert rev_re.search(spec['base_url']), (family, spec['base_url'])
+        assert '/master/' not in spec['base_url']
+        assert set(spec['files']) == expected_files
+        for fname, meta in spec['files'].items():
+            assert isinstance(meta['size'], int) and meta['size'] > 0, (family, fname)
+            assert re.fullmatch(r'[0-9a-f]{64}', meta['sha256']), (family, fname)
+
+    # Distinct TensorRT engine plans across JetPack lines, shared manifest/head.
+    assert (bundles['jp511']['files']['stgcnpp-action126-v4-ntu200-y26s.engine']['sha256']
+            != bundles['jp61']['files']['stgcnpp-action126-v4-ntu200-y26s.engine']['sha256'])
+    assert (bundles['jp511']['files']['mnv2-sv16f-crope-ctx4-v4-feat.engine']['sha256']
+            != bundles['jp61']['files']['mnv2-sv16f-crope-ctx4-v4-feat.engine']['sha256'])
+    assert bundles['jp511']['files']['models.json'] == bundles['jp61']['files']['models.json']
+    assert (bundles['jp511']['files']['mnv2-sv16f-crope-ctx4-v4-head.npz']
+            == bundles['jp61']['files']['mnv2-sv16f-crope-ctx4-v4-head.npz'])
+
+    seen = []
+    def fake_bundle(name, model_dir, base_url, files, progress_cb=None):
+        seen.append((name, model_dir, base_url, progress_cb))
+        return {k: f'{model_dir}/{k}' for k in files}
+
+    monkeypatch.setattr(md, 'ensure_verified_bundle', fake_bundle)
+    monkeypatch.setattr(md, 'require_models_subpath', lambda path: path)
+    sentinel = lambda *a: None
+    p5 = md.ensure_segment_action_model('/models/action-segment', family='jp511', progress_cb=sentinel)
+    p6 = md.ensure_segment_action_model('/models/action-segment', family='jp61', progress_cb=sentinel)
+    assert p5['models.json'] == '/models/action-segment/jp511/models.json'
+    assert p6['models.json'] == '/models/action-segment/jp61/models.json'
+    assert [(x[0], x[1], x[3]) for x in seen] == [
+        ('action-segment/jp511', '/models/action-segment/jp511', sentinel),
+        ('action-segment/jp61', '/models/action-segment/jp61', sentinel),
+    ]
+
+
+def test_cold_segment_start_downloads_pinned_bundle_and_reports_live_info_progress(tmp_path, monkeypatch):
+    from utils import model_downloader as md
+
+    monkeypatch.delenv('ACTION_SEGMENT_MODEL_DIR', raising=False)
+    monkeypatch.delenv('POSE_ACTIVITY_MODE', raising=False)
+
+    # Default rolling mode must never trigger segment bundle downloads.
+    monkeypatch.setattr(
+        md, 'ensure_segment_action_model',
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError('rolling mode downloaded segment bundle')),
+    )
+    rolling_plugin, _ = _plugin({'activity_mode': 'rolling'})
+    rolling_plugin._classifier_for = lambda cfg: _FinalClassifier()
+    rolling_plugin.dispatch('pose', {'action': 'start', 'input_topic': '/cam/rolling'})
+    try:
+        assert rolling_plugin._nodes['/cam/rolling']._segment_backend is None
+    finally:
+        rolling_plugin.dispatch('pose', {'action': 'stop', 'input_topic': '/cam/rolling'})
+
+    # Segment mode lazily downloads once, releases _nodes_lock so concurrent
+    # info() calls from another thread never block, and surfaces live progress.
+    manifest = tmp_path / 'models.json'
+    manifest.write_text('{}')
+    download_calls = []
+    warmups = []
+    observed_infos = []
+
+    def _info_from_other_thread(plugin, topic):
+        box = {}
+        def _worker():
+            box['info'] = plugin.dispatch('pose', {'action': 'info', 'input_topic': topic})
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout=1.5)
+        assert not t.is_alive(), 'info() blocked on _nodes_lock during segment bundle load'
+        return box['info']
+
+    plugin, _ = _plugin({'activity_mode': 'segment'})
+    plugin._classifier_for = lambda cfg: _FinalClassifier()
+
+    def fake_ensure(model_dir='/models/action-segment', family=None, progress_cb=None):
+        download_calls.append(model_dir)
+        assert progress_cb is not None
+        progress_cb(40, 7.2, 18.0)
+        info = _info_from_other_thread(plugin, '/cam/seg')
+        observed_infos.append(info)
+        return {'models.json': str(manifest)}
+
+    class _FakeLoadedBackend:
+        def __init__(self):
+            self.body = SimpleNamespace(
+                _engine=SimpleNamespace(input_shape=(1, 2, 100, 17, 6))
+            )
+            self.rgb_engine = SimpleNamespace(input_shape=(1, 32, 3, 192, 192))
+            self.ntu_rgb_weight = 0.35
+            self.crop_mode = 'E'
+            self.router = None
+            self.rgb_head = None
+
+        def warmup(self, include_rgb=False):
+            warmups.append(include_rgb)
+            observed_infos.append(_info_from_other_thread(plugin, '/cam/seg'))
+
+    monkeypatch.setattr(md, 'ensure_segment_action_model', fake_ensure)
+    monkeypatch.setattr(
+        SegmentActionBackend, 'from_directory',
+        classmethod(lambda cls, pose_model, directory: _FakeLoadedBackend()),
+    )
+
+    plugin.dispatch('pose', {'action': 'start', 'input_topic': '/cam/seg'})
+    try:
+        assert download_calls == ['/models/action-segment']
+        assert warmups == [False]
+        assert len(observed_infos) == 2
+        assert observed_infos[0]['state'] == 'loading'
+        assert 'action-segment' in observed_infos[0]['desc'] and '40%' in observed_infos[0]['desc']
+        assert observed_infos[1]['state'] == 'loading'
+        assert 'Loading action-segment' in observed_infos[1]['desc']
+        post = plugin.dispatch('pose', {'action': 'info', 'input_topic': '/cam/seg'})
+        assert post['state'] == 'running'
+        assert plugin._model_loading is False
+        assert plugin._model_load_status is None
+    finally:
+        plugin.dispatch('pose', {'action': 'stop', 'input_topic': '/cam/seg'})
+
+    # Explicit ACTION_SEGMENT_MODEL_DIR bypasses downloader completely.
+    monkeypatch.setenv('ACTION_SEGMENT_MODEL_DIR', str(tmp_path))
+    monkeypatch.setattr(
+        md, 'ensure_segment_action_model',
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError('local override should not download')),
+    )
+    local_plugin, _ = _plugin({'activity_mode': 'segment'})
+    local_plugin._classifier_for = lambda cfg: _FinalClassifier()
+    local_plugin.dispatch('pose', {'action': 'start', 'input_topic': '/cam/local'})
+    try:
+        assert local_plugin._nodes['/cam/local']._segment_backend is not None
+    finally:
+        local_plugin.dispatch('pose', {'action': 'stop', 'input_topic': '/cam/local'})
+
+    # Cold start with _model=None stays state="loading" across BOTH pose load
+    # and segment bundle download without flashing "idle" in between.
+    monkeypatch.delenv('ACTION_SEGMENT_MODEL_DIR', raising=False)
+    cold_plugin, _ = _plugin({'activity_mode': 'segment'})
+    cold_plugin._model = None
+    cold_plugin._classifier_for = lambda cfg: _FinalClassifier()
+    bg_states = []
+    release_seg = threading.Event()
+    entered_seg = threading.Event()
+
+    def fake_ensure_pose():
+        bg_states.append(cold_plugin.dispatch('pose', {'action': 'info', 'input_topic': '/cam/cold'})['state'])
+        cold_plugin._model = _plugin()[0]._model
+
+    def fake_ensure_seg(model_dir='/models/action-segment', family=None, progress_cb=None):
+        progress_cb(60, 10.8, 18.0)
+        entered_seg.set()
+        assert release_seg.wait(2.0)
+        return {'models.json': str(manifest)}
+
+    cold_plugin._ensure_model = fake_ensure_pose
+    monkeypatch.setattr(md, 'ensure_segment_action_model', fake_ensure_seg)
+    try:
+        resp = cold_plugin.dispatch('pose', {'action': 'start', 'input_topic': '/cam/cold'})
+        assert resp['state'] == 'loading'
+        assert entered_seg.wait(2.0)
+        mid = cold_plugin.dispatch('pose', {'action': 'info', 'input_topic': '/cam/cold'})
+        assert mid['state'] == 'loading'
+        assert 'action-segment' in mid['desc'] and '60%' in mid['desc']
+        release_seg.set()
+        assert _wait_until(
+            lambda: cold_plugin.dispatch('pose', {'action': 'info', 'input_topic': '/cam/cold'})['state'] == 'running',
+            timeout=3.0,
+        )
+        assert bg_states == ['loading']
+    finally:
+        release_seg.set()
+        cold_plugin.dispatch('pose', {'action': 'stop', 'input_topic': '/cam/cold'})

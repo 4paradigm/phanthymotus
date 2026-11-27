@@ -1848,15 +1848,33 @@ class PosePerceptionPlugin:
         if merged["activity_mode"] != "segment" or merged["action_backend"] == "rules":
             return None
         from plugins.pose_segment import SegmentActionBackend
-        directory = os.environ.get("ACTION_SEGMENT_MODEL_DIR") or "/models/action-segment"
+
         with self._segment_model_lock:
             if self._segment_model is None:
-                model = SegmentActionBackend.from_directory(
-                    self._model, directory)
-                model.warmup(
-                    include_rgb=(os.environ.get("ACTION_SEGMENT_WARMUP_RGB") == "1")
-                )
-                self._segment_model = model
+                prev_loading = self._model_loading
+                self._model_loading = True
+                try:
+                    directory = os.environ.get("ACTION_SEGMENT_MODEL_DIR", "").strip()
+                    if not directory:
+                        from utils.model_downloader import ensure_segment_action_model
+                        from utils.model_progress import fetch_status
+
+                        progress_cb, _ = fetch_status(
+                            lambda text: setattr(self, "_model_load_status", text),
+                            "action-segment",
+                        )
+                        paths = ensure_segment_action_model(progress_cb=progress_cb)
+                        directory = os.path.dirname(paths["models.json"])
+                    self._model_load_status = "Loading action-segment engines..."
+                    model = SegmentActionBackend.from_directory(
+                        self._model, directory)
+                    model.warmup(
+                        include_rgb=(os.environ.get("ACTION_SEGMENT_WARMUP_RGB") == "1")
+                    )
+                    self._segment_model = model
+                finally:
+                    self._model_load_status = None
+                    self._model_loading = prev_loading
         return SegmentActionBackend(
             self._model, self._segment_model.body._engine,
             self._segment_model.rgb_engine,
@@ -2189,20 +2207,28 @@ class PosePerceptionPlugin:
     def _start_node(self, node_key: str, input_topic: str):
         """Create and start a _PoseNode for the given topic.
 
-        Registers the node before starting it so a concurrent stop can always
-        find and cancel it; the lock covers only the registration, never the
-        start, so a stop is not queued behind the start it is trying to abort
-        (perception/README.md § "Plugin Concurrency").
+        Builds optional model backends outside `_nodes_lock` so cold bundle
+        downloads never block `info()` or a concurrent `stop()`. Registers the
+        node before starting it so a concurrent stop can always find and cancel
+        it; the lock covers only the registration, never the start or model
+        load (perception/README.md § "Plugin Concurrency").
         """
         with self._nodes_lock:
             if node_key in self._nodes:
                 return
             merged = self._merged_config(node_key)
-            suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
+        suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
+        classifier = self._classifier_for(merged)
+        segment_backend = self._segment_backend_for(merged)
+        gesture_tracker = self._gesture_tracker_for(merged)
+        hand_channel = self._hand_channel_for(merged)
+        with self._nodes_lock:
+            if node_key in self._nodes:
+                return
             node = _PoseNode(
                 input_topic or None, self._model, merged["confidence"],
                 merged["fps"], node_suffix=suffix,
-                classifier=self._classifier_for(merged),
+                classifier=classifier,
                 kpt_confidence=merged["kpt_confidence"],
                 max_persons=merged["max_persons"],
                 publish_keypoints=merged["publish_keypoints"],
@@ -2213,11 +2239,11 @@ class PosePerceptionPlugin:
                 activity_idle_flush_s=merged["activity_idle_flush_s"],
                 activity_segment_pause_s=merged["activity_segment_pause_s"],
                 activity_stall_backfill_s=merged["activity_stall_backfill_s"],
-                segment_backend=self._segment_backend_for(merged),
+                segment_backend=segment_backend,
                 tracker_timeout_s=merged["tracker_timeout_s"],
-                gesture_tracker=self._gesture_tracker_for(merged),
+                gesture_tracker=gesture_tracker,
                 publish_gesture_events=merged["publish_gesture_events"],
-                hand_channel=self._hand_channel_for(merged),
+                hand_channel=hand_channel,
                 publish_hand_keypoints=merged["publish_hand_keypoints"],
                 hand_gestures=merged["gesture_whitelist"],
             )
@@ -2620,19 +2646,21 @@ class PosePerceptionPlugin:
                 return {"state": "error",
                         "message": f"Engine failed to load: {self._model_load_error}"}
 
+            self._model_loading = True
+
             def _bg_start():
-                self._model_loading = True
                 self._model_load_error = None
                 self._model_load_status = None
                 try:
                     self._ensure_model()
-                    self._model_loading = False
                     self._model_load_status = None
                     self._start_node(node_key, input_topic)
                 except Exception as error:  # noqa: BLE001
-                    self._model_loading = False
                     self._model_load_error = str(error)
                     log.error(f"[pose] engine load failed: {error}", exc_info=True)
+                finally:
+                    self._model_load_status = None
+                    self._model_loading = False
 
             threading.Thread(target=_bg_start, daemon=True,
                              name="pose_model_load").start()
