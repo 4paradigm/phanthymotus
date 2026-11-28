@@ -18,8 +18,10 @@ registered SQLite writer; it fails rather than publishing an image if the
 check fails. The check verifies the inherited runtime; it does not install it.
 
 Add the Card to a project and configure the topic names before starting the
-project. Project start begins recording; project stop ends it and waits for the
-recorder to finish writing. The Card reports recording status and errors. This
+project. Project start launches the recorder; the Card reports it as starting
+until the SQLite file appears and then shows its state on the canvas. If the
+file does not appear within 30 seconds, startup fails. Project stop ends
+recording and waits for the recorder to finish writing. This
 Card does not play bags.
 
 Use **查看录制与文件** on the card to see its current state and select a
@@ -37,6 +39,9 @@ download each selected file from the panel and keep `metadata.yaml`, all data
 files, and `rosbag_card.json` (when present) together in the same directory. Downloads go
 through the Agent Core API (using the platform's existing authentication
 settings) and stream from Perception without buffering the bag in the service.
+Agent Core passes its cached access token to Perception when deploying it. For
+custom or manual Compose deployments, supply the exact same `ACCESS_TOKEN` to
+both services.
 Browsers supporting the File System Access
 API can save large files as a stream. For other browsers, the fallback is
 limited to 128 MiB per file; for larger files use a supported browser or copy
@@ -2978,10 +2983,9 @@ Details worth knowing about the receiving end:
 * **Uploads are pruned after `retention_days`** (7). They are a transfer buffer,
   not storage: enrolment keeps the *embedding* and never the photo, so without
   this the directory grows forever on a 57 GB eMMC.
-* **Auth is by reachability, not a secret.** The endpoint honours `ACCESS_TOKEN`
-  if the service has one, but perception is not given one today (verified on
-  Tianyi) — and the port already serves `tools/call`, so anything that can reach
-  it can already drive the plugin.
+* **The upload endpoint honours `ACCESS_TOKEN` when set.** The supplied
+  Perception deployment receives the host token. Older or custom deployments
+  without one rely on reachability; the same port also serves `tools/call`.
 
 Verified on Tianyi: 200 KB of random binary round-trips byte-identically through
 the real endpoint with a Chinese filename, returning `/…/2026-09-08/戴文渊.jpg`.

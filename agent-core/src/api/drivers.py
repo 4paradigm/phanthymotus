@@ -57,6 +57,14 @@ LOG_MAX_SIZE = '10m'
 LOG_MAX_FILE = '3'
 
 
+def _compose_environment(service_name: str):
+    if service_name != 'perception':
+        return None
+    import auth
+    # Compose parses .env differently from auth.py; forward the cached value.
+    return {**os.environ, 'ACCESS_TOKEN': auth.get_token()}
+
+
 def _log_config() -> dict:
     """docker-py log_config for a container. Values must be strings."""
     return {
@@ -439,6 +447,7 @@ def _deploy_sync_inner(driver: dict) -> dict:
     # Remove old container if it exists (may be from legacy docker run)
     try:
         old = client.containers.get(name)
+        old.stop()  # Honour the container's configured StopTimeout.
         old.remove(force=True)
     except docker_sdk.errors.NotFound:
         pass
@@ -447,6 +456,7 @@ def _deploy_sync_inner(driver: dict) -> dict:
     if svc_container_name and svc_container_name != name:
         try:
             old = client.containers.get(svc_container_name)
+            old.stop()
             old.remove(force=True)
         except docker_sdk.errors.NotFound:
             pass
@@ -455,7 +465,7 @@ def _deploy_sync_inner(driver: dict) -> dict:
     _log_deploy(driver['id'], f'[compose] up -d {service_name}')
     result = subprocess.run(
         ['docker', 'compose', '-f', compose_file, 'up', '-d', '--no-deps', '--force-recreate', service_name],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=_compose_environment(service_name),
     )
     if result.stdout:
         _log_deploy(driver['id'], result.stdout.strip())
@@ -478,7 +488,7 @@ def _deploy_sync_legacy(driver: dict) -> dict:
     # Remove existing
     try:
         existing = client.containers.get(name)
-        existing.stop(timeout=5)
+        existing.stop()
         existing.remove(force=True)
     except docker_sdk.errors.NotFound:
         pass
@@ -576,7 +586,7 @@ def _stop_sync(driver_id: str, container_name_override: str = '') -> dict:
         client = _docker()
         name = _container_name(driver_id, container_name_override)
         container = client.containers.get(name)
-        container.stop(timeout=5)
+        container.stop()
         return {'status': 'stopped'}
     except docker_sdk.errors.NotFound:
         return {'status': 'already_stopped'}
@@ -591,6 +601,7 @@ def _remove_sync(driver_id: str, container_name_override: str = '') -> dict:
         client = _docker()
         name = _container_name(driver_id, container_name_override)
         container = client.containers.get(name)
+        container.stop()
         container.remove(force=True)
         return {'status': 'removed'}
     except docker_sdk.errors.NotFound:

@@ -520,7 +520,7 @@ def test_failure_summary_distinguishes_two_instances_of_one_tool(driver, capsys)
     assert '2 cards failed (wrist_camera (left), wrist_camera (right))' in capsys.readouterr().out
 
 
-@pytest.mark.parametrize('terminal', ['running', 'error', 'idle', 'timeout'])
+@pytest.mark.parametrize('terminal', ['running', 'error', 'idle', 'timeout', 'completed'])
 def test_loading_progress_retains_instance_identity(driver, monkeypatch, terminal):
     import itertools
 
@@ -533,6 +533,9 @@ def test_loading_progress_retains_instance_identity(driver, monkeypatch, termina
     if terminal == 'timeout':
         monkeypatch.setattr(config_api, 'time', types.SimpleNamespace(
             time=itertools.count(0, 1000).__next__))
+    if terminal == 'completed':
+        monkeypatch.setattr(config_api, 'find_tool', lambda *_: {
+            'inputSchema': {'x-start': {'failed_states': ['completed']}}})
     original_sleep = asyncio.sleep
 
     async def yield_immediately(_delay):
@@ -552,7 +555,8 @@ def test_loading_progress_retains_instance_identity(driver, monkeypatch, termina
     asyncio.run(run())
     items = [e['payload'] for e in driver.events if e['type'] == 'project_start_item']
     assert all(p.get('card_id') in ('left', 'right') for p in items)
-    expected = {'running': 'ready', 'error': 'error', 'idle': 'cancelled', 'timeout': 'error'}
+    expected = {'running': 'ready', 'error': 'error', 'idle': 'cancelled', 'timeout': 'error',
+                'completed': 'error'}
     left = [p for p in items if p['card_id'] == 'left']
     assert left[-1]['status'] == expected[terminal]
     if terminal != 'timeout':

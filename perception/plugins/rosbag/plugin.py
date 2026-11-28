@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import math
-import re
 import threading
 
-from .recorder import Recorder
+from .recorder import Recorder, validate_config
 from .store import BagStore
 
 
@@ -37,6 +35,8 @@ class RosbagRecorderPlugin:
                 "properties": {"action": {"type": "string", "enum": ["start", "stop", "info", "config"]}},
                 "required": ["action"],
                 "x-rosbag-manager": {"version": 1},
+                # A recorder that already ended is not ready to record.
+                "x-start": {"failed_states": ["completed"]},
                 # Graceful SIGINT (15s) plus a bounded kill/reap (5s) can
                 # legitimately outlast the platform's normal stop deadline.
                 "x-stop": {"timeout_s": 25},
@@ -70,14 +70,10 @@ class RosbagRecorderPlugin:
             if action == "start":
                 if self._config_error:
                     return self._error(self._config_error)
-                try:
-                    self._validate(self._topics, self._max_duration_sec, self._min_free_bytes)
-                    return self._recorder.start(
-                        list(self._topics), max_duration_sec=self._max_duration_sec,
-                        min_free_bytes=self._min_free_bytes,
-                    )
-                except (ValueError, TypeError, OSError) as exc:
-                    return self._error(str(exc))
+                return self._recorder.start(
+                    self._topics, max_duration_sec=self._max_duration_sec,
+                    min_free_bytes=self._min_free_bytes,
+                )
             if action == "stop":
                 return self._with_result(self._recorder.stop())
             if action == "info":
@@ -111,7 +107,7 @@ class RosbagRecorderPlugin:
         return Path(path).name
 
     def _active_id(self, snapshot):
-        if snapshot.get("process_active", snapshot.get("state") in ("recording", "stopping")):
+        if snapshot.get("process_active", snapshot.get("state") in ("loading", "recording", "stopping")):
             return self._snapshot_id(snapshot)
         return None
 
@@ -133,26 +129,15 @@ class RosbagRecorderPlugin:
             return self._store.open_file(bag_id, filename,
                                          active=(bag_id == self._active_id(snapshot)))
 
-    @staticmethod
-    def _validate(topics, duration, min_free):
-        if not isinstance(topics, list) or not topics or any(
-            not isinstance(t, str) or not re.fullmatch(r"/[A-Za-z0-9_~/]+", t)
-            for t in topics
-        ):
-            raise ValueError("topics 必须是非空的绝对 ROS 2 话题名称列表")
-        if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration < 0:
-            raise ValueError("max_duration_sec 必须是非负有限数字")
-        if isinstance(min_free, bool) or not isinstance(min_free, int) or min_free < 0:
-            raise ValueError("min_free_bytes 必须是非负整数")
-
     def _config(self, args: dict) -> dict:
-        if self._recorder.info().get("state") in ("recording", "stopping"):
+        snapshot = self._recorder.info()
+        if snapshot.get("process_active", snapshot.get("state") in ("loading", "recording", "stopping")):
             return self._error("录制进行中不能更改配置")
         topics = args.get("topics", self._topics)
         duration = args.get("max_duration_sec", self._max_duration_sec)
         min_free = args.get("min_free_bytes", self._min_free_bytes)
         try:
-            self._validate(topics, duration, min_free)
+            validate_config(topics, duration, min_free)
         except (ValueError, TypeError) as exc:
             self._config_error = str(exc)
             return self._error(self._config_error)

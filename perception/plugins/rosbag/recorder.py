@@ -19,6 +19,19 @@ from pathlib import Path
 from .store import BagStore
 
 
+def validate_config(topics, duration, min_free):
+    if not isinstance(topics, list) or not topics or any(
+        not isinstance(t, str) or len(t) > 247 or
+        not re.fullmatch(r"/[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*", t)
+        for t in topics
+    ):
+        raise ValueError("topics 必须是非空的绝对 ROS 2 话题名称列表")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration < 0:
+        raise ValueError("max_duration_sec 必须是非负有限数字")
+    if isinstance(min_free, bool) or not isinstance(min_free, int) or min_free < 0:
+        raise ValueError("min_free_bytes 必须是非负整数")
+
+
 class Recorder:
     """Own at most one recording; output paths are generated under ``root``."""
 
@@ -62,16 +75,13 @@ class Recorder:
             self._refresh()
             if self._process is not None:
                 return self._error("A recording is already running")
-            if (not isinstance(topics, (list, tuple)) or not topics or
-                    any(not isinstance(t, str) or
-                        not re.fullmatch(r"/[A-Za-z0-9_~/]+", t) for t in topics)):
-                return self._error("Provide at least one valid absolute ROS topic name")
+            try:
+                validate_config(topics, max_duration_sec, min_free_bytes)
+            except (TypeError, ValueError) as exc:
+                return self._error(str(exc))
             try:
                 max_duration = float(max_duration_sec)
-                min_free = int(min_free_bytes)
-                if (not math.isfinite(max_duration) or max_duration < 0 or
-                        min_free < 0 or isinstance(min_free_bytes, bool)):
-                    raise ValueError("limits must be non-negative")
+                min_free = min_free_bytes
                 self._root.mkdir(parents=True, exist_ok=True)
                 if shutil.disk_usage(self._root).free < min_free:
                     self._state = "error"
@@ -83,7 +93,8 @@ class Recorder:
                     return self._snapshot()
                 # The rosbag CLI requires a path which does not already exist.
                 path = self._root / (time.strftime("bag_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:12])
-                command = [self._executable, "bag", "record", "-o", str(path), *topics]
+                command = [self._executable, "bag", "record", "--include-hidden-topics",
+                           "-s", "sqlite3", "-o", str(path), *topics]
                 # Inherit the service logs: this avoids a blocked unread pipe
                 # and preserves ROS/storage errors for diagnosis.
                 process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
@@ -103,8 +114,8 @@ class Recorder:
             self._duration = 0.0
             self._max_duration = max_duration
             self._min_free = min_free
-            self._state = "recording"
-            self._message = "Recorder started; message reception is not yet verified"
+            self._state = "loading"
+            self._message = "Recorder is starting"
             self._reason = ""
             self._watch_stop = threading.Event()
             threading.Thread(target=self._watch, args=(process, self._watch_stop),
@@ -124,6 +135,10 @@ class Recorder:
             self._reason = "unexpected_exit"
             self._message = f"Recorder exited unexpectedly (code {code}); bag may be incomplete"
             self._remember_topics()
+        elif (self._process is not None and self._state == "loading" and self._path and
+              self._path.joinpath(self._path.name + "_0.db3").is_file()):
+            self._state = "recording"
+            self._message = "Recorder started; message reception is not yet verified"
 
     def _remember_topics(self):
         if not self._path or not self._topics:
@@ -142,6 +157,11 @@ class Recorder:
                     return
                 self._refresh()
                 if self._process is None:
+                    return
+                if self._state == "loading" and time.monotonic() - self._started >= 30:
+                    self._finish("startup_timeout")
+                    self._state = "error"
+                    self._message = "Recorder did not initialize within 30 seconds; bag may be incomplete"
                     return
                 if self._max_duration and time.monotonic() - self._started >= self._max_duration:
                     self._finish("duration_limit")

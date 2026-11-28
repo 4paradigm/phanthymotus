@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 // Execute the canvas's actual event handler without mounting the whole editor.
-const canvas = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8');
+const canvas = readFileSync(new URL('./canvas.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const start = canvas.indexOf('  // Subscribe to startup progress events');
 const end = canvas.indexOf('  onMotusEvent(null, _onEvent);', start);
 assert.ok(start >= 0 && end > start);

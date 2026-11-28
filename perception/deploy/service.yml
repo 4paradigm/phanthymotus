@@ -29,6 +29,8 @@ perception:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    # The same host .env supplies Agent Core's dashboard token.
+    - ACCESS_TOKEN=${ACCESS_TOKEN:-}
   logging:
     driver: local
     options:

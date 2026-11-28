@@ -483,21 +483,8 @@ async def _do_start_project_impl():
     # 循环就永远不会再判一次条件。**循环里的 deadline 挡不住循环内部的挂起。**
     INFO_TIMEOUT_S = 10
 
-    async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
-                                   info_args: dict) -> dict:
-        """info() the card, register its topic_out on the bus, return the payload.
-
-        info_args carries the input_topic the card was started with: without it a
-        tool that has no live node yet can only report its fallback output topic
-        (perception TTS answers /perception/tts), and that wrong topic is what
-        the dashboard would then subscribe to — no waveform, while audio flows on
-        the real one.
-        """
-        info = await mcp_call_tool(mcp_id, MCPCallRequest(
-            tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
-                                       **info_args},
-        ), timeout_s=INFO_TIMEOUT_S)
-        data = payload_of(info)
+    async def _register_info(mcp_id: str, card_id: str, data: dict) -> dict:
+        """Register the same info payload used to decide the card's state."""
         # Kept whole, not just `topic_out`. A card's `info()` is the only place
         # it describes itself, and a consumer downstream may need more of that
         # description than its output topics — `camera_info` is the first such
@@ -514,6 +501,22 @@ async def _do_start_project_impl():
                     await register_topic_internal(tp['topic'], tp['format'], mcp_id)
         return data
 
+    async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
+                                   info_args: dict) -> dict:
+        """info() the card, register its topic_out on the bus, return the payload.
+
+        info_args carries the input_topic the card was started with: without it a
+        tool that has no live node yet can only report its fallback output topic
+        (perception TTS answers /perception/tts), and that wrong topic is what
+        the dashboard would then subscribe to — no waveform, while audio flows on
+        the real one.
+        """
+        info = await mcp_call_tool(mcp_id, MCPCallRequest(
+            tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
+                                       **info_args},
+        ), timeout_s=INFO_TIMEOUT_S)
+        return await _register_info(mcp_id, card_id, payload_of(info))
+
     async def _settle_loading_item(mcp_id: str, tool_name: str, card_id: str,
                                   info_args: dict) -> None:
         """Poll a card that started into `loading` and report its real outcome.
@@ -522,9 +525,15 @@ async def _do_start_project_impl():
         and the operator must not be told 已就绪 before the tool can do its job.
         On success the topics are registered again: they were resolved before the
         node existed, so only now can the card report the real ones.
+        A tool may declare additional unsuccessful terminal states in
+        inputSchema['x-start']['failed_states'].
         """
         deadline = time.time() + LOADING_TIMEOUT_S
         last_message = ''
+        schema = (find_tool(mcp_id, tool_name) or {}).get('inputSchema') or {}
+        start_rules = schema.get('x-start') if isinstance(schema, dict) else None
+        failed_states = start_rules.get('failed_states') if isinstance(start_rules, dict) else []
+        failed_states = set(v for v in failed_states if isinstance(v, str)) if isinstance(failed_states, list) else set()
         while time.time() < deadline:
             await _asyncio.sleep(LOADING_POLL_S)
             try:
@@ -561,11 +570,13 @@ async def _do_start_project_impl():
                     'message': '启动已取消',
                 }})
                 return
-            status = 'error' if state == 'error' else 'ready'
+            status = 'error' if state == 'error' or state in failed_states else 'ready'
+            if status == 'error' and not message:
+                message = '启动未完成'
             print(f'[start-project] {tool_name} ({mcp_id}) settled: {state}')
             if status == 'ready':
                 try:
-                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+                    await _register_info(mcp_id, card_id, payload_of(info))
                 except Exception as error:
                     print(f'[start-project] {tool_name} topic re-register failed: {error}')
             await push_event({'type': 'project_start_item', 'payload': {

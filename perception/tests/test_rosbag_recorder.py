@@ -49,7 +49,7 @@ def harness(tmp_path, monkeypatch):
     thread = Mock()
     clock = SimpleNamespace(now=100.0)
     disk = SimpleNamespace(free=10_000)
-    fake_time = SimpleNamespace(monotonic=lambda: clock.now, strftime=lambda _fmt: "20260101_")
+    fake_time = SimpleNamespace(monotonic=lambda: clock.now, strftime=lambda _fmt: "bag_20260101_000000_")
     monkeypatch.setattr(recorder_module, "time", fake_time)
     monkeypatch.setattr(recorder_module.subprocess, "Popen", popen)
     monkeypatch.setattr(recorder_module.shutil, "disk_usage", lambda _path: disk)
@@ -63,6 +63,7 @@ def harness(tmp_path, monkeypatch):
 def _metadata(result):
     path = Path(result["path"])
     path.mkdir(parents=True)
+    (path / (path.name + "_0.db3")).touch()
     (path / "metadata.yaml").write_text("rosbag2_bagfile_information: {}\n", encoding="utf-8")
 
 
@@ -70,16 +71,18 @@ def test_card_declares_bounded_stop_deadline(tmp_path):
     card = card_module.RosbagRecorderPlugin({"output_root": str(tmp_path)})
     tool = card.get_tools()[0]
     assert tool["inputSchema"]["x-stop"]["timeout_s"] == 25
+    assert tool["inputSchema"]["x-start"]["failed_states"] == ["completed"]
 
 
 def test_records_requested_topics_and_closes_on_sigint(harness):
     started = harness.recorder.start(["/camera/image", "/imu"])
-    assert started["state"] == "recording"
+    assert started["state"] == "loading"
     args, kwargs = harness.popen.call_args
-    assert args[0][:4] == ["ros2", "bag", "record", "-o"]
-    assert args[0][4:] == [started["path"], "/camera/image", "/imu"]
+    assert args[0][:7] == ["ros2", "bag", "record", "--include-hidden-topics", "-s", "sqlite3", "-o"]
+    assert args[0][7:] == [started["path"], "/camera/image", "/imu"]
     assert kwargs.get("shell", False) is False
     _metadata(started)
+    assert harness.recorder.info()["state"] == "recording"
     harness.clock.now += 3
 
     stopped = harness.recorder.stop()
@@ -200,10 +203,21 @@ def test_duplicate_start_does_not_replace_running_state(harness):
 
     assert refused["state"] == "error"
     info = harness.recorder.info()
-    assert info["state"] == "recording"
+    assert info["state"] == "loading"
     assert info["path"] == started["path"]
     assert info["topics"] == ["/imu"]
     harness.popen.assert_called_once()
+
+
+def test_recorder_that_never_opens_storage_is_stopped(harness):
+    started = harness.recorder.start(["/imu"], max_duration_sec=60)
+    assert started["state"] == "loading"
+    harness.clock.now += 31
+    harness.recorder._watch(harness.process, OneTick())
+    result = harness.recorder.info()
+    assert result["state"] == "error"
+    assert result["stop_reason"] == "startup_timeout"
+    assert not result["process_active"]
 
 
 def test_bad_configuration_does_not_start_with_previous_topics(tmp_path, monkeypatch):
@@ -221,3 +235,28 @@ def test_bad_configuration_does_not_start_with_previous_topics(tmp_path, monkeyp
     assert card.dispatch(card.PREFIX, {"action": "config", "topics": ["/new"]})["state"] == "ok"
     assert card.dispatch(card.PREFIX, {"action": "start"})["state"] == "recording"
     assert recorder.start.call_args.args[0] == ["/new"]
+
+
+def test_config_is_rejected_while_process_is_loading_or_failed_but_active(tmp_path, monkeypatch):
+    recorder = Mock()
+    monkeypatch.setattr(card_module, "Recorder", Mock(return_value=recorder))
+    card = card_module.RosbagRecorderPlugin({"output_root": str(tmp_path)})
+    for state in ("loading", "error"):
+        recorder.info.return_value = {"state": state, "process_active": True}
+        assert card.dispatch(card.PREFIX, {"action": "config", "topics": ["/imu"]})["state"] == "error"
+
+
+@pytest.mark.parametrize('topic', ['/', '/camera/', '/camera//image', '/camera/1', '/camera/~private'])
+def test_invalid_absolute_topic_names_are_refused(topic):
+    with pytest.raises(ValueError):
+        recorder_module.validate_config([topic], 0, 0)
+
+
+def test_hidden_topic_is_valid():
+    recorder_module.validate_config(['/_internal/camera_1'], 0, 0)
+
+
+def test_topic_length_respects_ros_limit():
+    recorder_module.validate_config(['/' + 'a' * 246], 0, 0)
+    with pytest.raises(ValueError):
+        recorder_module.validate_config(['/' + 'a' * 247], 0, 0)

@@ -405,7 +405,8 @@ def make_handler():
                     return
                 token = access_token()
                 provided = self.headers.get("X-Access-Token", "")
-                if token and not hmac.compare_digest(token, provided):
+                expected = hmac.new(token.encode(), b'rosbag-file', 'sha256').hexdigest() if token else ''
+                if expected and (not provided.isascii() or not hmac.compare_digest(expected, provided)):
                     self._send(401, '{"error":"认证失败"}')
                     return
                 query = parse_qs(urlsplit(self.path).query)

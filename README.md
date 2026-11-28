@@ -375,7 +375,7 @@ Its behaviour, each point with a test:
 | filename → one component, CJK kept | users name files in Chinese; NFC-normalised so a macOS and a Linux upload of one name agree |
 | `subdir` refused, not sanitised | `../escape` became `.._escape` — a valid name, so the write succeeded somewhere unasked-for, silently |
 | pruned after `retention_days` (7) | uploads are a transfer buffer; enrolment keeps the *embedding*, never the photo |
-| `ACCESS_TOKEN` honoured when set | today perception is not given one, and the same port already serves `tools/call` — so this is reachability-gated, and the check is ready for when a token is wired in |
+| `ACCESS_TOKEN` honoured when set | the supplied Perception deployment receives the host token; without one, access is gated by reachability |
 
 ## Skill Files
 
@@ -457,6 +457,7 @@ fields, so an unknown key there is silently dropped.
 | `x-hooks`, `x-show-when`, `x-sensitive` | how to render this field in the config form |
 | `x-skill-package` | this card can receive and emit skill packages — see below |
 | `x-workbench` | this card provides an interactive page to host in an iframe |
+| `x-start` | extra states that mean an asynchronously loading card did not become ready |
 | `x-stop` | this card has a release protocol; here is what "still stopping" looks like |
 
 A skill's own `files` manifest is **not** in this family — it is not a tool

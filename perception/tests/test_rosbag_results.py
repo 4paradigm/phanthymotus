@@ -167,6 +167,7 @@ def test_a_failed_but_still_running_process_cannot_be_downloaded(tmp_path, monke
 
 
 def test_local_file_endpoint_requires_token_and_streams_managed_file(tmp_path, monkeypatch):
+    import hmac
     import http.client
     import threading
     import main
@@ -177,7 +178,7 @@ def test_local_file_endpoint_requires_token_and_streams_managed_file(tmp_path, m
     bundle = Mock()
     bundle.open_rosbag_file = card.open_recording_file
     monkeypatch.setattr(main, "_bundle", bundle)
-    monkeypatch.setattr(utils.file_intake, "access_token", lambda: "test-token")
+    monkeypatch.setenv("ACCESS_TOKEN", "test-token")
     server = main.ThreadingHTTPServer(("127.0.0.1", 0), main.make_handler())
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
@@ -190,6 +191,11 @@ def test_local_file_endpoint_requires_token_and_streams_managed_file(tmp_path, m
         response.read()
         connection.request("GET", path, headers={"X-Access-Token": "test-token"})
         response = connection.getresponse()
+        assert response.status == 401
+        response.read()
+        scoped = hmac.new(b"test-token", b"rosbag-file", "sha256").hexdigest()
+        connection.request("GET", path, headers={"X-Access-Token": scoped})
+        response = connection.getresponse()
         assert response.status == 200
         assert int(response.getheader("Content-Length")) == len(b"recorded data")
         assert response.read() == b"recorded data"
@@ -198,3 +204,9 @@ def test_local_file_endpoint_requires_token_and_streams_managed_file(tmp_path, m
         server.shutdown()
         server.server_close()
         worker.join(2)
+
+
+def test_default_deployment_shares_dashboard_token():
+    from pathlib import Path
+    service = yaml.safe_load((Path(__file__).parents[1] / "deploy" / "service.yml").read_text(encoding="utf-8"))
+    assert "ACCESS_TOKEN=${ACCESS_TOKEN:-}" in service["perception"]["environment"]

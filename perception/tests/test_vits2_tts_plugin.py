@@ -593,7 +593,7 @@ def test_speak_reads_in_the_language_it_asks_for(monkeypatch, prepared):
     assert _installed(plugin).readings == ["en"]
 
 
-def test_speak_without_a_language_reads_by_context(monkeypatch, prepared):
+def test_speak_without_a_language_reads_by_context(monkeypatch, prepared, completions):
     """There is no card setting: anything that does not ask for a reading —
     on_notify, the input topic, an LLM that leaves the argument out — is auto."""
     plugin, executor, state = _plugin(monkeypatch)

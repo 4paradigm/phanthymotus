@@ -1,5 +1,6 @@
 """The browser receives bag files through the owning MCP, in bounded chunks."""
 import asyncio
+import hmac
 import os
 import sys
 
@@ -64,7 +65,8 @@ def test_download_uses_registered_service_and_streams(monkeypatch):
     assert response.headers["content-length"] == "11"
     assert session.request[0] == "http://localhost:15720/rosbag/file"
     assert session.request[1]["params"] == {"bag": BAG, "file": FILE}
-    assert session.request[1]["headers"] == {"X-Access-Token": "test-token"}
+    scoped = hmac.new(b"test-token", b"rosbag-file", "sha256").hexdigest()
+    assert session.request[1]["headers"] == {"X-Access-Token": scoped}
     assert session.closed and session.response.released
 
 
@@ -77,3 +79,51 @@ def test_download_rejects_paths_and_services_without_the_card(monkeypatch):
     with pytest.raises(fastapi.HTTPException) as no_card:
         asyncio.run(mcp_manage.mcp_rosbag_file("other", BAG, FILE))
     assert no_card.value.status_code == 404
+
+
+@pytest.mark.parametrize("url", [
+    "http://attacker.example/mcp", "http://localhost.attacker.example/mcp",
+    "http://attacker.example@localhost/mcp", "http://localhost@attacker.example/mcp",
+])
+def test_download_never_sends_token_to_registered_remote_url(monkeypatch, url):
+    target = {"id": "perception", "url": url, "tools": [{"name": "rosbag_recorder"}]}
+    monkeypatch.setattr(mcp_manage, "_get_mcp_list", lambda: [target])
+    monkeypatch.setattr(auth, "get_token", lambda: "test-token")
+    monkeypatch.setattr(mcp_manage.aiohttp, "ClientSession", lambda **_: pytest.fail("request sent"))
+    with pytest.raises(fastapi.HTTPException) as denied:
+        asyncio.run(mcp_manage.mcp_rosbag_file("perception", BAG, FILE))
+    assert denied.value.status_code == 400
+
+
+def test_cancelled_connection_closes_upstream_session(monkeypatch):
+    target = {"id": "perception", "url": "http://localhost:15720/mcp",
+              "tools": [{"name": "rosbag_recorder"}]}
+    monkeypatch.setattr(mcp_manage, "_get_mcp_list", lambda: [target])
+    session = FakeSession()
+
+    async def cancelled(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    session.get = cancelled
+    monkeypatch.setattr(mcp_manage.aiohttp, "ClientSession", lambda **_: session)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(mcp_manage.mcp_rosbag_file("perception", BAG, FILE))
+    assert session.closed
+
+
+def test_rejected_upstream_response_is_closed(monkeypatch):
+    target = {"id": "perception", "url": "http://localhost:15720/mcp",
+              "tools": [{"name": "rosbag_recorder"}]}
+    monkeypatch.setattr(mcp_manage, "_get_mcp_list", lambda: [target])
+    session = FakeSession()
+    session.response.status = 404
+
+    async def error_json(**_kwargs):
+        return {"error": "missing"}
+
+    session.response.json = error_json
+    monkeypatch.setattr(mcp_manage.aiohttp, "ClientSession", lambda **_: session)
+    with pytest.raises(fastapi.HTTPException) as denied:
+        asyncio.run(mcp_manage.mcp_rosbag_file("perception", BAG, FILE))
+    assert denied.value.status_code == 404
+    assert session.closed and session.response.released

@@ -33,6 +33,21 @@ async function info(target, view, bagId, offset) {
   return payload;
 }
 
+export async function refreshRosbagCard(target, button, isCurrent = () => true) {
+  try {
+    const data = await info(target, 'status');
+    if (!isCurrent()) return;
+    const labels = {loading: '录制启动中', recording: '录制中', stopping: '正在保存',
+      completed: '录制已结束', error: '录制异常', idle: '录制未启动'};
+    button.textContent = `${labels[data.state] || '录制状态未知'} · 查看文件`;
+    button.title = data.message || '';
+  } catch (e) {
+    if (!isCurrent()) return;
+    button.textContent = '录制状态不可用 · 查看文件';
+    button.title = e.message;
+  }
+}
+
 async function downloadFile(target, bagId, file) {
   // Ask for the destination while still handling the click: browsers require
   // a user gesture. This permits large recordings without buffering them.
@@ -114,16 +129,17 @@ export function openRosbagManager(target) {
     try {
       const data = await info(target, 'status');
       if (closed) return;
-      const names = {idle: '空闲', recording: '录制中', stopping: '正在保存', completed: '已结束', error: '失败'};
+      const names = {idle: '空闲', loading: '启动中', recording: '录制中', stopping: '正在保存', completed: '已结束', error: '失败'};
       const reasons = {requested: '手动停止', duration_limit: '达到时长上限', disk_space_limit: '磁盘剩余空间不足',
-        disk_check_failed: '磁盘检查失败', unexpected_exit: '录制进程意外退出', shutdown: '服务关闭'};
+        disk_check_failed: '磁盘检查失败', unexpected_exit: '录制进程意外退出', shutdown: '服务关闭',
+        startup_timeout: '录制启动超时'};
       const elapsed = Number.isFinite(data.duration_sec) && data.path ? ` · ${data.duration_sec.toFixed(1)} 秒` : '';
       const reason = data.stop_reason ? ` · ${reasons[data.stop_reason] || data.stop_reason}` : '';
       const stillRunning = data.process_active === true;
       const unconfirmed = data.state === 'recording' ? ' · 尚未确认消息已写入' : '';
       status.textContent = `状态：${names[data.state] || data.state || '未知'}${elapsed}${reason}${unconfirmed}${data.state === 'error' && stillRunning ? ' · 进程尚未退出' : ''}${data.state === 'error' && data.message ? ` · ${data.message}` : ''}`;
       const wasActive = lastState === true;
-      const isActive = stillRunning || data.state === 'recording' || data.state === 'stopping';
+      const isActive = stillRunning || ['loading', 'recording', 'stopping'].includes(data.state);
       lastState = isActive;
       if (wasActive && !isActive) refreshList();
     } catch (e) { if (!closed) status.textContent = `状态暂不可用：${e.message}`; }

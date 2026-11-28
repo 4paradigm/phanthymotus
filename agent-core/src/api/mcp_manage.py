@@ -467,13 +467,31 @@ async def mcp_rosbag_file(mcp_id: str, bag: str, file: str):
                for t in target.get('tools', [])):
         raise fastapi.HTTPException(status_code=404, detail='录制卡不可用')
     endpoint = _file_intake_url(mcp_id).rsplit('/file/upload', 1)[0] + '/rosbag/file'
+    # The registry accepts arbitrary MCP URLs. Never send the dashboard token
+    # to an untrusted service advertising this card.
+    from urllib.parse import urlsplit
+    try:
+        parsed = urlsplit(endpoint)
+        local = (parsed.scheme in ('http', 'https') and
+                 parsed.hostname in ('localhost', '127.0.0.1', '::1') and
+                 parsed.username is None and parsed.password is None)
+    except ValueError:
+        local = False
+    if not local:
+        raise fastapi.HTTPException(status_code=400, detail='录制服务必须位于本机')
     token = auth.get_token()
-    headers = {'X-Access-Token': token} if token else {}
+    # A local MCP registration is not authority to receive the dashboard key.
+    import hmac
+    file_token = hmac.new(token.encode(), b'rosbag-file', 'sha256').hexdigest() if token else ''
+    headers = {'X-Access-Token': file_token} if file_token else {}
     session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
         total=None, sock_connect=10, sock_read=60))
     try:
         upstream = await session.get(endpoint, params={'bag': bag, 'file': file},
                                      headers=headers, allow_redirects=False)
+    except asyncio.CancelledError:
+        await session.close()
+        raise
     except (aiohttp.ClientError, asyncio.TimeoutError) as error:
         await session.close()
         raise fastapi.HTTPException(status_code=502, detail=f'无法连接录制服务：{error}') from error
@@ -483,9 +501,10 @@ async def mcp_rosbag_file(mcp_id: str, bag: str, file: str):
             message = payload.get('error', '无法读取录制文件') if isinstance(payload, dict) else '无法读取录制文件'
         except (ValueError, aiohttp.ClientError):
             message = '无法读取录制文件'
+        finally:
+            upstream.release()
+            await session.close()
         status = upstream.status if 400 <= upstream.status < 500 else 502
-        upstream.release()
-        await session.close()
         raise fastapi.HTTPException(status_code=status, detail=message)
 
     async def chunks():

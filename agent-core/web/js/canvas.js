@@ -328,6 +328,9 @@ async function _rearmBrowserSources() {
 function _applyProjectState(running) {
   _projectRunning = !!running;
   _projectStateKnown = true;
+  if (!_projectRunning) document.querySelectorAll('.rosbag-manager-btn').forEach(btn => {
+    btn.textContent = '查看录制与文件'; btn.title = '';
+  });
   _syncProjectBtn();
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
     btn.classList.toggle('locked', !_projectRunning);
@@ -628,6 +631,18 @@ export function updateCanvasMcps(mcps) {
       const hasManager = !!card.el.querySelector('.rosbag-manager-btn');
       const liveHasManager = toolObj.inputSchema?.['x-rosbag-manager']?.version === 1;
       if (hasManager !== liveHasManager) topicsChanged = true;
+    }
+    const manager = card.el.querySelector('.rosbag-manager-btn');
+    if (manager && _projectRunning && !manager.dataset.polling) {
+      manager.dataset.polling = '1';
+      import('./rosbag-manager.js').then(({refreshRosbagCard}) =>
+        refreshRosbagCard({mcpId: card.mcpId, toolName: card.toolName}, manager,
+          () => _projectRunning && manager.isConnected))
+        .catch(() => { if (_projectRunning && manager.isConnected) manager.textContent = '录制状态不可用 · 查看文件'; })
+        .finally(() => { delete manager.dataset.polling; });
+    } else if (manager && !_projectRunning) {
+      manager.textContent = '查看录制与文件';
+      manager.title = '';
     }
   }
   if (topicsChanged) {
