@@ -1,3 +1,4 @@
+import math
 import time
 from urllib.parse import urlparse
 from typing import List
@@ -324,7 +325,10 @@ def stop_rules(tool_obj: dict) -> dict:
 
         "x-stop": {"pending_states": ["handing_back"],
                    "pending_flags": {"authority_released": false},
-                   "failed_states": ["refused"]}
+                   "failed_states": ["refused"], "timeout_s": 25}
+
+    `timeout_s` may extend the default per-card deadline, bounded by
+    MAX_STOP_CARD_TIMEOUT_S; malformed declarations use the default.
 
     The alternative -- a hardcoded vocabulary -- was tried and does not work.
     A list carrying `hold`, `handback`, `sdk_pending`, `ownership_held` and
@@ -479,21 +483,8 @@ async def _do_start_project_impl():
     # 循环就永远不会再判一次条件。**循环里的 deadline 挡不住循环内部的挂起。**
     INFO_TIMEOUT_S = 10
 
-    async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
-                                   info_args: dict) -> dict:
-        """info() the card, register its topic_out on the bus, return the payload.
-
-        info_args carries the input_topic the card was started with: without it a
-        tool that has no live node yet can only report its fallback output topic
-        (perception TTS answers /perception/tts), and that wrong topic is what
-        the dashboard would then subscribe to — no waveform, while audio flows on
-        the real one.
-        """
-        info = await mcp_call_tool(mcp_id, MCPCallRequest(
-            tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
-                                       **info_args},
-        ), timeout_s=INFO_TIMEOUT_S)
-        data = payload_of(info)
+    async def _register_info(mcp_id: str, card_id: str, data: dict) -> dict:
+        """Register the same info payload used to decide the card's state."""
         # Kept whole, not just `topic_out`. A card's `info()` is the only place
         # it describes itself, and a consumer downstream may need more of that
         # description than its output topics — `camera_info` is the first such
@@ -510,6 +501,22 @@ async def _do_start_project_impl():
                     await register_topic_internal(tp['topic'], tp['format'], mcp_id)
         return data
 
+    async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
+                                   info_args: dict) -> dict:
+        """info() the card, register its topic_out on the bus, return the payload.
+
+        info_args carries the input_topic the card was started with: without it a
+        tool that has no live node yet can only report its fallback output topic
+        (perception TTS answers /perception/tts), and that wrong topic is what
+        the dashboard would then subscribe to — no waveform, while audio flows on
+        the real one.
+        """
+        info = await mcp_call_tool(mcp_id, MCPCallRequest(
+            tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
+                                       **info_args},
+        ), timeout_s=INFO_TIMEOUT_S)
+        return await _register_info(mcp_id, card_id, payload_of(info))
+
     async def _settle_loading_item(mcp_id: str, tool_name: str, card_id: str,
                                   info_args: dict) -> None:
         """Poll a card that started into `loading` and report its real outcome.
@@ -518,9 +525,15 @@ async def _do_start_project_impl():
         and the operator must not be told 已就绪 before the tool can do its job.
         On success the topics are registered again: they were resolved before the
         node existed, so only now can the card report the real ones.
+        A tool may declare additional unsuccessful terminal states in
+        inputSchema['x-start']['failed_states'].
         """
         deadline = time.time() + LOADING_TIMEOUT_S
         last_message = ''
+        schema = (find_tool(mcp_id, tool_name) or {}).get('inputSchema') or {}
+        start_rules = schema.get('x-start') if isinstance(schema, dict) else None
+        failed_states = start_rules.get('failed_states') if isinstance(start_rules, dict) else []
+        failed_states = set(v for v in failed_states if isinstance(v, str)) if isinstance(failed_states, list) else set()
         while time.time() < deadline:
             await _asyncio.sleep(LOADING_POLL_S)
             try:
@@ -557,11 +570,13 @@ async def _do_start_project_impl():
                     'message': '启动已取消',
                 }})
                 return
-            status = 'error' if state == 'error' else 'ready'
+            status = 'error' if state == 'error' or state in failed_states else 'ready'
+            if status == 'error' and not message:
+                message = '启动未完成'
             print(f'[start-project] {tool_name} ({mcp_id}) settled: {state}')
             if status == 'ready':
                 try:
-                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+                    await _register_info(mcp_id, card_id, payload_of(info))
                 except Exception as error:
                     print(f'[start-project] {tool_name} topic re-register failed: {error}')
             await push_event({'type': 'project_start_item', 'payload': {
@@ -1117,6 +1132,23 @@ async def _do_start_project_impl():
 # 进程的线程把 GIL 饿死、容器正在重启）会让停止永远挂着。容器内实测：
 # `timeout=None` 对着一个只 accept 不回的端口 25 秒仍未返回；给 5 秒则 5.3 秒失败。
 STOP_CARD_TIMEOUT_S = 5.0
+MAX_STOP_CARD_TIMEOUT_S = 30.0
+
+
+def _stop_timeout(tool_obj: dict) -> float:
+    """Bound any card-specific stop deadline; malformed declarations use the default."""
+    schema = (tool_obj or {}).get('inputSchema') or {}
+    declaration = schema.get('x-stop') if isinstance(schema, dict) else None
+    value = declaration.get('timeout_s') if isinstance(declaration, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return STOP_CARD_TIMEOUT_S
+    try:
+        timeout = float(value)
+    except (OverflowError, ValueError):
+        return STOP_CARD_TIMEOUT_S
+    if not math.isfinite(timeout) or timeout <= 0:
+        return STOP_CARD_TIMEOUT_S
+    return max(STOP_CARD_TIMEOUT_S, min(timeout, MAX_STOP_CARD_TIMEOUT_S))
 
 
 async def _stop_cards(cards, progress: bool = False) -> list[dict]:
@@ -1148,14 +1180,16 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
         tool_name = card.get('toolName', '')
         entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
                  'card_id': card.get('id', ''), 'ok': False, 'error': ''}
-        rules = stop_rules(find_tool(card.get('mcpId', ''), tool_name))
+        tool = find_tool(card.get('mcpId', ''), tool_name)
+        rules = stop_rules(tool)
+        timeout_s = _stop_timeout(tool)
         try:
             async def stop_and_confirm():
                 action = 'stop'
                 while True:
                     result = await mcp_call_tool(card.get('mcpId', ''), MCPCallRequest(
                         tool=tool_name, arguments={'action': action, 'instance_id': card.get('id', '')}),
-                        timeout_s=STOP_CARD_TIMEOUT_S)
+                        timeout_s=timeout_s)
                     if result.get('code') != 200:
                         raise RuntimeError(result.get('message') or '设备拒绝停止请求')
                     payload = payload_of(result)
@@ -1176,17 +1210,17 @@ async def _stop_cards(cards, progress: bool = False) -> list[dict]:
                     # its actual state within the existing per-card deadline --
                     # and never spend the whole budget on one sleep, or a short
                     # deadline gets no read at all.
-                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, STOP_CARD_TIMEOUT_S / 4))
+                    await _aio.sleep(min(_STOP_POLL_INTERVAL_S, timeout_s / 4))
                     action = 'info'
             # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
             # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
             # GIL 握死的线程),而停止这条路径的要求是「无论挂在哪都要能回来」。
-            await _aio.wait_for(stop_and_confirm(), STOP_CARD_TIMEOUT_S)
+            await _aio.wait_for(stop_and_confirm(), timeout_s)
             entry['ok'] = True
         except _aio.TimeoutError:
             # 这条消息会被操作者读到，所以说的是**后果**，不是异常类名：一张没能停
             # 下来的卡片意味着那台设备可能还在跑。
-            entry['error'] = f'停止未确认（{STOP_CARD_TIMEOUT_S:g}s 死线）；请检查设备状态'
+            entry['error'] = f'停止未确认（{timeout_s:g}s 死线）；请检查设备状态'
         except Exception as error:  # noqa: BLE001
             entry['error'] = str(error) or type(error).__name__
         if progress:

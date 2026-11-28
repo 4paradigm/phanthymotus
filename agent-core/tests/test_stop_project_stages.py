@@ -136,6 +136,45 @@ def test_every_card_gets_a_deadline(rig):
             '没传 timeout_s 的话默认是不限时,一个不回应的 MCP 会永远挂住停止'
 
 
+@pytest.mark.parametrize(('value', 'expected'), [
+    (None, 5.0), (True, 5.0), ('25', 5.0), (-1, 5.0), (0, 5.0),
+    (float('nan'), 5.0), (float('inf'), 5.0), (2, 5.0),
+    (25, 25.0), (1000, 30.0),
+])
+def test_card_stop_timeout_is_bounded_and_validated(monkeypatch, value, expected):
+    monkeypatch.setattr(api_config, 'STOP_CARD_TIMEOUT_S', 5.0)
+    tool = {'inputSchema': {'x-stop': {'timeout_s': value}}}
+    assert api_config._stop_timeout(tool) == expected
+
+
+def test_declared_stop_timeout_applies_to_request_and_total_deadline(rig, monkeypatch):
+    monkeypatch.setattr(api_config, 'find_tool', lambda *_: {
+        'inputSchema': {'x-stop': {'timeout_s': 0.6}},
+    })
+    calls = []
+
+    async def delayed_call(_mcp, req, timeout_s=None):
+        calls.append((req.arguments['action'], timeout_s))
+        await asyncio.sleep(0.3)  # Longer than rig's default 0.2s.
+        return {'code': 200, 'data': {'state': 'idle'}}
+
+    monkeypatch.setattr('api.mcp_manage.mcp_call_tool', delayed_call)
+    result = run(api_config._stop_cards(CARDS[:1]))[0]
+    assert result['ok'] is True
+    assert calls == [('stop', pytest.approx(0.6))]
+
+
+def test_declared_stop_timeout_is_reported_on_timeout(rig, monkeypatch):
+    monkeypatch.setattr(api_config, 'find_tool', lambda *_: {
+        'inputSchema': {'x-stop': {'timeout_s': 0.3}},
+    })
+    rec = rig.install(Recorder(hang_for={'remote_mic'}))
+    result = run(api_config._stop_cards(CARDS[:1]))[0]
+    assert result['ok'] is False
+    assert '0.3s' in result['error']
+    assert rec.calls[0][3] == pytest.approx(0.3)
+
+
 def test_cards_stop_in_parallel(rig):
     run(api_config._stop_cards(CARDS))
     assert rig.concurrent_peak == len(CARDS), \

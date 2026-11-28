@@ -116,17 +116,8 @@ def safe_subdir(subdir: str) -> str:
     return cleaned
 
 
-# ACCESS_TOKEN, when this service is given one. Read from the environment and
-# from the shared .env if that happens to be mounted — but **absent is the
-# normal case**, verified on Tianyi: the perception container has ROS_DOMAIN_ID
-# and the DDS profile, no ACCESS_TOKEN, and it mounts `dds-local.xml` as a single
-# file rather than the directory holding `.env`.
-#
-# So this endpoint is gated by *reachability*, not by a secret: it binds the same
-# host-network port the MCP server already serves `tools/call` on, and anything
-# that can reach it can already drive the plugin. The token check is here so that
-# a deployment which does distribute one gets enforcement for free, and so the
-# check is not something to remember to add later.
+# The supplied deployment passes the host ACCESS_TOKEN to Perception. Older or
+# custom deployments may instead mount a shared .env or have no token at all.
 _ENV_CANDIDATES = ("/opt/phanthy-motus/.env", "/work/.env")
 
 

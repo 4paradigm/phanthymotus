@@ -29,11 +29,17 @@ perception:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    # The same host .env supplies Agent Core's dashboard token.
+    - ACCESS_TOKEN=${ACCESS_TOKEN:-}
   logging:
     driver: local
     options:
       max-size: "10m"
       max-file: "3"
+  # Allow recorder shutdown (15s flush + up to 5s process reap) and time for
+  # the server and other plugins to stop. Contended locks or other slow plugin
+  # shutdowns can still exceed this shared container deadline.
+  stop_grace_period: 30s
   # always, not unless-stopped: after a host reboot the robot must come back
   # on its own. G1 came up from a reboot with every container still exited —
   # somebody had to SSH in and start them, and until they did the robot was

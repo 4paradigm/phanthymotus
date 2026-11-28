@@ -23,7 +23,7 @@ from api.deploy_stream import DeployProgress
 from api.preflight import run_preflight_checks
 from api.drivers import (
     _container_name, _log_deploy, _clear_deploy_log,
-    _explain_pull_error, _merge_service_into_compose,
+    _compose_environment, _explain_pull_error, _merge_service_into_compose,
     LOG_MAX_SIZE, LOG_MAX_FILE,
 )
 
@@ -342,6 +342,7 @@ async def _prepare_compose(driver: dict, target_image: str, name: str, progress:
         # Remove old container
         try:
             old = client.containers.get(name)
+            old.stop()  # Honour the container's configured StopTimeout.
             old.remove(force=True)
         except docker_sdk.errors.NotFound:
             pass
@@ -350,6 +351,7 @@ async def _prepare_compose(driver: dict, target_image: str, name: str, progress:
         if svc_container_name and svc_container_name != name:
             try:
                 old = client.containers.get(svc_container_name)
+                old.stop()
                 old.remove(force=True)
             except docker_sdk.errors.NotFound:
                 pass
@@ -375,7 +377,7 @@ async def _start_container(driver_id: str, compose_result: dict, progress: Deplo
         _log_deploy(driver_id, f'[compose] up -d {service_name}')
         result = subprocess.run(
             ['docker', 'compose', '-f', compose_file, 'up', '-d', '--no-deps', '--force-recreate', service_name],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=_compose_environment(service_name),
         )
 
         if result.stdout:
